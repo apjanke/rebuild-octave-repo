@@ -6,7 +6,7 @@
 # Issue: This only gets changesets on the main branch. Are there other branches
 # that we need to export?
 
-IFS=$'\r\n' GLOBIGNORE='*' command eval  'changesets=($(cat original-hg-changesets | sort -n))'
+changesets=($(cat changesets | sort -n))
 
 for cs in "${changesets[@]}"; do
 	cs_file="changeset-exports/${cs}.patch"
