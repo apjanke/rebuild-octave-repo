@@ -21,6 +21,15 @@ I talked to Bitbucket support and they say it's an issue with the repo's history
 
 This repo contains code and stuff I'm using to try and work the situation.
 
+## What's in this repo
+
+* `.` - scripts for working with the problem
+* `changeset-exports` - the entire `octave` repo history as single changeset patches, created with `hg export -r`
+
+### Stuff you should add
+
+Create `octave/` with `hg clone https://www.octave.org/hg/octave`.
+
 ## Author
 
 [Andrew Janke](https://apjanke.net), March 2019
