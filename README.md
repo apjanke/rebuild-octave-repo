@@ -1,7 +1,7 @@
 rebuild-octave-repo
 ===================
 
-There's something wrong with the Octave hg repo. When I clone it and try to push it to another remote repo (e.g. on Bitbucket), the push fails.
+There's something wrong with the Octave hg repo as of March 2019. When I clone it and try to push it to another remote repo (e.g. on Bitbucket), the push fails.
 
 ```
 $ hg push bitbucket-ssh
