@@ -46,6 +46,27 @@ abort: push failed on remote
 
 I talked to Bitbucket support and they say it's an issue with the repo's history; Hg doesn't like something about it, and it fails during the validation stage used in remote pushes.
 
+Hg agrees: `hg verify` fails on the repo.
+
+```
+$ hg verify
+checking changesets
+checking manifests
+crosschecking files in changesets and manifests
+checking files
+checked 26998 changesets with 176234 changes to 13915 files
+checking subrepo links
+.hgsubstate is corrupt in revision ecf0c6bca0c9
+.hgsubstate is corrupt in revision e0fb702a62a4
+.hgsubstate is corrupt in revision 1398901839b6
+[...]
+21820: repository /Users/janke/local/repos/octave/gnulib-hg not found
+21834: repository /Users/janke/local/repos/octave/gnulib-hg not found
+$
+```
+
+See http://lists.gnu.org/archive/html/octave-maintainers/2018-07/msg00177.html
+
 This repo contains code and stuff I'm using to try and work the situation.
 
 ## What's in this repo
