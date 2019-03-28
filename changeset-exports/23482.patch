@@ -1,0 +1,305 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1494437863 14400
+#      Wed May 10 13:37:43 2017 -0400
+# Node ID c9937e8657686256503885cd8557b0597084a6c1
+# Parent  73558a835b6461db5634ef3bc80e42dba21e9e80
+make isargout work again for nested function calls
+
+* pt-eval.cc, pt-eval.h (tree_evaluator::ignored_fcn_outputs):
+Return if lvalue_list is null.
+(tree_evaluator::make_value_list): Now a member function instead of
+static file-scope function.  Change all callers.
+(tree_evaluator::visit_index_expression, tree_evaluator::visit_cell):
+Push null lvalue_list on m_lvalue_list_stack.
+
+* ov-usr-fcn.cc (octave_user_function::bind_automatic_var):
+Always define .ignored. symbol.  New tests.
+
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -721,20 +721,17 @@ octave_user_function::bind_automatic_var
+   symbol_table::mark_automatic (".saved_warning_states.");
+   symbol_table::mark_automatic (".saved_warning_states.");
+ 
+   if (takes_varargs ())
+     symbol_table::assign ("varargin", va_args.cell_value ());
+ 
+   Matrix ignored_fcn_outputs = tw ? tw->ignored_fcn_outputs () : Matrix ();
+ 
+-  if (ignored_fcn_outputs.is_empty ())
+-    symbol_table::assign (".ignored.");
+-  else
+-    symbol_table::assign (".ignored.", ignored_fcn_outputs);
++  symbol_table::assign (".ignored.", ignored_fcn_outputs);
+ 
+   symbol_table::mark_hidden (".ignored.");
+   symbol_table::mark_automatic (".ignored.");
+ }
+ 
+ void
+ octave_user_function::restore_warning_states (void)
+ {
+@@ -1068,16 +1065,21 @@ element-by-element and a logical array i
+ %!    if (isargout (2))
+ %!      y = -2;
+ %!    else
+ %!      error ("no outputs requested");
+ %!    endif
+ %!  endif
+ %!endfunction
+ %!
++%!function [a, b] = try_isargout2 (x, y)
++%!  a = y;
++%!  b = {isargout(1), isargout(2), x};
++%!endfunction
++%!
+ %!test
+ %! [x, y] = try_isargout ();
+ %! assert ([x, y], [1, 2]);
+ %!
+ %!test
+ %! [x, ~] = try_isargout ();
+ %! assert (x, -1);
+ %!
+@@ -1106,9 +1108,17 @@ element-by-element and a logical array i
+ %! [~, y] = fh ();
+ %! assert (y, -2);
+ %! [~, y] = af ();
+ %! assert (y, -2);
+ %! [~, y] = c{1}();
+ %! assert (y, -2);
+ %! [~, y] = c{2}();
+ %! assert (y, -2);
++%!
++## Nesting, anyone?
++%!test
++%! [~, b] = try_isargout2 (try_isargout, rand);
++%! assert (b, {0, 1, -1});
++%!test
++%! [~, b] = try_isargout2 ({try_isargout, try_isargout}, rand);
++%! assert (b, {0, 1, {-1, -1}});
+ */
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -411,21 +411,21 @@ namespace octave
+   Matrix
+   tree_evaluator::ignored_fcn_outputs (void) const
+   {
+     Matrix retval;
+ 
+     if (m_lvalue_list_stack.empty ())
+       return retval;
+ 
+-    //    std::cerr << "lvalue_list_stack size: "
+-    //              << m_lvalue_list_stack.size () << std::endl;
+-
+     const std::list<octave_lvalue> *lvalue_list = m_lvalue_list_stack.top ();
+ 
++    if (! lvalue_list)
++      return retval;
++
+     octave_idx_type nbh = 0;
+ 
+     for (const auto& lval : *lvalue_list)
+       nbh += lval.is_black_hole ();
+ 
+     if (nbh > 0)
+       {
+         retval.resize (1, nbh);
+@@ -1038,39 +1038,16 @@ namespace octave
+               stmt_lst->accept (*this);
+ 
+             break;
+           }
+       }
+   }
+ }
+ 
+-static inline octave_value_list
+-make_value_list (octave::tree_evaluator *tw, octave::tree_argument_list *args,
+-                 const string_vector& arg_nm,
+-                 const octave_value *object, bool rvalue = true)
+-{
+-  octave_value_list retval;
+-
+-  if (args)
+-    {
+-      if (rvalue && object && args->has_magic_end () && object->is_undefined ())
+-        err_invalid_inquiry_subscript ();
+-
+-      retval = args->convert_to_const_vector (tw, object);
+-    }
+-
+-  octave_idx_type n = retval.length ();
+-
+-  if (n > 0)
+-    retval.stash_name_tags (arg_nm);
+-
+-  return retval;
+-}
+-
+ // Final step of processing an indexing error.  Add the name of the
+ // variable being indexed, if any, then issue an error.  (Will this also
+ // be needed by pt-lvalue, which calls subsref?)
+ 
+ static void
+ final_index_error (octave::index_exception& e,
+                    const octave::tree_expression *expr)
+ {
+@@ -1127,16 +1104,26 @@ namespace octave
+         if (! (id->is_variable () || args.empty ()))
+           {
+             tree_argument_list *al = *(args.begin ());
+ 
+             size_t n = (al ? al->length () : 0);
+ 
+             if (n > 0)
+               {
++                // Function calls inside an argument list can't have ignored
++                // output arguments.
++
++                unwind_protect frame;
++
++                m_lvalue_list_stack.push (0);
++
++                frame.add_method (m_lvalue_list_stack,
++                                  &value_stack<const std::list<octave_lvalue>*>::pop);
++
+                 string_vector anm = *(arg_nm.begin ());
+                 have_args = true;
+                 first_args = al -> convert_to_const_vector (this);
+                 first_args.stash_name_tags (anm);
+ 
+                 first_expr_val = id->do_lookup  (first_args);
+               }
+           }
+@@ -1234,21 +1221,21 @@ namespace octave
+           {
+           case '(':
+             if (have_args)
+               {
+                 idx.push_back (first_args);
+                 have_args = false;
+               }
+             else
+-              idx.push_back (make_value_list (this, *p_args, *p_arg_nm, &tmp));
++              idx.push_back (make_value_list (*p_args, *p_arg_nm, &tmp));
+             break;
+ 
+           case '{':
+-            idx.push_back (make_value_list (this, *p_args, *p_arg_nm, &tmp));
++            idx.push_back (make_value_list (*p_args, *p_arg_nm, &tmp));
+             break;
+ 
+           case '.':
+             idx.push_back (octave_value
+                            (idx_expr.get_struct_index (this, p_arg_nm, p_dyn_field)));
+             break;
+ 
+           default:
+@@ -1483,16 +1470,26 @@ namespace octave
+     m_value_stack.push (retval);
+   }
+ 
+   void
+   tree_evaluator::visit_cell (tree_cell& expr)
+   {
+     octave_value retval;
+ 
++    // Function calls inside an argument list can't have ignored
++    // output arguments.
++
++    unwind_protect frame;
++
++    m_lvalue_list_stack.push (0);
++
++    frame.add_method (m_lvalue_list_stack,
++                      &value_stack<const std::list<octave_lvalue>*>::pop);
++
+     octave_idx_type nr = expr.length ();
+     octave_idx_type nc = -1;
+ 
+     Cell val;
+ 
+     octave_idx_type i = 0;
+ 
+     for (tree_argument_list *elt : expr)
+@@ -2504,16 +2501,50 @@ namespace octave
+     if (t1.is_defined ())
+       return t1.is_true ();
+     else
+       error ("%s: undefined value used in conditional expression", warn_for);
+ 
+     return expr_value;
+   }
+ 
++  octave_value_list
++  tree_evaluator::make_value_list (octave::tree_argument_list *args,
++                                   const string_vector& arg_nm,
++                                   const octave_value *object, bool rvalue)
++  {
++    octave_value_list retval;
++
++    if (args)
++      {
++        // Function calls inside an argument list can't have ignored
++        // output arguments.
++
++        unwind_protect frame;
++
++        m_lvalue_list_stack.push (0);
++
++        frame.add_method (m_lvalue_list_stack,
++                          &value_stack<const std::list<octave_lvalue>*>::pop);
++
++        if (rvalue && object && args->has_magic_end ()
++            && object->is_undefined ())
++          err_invalid_inquiry_subscript ();
++
++        retval = args->convert_to_const_vector (this, object);
++      }
++
++    octave_idx_type n = retval.length ();
++
++    if (n > 0)
++      retval.stash_name_tags (arg_nm);
++
++    return retval;
++  }
++
+   std::list<octave_lvalue>
+   tree_evaluator::make_lvalue_list (tree_argument_list *lhs)
+   {
+     std::list<octave_lvalue> retval;
+ 
+     for (tree_expression *elt : *lhs)
+       retval.push_back (elt->lvalue (this));
+ 
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -299,16 +299,21 @@ namespace octave
+     void do_breakpoint (bool is_breakpoint,
+                         bool is_end_of_fcn_or_script = false) const;
+ 
+     virtual octave_value
+     do_keyboard (const octave_value_list& args = octave_value_list ()) const;
+ 
+     bool is_logically_true (tree_expression *expr, const char *warn_for);
+ 
++    octave_value_list
++    make_value_list (octave::tree_argument_list *args,
++                     const string_vector& arg_nm,
++                     const octave_value *object, bool rvalue = true);
++
+     std::list<octave_lvalue> make_lvalue_list (tree_argument_list *);
+ 
+     value_stack<octave_value_list> m_value_stack;
+ 
+     value_stack<const std::list<octave_lvalue>*> m_lvalue_list_stack;
+ 
+     value_stack<int> m_nargout_stack;
+ 

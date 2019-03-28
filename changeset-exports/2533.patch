@@ -1,0 +1,489 @@
+# HG changeset patch
+# User jwe
+# Date 848427692 0
+#      Tue Nov 19 18:21:32 1996 +0000
+# Node ID 987e934bbb8ca48a2901278c6de5954e5ed0d13d
+# Parent  0e5eb97cb1378c06e31b3c809d2ca068382936a5
+[project @ 1996-11-19 18:21:23 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,50 @@
++Tue Nov 19 12:01:13 1996  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* parse.y (fold): New functions for constant folding for binary
++	and unary expressions.  Keep track of original text even when
++	transformations occur.
++	(make_binary_op, make_boolean_op, make_unary_op): Use them.
++	(finish_colon_expression, finish_matrix): Keep track of original
++	text even when transformations occur.
++
++	* help.cc (Ftype): Don't mess with Vps4.
++	Handle new option `-transformed'.
++
++	* pt-const.h, pt-const.cc (tree_constant::print):
++	New arg, pr_orig_text.
++
++	* pt-exp.h, pt-exp.cc (tree_colon_expression::is_range_constant):
++	Delete.
++
++	* pt-exp-base.h (tree_expression::original_text): New virtual function.
++	pt-exp-base.cc (tree_expression::original_text): Default version.
++
++	* pt-pr-code.h (tree_print_code::print_original_text,
++	tree_print_code::prefix): New fields.
++	* pt-pr-code.cc (tree_print_code::visit_constant): Pass
++	print_original_text to tree_constant::print().
++	(tree_print_code::indent): Use prefix instead of Vps4.
++	* pt-fcn.cc (tree_function::print_function_header,
++	tree_function::print_function_trailer): Pass Vps4 to
++	tree_print_code_constructor for prefix.
++	* pt-misc.cc (tree_statement::maybe_echo_code): Pass Vps4 to
++	tree_print_code_constructor for prefix.
++
++	* pt-mat.h, pt-mat.cc (tree_matrix::all_elements_are_constant):
++	Rename from is_matrix_constant.
++	(tree_matrix_row::all_elements_are_constant): Likewise.
++	Change all callers.
++
++Mon Nov 18 14:13:32 1996  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* Makefile.in (install-inc): Try harder to create the link from
++	include/octave to include/octave-VERSION.
++
+ Sun Nov 17 14:14:48 1996  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* Makefile.in (parse.cc): Expect 13 shift/reduce conflicts.
+ 
+ 	* parse.y (set_stmt_print_flag): New function.
+ 	(sep_type): New member for bison %union declaration.
+ 	Simplify rules for statement lists keeping track of the type of
+ 	the first separator in the values associated with the
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -51,16 +51,17 @@ Software Foundation, 59 Temple Place - S
+ #include "pt-const.h"
+ #include "pt-fcn.h"
+ #include "pt-fvc.h"
+ #include "pt-mat.h"
+ #include "pt-mvr.h"
+ #include "pt-exp.h"
+ #include "pt-misc.h"
+ #include "pt-plot.h"
++#include "pt-pr-code.h"
+ #include "symtab.h"
+ #include "token.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // If TRUE, generate a warning for the assignment in things like
+ //
+ //   octave> if (a = 2 < n)
+@@ -702,18 +703,16 @@ else_clause	: ELSE opt_sep opt_list
+ 		;
+ 
+ screwed_again	: // empty
+ 		  { lexer_flags.maybe_screwed_again++; }
+ 		;
+ 
+ expression	: simple_expr
+ 		  { $$ = $1; }
+-		| colon_expr
+-		  { $$ = finish_colon_expression ($1); }
+ 		| NUM '=' expression
+ 		  {
+ 		    yyerror ("invalid assignment to a number");
+ 		    $$ = 0;
+ 		    ABORT_PARSE;
+ 		  }
+ 		;
+ 
+@@ -737,16 +736,18 @@ simple_expr1	: NUM
+ 		  {
+ 		    $2->mark_in_parens ();
+ 		    $$ = $2;
+ 		  }
+ 		| word_list_cmd
+ 		  { $$ = $1; }
+ 		| variable
+ 		  { $$ = $1; }
++		| colon_expr
++		  { $$ = finish_colon_expression ($1); }
+ 		| matrix
+ 		  { $$ = $1; }
+ 		| '[' ']'
+ 		  { $$ = new tree_constant (Matrix ()); }
+ 		| '[' ';' ']'
+ 		  { $$ = new tree_constant (Matrix ()); }
+ 		| PLUS_PLUS identifier %prec UNARY
+ 		  { $$ = make_prefix_op (PLUS_PLUS, $2, $1); }
+@@ -1358,31 +1359,141 @@ make_plot_command (token *tok, plot_limi
+   lexer_flags.past_plot_range = 0;
+   lexer_flags.in_plot_range = 0;
+   lexer_flags.in_plot_using = 0;
+   lexer_flags.in_plot_style = 0;
+   
+   return new tree_plot_command (list, range, tok->pttype ());
+ }
+ 
++static tree_expression *
++fold (tree_binary_expression *e)
++{
++  tree_expression *retval = 0;
++
++  tree_expression *op1 = e->lhs ();
++  tree_expression *op2 = e->rhs ();
++
++  if (op1->is_constant () && op2->is_constant ())
++    {
++      octave_value tmp = e->eval (0);
++
++      if (! error_state)
++	{
++	  tree_constant *tc_retval = new tree_constant (tmp);
++
++	  ostrstream buf;
++
++	  tree_print_code tpc (buf);
++
++	  e->accept (tpc);
++
++	  buf << ends;
++
++	  char *s = buf.str ();
++
++	  tc_retval->stash_original_text (s);
++
++	  delete [] s;
++
++	  delete e;
++
++	  retval = tc_retval;
++	}
++      else
++	delete e;
++    }
++  else
++    retval = e;
++
++  return retval;
++}
++
++static tree_expression *
++fold (tree_unary_expression *e)
++{
++  tree_expression *retval = 0;
++
++  tree_expression *op1 = e->operand ();
++
++  if (op1->is_constant ())
++    {
++      octave_value tmp = e->eval (0);
++
++      if (! error_state)
++	{
++	  tree_constant *tc_retval = new tree_constant (tmp);
++
++	  ostrstream buf;
++
++	  tree_print_code tpc (buf);
++
++	  e->accept (tpc);
++
++	  buf << ends;
++
++	  char *s = buf.str ();
++
++	  tc_retval->stash_original_text (s);
++
++	  delete [] s;
++
++	  delete e;
++
++	  retval = tc_retval;
++	}
++      else
++	delete e;
++    }
++  else
++    retval = e;
++
++  return retval;
++}
++
+ // Finish building a range.
+ 
+ static tree_expression *
+ finish_colon_expression (tree_colon_expression *e)
+ {
+   tree_expression *retval = 0;
+ 
+-  if (e->is_range_constant ())
++  tree_expression *base = e->base ();
++  tree_expression *limit = e->limit ();
++  tree_expression *incr = e->increment ();
++
++  if (base->is_constant () && limit->is_constant ()
++      && (! incr || (incr && incr->is_constant ())))
+     {
+       octave_value tmp = e->eval (0);
+ 
+-      delete e;
++      if (! error_state)
++	{
++	  tree_constant *tc_retval = new tree_constant (tmp);
++
++	  ostrstream buf;
++
++	  tree_print_code tpc (buf);
++
++	  e->accept (tpc);
++
++	  buf << ends;
+ 
+-      if (! error_state)
+-	retval = new tree_constant (tmp);
++	  char *s = buf.str ();
++
++	  tc_retval->stash_original_text (s);
++
++	  delete [] s;
++
++	  delete e;
++
++	  retval = tc_retval;
++	}
++      else
++	delete e;
+     }
+   else
+     retval = e;
+ 
+   return retval;
+ }
+ 
+ // Make a constant.
+@@ -1393,18 +1504,20 @@ make_constant (int op, token *tok_val)
+   int l = tok_val->line ();
+   int c = tok_val->column ();
+ 
+   tree_constant *retval;
+ 
+   switch (op)
+     {
+     case NUM:
+-      retval = new tree_constant (tok_val->number (), l, c);
+-      retval->stash_original_text (tok_val->text_rep ());
++      {
++	retval = new tree_constant (tok_val->number (), l, c);
++	retval->stash_original_text (tok_val->text_rep ());
++      }
+       break;
+ 
+     case IMAG_NUM:
+       {
+ 	Complex C (0.0, tok_val->number ());
+ 	retval = new tree_constant (C, l, c);
+ 	retval->stash_original_text (tok_val->text_rep ());
+       }
+@@ -1423,18 +1536,16 @@ make_constant (int op, token *tok_val)
+ }
+ 
+ // Build a binary expression.
+ 
+ static tree_expression *
+ make_binary_op (int op, tree_expression *op1, token *tok_val,
+ 		tree_expression *op2)
+ {
+-  tree_expression *retval = 0;
+-
+   tree_binary_expression::type t;
+ 
+   switch (op)
+     {
+     case POW:
+       t = tree_binary_expression::power;
+       break;
+ 
+@@ -1509,40 +1620,28 @@ make_binary_op (int op, tree_expression 
+     default:
+       panic_impossible ();
+       break;
+     }
+ 
+   int l = tok_val->line ();
+   int c = tok_val->column ();
+ 
+-  retval = new tree_binary_expression (op1, op2, l, c, t);
+-
+-  if (op1->is_constant () && op2->is_constant ())
+-    {
+-      octave_value tmp = retval->eval (0);
++  tree_binary_expression *e
++    = new tree_binary_expression (op1, op2, l, c, t);
+ 
+-      delete retval;
+-      retval = 0;
+-
+-      if (! error_state)
+-	retval = new tree_constant (tmp);
+-    }
+-
+-  return retval;
++  return fold (e);
+ }
+ 
+ // Build a boolean expression.
+ 
+ static tree_expression *
+ make_boolean_op (int op, tree_expression *op1, token *tok_val,
+ 		 tree_expression *op2)
+ {
+-  tree_expression *retval = 0;
+-
+   tree_boolean_expression::type t;
+ 
+   switch (op)
+     {
+     case EXPR_AND_AND:
+       t = tree_boolean_expression::and;
+       break;
+ 
+@@ -1553,30 +1652,20 @@ make_boolean_op (int op, tree_expression
+     default:
+       panic_impossible ();
+       break;
+     }
+ 
+   int l = tok_val->line ();
+   int c = tok_val->column ();
+ 
+-  retval = new tree_boolean_expression (op1, op2, l, c, t);
+-
+-  if (op1->is_constant () && op2->is_constant ())
+-    {
+-      octave_value tmp = retval->eval (0);
++  tree_boolean_expression *e
++    = new tree_boolean_expression (op1, op2, l, c, t);
+ 
+-      delete retval;
+-      retval = 0;
+-
+-      if (! error_state)
+-	retval = new tree_constant (tmp);
+-    }
+-
+-  return retval;
++  return fold (e);
+ }
+ 
+ // Build a prefix expression.
+ 
+ static tree_expression *
+ make_prefix_op (int op, tree_identifier *op1, token *tok_val)
+ {
+   tree_prefix_expression::type t;
+@@ -1630,18 +1719,16 @@ make_postfix_op (int op, tree_identifier
+   return new tree_postfix_expression (op1, l, c, t);
+ }
+ 
+ // Build a unary expression.
+ 
+ static tree_expression *
+ make_unary_op (int op, tree_expression *op1, token *tok_val)
+ {
+-  tree_expression *retval = 0;
+-
+   tree_unary_expression::type t;
+ 
+   switch (op)
+     {
+     case QUOTE:
+       t = tree_unary_expression::hermitian;
+       break;
+ 
+@@ -1660,30 +1747,20 @@ make_unary_op (int op, tree_expression *
+     default:
+       panic_impossible ();
+       break;
+     }
+ 
+   int l = tok_val->line ();
+   int c = tok_val->column ();
+ 
+-  retval = new tree_unary_expression (op1, l, c, t);
+-
+-  if (op1->is_constant ())
+-    {
+-      octave_value tmp = retval->eval (0);
++  tree_unary_expression *e
++    = new tree_unary_expression (op1, l, c, t);
+ 
+-      delete retval;
+-      retval = 0;
+-
+-      if (! error_state)
+-	retval = new tree_constant (tmp);
+-    }
+-
+-  return retval;
++  return fold (e);
+ }
+ 
+ // Build an unwind-protect command.
+ 
+ static tree_command *
+ make_unwind_command (token *unwind_tok, tree_statement_list *body,
+ 		     tree_statement_list *cleanup, token *end_tok)
+ {
+@@ -2075,24 +2152,44 @@ make_index_expression (tree_indirect_ref
+ 
+ static tree_expression *
+ finish_matrix (tree_matrix *m)
+ {
+   tree_expression *retval = 0;
+ 
+   lexer_flags.maybe_screwed_again--;
+ 
+-  if (m->is_matrix_constant ())
++  if (m->all_elements_are_constant ())
+     {
+       octave_value tmp = m->eval (0);
+ 
+-      delete m;
++      if (! error_state)
++	{
++	  tree_constant *tc_retval = new tree_constant (tmp);
++
++	  ostrstream buf;
++
++	  tree_print_code tpc (buf);
++
++	  m->accept (tpc);
++
++	  buf << ends;
+ 
+-      if (! error_state)
+-	retval = new tree_constant (tmp);
++	  char *s = buf.str ();
++
++	  tc_retval->stash_original_text (s);
++
++	  delete [] s;
++
++	  delete m;
++
++	  retval = tc_retval;
++	}
++      else
++	delete m;
+     }
+   else
+     retval = m;
+ 
+   return retval;
+ }
+ 
+ static void

@@ -1,0 +1,279 @@
+# HG changeset patch
+# User jwe
+# Date 1196194579 0
+#      Tue Nov 27 20:16:19 2007 +0000
+# Node ID ffdbdf53665c730f30a09e54233fd8060c270567
+# Parent  76341ffda11e071405bce761e436bbbfa03f99fa
+[project @ 2007-11-27 20:14:41 by jwe]
+
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,14 +1,19 @@
++2007-11-27  David Bateman  <dbateman@free.fr>
++
++	* plot/__go_draw_figure__.m: Force a multiplot mode with a
++	colorbar, to ensure that the colorbar is on the canvas for png and
++	postscipt outputs.
++
+ 2007-11-26  David Bateman  <dbateman@free.fr>
+ 
+ 	* sparse/spstats.m, statistics/base/mode.m: More care with sparse
+ 	return values.
+ 
+-
+ 	* plot/plotyy.m: New function
+ 	* plot/Makefile.in (SOURCES): Add it here.
+ 	* plot/__go_draw_axes__.m: Force axis margins for plotyy. Set text
+ 	color for {x|y|z}label and {x|y|z}tics. Also force the label of 
+ 	{x|y}label to respect the axis position.
+ 	* plot/xlabel.m, plot/ylabel.m, plot/zlabel.m: Accept an axis
+ 	handle as the first argument.
+ 	
+diff --git a/scripts/plot/__go_draw_figure__.m b/scripts/plot/__go_draw_figure__.m
+--- a/scripts/plot/__go_draw_figure__.m
++++ b/scripts/plot/__go_draw_figure__.m
+@@ -32,16 +32,20 @@ function __go_draw_figure__ (f, plot_str
+ 
+       if (nkids > 0)
+ 	axes_count = 0;
+ 	for i = 1:nkids
+ 	  obj = get (kids(i));
+ 	  switch (obj.type)
+ 	    case "axes"
+ 	      axes_count++;
++	      ## Force multiplot with a colorbar to ensure colorbar on the page
++	      if (!strcmp (obj.__colorbar__, "none"))
++		axes_count++;
++	      endif
+ 	  endswitch
+ 	endfor
+ 
+ 	fputs (plot_stream, "\nreset;\n");
+ 
+ 	multiplot_mode = axes_count > 1;
+ 
+ 	if (multiplot_mode)
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,18 @@
+ 2007-11-27  John W. Eaton  <jwe@octave.org>
+ 
++	* error.cc (Fwarning): If setting state "all" to "error", leave
++	Octave:matlab-incompatible warning state unchanged.
++
++	* octave.cc (execute_eval_option_code, execute_command_line_file):
++	Handle interrupts.
++	* toplev.cc (recover_from_exception): Now extern.
++	* toplev.h (recover_from_exception): Provide decl.
++
+ 	* pt-idx.cc (tree_index_expression::lvalue): Treat object == []
+ 	the same as undefined.
+ 
+ 2007-11-26  John W. Eaton  <jwe@octave.org>
+ 
+ 	* oct-stream.cc (DO_DOUBLE_CONV): Always use long.
+ 
+ 	* oct-stream.cc (do_write): Call float_value and double_value on
+diff --git a/src/error.cc b/src/error.cc
+--- a/src/error.cc
++++ b/src/error.cc
+@@ -1069,18 +1069,54 @@ warning named by @var{id} is handled as 
+ 	  if (arg1 == "on" || arg1 == "off" || arg1 == "error")
+ 	    {
+ 	      Octave_map old_warning_options = warning_options;
+ 
+ 	      if (arg2 == "all")
+ 		{
+ 		  Octave_map tmp;
+ 
+-		  tmp.assign ("identifier", arg2);
+-		  tmp.assign ("state", arg1);
++		  Cell id (1, 1);
++		  Cell st (1, 1);
++
++		  id(0) = arg2;
++		  st(0) = arg1;
++
++		  // Since internal Octave functions are not
++		  // compatible, turning all warnings into errors
++		  // should leave the state of
++		  // Octave:matlab-incompatible alone.
++
++		  if (arg1 == "error"
++		      && warning_options.contains ("identifier"))
++		    {
++		      Cell tid = warning_options.contents ("identifier");
++		      Cell tst = warning_options.contents ("state");
++
++		      for (octave_idx_type i = 0; i < tid.numel (); i++)
++			{
++			  octave_value vid = tid(i);
++
++			  if (vid.is_string ()
++			      && (vid.string_value ()
++				  == "Octave:matlab-incompatible"))
++			    {
++			      id.resize (dim_vector (1, 2));
++			      st.resize (dim_vector (1, 2));
++
++			      id(1) = tid(i);
++			      st(1) = tst(i);
++
++			      break;
++			    }
++			}
++		    }
++
++		  tmp.assign ("identifier", id);
++		  tmp.assign ("state", st);
+ 
+ 		  warning_options = tmp;
+ 
+ 		  done = true;
+ 		}
+ 	      else if (arg2 == "backtrace")
+ 		{
+ 		  if (arg1 != "error")
+diff --git a/src/octave.cc b/src/octave.cc
+--- a/src/octave.cc
++++ b/src/octave.cc
+@@ -361,42 +361,71 @@ execute_startup_files (void)
+   unwind_protect::run_frame ("execute_startup_files");
+ }
+ 
+ static int
+ execute_eval_option_code (const std::string& code)
+ {
+   unwind_protect::begin_frame ("execute_eval_option_code");
+ 
++  octave_save_signal_mask ();
++
++  can_interrupt = true;
++
++  octave_signal_hook = octave_signal_handler;
++  octave_interrupt_hook = unwind_protect::run_all;
++  octave_bad_alloc_hook = unwind_protect::run_all;
++
++  octave_catch_interrupts ();
++
++  octave_initialized = true;
++
+   unwind_protect_bool (interactive);
+ 
+   interactive = false;
+ 
+   int parse_status = 0;
+ 
+   try
+     {
+       eval_string (code, false, parse_status, 0);
+     }
++  catch (octave_interrupt_exception)
++    {
++      recover_from_exception ();
++      octave_stdout << "\n";
++    }
+   catch (std::bad_alloc)
+     {
+       std::cerr << "error: memory exhausted or requested size too large for range of Octave's index type -- eval failed"
+ 		<< std::endl;
+     }
+ 
+   unwind_protect::run_frame ("execute_eval_option_code");
+ 
+   return parse_status;
+ }
+ 
+ static void
+ execute_command_line_file (const std::string& fname)
+ {
+   unwind_protect::begin_frame ("execute_command_line_file");
+ 
++  octave_save_signal_mask ();
++
++  can_interrupt = true;
++
++  octave_signal_hook = octave_signal_handler;
++  octave_interrupt_hook = unwind_protect::run_all;
++  octave_bad_alloc_hook = unwind_protect::run_all;
++
++  octave_catch_interrupts ();
++
++  octave_initialized = true;
++
+   unwind_protect_bool (interactive);
+   unwind_protect_bool (reading_script_file);
+   unwind_protect_bool (input_from_command_line_file);
+ 
+   unwind_protect_str (curr_fcn_file_name);
+   unwind_protect_str (curr_fcn_file_full_name);
+ 
+   unwind_protect_str (octave_program_invocation_name);
+@@ -417,16 +446,21 @@ execute_command_line_file (const std::st
+     ? curr_fcn_file_name.substr (pos+1) : curr_fcn_file_name;
+ 
+   octave_program_name = tmp;
+ 
+   try
+     {
+       parse_and_execute (fname, false, "octave");
+     }
++  catch (octave_interrupt_exception)
++    {
++      recover_from_exception ();
++      octave_stdout << "\n";
++    }
+   catch (std::bad_alloc)
+     {
+       std::cerr << "error: memory exhausted or requested size too large for range of Octave's index type -- execution of "
+ 		<< fname << " failed" << std::endl;
+     }
+  
+   unwind_protect::run_frame ("execute_command_line_file");
+ }
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -170,17 +170,17 @@ void
+ octave_call_stack::unwind_pop_script (void *)
+ {
+   octave_function *f = top ();
+   pop ();
+   assert (f && f->is_user_script ());
+   delete f;
+ }
+ 
+-static void
++void
+ recover_from_exception (void)
+ {
+   can_interrupt = true;
+   octave_interrupt_immediately = 0;
+   octave_interrupt_state = 0;
+   octave_signal_caught = 0;
+   octave_allocation_error = 0;
+   octave_restore_signal_mask ();
+diff --git a/src/toplev.h b/src/toplev.h
+--- a/src/toplev.h
++++ b/src/toplev.h
+@@ -34,16 +34,18 @@ class octave_value_list;
+ class octave_function;
+ class octave_user_script;
+ class tree_statement_list;
+ class charMatrix;
+ 
+ extern void
+ clean_up_and_exit (int) GCC_ATTR_NORETURN;
+ 
++extern void recover_from_exception (void);
++
+ extern int main_loop (void);
+ 
+ extern void
+ do_octave_atexit (void);
+ 
+ // Current command to execute.
+ extern tree_statement_list *global_command;
+ 

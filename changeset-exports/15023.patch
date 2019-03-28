@@ -1,0 +1,354 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1343323076 18000
+#      Thu Jul 26 12:17:56 2012 -0500
+# Node ID 75d1bc2fd6d2d70131282c8d822be21a1df4d58b
+# Parent  e47b4e8c2714b33ecabe66346c7472bbf47fe83e
+Compile top level while loops in JIT.
+
+* src/pt-eval.cc (tree_evaluator::visit_while_command): Try compile while loops.
+
+* src/pt-jit.cc (jit_convert::jit_convert): Add first terminator to worklist.
+(tree_jit::execute): New overload.
+* src/pt-jit.h (tree_jit::execute): New overload.
+
+* src/pt-loop.cc (tree_while_command::~tree_while_command): Delete compiled.
+(tree_simple_for_command::~tree_simple_for_command): Only delete compiled if JIT
+is enabled.
+* src/pt-loop.h (tree_while_command::get_info, tree_while_command::stash_info):
+New function.
+
+diff --git a/src/pt-eval.cc b/src/pt-eval.cc
+--- a/src/pt-eval.cc
++++ b/src/pt-eval.cc
+@@ -1029,16 +1029,21 @@ tree_evaluator::visit_unwind_protect_com
+ }
+ 
+ void
+ tree_evaluator::visit_while_command (tree_while_command& cmd)
+ {
+   if (error_state)
+     return;
+ 
++#if HAVE_LLVM
++  if (jiter.execute (cmd))
++    return;
++#endif
++
+   unwind_protect frame;
+ 
+   frame.protect_var (in_loop_command);
+ 
+   in_loop_command = true;
+ 
+   tree_expression *expr = cmd.condition ();
+ 
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -87,16 +87,20 @@ jit_convert::jit_convert (llvm::Module *
+ 
+   construct_ssa ();
+ 
+   // initialize the worklist to instructions derived from constants
+   for (std::list<jit_value *>::iterator iter = constants.begin ();
+        iter != constants.end (); ++iter)
+     append_users (*iter);
+ 
++  // the entry block terminator may be a regular branch statement
++  if (entry_block->terminator ())
++    push_worklist (entry_block->terminator ());
++
+   // FIXME: Describe algorithm here
+   while (worklist.size ())
+     {
+       jit_instruction *next = worklist.front ();
+       worklist.pop_front ();
+       next->stash_in_worklist (false);
+ 
+       if (next->infer ())
+@@ -1470,16 +1474,33 @@ tree_jit::execute (tree_simple_for_comma
+       info = new jit_info (*this, cmd);
+       cmd.stash_info (info);
+     }
+ 
+   return info->execute ();
+ }
+ 
+ bool
++tree_jit::execute (tree_while_command& cmd)
++{
++  if (! initialize ())
++    return false;
++
++  jit_info *info = cmd.get_info ();
++  if (! info || ! info->match ())
++    {
++      delete info;
++      info = new jit_info (*this, cmd);
++      cmd.stash_info (info);
++    }
++
++  return info->execute ();
++}
++
++bool
+ tree_jit::initialize (void)
+ {
+   if (engine)
+     return true;
+ 
+   if (! module)
+     {
+       llvm::InitializeNativeTarget ();
+@@ -1703,9 +1724,17 @@ Test some simple cases that compile.
+ %!    z(end-counter+1:end) = 0;
+ %!  endif
+ %!endfunction
+ 
+ %!test
+ %! test_set = gen_test (10000);
+ %! assert (all (vectorized (test_set, 3) == loopy (test_set, 3)));
+ 
++%!test
++%! niter = 1001;
++%! i = 0;
++%! while (i < niter)
++%!   i = i + 1;
++%! endwhile
++%! assert (i == niter);
++
+ */
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -401,16 +401,18 @@ tree_jit
+ {
+ public:
+   tree_jit (void);
+ 
+   ~tree_jit (void);
+ 
+   bool execute (tree_simple_for_command& cmd);
+ 
++  bool execute (tree_while_command& cmd);
++
+   llvm::ExecutionEngine *get_engine (void) const { return engine; }
+ 
+   llvm::Module *get_module (void) const { return module; }
+ 
+   void optimize (llvm::Function *fn);
+  private:
+   bool initialize (void);
+ 
+diff --git a/src/pt-loop.cc b/src/pt-loop.cc
+--- a/src/pt-loop.cc
++++ b/src/pt-loop.cc
+@@ -45,16 +45,19 @@ along with Octave; see the file COPYING.
+ // While.
+ 
+ tree_while_command::~tree_while_command (void)
+ {
+   delete expr;
+   delete list;
+   delete lead_comm;
+   delete trail_comm;
++#ifdef HAVE_LLVM
++  delete compiled;
++#endif
+ }
+ 
+ tree_command *
+ tree_while_command::dup (symbol_table::scope_id scope,
+                          symbol_table::context_id context) const
+ {
+   return new tree_while_command (expr ? expr->dup (scope, context) : 0,
+                                  list ? list->dup (scope, context) : 0,
+@@ -93,17 +96,19 @@ tree_do_until_command::accept (tree_walk
+ tree_simple_for_command::~tree_simple_for_command (void)
+ {
+   delete lhs;
+   delete expr;
+   delete maxproc;
+   delete list;
+   delete lead_comm;
+   delete trail_comm;
++#ifdef HAVE_LLVM
+   delete compiled;
++#endif
+ }
+ 
+ tree_command *
+ tree_simple_for_command::dup (symbol_table::scope_id scope,
+                               symbol_table::context_id context) const
+ {
+   return new tree_simple_for_command
+     (parallel, lhs ? lhs->dup (scope, context) : 0,
+diff --git a/src/pt-loop.h b/src/pt-loop.h
+--- a/src/pt-loop.h
++++ b/src/pt-loop.h
+@@ -42,63 +42,93 @@ class jit_info;
+ 
+ class
+ tree_while_command : public tree_command
+ {
+ public:
+ 
+   tree_while_command (int l = -1, int c = -1)
+     : tree_command (l, c), expr (0), list (0), lead_comm (0),
+-      trail_comm (0) { }
++      trail_comm (0)
++#ifdef HAVE_LLVM
++    , compiled (0)
++#endif
++  { }
+ 
+   tree_while_command (tree_expression *e,
+                       octave_comment_list *lc = 0,
+                       octave_comment_list *tc = 0,
+                       int l = -1, int c = -1)
+     : tree_command (l, c), expr (e), list (0), lead_comm (lc),
+-      trail_comm (tc) { }
++      trail_comm (tc)
++#ifdef HAVE_LLVM
++    , compiled (0)
++#endif
++  { }
+ 
+   tree_while_command (tree_expression *e, tree_statement_list *lst,
+                       octave_comment_list *lc = 0,
+                       octave_comment_list *tc = 0,
+                       int l = -1, int c = -1)
+     : tree_command (l, c), expr (e), list (lst), lead_comm (lc),
+-      trail_comm (tc) { }
++      trail_comm (tc)
++#ifdef HAVE_LLVM
++    , compiled (0)
++#endif
++  { }
+ 
+   ~tree_while_command (void);
+ 
+   tree_expression *condition (void) { return expr; }
+ 
+   tree_statement_list *body (void) { return list; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
+   tree_command *dup (symbol_table::scope_id scope,
+                      symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
++#ifdef HAVE_LLVM
++  // some functions use by tree_jit
++  jit_info *get_info (void) const
++  {
++    return compiled;
++  }
++
++  void stash_info (jit_info *jinfo)
++  {
++    compiled = jinfo;
++  }
++#endif
++
+ protected:
+ 
+   // Expression to test.
+   tree_expression *expr;
+ 
+   // List of commands to execute.
+   tree_statement_list *list;
+ 
+   // Comment preceding WHILE token.
+   octave_comment_list *lead_comm;
+ 
+   // Comment preceding ENDWHILE token.
+   octave_comment_list *trail_comm;
+ 
+ private:
+ 
++#ifdef HAVE_LLVM
++  // compiled version of the loop
++  jit_info *compiled;
++#endif
++
+   // No copying!
+ 
+   tree_while_command (const tree_while_command&);
+ 
+   tree_while_command& operator = (const tree_while_command&);
+ };
+ 
+ // Do-Until.
+@@ -143,28 +173,36 @@ private:
+ 
+ class
+ tree_simple_for_command : public tree_command
+ {
+ public:
+ 
+   tree_simple_for_command (int l = -1, int c = -1)
+     : tree_command (l, c), parallel (false), lhs (0), expr (0),
+-      maxproc (0), list (0), lead_comm (0), trail_comm (0), compiled (0) { }
++      maxproc (0), list (0), lead_comm (0), trail_comm (0)
++#ifdef HAVE_LLVM
++    , compiled (0)
++#endif
++  { }
+ 
+   tree_simple_for_command (bool parallel_arg, tree_expression *le,
+                            tree_expression *re,
+                            tree_expression *maxproc_arg,
+                            tree_statement_list *lst,
+                            octave_comment_list *lc = 0,
+                            octave_comment_list *tc = 0,
+                            int l = -1, int c = -1)
+     : tree_command (l, c), parallel (parallel_arg), lhs (le),
+       expr (re), maxproc (maxproc_arg), list (lst),
+-      lead_comm (lc), trail_comm (tc), compiled (0) { }
++      lead_comm (lc), trail_comm (tc)
++#ifdef HAVE_LLVM
++    , compiled (0)
++#endif
++  { }
+ 
+   ~tree_simple_for_command (void);
+ 
+   bool in_parallel (void) { return parallel; }
+ 
+   tree_expression *left_hand_side (void) { return lhs; }
+ 
+   tree_expression *control_expr (void) { return expr; }
+@@ -177,26 +215,28 @@ public:
+ 
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
+   tree_command *dup (symbol_table::scope_id scope,
+                      symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
++#ifdef HAVE_LLVM
+   // some functions use by tree_jit
+   jit_info *get_info (void) const
+   {
+     return compiled;
+   }
+ 
+   void stash_info (jit_info *jinfo)
+   {
+     compiled = jinfo;
+   }
++#endif
+ 
+ private:
+   // TRUE means operate in parallel (subject to the value of the
+   // maxproc expression).
+   bool parallel;
+ 
+   // Expression to modify.
+   tree_expression *lhs;

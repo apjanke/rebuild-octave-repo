@@ -1,0 +1,586 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1537470940 -7200
+#      Thu Sep 20 21:15:40 2018 +0200
+# Node ID 2da65009cc7fe6a552225be5a7d98ff417ee1878
+# Parent  6109f302cf43905cf9086dcf0a5a06f79851fe0d
+Fix graphics object selection on high resolution screens (bug #49053)
+
+* gl-render.cc/h (opengl_renderer::set_device_pixel_ratio ()): New public
+  method to set device pixel ratio independent of the actual
+  __device_pixel_ratio__.
+  (opengl_renderer::get_viewport_scaled): New convenience method for fetching
+  the current viewport and scaling it (avoids code duplication).
+  (opengl_renderer::setup_opengl_transformation,
+  opengl_renderer::init_marker, opengl_renderer::draw_text_background): Make
+  use of get_viewport_scaled.
+  (opengl_renderer::draw_text_background): unscale the text bbox before
+  computing background coordinates.
+
+* GLCanvas.cc (GLCanvas::selectFromAxes): Draw at scale 1 since mouse event
+  return logical coordinates, not actual device pixels.
+
+* gl-select (opengl_selector::apply_pick_matrix): Make use of
+  get_viewport_scaled.
+
+* Figure.cc (Figure::screenChanged): Force redraw after a screen change.
+
+diff --git a/libgui/graphics/Figure.cc b/libgui/graphics/Figure.cc
+--- a/libgui/graphics/Figure.cc
++++ b/libgui/graphics/Figure.cc
+@@ -499,17 +499,17 @@ namespace QtHandles
+ 
+             win->setWindowModality (Qt::ApplicationModal);
+             win->setVisible (is_visible);
+           }
+         else
+           win->setWindowModality (Qt::NonModal);
+ 
+         break;
+-        
++
+       case figure::properties::ID___MOUSE_MODE__:
+         m_container->canvas (m_handle)->setCursor (mouseMode ());
+         break;
+ 
+       default:
+         break;
+       }
+ 
+@@ -550,17 +550,17 @@ namespace QtHandles
+       {
+         QRect r = qWidget<QWidget> ()->geometry ();
+ 
+         r.adjust (0, dh, 0, 0);
+ 
+         m_blockUpdates = true;
+         qWidget<QWidget> ()->setGeometry (r);
+         m_blockUpdates = false;
+-        
++
+         updateBoundingBox (false);
+       }
+   }
+ 
+   void
+   Figure::updateStatusBar (ColumnVector pt)
+   {
+     if (! m_statusBar->isHidden ())
+@@ -899,35 +899,45 @@ namespace QtHandles
+   }
+ 
+   void
+   Figure::figureWindowShown ()
+   {
+ #if defined (HAVE_QSCREEN_DEVICEPIXELRATIO)
+     QWindow* window = qWidget<QMainWindow> ()->windowHandle ();
+     QScreen* screen = window->screen ();
+-    
++
+     gh_manager::auto_lock lock;
+-    
++
+     figure::properties& fp = properties<figure> ();
+     fp.set___device_pixel_ratio__ (screen->devicePixelRatio ());
+ 
+     connect (window, SIGNAL (screenChanged (QScreen*)),
+              this, SLOT (screenChanged (QScreen*)));
++
+ #endif
+   }
+ 
+   void
+   Figure::screenChanged (QScreen* screen)
+   {
+ #if defined (HAVE_QSCREEN_DEVICEPIXELRATIO)
+     gh_manager::auto_lock lock;
+-    
++
+     figure::properties& fp = properties<figure> ();
+-    fp.set___device_pixel_ratio__ (screen->devicePixelRatio ());
++    double old_dpr = fp.get___device_pixel_ratio__ ();
++    double new_dpr = screen->devicePixelRatio ();
++    if (old_dpr != new_dpr)
++      {
++        fp.set___device_pixel_ratio__ (new_dpr);
++
++        // For some obscure reason, changing the __device_pixel_ratio__ property
++        // from the GUI thread does not necessarily trigger a redraw. Force it.
++        redraw ();
++      }
+ #endif
+   }
+ 
+   void
+   Figure::enableMouseTracking (void)
+   {
+     // Enable mouse tracking on every widgets
+     m_container->setMouseTracking (true);
+diff --git a/libgui/graphics/GLCanvas.cc b/libgui/graphics/GLCanvas.cc
+--- a/libgui/graphics/GLCanvas.cc
++++ b/libgui/graphics/GLCanvas.cc
+@@ -70,16 +70,17 @@ namespace QtHandles
+     gh_manager::auto_lock lock;
+     graphics_object go = gh_manager::get_object (gh);
+ 
+     if (go)
+       {
+         graphics_object fig = go.get_ancestor ("figure");
+         double dpr = fig.get ("__device_pixel_ratio__").double_value ();
+         m_renderer.set_viewport (dpr * width (), dpr * height ());
++        m_renderer.set_device_pixel_ratio (dpr);
+         m_renderer.draw (go);
+       }
+   }
+ 
+   uint8NDArray
+   GLCanvas::do_getPixels (const graphics_handle& gh)
+   {
+     uint8NDArray retval;
+@@ -172,20 +173,17 @@ namespace QtHandles
+   GLCanvas::selectFromAxes (const graphics_object& ax, const QPoint& pt)
+   {
+     makeCurrent ();
+ 
+     if (ax)
+       {
+         octave::opengl_selector s (m_glfcns);
+ 
+-        graphics_object fig = ax.get_ancestor ("figure");
+-        double dpr = fig.get ("__device_pixel_ratio__").double_value ();
+-
+-        s.set_viewport (dpr * width (), dpr * height ());
++        s.set_viewport (width (), height ());
+         return s.select (ax, pt.x (), height () - pt.y (),
+                          octave::select_ignore_hittest);
+       }
+ 
+     return graphics_object ();
+   }
+ 
+   void
+diff --git a/libgui/graphics/gl-select.cc b/libgui/graphics/gl-select.cc
+--- a/libgui/graphics/gl-select.cc
++++ b/libgui/graphics/gl-select.cc
+@@ -30,34 +30,34 @@ along with Octave; see the file COPYING.
+ 
+ namespace octave
+ {
+ 
+   void
+   opengl_selector::apply_pick_matrix (void)
+   {
+     GLdouble p_matrix[16];
+-    GLint viewport[4];
+ 
+     m_glfcns.glGetDoublev (GL_PROJECTION_MATRIX, p_matrix);
+-    m_glfcns.glGetIntegerv (GL_VIEWPORT, viewport);
+     m_glfcns.glMatrixMode (GL_PROJECTION);
+     m_glfcns.glLoadIdentity ();
+ 
+     // The following block is equivalent to gluPickMatrix, but we avoid
+     // using glu functions so that we can call OpenGL functions through
+     // the QOpenGLFunctions class so that the OpenGL implementation may
+     // be selected dynamically.
+ 
++    Matrix viewport = get_viewport_scaled ();
++
+     if (size > 0)
+       {
+-        m_glfcns.glTranslatef ((viewport[2] - 2 * (xp - viewport[0])) / size,
+-                               (viewport[3] - 2 * (yp - viewport[1])) / size, 0);
++        m_glfcns.glTranslatef ((viewport(2) - 2 * (xp - viewport(0))) / size,
++                               (viewport(3) - 2 * (yp - viewport(1))) / size, 0);
+ 
+-        m_glfcns.glScalef (viewport[2] / size, viewport[3] / size, 1.0);
++        m_glfcns.glScalef (viewport(2) / size, viewport(3) / size, 1.0);
+       }
+ 
+     m_glfcns.glMultMatrixd (p_matrix);
+     m_glfcns.glMatrixMode (GL_MODELVIEW);
+   }
+ 
+   void
+   opengl_selector::setup_opengl_transformation (const axes::properties& props)
+diff --git a/libinterp/corefcn/gl-render.cc b/libinterp/corefcn/gl-render.cc
+--- a/libinterp/corefcn/gl-render.cc
++++ b/libinterp/corefcn/gl-render.cc
+@@ -608,22 +608,21 @@ namespace octave
+   opengl_renderer::patch_tesselator
+   {
+     // Dummy class.
+   };
+ 
+ #endif
+ 
+   opengl_renderer::opengl_renderer (opengl_functions& glfcns)
+-    : m_glfcns (glfcns), toolkit (), xform (), xmin (), xmax (),
+-      ymin (), ymax (), zmin (), zmax (), xZ1 (), xZ2 (),
+-      marker_id (), filled_marker_id (), camera_pos (), camera_dir (),
+-      view_vector (), interpreter ("none"), txt_renderer (),
+-      m_current_light (0), m_max_lights (0), selecting (false),
+-      m_devpixratio (1.)
++    : m_glfcns (glfcns), toolkit (), xform (), xmin (), xmax (), ymin (),
++      ymax (), zmin (), zmax (), xZ1 (), xZ2 (), marker_id (),
++      filled_marker_id (), camera_pos (), camera_dir (), view_vector (),
++      interpreter ("none"), txt_renderer (), m_current_light (0),
++      m_max_lights (0), selecting (false), m_devpixratio (1.)
+   {
+     // This constructor will fail if we don't have OpenGL or if the data
+     // types we assumed in our public interface aren't compatible with the
+     // OpenGL types.
+ 
+ #if defined (HAVE_OPENGL)
+ 
+     // Ensure that we can't request an image larger than OpenGL can handle.
+@@ -698,21 +697,18 @@ namespace octave
+                gluErrorString (gl_error), gl_error, props.graphics_object_name ().c_str ());
+ 
+ #endif
+   }
+ 
+   void
+   opengl_renderer::draw_figure (const figure::properties& props)
+   {
+-    // Current physical-pixel to toolkit-pixel factor
+-    m_devpixratio = props.get___device_pixel_ratio__ ();
+-    
+     // Initialize OpenGL context
+-    
++
+     init_gl_context (props.is_graphicssmoothing (), props.get_color_rgb ());
+ 
+ #if defined (HAVE_OPENGL)
+ 
+     props.set___gl_extensions__ (get_string (GL_EXTENSIONS));
+     props.set___gl_renderer__ (get_string (GL_RENDERER));
+     props.set___gl_vendor__ (get_string (GL_VENDOR));
+     props.set___gl_version__ (get_string (GL_VERSION));
+@@ -1207,36 +1203,25 @@ namespace octave
+     Matrix x_zlim = props.get_transform_zlim ();
+ 
+     xZ1 = std::max (-1e6, x_zlim(0)-(x_zlim(1)-x_zlim(0))*100.0);
+     xZ2 = std::min (1e6, x_zlim(1)+(x_zlim(1)-x_zlim(0))*100.0);
+ 
+     Matrix x_mat1 = props.get_opengl_matrix_1 ();
+     Matrix x_mat2 = props.get_opengl_matrix_2 ();
+ 
+-#if defined (HAVE_FRAMEWORK_OPENGL)
+-    GLint vw[4];
+-#else
+-    int vw[4];
+-#endif
+-
+-    m_glfcns.glGetIntegerv (GL_VIEWPORT, vw);
+-
+     m_glfcns.glMatrixMode (GL_MODELVIEW);
+     m_glfcns.glLoadIdentity ();
+     m_glfcns.glScaled (1, 1, -1);
+     m_glfcns.glMultMatrixd (x_mat1.data ());
+     m_glfcns.glMatrixMode (GL_PROJECTION);
+     m_glfcns.glLoadIdentity ();
+ 
+-     // Use abstract Octave-pixels for transformation, not physical-pixels
+-     vw[2] = octave::math::round (static_cast<float> (vw[2]) / m_devpixratio);
+-     vw[3] = octave::math::round (static_cast<float> (vw[3]) / m_devpixratio);
+-
+-    m_glfcns.glOrtho (0, vw[2], vw[3], 0, xZ1, xZ2);
++    Matrix vp = get_viewport_scaled ();
++    m_glfcns.glOrtho (0, vp(2), vp(3), 0, xZ1, xZ2);
+     m_glfcns.glMultMatrixd (x_mat2.data ());
+     m_glfcns.glMatrixMode (GL_MODELVIEW);
+ 
+     m_glfcns.glClear (GL_DEPTH_BUFFER_BIT);
+ 
+     // store axes transformation data
+ 
+     xform = props.get_transform ();
+@@ -3673,58 +3658,48 @@ namespace octave
+ #if defined (HAVE_OPENGL)
+ 
+     Matrix bgcol = props.get_backgroundcolor_rgb ();
+     Matrix ecol = props.get_edgecolor_rgb ();
+ 
+     if (bgcol.isempty () && ecol.isempty ())
+       return;
+ 
+-    Matrix pos = xform.scale (props.get_data_position ());
++    Matrix pos = props.get_data_position ();
+     ColumnVector pixpos = get_transform ().transform (pos(0), pos(1),
+-                                                      pos(2), false);
+-    const Matrix bbox = props.get_extent_matrix ();
+-
+-#  if defined (HAVE_FRAMEWORK_OPENGL)
+-    GLint vp[4];
+-#  else
+-    int vp[4];
+-#  endif
+-
+-    m_glfcns.glGetIntegerv (GL_VIEWPORT, vp);
++                                                      pos(2), true);
+ 
+     // Save current transform matrices and set orthogonal window coordinates
+     m_glfcns.glMatrixMode (GL_PROJECTION);
+     m_glfcns.glPushMatrix ();
+     m_glfcns.glLoadIdentity ();
+ 
+-    vp[2] = octave::math::round (static_cast<float> (vp[2]) / m_devpixratio);
+-    vp[3] = octave::math::round (static_cast<float> (vp[3]) / m_devpixratio);
+-
+-    m_glfcns.glOrtho (0, vp[2], vp[3], 0, xZ1, xZ2);
++    Matrix vp = get_viewport_scaled ();
++    m_glfcns.glOrtho (0, vp(2), vp(3), 0, xZ1, xZ2);
+     m_glfcns.glMatrixMode (GL_MODELVIEW);
+     m_glfcns.glPushMatrix ();
+     m_glfcns.glLoadIdentity ();
+ 
+     // Translate coordinates so that the text anchor is (0,0)
+     m_glfcns.glTranslated (pixpos(0), pixpos(1), -pixpos(2));
+ 
+     // FIXME: Only multiples of 90° are handled by the text renderer.
+     //        Handle others here.
+     double rotation = props.get_rotation ();
+ 
+     if (do_rotate && rotation != 0.0 && rotation != 90.0
+         && rotation != 180.0 && rotation != 270.0)
+       m_glfcns.glRotated (-rotation, 0.0, 0.0, 1.0);
+ 
+     double m = props.get_margin ();
+-    double x0 = bbox (0) - m;
+-    double x1 = x0 + bbox(2) + 2 * m;
+-    double y0 = -(bbox (1) - m);
+-    double y1 = y0 - (bbox(3) + 2 * m);
++    const Matrix bbox = props.get_extent_matrix ();
++    double x0 = bbox (0) / m_devpixratio - m;
++    double x1 = x0 + bbox(2) / m_devpixratio + 2 * m;
++    double y0 = -(bbox (1) / m_devpixratio - m);
++    double y1 = y0 - (bbox(3) / m_devpixratio + 2 * m);
+ 
+     if (! bgcol.isempty ())
+       {
+         m_glfcns.glColor3f (bgcol(0), bgcol(1), bgcol(2));
+ 
+         bool depth_test = m_glfcns.glIsEnabled (GL_DEPTH_TEST);
+         if (depth_test)
+           set_polygon_offset (true, 4.0);
+@@ -3858,18 +3833,16 @@ namespace octave
+ 
+         if (im_ymin < ymin)
+           i0 += (ymin - im_ymin)/nor_dy + 1;
+         if (im_ymax > ymax)
+           i1 -= (im_ymax - ymax)/nor_dy;
+       }
+     else // clip to viewport
+       {
+-        GLfloat vp[4];
+-        m_glfcns.glGetFloatv (GL_VIEWPORT, vp);
+         // FIXME: actually add the code to do it!
+       }
+ 
+     if (i0 >= i1 || j0 >= j1)
+       return;
+ 
+     m_glfcns.glPixelZoom (m_devpixratio * pix_dx,
+                           - m_devpixratio * pix_dy);
+@@ -3992,16 +3965,45 @@ namespace octave
+     // This shouldn't happen because construction of opengl_renderer
+     // objects is supposed to be impossible if OpenGL is not available.
+ 
+     panic_impossible ();
+ 
+ #endif
+   }
+ 
++  Matrix
++  opengl_renderer::get_viewport_scaled (void) const
++  {
++    Matrix retval (1, 4, 0.0);
++
++#if defined (HAVE_OPENGL)
++#if defined (HAVE_FRAMEWORK_OPENGL)
++    GLint vp[4];
++#else
++    int vp[4];
++#endif
++
++    m_glfcns.glGetIntegerv (GL_VIEWPORT, vp);
++
++    for (int i = 0; i < 4; i++)
++      retval(i) = static_cast<double> (vp[i]) / m_devpixratio;
++
++#else
++
++    // This shouldn't happen because construction of opengl_renderer
++    // objects is supposed to be impossible if OpenGL is not available.
++
++    panic_impossible ();
++
++#endif
++
++    return retval;
++  }
++
+   void
+   opengl_renderer::draw_pixels (int width, int height, const float *data)
+   {
+ #if defined (HAVE_OPENGL)
+ 
+     m_glfcns.glDrawPixels (width, height, GL_RGB, GL_FLOAT, data);
+ 
+ #else
+@@ -4078,17 +4080,17 @@ namespace octave
+ 
+     panic_impossible ();
+ 
+ #endif
+   }
+ 
+   void
+   opengl_renderer::set_font (const base_properties& props)
+-  {    
++  {
+     txt_renderer.set_font (props.get ("fontname").string_value (),
+                            props.get ("fontweight").string_value (),
+                            props.get ("fontangle").string_value (),
+                            props.get ("__fontsize_points__").double_value ()
+                            * m_devpixratio);
+   }
+ 
+   void
+@@ -4259,33 +4261,22 @@ namespace octave
+ 
+ #endif
+   }
+ 
+   void
+   opengl_renderer::init_marker (const std::string& m, double size, float width)
+   {
+ #if defined (HAVE_OPENGL)
+-
+-#  if defined (HAVE_FRAMEWORK_OPENGL)
+-    GLint vw[4];
+-#  else
+-    int vw[4];
+-#  endif
+-
+-    m_glfcns.glGetIntegerv (GL_VIEWPORT, vw);
+-
+     m_glfcns.glMatrixMode (GL_PROJECTION);
+     m_glfcns.glPushMatrix ();
+     m_glfcns.glLoadIdentity ();
+ 
+-    vw[2] = octave::math::round (static_cast<float> (vw[2]) / m_devpixratio);
+-    vw[3] = octave::math::round (static_cast<float> (vw[3]) / m_devpixratio);
+-
+-    m_glfcns.glOrtho (0, vw[2], vw[3], 0, xZ1, xZ2);
++    Matrix vp = get_viewport_scaled ();
++    m_glfcns.glOrtho (0, vp(2), vp(3), 0, xZ1, xZ2);
+     m_glfcns.glMatrixMode (GL_MODELVIEW);
+     m_glfcns.glPushMatrix ();
+ 
+     set_clipping (false);
+     set_linewidth (width);
+ 
+     marker_id = make_marker_list (m, size, false);
+     filled_marker_id = make_marker_list (m, size, true);
+diff --git a/libinterp/corefcn/gl-render.h b/libinterp/corefcn/gl-render.h
+--- a/libinterp/corefcn/gl-render.h
++++ b/libinterp/corefcn/gl-render.h
+@@ -60,16 +60,18 @@ namespace octave
+           graphics_object obj = gh_manager::get_object (hlist(i));
+ 
+           if (obj)
+             draw (obj, toplevel);
+         }
+     }
+ 
+     virtual void set_viewport (int w, int h);
++    virtual void set_device_pixel_ratio (double dpr) { m_devpixratio = dpr; }
++    virtual Matrix get_viewport_scaled (void) const;
+     virtual graphics_xform get_transform (void) const { return xform; }
+     virtual uint8NDArray get_pixels (int width, int height);
+ 
+     virtual void draw_zoom_box (int width, int height,
+                                 int x1, int y1, int x2, int y2,
+                                 const Matrix& overlaycolor,
+                                 double overlayalpha,
+                                 const Matrix& bordercolor,
+@@ -242,14 +244,15 @@ namespace octave
+     unsigned int m_current_light;
+     unsigned int m_max_lights;
+ 
+     // Indicate we are drawing for selection purpose
+     bool selecting;
+ 
+     // Factor used for translating Octave pixels to actual device pixels
+     double m_devpixratio;
++
+   private:
+     class patch_tesselator;
+   };
+ }
+ 
+ #endif
+diff --git a/libinterp/corefcn/gl2ps-print.cc b/libinterp/corefcn/gl2ps-print.cc
+--- a/libinterp/corefcn/gl2ps-print.cc
++++ b/libinterp/corefcn/gl2ps-print.cc
+@@ -408,16 +408,19 @@ namespace octave
+ 
+             // FIXME: workaround gl2ps drawing 2 background planes, the first
+             //        eventually being black and producing visual artifacts
+             const figure::properties& fprop
+               = dynamic_cast<const figure::properties&> (go.get_properties ());
+             Matrix c = fprop.get_color_rgb ();
+             m_glfcns.glClearColor (c(0), c(1), c(2), 1);
+ 
++            // Allow figures to be printed at arbitrary resolution
++            set_device_pixel_ratio (fprop.get___device_pixel_ratio__ ());
++
+             // GL2PS_SILENT was removed to allow gl2ps to print errors on stderr
+             GLint ret = gl2psBeginPage ("gl2ps_renderer figure", "Octave",
+                                         nullptr, gl2ps_term, gl2ps_sort,
+                                         (GL2PS_BEST_ROOT
+                                          | gl2ps_text
+                                          | GL2PS_DRAW_BACKGROUND
+                                          | GL2PS_NO_PS3_SHADING
+                                          | GL2PS_USE_CURRENT_VIEWPORT),
+@@ -915,36 +918,36 @@ namespace octave
+             fontname = select_font (txtobj.get_name (),
+                                     txtobj.get_weight () == "bold",
+                                     txtobj.get_angle () == "italic");
+ 
+             // Check that the string is composed of single byte characters
+             const std::string tmpstr = txtobj.get_string ();
+             const uint8_t *c =
+               reinterpret_cast<const uint8_t *> (tmpstr.c_str ());
+-            
++
+             for (size_t i = 0; i < tmpstr.size ();)
+               {
+                 int mblen = octave_u8_strmblen_wrapper (c + i);
+-                
++
+                 if (mblen > 1)
+                   {
+                     str += " ";
+                     if (! warned)
+                       {
+                         warning_with_id ("Octave:print:unsupported-multibyte",
+                                          "print: only ASCII characters are "
+                                          "supported for EPS and derived "
+                                          "formats.");
+                         warned = true;
+                       }
+                   }
+                 else
+                   str += tmpstr.at (i);
+-                
++
+                 i += mblen;
+               }
+           }
+ 
+         escape_character ("(", str);
+         escape_character (")", str);
+ 
+         ss << "(" << str << ") [";

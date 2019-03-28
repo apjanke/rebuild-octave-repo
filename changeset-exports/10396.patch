@@ -1,0 +1,318 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1267788690 -3600
+#      Fri Mar 05 12:31:30 2010 +0100
+# Node ID a0b51ac0f88a3573049cc750a45909af6012e51e
+# Parent  aeb5b1e4797882cb99e705190a7c29bbfe2a34f0
+optimize accumdim with summation
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,13 @@
++2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
++
++	* MArray.cc (MArray<T>::idx_add_nd): New method.
++	* MArray.h: Declare it.
++
+ 2010-03-04  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* lo-specfun.cc (erfcx, erfcx_impl): New functions.
+ 	* lo-specfun.h: Declare erfcx.
+ 
+ 2010-03-03  John W. Eaton  <jwe@octave.org>
+ 
+ 	* oct-convn.cc (convolve): Cast int constant to octave_idx_type in
+diff --git a/liboctave/MArray.cc b/liboctave/MArray.cc
+--- a/liboctave/MArray.cc
++++ b/liboctave/MArray.cc
+@@ -130,16 +130,80 @@ MArray<T>::idx_max (const idx_vector& id
+     }
+ 
+   octave_quit ();
+ 
+   octave_idx_type len = std::min (idx.length (n), vals.length ());
+   idx.loop (len, _idxbinop_helper<T, xmax> (this->fortran_vec (), vals.data ()));
+ }
+ 
++#include <iostream>
++
++template <class T>
++void MArray<T>::idx_add_nd (const idx_vector& idx, const MArray<T>& vals, int dim)
++{
++  int nd = std::max (this->ndims (), vals.ndims ());
++  if (dim < 0)
++    dim = vals.dims ().first_non_singleton ();
++  else if (dim > nd)
++    nd = dim;
++
++  // Check dimensions.
++  dim_vector ddv = Array<T>::dims ().redim (nd);
++  dim_vector sdv = vals.dims ().redim (nd);
++
++  octave_idx_type ext = idx.extent (ddv (dim));
++
++  if (ext > ddv(dim))
++    {
++      ddv(dim) = ext;
++      Array<T>::resize (ddv);
++      ext = ddv(dim);
++    }
++
++  octave_idx_type l,n,u,ns;
++  get_extent_triplet (ddv, dim, l, n, u);
++  ns = sdv(dim);
++
++  sdv(dim) = ddv(dim) = 0;
++  if (ddv != sdv)
++    (*current_liboctave_error_handler)
++      ("accumdim: dimension mismatch");
++
++  T *dst = Array<T>::fortran_vec ();
++  const T *src = vals.data ();
++  octave_idx_type len = idx.length (ns);
++
++  if (l == 1)
++    {
++      for (octave_idx_type j = 0; j < u; j++)
++        {
++          octave_quit ();
++
++          idx.loop (len, _idxadda_helper<T> (dst + j*n, src + j*ns));
++        }
++    }
++  else
++    {
++      for (octave_idx_type j = 0; j < u; j++)
++        {
++          octave_quit ();
++          for (octave_idx_type i = 0; i < len; i++)
++            {
++              octave_idx_type k = idx(i);
++
++              mx_inline_add2 (l, dst + l*k, src + l*i);
++            }
++
++          dst += l*n;
++          src += l*ns;
++        }
++    }
++}
++
+ // N-dimensional array with math ops.
+ template <class T>
+ void
+ MArray<T>::changesign (void)
+ {
+   if (Array<T>::is_shared ())
+     *this = - *this;
+   else
+diff --git a/liboctave/MArray.h b/liboctave/MArray.h
+--- a/liboctave/MArray.h
++++ b/liboctave/MArray.h
+@@ -91,12 +91,14 @@ public:
+   void idx_add (const idx_vector& idx, T val);
+ 
+   void idx_add (const idx_vector& idx, const MArray<T>& vals);
+ 
+   void idx_min (const idx_vector& idx, const MArray<T>& vals);
+ 
+   void idx_max (const idx_vector& idx, const MArray<T>& vals);
+ 
++  void idx_add_nd (const idx_vector& idx, const MArray<T>& vals, int dim = -1);
++
+   void changesign (void);
+ };
+ 
+ #endif
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,8 +1,12 @@
++2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
++
++	* general/accumdim.m: Optimize the summation case.
++
+ 2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* general/accumdim.m: New function.
+ 
+ 2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* optimization/fzero.m: Avoid division by zero.
+ 
+diff --git a/scripts/general/accumdim.m b/scripts/general/accumdim.m
+--- a/scripts/general/accumdim.m
++++ b/scripts/general/accumdim.m
+@@ -58,43 +58,56 @@ function A = accumdim (subs, val, dim, n
+   if (nargin < 2 || nargin > 5)
+     print_usage ();
+   endif
+ 
+   if (isempty (fillval))
+     fillval = 0;
+   endif
+ 
+-  if (isempty (func))
+-    func = @sum;
+-  endif
+-
+   if (! isvector (subs))
+     error ("accumdim: subs must be a subscript vector");
+   elseif (! isindex (subs)) # creates index cache
+     error ("accumdim: indices must be positive integers");
+   else
+     m = max (subs);
+     if (n == 0)
+       n = m;
+     elseif (n < m)
+       error ("accumdim: index out of range")
+     endif
+   endif
+ 
+-  ## The general case.
+   sz = size (val);
+ 
+   if (nargin < 3)
+     [~, dim] = max (sz != 1); # first non-singleton dim
+-  elseif (! isindex (dim, ndims (val)))
++  elseif (! isindex (dim))
+     error ("accumdim: dim must be a valid dimension");
++  elseif (dim > length (sz))
++    sz(end+1:dim) = 1;
+   endif
+   sz(dim) = n;
+  
++  if (isempty (func) || func == @sum)
++    ## Fast summation case.
++    A = __accumdim_sum__ (subs, val, dim, n);
++    
++    ## Fill in nonzero fill value
++    if (fillval != 0)
++      mask = true (n, 1);
++      mask(subs) = false;
++      subsc = {':'}(ones (1, length (sz)));
++      subsc{dim} = mask;
++      A(subsc{:}) = fillval;
++    endif
++    return
++  endif
++
++  ## The general case.
+   ns = length (subs);
+   ## Sort indices.
+   [subs, idx] = sort (subs(:));
+   ## Identify runs.
+   jdx = find (subs(1:ns-1) != subs(2:ns));
+   jdx = [jdx; ns];
+   ## Collect common slices.
+   szc = num2cell (sz);
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,13 @@
++2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
++
++	* data.cc (do_accumdim_sum): New helper function.
++	(F__accumdim_sum__): New DEFUN.
++
+ 2010-03-04  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* ov-base.h (unary_mapper_t::umap_erfcx): New enum member.
+ 	* ov.h (octave_value::erfcx): New forwarder method.
+ 	* ov-scalar.cc (octave_scalar::map): Handle erfcx.
+ 	* ov-float.cc (octave_float_scalar::map): Ditto.
+ 	* ov-re-mat.cc (octave_matrix::map): Ditto.
+ 	* ov-flt-re-mat.cc (octave_float_matrix::map): Ditto.
+diff --git a/src/data.cc b/src/data.cc
+--- a/src/data.cc
++++ b/src/data.cc
+@@ -6434,16 +6434,88 @@ DEFUN (__accumarray_max__, args, ,
+ @deftypefn {Built-in Function} {} __accumarray_max__ (@var{idx}, @var{vals}, @var{zero}, @var{n})\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   return do_accumarray_minmax_fun (args, false);
+ }
+ 
+ template <class NDT>
++static NDT 
++do_accumdim_sum (const idx_vector& idx, const NDT& vals,
++                 int dim = -1, octave_idx_type n = -1)
++{
++  typedef typename NDT::element_type T;
++  if (n < 0)
++    n = idx.extent (0);
++  else if (idx.extent (n) > n)
++    error ("accumarray: index out of range");
++
++  dim_vector rdv = vals.dims ();
++  if (dim < 0)
++    dim = vals.dims ().first_non_singleton ();
++  else if (dim >= rdv.length ())
++    rdv.resize (dim+1, 1);
++
++  rdv(dim) = n;
++
++  NDT retval (rdv, T());
++
++  retval.idx_add_nd (idx, vals, dim);
++  return retval;
++}
++
++DEFUN (__accumdim_sum__, args, ,
++  "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} __accumdim_sum__ (@var{idx}, @var{vals}, @var{dim}, @var{n})\n\
++Undocumented internal function.\n\
++@end deftypefn")
++{
++  octave_value retval;
++  int nargin = args.length ();
++  if (nargin >= 2 && nargin <= 4 && args(0).is_numeric_type ())
++    {
++      idx_vector idx = args(0).index_vector ();
++      int dim = -1;
++      if (nargin >= 3)
++        dim = args(2).int_value () - 1;
++
++      octave_idx_type n = -1;
++      if (nargin == 4)
++        n = args(3).idx_type_value (true);
++
++      if (! error_state)
++        {
++          octave_value vals = args(1);
++
++          if (vals.is_single_type ())
++            {
++              if (vals.is_complex_type ())
++                retval = do_accumdim_sum (idx, vals.float_complex_array_value (), dim, n);
++              else
++                retval = do_accumdim_sum (idx, vals.float_array_value (), dim, n);
++            }
++          else if (vals.is_numeric_type () || vals.is_bool_type ())
++            {
++              if (vals.is_complex_type ())
++                retval = do_accumdim_sum (idx, vals.complex_array_value (), dim, n);
++              else
++                retval = do_accumdim_sum (idx, vals.array_value (), dim, n);
++            }
++          else
++            gripe_wrong_type_arg ("accumdim", vals);
++        }
++    }
++  else
++    print_usage ();
++
++  return retval;  
++}
++
++template <class NDT>
+ static NDT
+ do_merge (const Array<bool>& mask,
+           const NDT& tval, const NDT& fval)
+ {
+   typedef typename NDT::element_type T;
+   dim_vector dv = mask.dims ();
+   NDT retval (dv);
+ 

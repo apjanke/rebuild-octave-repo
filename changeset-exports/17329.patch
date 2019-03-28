@@ -1,0 +1,253 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1377379782 -7200
+#      Sat Aug 24 23:29:42 2013 +0200
+# Node ID 352b442a72a51453b6460f3a6094b7c32acbf925
+# Parent  4daf633100db8d1fc161917588ed452b2c525984
+queue and synchronize mutliple commands executed fro history (bug #39723)
+
+* main-window.cc(constructor): Initialization of new class variables for the
+  command queue, its mutex and a counting semaphore for handling the queue;
+  (destructor): delete command queue;
+  (execute_command_in_terinal): only call new function for queuing the command;
+  (run_file_in_terminal): checking the path and building the cresulting ommand
+  is done here and not in the callback, the command is finally queued
+  (queue_command): new function for queuing commands and posteing the event
+  for the execution callback if the callback is not already active;
+  (execute_command_callback): no parameter because working on the command queue,
+  reposting own event if the queue si not empty, releasing a semaphore if empty;
+  (run_file_callback): removed, code is in run_file_in_terminal now
+
+* main-window.h: execute_command_callback without parameters,
+  new function queue_command, new variables for the command queue, its mutex
+  and for a semaphore handling the queue
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -73,17 +73,20 @@ main_window::main_window (QWidget *p)
+     history_window (new history_dock_widget (this)),
+     file_browser_window (new files_dock_widget (this)),
+     doc_browser_window (new documentation_dock_widget (this)),
+     editor_window (create_default_editor (this)),
+     workspace_window (new workspace_view (this)),
+     find_files_dlg (0),
+     _octave_main_thread (0),
+     _octave_qt_link (0),
+-    _clipboard (QApplication::clipboard ())
++    _clipboard (QApplication::clipboard ()),
++    _cmd_queue (new QStringList ()),  // no command pending
++    _cmd_processing (1),
++    _cmd_queue_mutex ()
+ {
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
+ }
+ 
+ main_window::~main_window (void)
+ {
+   // Destroy the terminal first so that STDERR stream is redirected back
+@@ -99,16 +102,17 @@ main_window::~main_window (void)
+   delete _workspace_model;
+   if (find_files_dlg) 
+     {
+       delete find_files_dlg;
+       find_files_dlg = 0;
+     }
+   delete _octave_main_thread;
+   delete _octave_qt_link;
++  delete _cmd_queue;
+ }
+ 
+ bool
+ main_window::command_window_has_focus (void) const
+ {
+   return command_window->has_focus ();
+ }
+ 
+@@ -193,26 +197,40 @@ void
+ main_window::handle_clear_history_request (void)
+ {
+   octave_link::post_event (this, &main_window::clear_history_callback);
+ }
+ 
+ void
+ main_window::execute_command_in_terminal (const QString& command)
+ {
+-  octave_link::post_event (this, &main_window::execute_command_callback,
+-                           command.toStdString ());
+-
++  queue_command (command);
+   focus_command_window ();
+ }
+ 
+ void
+ main_window::run_file_in_terminal (const QFileInfo& info)
+ {
+-  octave_link::post_event (this, &main_window::run_file_callback, info);
++  QString dir = info.absolutePath ();
++  QString function_name = info.fileName ();
++  function_name.chop (info.suffix ().length () + 1);
++  if (octave_qt_link::file_in_path (info.absoluteFilePath ().toStdString (),
++                                    dir.toStdString ()))
++    queue_command (function_name);
++}
++
++void
++main_window::queue_command (QString command)
++{
++  _cmd_queue_mutex.lock ();
++  _cmd_queue->append (command);   // queue command
++  _cmd_queue_mutex.unlock ();
++
++  if (_cmd_processing.tryAcquire ())   // if callback is not processing, post event
++    octave_link::post_event (this, &main_window::execute_command_callback);
+ }
+ 
+ void
+ main_window::handle_new_figure_request (void)
+ {
+   octave_link::post_event (this, &main_window::new_figure_callback);
+ }
+ 
+@@ -1477,39 +1495,44 @@ main_window::resize_command_window_callb
+ 
+ void
+ main_window::clear_history_callback (void)
+ {
+   Fhistory (ovl ("-c"));
+ }
+ 
+ void
+-main_window::execute_command_callback (const std::string& command)
++main_window::execute_command_callback ()
+ {
+-  std::string pending_input = command_editor::get_current_line ();
++  bool repost = false;          // flag for reposting event for this callback
+ 
+-  command_editor::set_initial_input (pending_input);
+-
+-  command_editor::replace_line (command);
+-  command_editor::redisplay ();
++  if (!_cmd_queue->isEmpty ())  // list can not be empty here, just to make sure
++    {
++      std::string pending_input = command_editor::get_current_line ();
++      command_editor::set_initial_input (pending_input);
+ 
+-  // We are executing inside the command editor event loop.  Force
+-  // the current line to be returned for processing.
+-  command_editor::interrupt ();
+-}
++      _cmd_queue_mutex.lock (); // critical path
++      std::string command = _cmd_queue->takeFirst ().toStdString ();
++      if (_cmd_queue->isEmpty ())
++        _cmd_processing.release ();  // command queue empty, processing will stop
++      else
++        repost = true;          // not empty, repost at end
++      _cmd_queue_mutex.unlock ();
++
++      command_editor::replace_line (command);
+ 
+-void
+-main_window::run_file_callback (const QFileInfo& info)
+-{
+-  QString dir = info.absolutePath ();
+-  QString function_name = info.fileName ();
+-  function_name.chop (info.suffix ().length () + 1);
+-  if (octave_qt_link::file_in_path (info.absoluteFilePath ().toStdString (),
+-                                    dir.toStdString ()))
+-    execute_command_callback (function_name.toStdString ());
++      command_editor::redisplay ();
++      // We are executing inside the command editor event loop.  Force
++      // the current line to be returned for processing.
++      command_editor::interrupt ();
++    }
++
++  if (repost)  // queue not empty, so repost event for further processing
++    octave_link::post_event (this, &main_window::execute_command_callback);
++
+ }
+ 
+ void
+ main_window::new_figure_callback (void)
+ {
+   Fbuiltin (ovl ("figure"));
+   Fdrawnow ();
+ }
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -31,16 +31,17 @@ along with Octave; see the file COPYING.
+ #include <QMdiArea>
+ #include <QStatusBar>
+ #include <QToolBar>
+ #include <QQueue>
+ #include <QMdiSubWindow>
+ #include <QCloseEvent>
+ #include <QToolButton>
+ #include <QComboBox>
++#include <QSemaphore>
+ 
+ // Editor includes
+ #include "file-editor-interface.h"
+ 
+ // QTerminal includes
+ #include "QTerminal.h"
+ 
+ // Own includes
+@@ -228,17 +229,17 @@ private:
+   void clear_command_window_callback (void);
+ 
+   void resize_command_window_callback (void);
+ 
+   void clear_workspace_callback (void);
+ 
+   void clear_history_callback (void);
+ 
+-  void execute_command_callback (const std::string& command);
++  void execute_command_callback ();
+   void run_file_callback (const QFileInfo& info);
+ 
+   void new_figure_callback (void);
+ 
+   void change_directory_callback (const std::string& directory);
+ 
+   void debug_continue_callback (void);
+ 
+@@ -247,17 +248,18 @@ private:
+   void debug_step_over_callback (void);
+ 
+   void debug_step_out_callback (void);
+ 
+   void debug_quit_callback (void);
+ 
+   void exit_callback (void);
+ 
+-  // Data models.
++  void queue_command (QString command);  // Data models.
++
+   workspace_model *_workspace_model;
+ 
+   // Toolbars.
+   QStatusBar *status_bar;
+ 
+   // Subwindows.
+   terminal_dock_widget *command_window;
+   history_dock_widget *history_window;
+@@ -312,11 +314,16 @@ private:
+   octave_main_thread *_octave_main_thread;
+ 
+   octave_qt_link *_octave_qt_link;
+ 
+   QClipboard *_clipboard;
+ 
+   // Flag for closing whole application.
+   bool _closing;
++
++  // semaphore to synchronize execution signals and related callback
++  QStringList *_cmd_queue;
++  QSemaphore   _cmd_processing;
++  QMutex       _cmd_queue_mutex;
+ };
+ 
+ #endif // MAINWINDOW_H

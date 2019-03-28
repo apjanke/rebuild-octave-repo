@@ -1,0 +1,368 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1279623054 -7200
+#      Tue Jul 20 12:50:54 2010 +0200
+# Node ID 3d5c6b84ddaf8daeca30556d39faa375ffb3c04f
+# Parent  75780a2b04176ec624a0e2a52d91fef7d3de404d
+speed-up fixes to dlmread
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,15 @@
++2010-07-20  Jaroslav Hajek  <highegg@gmail.com>
++
++	* DLD-FUNCTIONS/dlmread.cc (Fdlmread): Use octave_idx_type instead of
++	unsigned long. Over-allocate by a factor 2 to reduce copying.
++	Attempt to estimate number of columns from first line.
++	Hoist tmp_stream out of the loop and reset it for each substring.
++
+ 2010-07-17  Rik <octave@nomad.inbox5.com>
+ 
+ 	* data.cc (repelems): Add more documentation about new function.
+ 
+ 2010-07-19  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* data.cc (do_repelems): New helper func.
+ 	(Frepelems): New DEFUN.
+diff --git a/src/DLD-FUNCTIONS/dlmread.cc b/src/DLD-FUNCTIONS/dlmread.cc
+--- a/src/DLD-FUNCTIONS/dlmread.cc
++++ b/src/DLD-FUNCTIONS/dlmread.cc
+@@ -1,11 +1,12 @@
+ /*
+ 
+ Copyright (C) 2008, 2009 Jonathan Stickel
++Copyright (C) 2010 Jaroslav Hajek
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -24,27 +25,30 @@ along with Octave; see the file COPYING.
+ // Habel, but core code has been completely re-written.
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <cctype>
+ #include <fstream>
++#include <limits>
+ 
+ #include "file-ops.h"
+ #include "lo-ieee.h"
+ 
+ #include "defun-dld.h"
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "utils.h"
+ 
++static const octave_idx_type idx_max =  std::numeric_limits<octave_idx_type>::max ();
++
+ static bool
+-read_cell_spec (std::istream& is, unsigned long& row, unsigned long& col)
++read_cell_spec (std::istream& is, octave_idx_type& row, octave_idx_type& col)
+ {
+   bool stat = false;
+ 
+   if (is.peek () == std::istream::traits_type::eof ())
+     stat = true;
+   else
+     {
+       if (::isalpha (is.peek ()))
+@@ -71,18 +75,18 @@ read_cell_spec (std::istream& is, unsign
+         }
+     }
+ 
+   return stat;
+ }
+ 
+ static bool
+ parse_range_spec (const octave_value& range_spec,
+-                  unsigned long& rlo, unsigned long& clo,
+-                  unsigned long& rup, unsigned long& cup)
++                  octave_idx_type& rlo, octave_idx_type& clo,
++                  octave_idx_type& rup, octave_idx_type& cup)
+ {
+   bool stat = true;
+ 
+   if (range_spec.is_string ())
+     {
+       std::istringstream is (range_spec.string_value ());
+       char ch = is.peek ();
+ 
+@@ -111,18 +115,18 @@ parse_range_spec (const octave_value& ra
+                   ch = is.get ();
+                   if (ch == '.')
+                     {
+                       ch = is.get ();
+                       if (!is || ch != '.')
+                         stat = false;
+                     }
+ 
+-                  rup = ULONG_MAX - 1;
+-                  cup = ULONG_MAX - 1;
++                  rup = idx_max - 1;
++                  cup = idx_max - 1;
+                 }
+               else
+                 {
+                   rup = rlo;
+                   cup = clo;
+                   if (!is || !is.eof ())
+                     stat = false;
+                 }
+@@ -134,20 +138,20 @@ parse_range_spec (const octave_value& ra
+ 
+       if (!is || !is.eof ())
+         stat = false;
+     }
+   else if (range_spec.is_real_matrix () && range_spec.numel () == 4)
+     {
+       ColumnVector range(range_spec.vector_value ());
+       // double --> unsigned int     
+-      rlo = static_cast<unsigned long> (range(0));
+-      clo = static_cast<unsigned long> (range(1));
+-      rup = static_cast<unsigned long> (range(2));
+-      cup = static_cast<unsigned long> (range(3));
++      rlo = static_cast<octave_idx_type> (range(0));
++      clo = static_cast<octave_idx_type> (range(1));
++      rup = static_cast<octave_idx_type> (range(2));
++      cup = static_cast<octave_idx_type> (range(3));
+     }
+   else 
+     stat = false;
+ 
+   return stat;
+ }
+ 
+ DEFUN_DLD (dlmread, args, ,
+@@ -210,53 +214,58 @@ index 'A' refers to the first column.  T
+       else
+         sep = args(1).string_value ();
+ 
+       if (error_state)
+         return retval;
+     }
+   
+   // Take a subset if a range was given.
+-  unsigned long r0 = 0, c0 = 0, r1 = ULONG_MAX-1, c1 = ULONG_MAX-1;
++  octave_idx_type r0 = 0, c0 = 0, r1 = idx_max-1, c1 = idx_max-1;
+   if (nargin > 2)
+     {
+       if (nargin == 3)
+         {
+           if (!parse_range_spec (args (2), r0, c0, r1, c1))
+             error ("dlmread: error parsing range");
+         } 
+       else if (nargin == 4) 
+         {
+-          r0 = args(2).ulong_value ();
+-          c0 = args(3).ulong_value ();
++          r0 = args(2).idx_type_value ();
++          c0 = args(3).idx_type_value ();
+ 
+           if (error_state)
+             return retval;
+         }
++
++      if (r0 < 0 || c0 < 0)
++        error ("dlmread: left & top must not be negative");
+     }
+ 
+   if (!error_state)
+     {
+-      unsigned long i = 0, j = 0, r = 1, c = 1, rmax = 0, cmax = 0;
++      octave_idx_type i = 0, j = 0, r = 1, c = 1, rmax = 0, cmax = 0;
+ 
+       Matrix rdata;
+       ComplexMatrix cdata;
+ 
+       bool iscmplx = false;
+       bool sepflag = false;
+ 
+-      unsigned long maxrows = r1 - r0;
++      octave_idx_type maxrows = r1 - r0;
+ 
+       std::string line;
+ 
+       // Skip the r0 leading lines as these might be a header.
+-      for (unsigned long m = 0; m < r0; m++)
++      for (octave_idx_type m = 0; m < r0; m++)
+         getline (file, line);
+       r1 -= r0;
+ 
++      std::istringstream tmp_stream;
++
+       // Read in the data one field at a time, growing the data matrix
+       // as needed.
+       while (getline (file, line))
+         {
+           // Skip blank lines for compatibility.
+           if (line.find_first_not_of (" \t") == std::string::npos)
+             continue;
+ 
+@@ -285,16 +294,50 @@ index 'A' refers to the first column.  T
+ 
+                     default:
+                       sep = ch;
+                       break;
+                     }
+                 }
+             }
+ 
++          if (cmax == 0)
++            {
++              // Try to estimate the number of columns.
++              size_t pos1 = 0;
++              do
++                {
++                  size_t pos2 = line.find_first_of (sep, pos1);
++
++                  if (sepflag && pos2 != std::string::npos)
++                    // Treat consecutive separators as one.
++                    {
++                      pos2 = line.find_first_not_of (sep, pos2);
++                      if (pos2 != std::string::npos)
++                        pos2 -= 1;
++                      else
++                        pos2 = line.length () - 1;
++                    }
++
++                  cmax++;
++
++                  if (pos2 != std::string::npos)
++                    pos1 = pos2 + 1;
++                  else
++                    pos1 = std::string::npos;
++
++                }
++              while (pos1 != std::string::npos);
++
++              if (iscmplx)
++                cdata.resize (rmax, cmax);
++              else
++                rdata.resize (rmax, cmax);
++            }
++
+           r = (r > i + 1 ? r : i + 1);
+           j = 0;
+           size_t pos1 = 0;
+           do
+             {
+               size_t pos2 = line.find_first_of (sep, pos1);
+               std::string str = line.substr (pos1, pos2 - pos1);
+ 
+@@ -302,33 +345,45 @@ index 'A' refers to the first column.  T
+                 // Treat consecutive separators as one.
+                 pos2 = line.find_first_not_of (sep, pos2) - 1;
+ 
+               c = (c > j + 1 ? c : j + 1);
+               if (r > rmax || c > cmax)
+                 { 
+                   // Use resize_and_fill for the case of not-equal
+                   // length rows.
++                  rmax = 2*r;
++                  cmax = c;
+                   if (iscmplx)
+-                    cdata.resize (r, c, 0);
++                    cdata.resize (rmax, cmax);
+                   else
+-                    rdata.resize (r, c, 0);
+-                  rmax = r;
+-                  cmax = c;
++                    rdata.resize (rmax, cmax);
+                 }
+ 
+-              std::istringstream tmp_stream (str);
++              tmp_stream.str (str);
++              tmp_stream.clear ();
++
+               double x = octave_read_double (tmp_stream);
+               if (tmp_stream)
+                 {
+                   if (tmp_stream.eof ())
+-                    if (iscmplx)
+-                      cdata(i,j++) = x;
+-                    else
+-                      rdata(i,j++) = x;
++                    {
++                      if (iscmplx)
++                        cdata(i,j++) = x;
++                      else
++                        rdata(i,j++) = x;
++                    }
++                  else if (std::toupper (tmp_stream.peek ()) == 'I')
++                    {
++                      // This is to allow pure imaginary numbers.
++                      if (iscmplx)
++                        cdata(i,j++) = x;
++                      else
++                        rdata(i,j++) = x;
++                    }
+                   else
+                     {
+                       double y = octave_read_double (tmp_stream);
+ 
+                       if (!iscmplx && y != 0.)
+                         {
+                           iscmplx = true;
+                           cdata = ComplexMatrix (rdata);
+@@ -354,45 +409,26 @@ index 'A' refers to the first column.  T
+           while (pos1 != std::string::npos);
+ 
+           if (nargin == 3 && i == maxrows)
+             break;
+ 
+           i++;
+         }
+  
+-      if (nargin > 2)
+-        {
+-          if (nargin == 3)
+-            {
+-              if (r1 >= r)
+-                r1 = r - 1;
+-              if (c1 >= c)
+-                c1 = c - 1;
+-            }
+-          else if (nargin == 4) 
+-            {
+-              // If r1 and c1 are not given, use what was found to be
+-              // the maximum.
+-              r1 = r - 1;
+-              c1 = c - 1;
+-            }
++      if (r1 >= r)
++        r1 = r - 1;
++      if (c1 >= c)
++        c1 = c - 1;
+ 
+-          // Now take the subset of the matrix.
+-          if (iscmplx)
+-            {
+-              cdata = cdata.extract (0, c0, r1, c1);
+-              cdata.resize (r1 + 1, c1 - c0 + 1);
+-            }
+-          else
+-            {
+-              rdata = rdata.extract (0, c0, r1, c1);
+-              rdata.resize (r1 + 1, c1 - c0 + 1);
+-            }
+-        }
++      // Now take the subset of the matrix.
++      if (iscmplx)
++        cdata = cdata.extract (0, c0, r1, c1);
++      else
++        rdata = rdata.extract (0, c0, r1, c1);
+   
+       if (iscmplx)
+         retval(0) = cdata;
+       else
+         retval(0) = rdata;
+     }
+ 
+   return retval;

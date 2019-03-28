@@ -1,0 +1,540 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1545417812 18000
+#      Fri Dec 21 13:43:32 2018 -0500
+# Node ID 42437d6e4096be7776513482eb24a7202c6508c0
+# Parent  dd97dc55967983930457c3e426a2ae62839c5971
+# Parent  01fdb337fa20a4a6de12ff445f50e7434dd625f7
+maint: Merge stable to default.
+
+diff --git a/libgui/graphics/Backend.cc b/libgui/graphics/Backend.cc
+--- a/libgui/graphics/Backend.cc
++++ b/libgui/graphics/Backend.cc
+@@ -71,17 +71,18 @@ namespace QtHandles
+   }
+ 
+   Backend::Backend (void)
+     : QObject (), base_graphics_toolkit ("qt")
+   {
+     ObjectFactory *factory = ObjectFactory::instance ();
+ 
+     connect (this, SIGNAL (createObject (double)),
+-             factory, SLOT (createObject (double)));
++             factory, SLOT (createObject (double)),
++             Qt::BlockingQueuedConnection);
+   }
+ 
+   Backend::~Backend (void)
+   { }
+ 
+   bool
+   Backend::initialize (const graphics_object& go)
+   {
+@@ -91,16 +92,21 @@ namespace QtHandles
+         || go.isa ("uibuttongroup")
+         || go.isa ("uimenu")
+         || go.isa ("uicontextmenu")
+         || go.isa ("uitable")
+         || go.isa ("uitoolbar")
+         || go.isa ("uipushtool")
+         || go.isa ("uitoggletool"))
+       {
++        // FIXME: We need to unlock the mutex here but we have no way to know if
++        // if it was previously locked by this thread, and thus if we should
++        // re-lock it.
++        gh_manager::unlock ();
++
+         Logger::debug ("Backend::initialize %s from thread %08x",
+                        go.type ().c_str (), QThread::currentThreadId ());
+ 
+         ObjectProxy *proxy = new ObjectProxy ();
+         graphics_object gObj (go);
+ 
+         OCTAVE_PTR_TYPE tmp (reinterpret_cast<OCTAVE_INTPTR_TYPE> (proxy));
+         gObj.get_properties ().set (toolkitObjectProperty (go), tmp);
+@@ -149,16 +155,21 @@ namespace QtHandles
+         else
+           proxy->update (pId);
+       }
+   }
+ 
+   void
+   Backend::finalize (const graphics_object& go)
+   {
++    // FIXME: We need to unlock the mutex here but we have no way to know if
++    // if it was previously locked by this thread, and thus if we should
++    // re-lock it.
++    gh_manager::unlock ();
++
+     Logger::debug ("Backend::finalize %s from thread %08x",
+                    go.type ().c_str (), QThread::currentThreadId ());
+ 
+     ObjectProxy *proxy = toolkitObjectProxy (go);
+ 
+     if (proxy)
+       {
+         proxy->finalize ();
+diff --git a/libgui/graphics/GLCanvas.cc b/libgui/graphics/GLCanvas.cc
+--- a/libgui/graphics/GLCanvas.cc
++++ b/libgui/graphics/GLCanvas.cc
+@@ -135,30 +135,32 @@ namespace QtHandles
+                       const graphics_handle& handle)
+   {
+     gh_manager::auto_lock lock;
+     graphics_object obj = gh_manager::get_object (handle);
+ 
+     if (obj.valid_object ())
+       {
+         graphics_object figObj (obj.get_ancestor ("figure"));
++        
++        // Make sure we have a valid current context
++        if (! begin_rendering ())
++          error ("print: no valid OpenGL offscreen context");
++        
+         try
+           {
+-            // Make sure we have a valid current context
+-            if (! begin_rendering ())
+-              error ("print: no valid OpenGL offscreen context");
+-
+             octave::gl2ps_print (m_glfcns, figObj, file_cmd.toStdString (),
+                                  term.toStdString ());
+           }
+         catch (octave::execution_exception& e)
+           {
+             octave_link::post_exception (std::current_exception ());
+-            end_rendering ();
+           }
++        
++        end_rendering ();
+       }
+   }
+ 
+   void
+   GLCanvas::toggleAxes (const graphics_handle& gh)
+   {
+     canvasToggleAxes (gh);
+   }
+diff --git a/libgui/graphics/ObjectProxy.cc b/libgui/graphics/ObjectProxy.cc
+--- a/libgui/graphics/ObjectProxy.cc
++++ b/libgui/graphics/ObjectProxy.cc
+@@ -47,66 +47,69 @@ namespace QtHandles
+   ObjectProxy::init (Object *obj)
+   {
+     if (obj != m_object)
+       {
+         if (m_object)
+           {
+             disconnect (this, SIGNAL (sendUpdate (int)),
+                         m_object, SLOT (slotUpdate (int)));
+-            disconnect (this, SIGNAL (sendFinalize (void)),
+-                        m_object, SLOT (slotFinalize (void)));
+             disconnect (this, SIGNAL (sendRedraw (void)),
+                         m_object, SLOT (slotRedraw (void)));
+             disconnect (this, SIGNAL (sendShow (void)),
+                         m_object, SLOT (slotShow (void)));
+             disconnect (this, SIGNAL (sendPrint (const QString&, const QString&)),
+                         m_object, SLOT (slotPrint (const QString&, const QString&)));
+           }
+ 
+         m_object = obj;
+ 
+         if (m_object)
+           {
+             connect (this, SIGNAL (sendUpdate (int)),
+                      m_object, SLOT (slotUpdate (int)));
+-            connect (this, SIGNAL (sendFinalize (void)),
+-                     m_object, SLOT (slotFinalize (void)));
+             connect (this, SIGNAL (sendRedraw (void)),
+                      m_object, SLOT (slotRedraw (void)));
+             connect (this, SIGNAL (sendShow (void)),
+                      m_object, SLOT (slotShow (void)));
+             connect (this, SIGNAL (sendPrint (const QString&, const QString&)),
+                      m_object, SLOT (slotPrint (const QString&, const QString&)),
+                      Qt::BlockingQueuedConnection);
+           }
+       }
+   }
+ 
+   void
+   ObjectProxy::setObject (Object *obj)
+   {
+-    emit sendFinalize ();
++    finalize ();
+     init (obj);
+   }
+ 
+   void
+   ObjectProxy::update (int pId)
+   {
+     if (octave::thread::is_thread ())
+       emit sendUpdate (pId);
+     else if (m_object)
+       m_object->slotUpdate (pId);
+   }
+ 
+   void
+   ObjectProxy::finalize (void)
+   {
+-    emit sendFinalize ();
+-    init (nullptr);
++    if (! m_object)
++      return;
++
++    Qt::ConnectionType t = Qt::BlockingQueuedConnection;
++
++    if (QThread::currentThread () == QCoreApplication::instance ()->thread ())
++      t = Qt::DirectConnection;
++
++    QMetaObject::invokeMethod (m_object, "slotFinalize", t);
+   }
+ 
+   void
+   ObjectProxy::redraw (void)
+   {
+     emit sendRedraw ();
+   }
+ 
+@@ -135,28 +138,12 @@ namespace QtHandles
+     Qt::ConnectionType t = Qt::BlockingQueuedConnection;
+ 
+     if (QThread::currentThread () == QCoreApplication::instance ()->thread ())
+       t = Qt::DirectConnection;
+ 
+     QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
+                                Q_RETURN_ARG (uint8NDArray, retval));
+ 
+-    // FIXME: The following may fail for obscure reasons, see bug #53328.
+-    //        In absence of a solution, we retry twice before calling error().
+-    if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
+-                                     Q_RETURN_ARG (uint8NDArray, retval)))
+-      {
+-        octave::sleep (0.1);
+-        if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
+-                                         Q_RETURN_ARG (uint8NDArray, retval)))
+-          {
+-            octave::sleep (0.2);
+-            if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
+-                                             Q_RETURN_ARG (uint8NDArray, retval)))
+-              error ("getframe: unable to retrieve figure pixels");
+-          }
+-      }
+-
+     return retval;
+   }
+ 
+ };
+diff --git a/libgui/graphics/ObjectProxy.h b/libgui/graphics/ObjectProxy.h
+--- a/libgui/graphics/ObjectProxy.h
++++ b/libgui/graphics/ObjectProxy.h
+@@ -48,17 +48,16 @@ namespace QtHandles
+     void print (const QString& file_cmd, const QString& term);
+     uint8NDArray get_pixels (void);
+ 
+     Object * object (void) { return m_object; }
+     void setObject (Object *obj);
+ 
+   signals:
+     void sendUpdate (int pId);
+-    void sendFinalize (void);
+     void sendRedraw (void);
+     void sendShow (void);
+     void sendPrint (const QString& file_cmd, const QString& term);
+ 
+   private:
+     void init (Object *obj);
+ 
+   private:
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -2745,16 +2745,34 @@ namespace octave
+          "</body>\n"
+          "</html>\n");
+ 
+     emit display_news_signal (html_text);
+ 
+     emit finished ();
+   }
+ 
++  //! Reimplements QApplication::notify.
++  /*! Octave's own exceptions are caugh and rethrown in the interpreter
++      thread.*/
++  bool
++  octave_qapplication::notify (QObject *receiver, QEvent *ev)
++  {
++    try
++      {
++        return QApplication::notify (receiver, ev);
++      }
++    catch (octave::execution_exception&)
++      {
++        octave_link::post_exception (std::current_exception ());
++      }
++
++   return false;
++  }
++
+   octave_qt_app::octave_qt_app (gui_application& app_context)
+     : QObject (), m_app_context (app_context),
+       m_argc (m_app_context.sys_argc ()),
+       m_argv (m_app_context.sys_argv ()), m_qt_app (nullptr),
+       m_qt_tr (new QTranslator ()), m_gui_tr (new QTranslator ()),
+       m_qsci_tr (new QTranslator ()), m_translators_installed (false),
+       m_octave_qt_link (new octave_qt_link ()),
+       m_interpreter (new octave_interpreter (m_app_context)),
+@@ -2791,17 +2809,17 @@ namespace octave
+ 
+     // Register octave_value_list for connecting thread crossing signals.
+ 
+     qRegisterMetaType<octave_value_list> ("octave_value_list");
+ 
+     // Even if START_GUI is false, we still set up the QApplication so
+     // that we can use Qt widgets for plot windows.
+ 
+-    m_qt_app = new QApplication (m_argc, m_argv);
++    m_qt_app = new octave_qapplication (m_argc, m_argv);
+ 
+     // Force left-to-right alignment (see bug #46204)
+     m_qt_app->setLayoutDirection (Qt::LeftToRight);
+ 
+     octave_link::connect_link (m_octave_qt_link);
+ 
+     connect (m_octave_qt_link, SIGNAL (confirm_shutdown_signal (void)),
+              this, SLOT (confirm_shutdown_octave (void)));
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -489,16 +489,29 @@ namespace octave
+   private:
+ 
+     QString m_base_url;
+     QString m_page;
+     int m_serial;
+     bool m_connect_to_web;
+   };
+ 
++  class octave_qapplication : public QApplication
++  {
++  public:
++
++    octave_qapplication (int& argc, char **argv)
++    : QApplication (argc, argv)
++    { }
++
++    virtual bool notify (QObject *receiver, QEvent *e) override;
++
++    ~octave_qapplication (void) { };
++  };
++
+   class octave_qt_app : public QObject
+   {
+     Q_OBJECT
+ 
+   public:
+ 
+     octave_qt_app (gui_application& app_context);
+ 
+@@ -548,17 +561,17 @@ namespace octave
+     gui_application& m_app_context;
+ 
+     // Use these to ensure that argc and argv exist for as long as the
+     // QApplication object.
+ 
+     int m_argc;
+     char **m_argv;
+ 
+-    QApplication *m_qt_app;
++    octave_qapplication *m_qt_app;
+ 
+     QTranslator *m_qt_tr;
+     QTranslator *m_gui_tr;
+     QTranslator *m_qsci_tr;
+ 
+     bool m_translators_installed;
+ 
+     octave_qt_link *m_octave_qt_link;
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -6105,17 +6105,17 @@ axes::properties::update_ticklength (voi
+   ticklen(0) *= std::max (bbox(2), bbox(3));
+   ticklen(1) *= std::max (bbox(2), bbox(3));
+ 
+   xticklen = ticksign * (mode2D ? ticklen(0) : ticklen(1));
+   yticklen = ticksign * (mode2D ? ticklen(0) : ticklen(1));
+   zticklen = ticksign * (mode2D ? ticklen(0) : ticklen(1));
+ 
+   double offset = get___fontsize_points__ () / 2;
+-  
++
+   xtickoffset = (mode2D ? std::max (0., xticklen) : std::abs (xticklen)) +
+                 (xstate == AXE_HORZ_DIR ? offset*1.5 : offset);
+   ytickoffset = (mode2D ? std::max (0., yticklen) : std::abs (yticklen)) +
+                 (ystate == AXE_HORZ_DIR ? offset*1.5 : offset);
+   ztickoffset = (mode2D ? std::max (0., zticklen) : std::abs (zticklen)) +
+                 (zstate == AXE_HORZ_DIR ? offset*1.5 : offset);
+ 
+   update_xlabel_position ();
+@@ -10402,17 +10402,16 @@ uicontextmenu::~uicontextmenu (void)
+ %!   hctx1 = uicontextmenu ("parent", hf);
+ %!   hctx2 = uicontextmenu ("parent", hf);
+ %!   set (hf, "uicontextmenu", hctx2);
+ %!   set (hax, "uicontextmenu", hctx2);
+ %!   assert (get (hf, "uicontextmenu"), hctx2);
+ %!   assert (get (hax, "uicontextmenu"), hctx2);
+ %!   assert (get (hf, "children"), [hctx2; hctx1; hax]);
+ %!   delete (hctx2);
+-%!   pause (.005);
+ %!   assert (get (hf, "uicontextmenu"), []);
+ %!   assert (get (hax, "uicontextmenu"), []);
+ %!   assert (get (hf, "children"), [hctx1; hax]);
+ %!   set (hf, "uicontextmenu", hctx1);
+ %!   assert (get (hf, "uicontextmenu"), hctx1);
+ %!   set (hf, "uicontextmenu", []);
+ %!   assert (get (hf, "uicontextmenu"), []);
+ %!   assert (get (hf, "children"), [hctx1; hax]);
+@@ -13153,34 +13152,20 @@ undocumented.
+ 
+           graphics_handle h = gcf ();
+ 
+           if (! h.ok ())
+             error ("drawnow: nothing to draw");
+ 
+           graphics_object go = gh_manager::get_object (h);
+ 
+-          // FIXME: when using qt toolkit the print_figure method
+-          // returns immediately and Canvas::print doesn't have
+-          // enough time to lock the mutex before we lock it here
+-          // again.  We thus wait 50 ms (which may not be enough) to
+-          // give it a chance: see http://octave.1599824.n4.nabble.com/Printing-issues-with-Qt-toolkit-tp4673270.html
+-
+           gh_manager::unlock ();
+ 
+           go.get_toolkit ().print_figure (go, term, file, debug_file);
+ 
+-          // FIXME: In ObjectProxy.cc ObjectProxy::init
+-          // we now use connect (..., Qt::BlockingQueuedConnection)
+-          // which should make the sleep unnecessary.
+-          // See bug #44463 and #48519
+-          // Remove it and the FIXME block above after testing.
+-
+-          // octave_sleep (0.05);
+-
+           gh_manager::lock ();
+         }
+     }
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (addlistener, args, ,
+diff --git a/scripts/linear-algebra/condeig.m b/scripts/linear-algebra/condeig.m
+--- a/scripts/linear-algebra/condeig.m
++++ b/scripts/linear-algebra/condeig.m
+@@ -86,17 +86,19 @@ function [v, lambda, c] = condeig (a)
+ 
+   ## Right eigenvectors
+   [v, lambda] = eig (a);
+ 
+   if (isempty (a))
+     c = [];
+   else
+     ## Corresponding left eigenvectors
+-    vl = inv (v)';
++    ## Use 2-argument form to suppress possible singular matrix warning.
++    [vl, ~] = inv (v);
++    vl = vl';
+     ## Normalize vectors
+     vl ./= repmat (sqrt (sum (abs (vl .^ 2))), rows (vl), 1);
+ 
+     ## Condition numbers
+     ## Definition: cos (angle) = (norm (v1) * norm (v2)) / dot (v1, v2)
+     ## Eigenvectors have been normalized so `norm (v1) * norm (v2)' = 1
+     c = abs (1 ./ dot (vl, v)');
+   endif
+diff --git a/scripts/testfun/__run_test_suite__.m b/scripts/testfun/__run_test_suite__.m
+--- a/scripts/testfun/__run_test_suite__.m
++++ b/scripts/testfun/__run_test_suite__.m
+@@ -56,28 +56,28 @@ function [pass, fail, xfail, xbug, skip,
+     try
+       fid = fopen (logfile, "wt");
+       if (fid < 0)
+         error ("__run_test_suite__: could not open %s for writing", logfile);
+       endif
+       test ("", "explain", fid);
+       puts ("\nIntegrated test scripts:\n\n");
+       for i = 1:length (fcndirs)
+-        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, fcndirs{i});
++        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, fcndirs{i}, false);
+         dp += p;
+         dn += n;
+         dxf += xf;
+         dxb += xb;
+         dsk += sk;
+         drtsk += rtsk;
+         drgrs += rgrs;
+       endfor
+       puts ("\nFixed test scripts:\n\n");
+       for i = 1:length (fixedtestdirs)
+-        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, fixedtestdirs{i});
++        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, fixedtestdirs{i}, true);
+         dp += p;
+         dn += n;
+         dxf += xf;
+         dxb += xb;
+         dsk += sk;
+         drtsk += rtsk;
+         drgrs += rgrs;
+       endfor
+@@ -145,24 +145,24 @@ function [pass, fail, xfail, xbug, skip,
+     fail = nfail;
+     xfail = dxf;
+     xbug = dxb;
+     skip = dsk;
+     rtskip = drtsk;
+     regress = drgrs;
+   endif
+ 
+-  function [dp, dn, dxf, dxb, dsk, drtsk, drgrs] = run_test_dir (fid, d)
++  function [dp, dn, dxf, dxb, dsk, drtsk, drgrs] = run_test_dir (fid, d, is_fixed = false)
+ 
+     lst = dir (d);
+     dp = dn = dxf = dxb = dsk = drtsk = drgrs = 0;
+     for i = 1:length (lst)
+       nm = lst(i).name;
+       if (lst(i).isdir && nm(1) != "." && ! strcmp (nm, "private"))
+-        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, [d, filesep, nm]);
++        [p, n, xf, xb, sk, rtsk, rgrs] = run_test_dir (fid, [d, filesep, nm], is_fixed);
+         dp += p;
+         dn += n;
+         dxf += xf;
+         dxb += xb;
+         dsk += sk;
+         drtsk += rtsk;
+         drgrs += rgrs;
+       endif
+@@ -175,20 +175,19 @@ function [pass, fail, xfail, xbug, skip,
+         cd (d);
+       endif
+       for i = 1:length (lst)
+         nm = lst(i).name;
+         ## Ignore hidden files
+         if (nm(1) == '.')
+           continue
+         endif
+-        if ((length (nm) > 2 && strcmpi (nm((end-1):end), ".m"))
+-            || (length (nm) > 4
+-                && (strcmpi (nm((end-3):end), "-tst")
+-                    || strcmpi (nm((end-3):end), ".tst"))))
++        if ((! is_fixed && length (nm) > 2 && strcmpi (nm((end-1):end), ".m"))
++            || (! is_fixed && length (nm) > 4 && strcmpi (nm((end-3):end), "-tst"))
++            || (is_fixed && length (nm) > 4 && strcmpi (nm((end-3):end), ".tst")))
+           p = n = xf = xb = sk = rtsk = rgrs = 0;
+           ffnm = fullfile (d, nm);
+           ## Only run if contains %!test, %!assert, %!error, %!fail, or %!warning
+           if (has_tests (ffnm))
+             tmp = reduce_test_file_name (ffnm, topbuilddir, topsrcdir);
+             print_test_file_name (tmp);
+             [p, n, xf, xb, sk, rtsk, rgrs] = test (ffnm, "quiet", fid);
+             print_pass_fail (p, n, xf, xb, sk, rtsk, rgrs);

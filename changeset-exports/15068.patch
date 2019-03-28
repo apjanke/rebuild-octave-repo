@@ -1,0 +1,312 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1343767252 18000
+#      Tue Jul 31 15:40:52 2012 -0500
+# Node ID f57d7578c1a6b2de99d455f0785c97ae7b22ec21
+# Parent  df4538e3b50bd0cd737c57c0ae82f46920dbd9b3
+Support ND matrix indexing with scalar assignment in JIT.
+
+* src/jit-typeinfo.cc (make_indices, octave_jit_paren_scalar_subsasgn,
+jit_typeinfo::gen_subsasgn): New function.
+(octave_jit_paren_scalar): Use make_indices.
+(jit_typeinfo::jit_typeinfo): Call gen_subsasgn.
+* src/pt-jit.h (jit_typeinfo::gen_subsasgn): New declaration.
+
+* src/pt-jit.cc (jit_convert::resolve): Add extra_arg argument.
+(jit_convert::do_assign): Pass rhs to resolve.
+* src/pt-jit.h (jit_convert::resolve): Change function signature.
+
+diff --git a/src/jit-typeinfo.cc b/src/jit-typeinfo.cc
+--- a/src/jit-typeinfo.cc
++++ b/src/jit-typeinfo.cc
+@@ -238,38 +238,68 @@ octave_jit_paren_subsasgn_impl (jit_matr
+ 
+   double *data = array->fortran_vec ();
+   data[index - 1] = value;
+ 
+   mat->update ();
+   *ret = *mat;
+ }
+ 
++static void
++make_indices (double *indices, octave_idx_type idx_count,
++              Array<idx_vector>& result)
++{
++  result.resize (dim_vector (1, idx_count));
++  for (octave_idx_type i = 0; i < idx_count; ++i)
++    result(i) = idx_vector (indices[i]);
++}
++
+ extern "C" double
+ octave_jit_paren_scalar (jit_matrix *mat, double *indicies,
+                          octave_idx_type idx_count)
+ {
+   // FIXME: Replace this with a more optimal version
+   try
+     {
+-      Array<idx_vector> idx (dim_vector (1, idx_count));
+-      for (octave_idx_type i = 0; i < idx_count; ++i)
+-        idx(i) = idx_vector (indicies[i]);
++      Array<idx_vector> idx;
++      make_indices (indicies, idx_count, idx);
+ 
+       Array<double> ret = mat->array->index (idx);
+       return ret.xelem (0);
+     }
+   catch (const octave_execution_exception&)
+     {
+       gripe_library_execution_error ();
+       return 0;
+     }
+ }
+ 
+ extern "C" void
++octave_jit_paren_scalar_subsasgn (jit_matrix *ret, jit_matrix *mat,
++                                  double *indices, octave_idx_type idx_count,
++                                  double value)
++{
++  // FIXME: Replace this with a more optimal version
++  try
++    {
++      Array<idx_vector> idx;
++      make_indices (indices, idx_count, idx);
++
++      Matrix temp (1, 1);
++      temp.xelem(0) = value;
++      mat->array->assign (idx, temp);
++      ret->update (mat->array);
++    }
++  catch (const octave_execution_exception&)
++    {
++      gripe_library_execution_error ();
++    }
++}
++
++extern "C" void
+ octave_jit_paren_subsasgn_matrix_range (jit_matrix *result, jit_matrix *mat,
+                                         jit_range *index, double value)
+ {
+   NDArray *array = mat->array;
+   bool done = false;
+ 
+   // optimize for the simple case (no resizing and no errors)
+   if (*array->jit_ref_count () == 1
+@@ -1337,19 +1367,29 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   // generate () subsref for ND indexing of matricies with scalars
+   jit_function paren_scalar = create_function (jit_convention::external,
+                                                "octave_jit_paren_scalar",
+                                                scalar, matrix, scalar_ptr,
+                                                index);
+   paren_scalar.add_mapping (engine, &octave_jit_paren_scalar);
+   paren_scalar.mark_can_error ();
+ 
++  jit_function paren_scalar_subsasgn
++    = create_function (jit_convention::external,
++                       "octave_jit_paren_scalar_subsasgn", matrix, matrix,
++                       scalar_ptr, index, scalar);
++  paren_scalar_subsasgn.add_mapping (engine, &octave_jit_paren_scalar_subsasgn);
++  paren_scalar_subsasgn.mark_can_error ();
++
+   // FIXME: Generate this on the fly
+   for (size_t i = 2; i < 10; ++i)
+-    gen_subsref (paren_scalar, i);
++    {
++      gen_subsref (paren_scalar, i);
++      gen_subsasgn (paren_scalar_subsasgn, i);
++    }
+ 
+   // paren subsasgn
+   paren_subsasgn_fn.stash_name ("()subsasgn");
+ 
+   jit_function resize_paren_subsasgn
+     = create_function (jit_convention::external,
+                        "octave_jit_paren_subsasgn_impl", matrix, matrix, index,
+                        scalar);
+@@ -1895,9 +1935,43 @@ jit_typeinfo::gen_subsref (const jit_fun
+ 
+   llvm::Value *nelem = llvm::ConstantInt::get (index->to_llvm (), n);
+   llvm::Value *mat = fn.argument (builder, 0);
+   llvm::Value *ret = paren_scalar.call (builder, mat, array, nelem);
+   fn.do_return (builder, ret);
+   paren_subsref_fn.add_overload (fn);
+ }
+ 
++void
++jit_typeinfo::gen_subsasgn (const jit_function& paren_scalar, size_t n)
++{
++  std::stringstream name;
++  name << "jit_paren_subsasgn_matrix_scalar" << n;
++  std::vector<jit_type *> args (n + 2, scalar);
++  args[0] = matrix;
++  jit_function fn = create_function (jit_convention::internal, name.str (),
++                                     matrix, args);
++  fn.mark_can_error ();
++  llvm::BasicBlock *body = fn.new_block ();
++  builder.SetInsertPoint (body);
++
++  llvm::Type *scalar_t = scalar->to_llvm ();
++  llvm::ArrayType *array_t = llvm::ArrayType::get (scalar_t, n);
++  llvm::Value *array = llvm::UndefValue::get (array_t);
++  for (size_t i = 0; i < n; ++i)
++    {
++      llvm::Value *idx = fn.argument (builder, i + 1);
++      array = builder.CreateInsertValue (array, idx, i);
++    }
++
++  llvm::Value *array_mem = builder.CreateAlloca (array_t);
++  builder.CreateStore (array, array_mem);
++  array = builder.CreateBitCast (array_mem, scalar_t->getPointerTo ());
++
++  llvm::Value *nelem = llvm::ConstantInt::get (index->to_llvm (), n);
++  llvm::Value *mat = fn.argument (builder, 0);
++  llvm::Value *value = fn.argument (builder, n + 1);
++  llvm::Value *ret = paren_scalar.call (builder, mat, array, nelem, value);
++  fn.do_return (builder, ret);
++  paren_subsasgn_fn.add_overload (fn);
++}
++
+ #endif
+diff --git a/src/jit-typeinfo.h b/src/jit-typeinfo.h
+--- a/src/jit-typeinfo.h
++++ b/src/jit-typeinfo.h
+@@ -628,16 +628,18 @@ private:
+   llvm::Value *complex_new (llvm::Value *real, llvm::Value *imag);
+ 
+   void create_int (size_t nbits);
+ 
+   jit_type *intN (size_t nbits) const;
+ 
+   void gen_subsref (const jit_function& paren_scalar, size_t n);
+ 
++  void gen_subsasgn (const jit_function& paren_scalar, size_t n);
++
+   static jit_typeinfo *instance;
+ 
+   llvm::Module *module;
+   llvm::ExecutionEngine *engine;
+   int next_id;
+ 
+   llvm::GlobalVariable *lerror_state;
+ 
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -805,17 +805,18 @@ jit_convert::next_name (const char *pref
+   std::stringstream ss;
+   ss << prefix << count;
+   if (inc)
+     ++count;
+   return ss.str ();
+ }
+ 
+ jit_instruction *
+-jit_convert::resolve (const jit_operation& fres, tree_index_expression& exp)
++jit_convert::resolve (const jit_operation& fres, tree_index_expression& exp,
++                      jit_value *extra_arg)
+ {
+   std::string type = exp.type_tags ();
+   if (! (type.size () == 1 && type[0] == '('))
+     throw jit_fail_exception ("Unsupported index operation");
+ 
+   std::list<tree_argument_list *> args = exp.arg_lists ();
+   if (args.size () != 1)
+     throw jit_fail_exception ("Bad number of arguments in tree_index_expression");
+@@ -827,43 +828,48 @@ jit_convert::resolve (const jit_operatio
+   if (arg_list->size () < 1)
+     throw jit_fail_exception ("Empty arg_list");
+ 
+   tree_expression *tree_object = exp.expression ();
+   jit_value *object = visit (tree_object);
+ 
+   size_t narg = arg_list->size ();
+   tree_argument_list::iterator iter = arg_list->begin ();
+-  std::vector<jit_value *> call_args (narg + 1);
++  bool have_extra = extra_arg;
++  std::vector<jit_value *> call_args (narg + 1 + have_extra);
+   call_args[0] = object;
+ 
+   for (size_t idx = 0; iter != arg_list->end (); ++idx, ++iter)
+     {
+       unwind_protect prot;
+       prot.add_method (&end_context,
+                        &std::vector<jit_magic_end::context>::pop_back);
+       end_context.push_back (jit_magic_end::context (object, idx, narg));
+       call_args[idx + 1] = visit (*iter);
+     }
+ 
++  if (extra_arg)
++    call_args[call_args.size () - 1] = extra_arg;
++
+   return create_checked (fres, call_args);
+ }
+ 
+ jit_value *
+ jit_convert::do_assign (tree_expression *exp, jit_value *rhs, bool artificial)
+ {
+   if (! exp)
+     throw jit_fail_exception ("NULL lhs in assign");
+ 
+   if (isa<tree_identifier> (exp))
+     return do_assign (exp->name (), rhs, exp->print_result (), artificial);
+   else if (tree_index_expression *idx
+            = dynamic_cast<tree_index_expression *> (exp))
+     {
+-      jit_value *new_object = resolve (jit_typeinfo::paren_subsasgn (), *idx);
++      jit_value *new_object = resolve (jit_typeinfo::paren_subsasgn (), *idx,
++                                       rhs);
+       do_assign (idx->expression (), new_object, true);
+ 
+       // FIXME: Will not work for values that must be release/grabed
+       return rhs;
+     }
+   else
+     throw jit_fail_exception ("Unsupported assignment");
+ }
+@@ -1857,9 +1863,24 @@ Test some simple cases that compile.
+ %! i = 1;
+ %! while (i <= ndim)
+ %!   for j = 1:ndim
+ %!     result = result + m(i, j);
+ %!    endfor
+ %!   i = i + 1;
+ %! endwhile
+ %! assert (result == sum (sum (m)));
++
++%!test
++%! ndim = 100;
++%! m = zeros (ndim);
++%! i = 1;
++%! while (i <= ndim)
++%!   for j = 1:ndim
++%!     m(i, j) = (j - 1) * ndim + i;
++%!   endfor
++%!   i = i + 1;
++%! endwhile
++%! m2 = zeros (ndim);
++%! m2(:) = 1:(ndim^2);
++%! assert (all (m == m2));
++
+ */
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -292,17 +292,18 @@ private:
+   { return next_name ("#for_bounds", for_bounds_count, inc); }
+ 
+   std::string next_shortcircut_result (bool inc = true)
+   { return next_name ("#shortcircut_result", short_count, inc); }
+ 
+   std::string next_name (const char *prefix, size_t& count, bool inc);
+ 
+   jit_instruction *resolve (const jit_operation& fres,
+-                            tree_index_expression& exp);
++                            tree_index_expression& exp,
++                            jit_value *extra_arg = 0);
+ 
+   jit_value *do_assign (tree_expression *exp, jit_value *rhs,
+                         bool artificial = false);
+ 
+   jit_value *do_assign (const std::string& lhs, jit_value *rhs, bool print,
+                         bool artificial = false);
+ 
+   jit_value *visit (tree *tee) { return visit (*tee); }

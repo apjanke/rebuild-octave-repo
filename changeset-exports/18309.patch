@@ -1,0 +1,902 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1390127415 -3600
+#      Sun Jan 19 11:30:15 2014 +0100
+# Branch gui-release
+# Node ID 024940bd5b7788718d965809497604450b7d5c36
+# Parent  106da7544504b49159cfd91080e37385a24516c3
+gui: provide prefernces for the octave directory at startup
+
+* settings-dialog.ui: add check box for restoring previous octave directory and
+  line edit / file dialog for setting startup directory
+
+* settings-dialog.cc (constructor): init new input widgets from settings;
+  (write_changed_settings): wirte values from new widgets into settings file;
+  (get_octave_directory): new slot for settings octave dir in a file dialog
+
+* main-window.h: new slot handle_octave_ready
+
+* main-window.cc (handle_octave_ready): depending on settings set octave
+  directory to the last one from the previous session, the one set in the
+  settings or the current one;
+  (construct): do not set dir here but in handle_octave_ready;
+  (construct_octave_qt_link): pass 'this' to octave link as parent;
+
+* octave-interpreter.h: new signal inidication interpreter is initialized
+
+* octave-interpreter.cc (constructor): emit new signal after init of interpreter
+
+* octave-qt-link.cc (constructor): connect new signal with slot in main window
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1256,29 +1256,58 @@ main_window::construct (void)
+   connect (this,
+            SIGNAL (update_breakpoint_marker_signal (bool, const QString&, int)),
+            editor_window,
+            SLOT (handle_update_breakpoint_marker_request (bool,
+                                                           const QString&,
+                                                           int)));
+ #endif
+ 
+-  QDir curr_dir;
+-  set_current_working_directory (curr_dir.absolutePath ());
+-
+   octave_link::post_event (this, &main_window::resize_command_window_callback);
+ 
+   set_global_shortcuts (true);
+ 
+ }
+ 
++
++void
++main_window::handle_octave_ready ()
++{
++  // actions after the startup files are executed
++  QSettings *settings = resource_manager::get_settings ();
++
++  QDir startup_dir = QDir ();    // current octave dir after startup
++
++  if (settings->value ("restore_octave_dir").toBool ())
++    {
++      // restore last dir from previous session
++      QStringList curr_dirs
++        = settings->value ("MainWindow/current_directory_list").toStringList ();
++      startup_dir = QDir (curr_dirs.at (0));  // last dir in previous session
++    }
++  else if (! settings->value ("octave_startup_dir").toString ().isEmpty ())
++    {
++      // do not restore but there is a startup dir configured
++      startup_dir = QDir (settings->value ("octave_startup_dir").toString ());
++    }
++
++  if (! startup_dir.exists ())
++    {
++      // the configured startup dir does not exist, take actual one
++      startup_dir = QDir ();
++    }
++
++  set_current_working_directory (startup_dir.absolutePath ());
++}
++
++
+ void
+ main_window::construct_octave_qt_link (void)
+ {
+-  _octave_qt_link = new octave_qt_link ();
++  _octave_qt_link = new octave_qt_link (this);
+ 
+   connect (_octave_qt_link, SIGNAL (exit_signal (int)),
+            this, SLOT (exit (int)));
+ 
+   connect (_octave_qt_link,
+            SIGNAL (set_workspace_signal
+                    (bool, const QString&, const QStringList&,
+                     const QStringList&, const QStringList&,
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -180,16 +180,18 @@ public slots:
+ 
+   void handle_create_filedialog (const QStringList &filters,
+                                  const QString& title, const QString& filename,
+                                  const QString &dirname,
+                                  const QString& multimode);
+ 
+   void handle_show_doc (const QString &file);
+ 
++  void handle_octave_ready ();
++
+   // find files dialog
+   void find_files (const QString &startdir=QDir::currentPath ());
+   void find_files_finished (int);
+ 
+   // setting global shortcuts
+   void set_global_shortcuts (bool enable);
+ 
+   // handling the clipboard
+diff --git a/libgui/src/octave-interpreter.cc b/libgui/src/octave-interpreter.cc
+--- a/libgui/src/octave-interpreter.cc
++++ b/libgui/src/octave-interpreter.cc
+@@ -38,16 +38,18 @@ octave_interpreter::execute (void)
+ {
+   thread_manager.register_current_thread ();
+ 
+   octave_thread_manager::unblock_interrupt_signal ();
+ 
+   octave_initialize_interpreter (octave_cmdline_argc, octave_cmdline_argv,
+                                  octave_embedded);
+ 
++  emit octave_ready_signal ();
++
+   octave_execute_interpreter ();
+ }
+ 
+ void
+ octave_interpreter::interrupt (void)
+ {
+   thread_manager.interrupt ();
+ }
+diff --git a/libgui/src/octave-interpreter.h b/libgui/src/octave-interpreter.h
+--- a/libgui/src/octave-interpreter.h
++++ b/libgui/src/octave-interpreter.h
+@@ -33,16 +33,20 @@ class octave_interpreter : public QObjec
+   Q_OBJECT
+ 
+ public:
+ 
+   // An object to manage the Octave interpreter.
+ 
+   octave_interpreter (void) : QObject (), thread_manager () { }
+ 
++signals:
++
++  void octave_ready_signal ();
++
+ public slots:
+ 
+   // Initialize and execute the octave interpreter.
+ 
+   void execute (void);
+ 
+   void interrupt (void);
+ 
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -38,23 +38,26 @@ along with Octave; see the file COPYING.
+ #include "load-path.h"
+ #include "oct-env.h"
+ #include "utils.h"
+ 
+ #include "octave-qt-link.h"
+ 
+ #include "resource-manager.h"
+ 
+-octave_qt_link::octave_qt_link (void)
++octave_qt_link::octave_qt_link (QWidget *p)
+   : octave_link (), main_thread (new QThread ()),
+     command_interpreter (new octave_interpreter ())
+ {
+   connect (this, SIGNAL (execute_interpreter_signal (void)),
+            command_interpreter, SLOT (execute (void)));
+ 
++  connect (command_interpreter, SIGNAL (octave_ready_signal ()),
++           p, SLOT (handle_octave_ready ()));
++
+   command_interpreter->moveToThread (main_thread);
+ 
+   main_thread->start ();
+ }
+ 
+ octave_qt_link::~octave_qt_link (void) { }
+ 
+ void
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -48,17 +48,17 @@ typedef QList<int> QIntList;
+ // readline event hook, which lives in the octave thread.
+ 
+ class octave_qt_link : public QObject, public octave_link
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+-  octave_qt_link (void);
++  octave_qt_link (QWidget *p);
+ 
+   ~octave_qt_link (void);
+ 
+   void execute_interpreter (void);
+ 
+   bool do_exit (int status);
+ 
+   bool do_edit_file (const std::string& file);
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include "resource-manager.h"
+ #include "workspace-model.h"
+ #include "settings-dialog.h"
+ #include "ui-settings-dialog.h"
+ #include <QDir>
+ #include <QFileInfo>
++#include <QFileDialog>
+ #include <QVector>
+ #include <QHash>
+ 
+ #ifdef HAVE_QSCINTILLA
+ #include <QScrollArea>
+ 
+ #if defined (HAVE_QSCI_QSCILEXEROCTAVE_H)
+ #define HAVE_LEXER_OCTAVE
+@@ -109,16 +110,24 @@ settings_dialog::settings_dialog (QWidge
+   _widget_title_fg_color->setEnabled (false);
+   ui->layout_widget_fgtitle->addWidget (_widget_title_fg_color,0);
+   connect (ui->cb_widget_custom_style, SIGNAL (toggled (bool)),
+            _widget_title_fg_color, SLOT (setEnabled (bool)));
+ 
+   ui->cb_widget_custom_style->setChecked (
+     settings->value ("DockWidgets/widget_title_custom_style",false).toBool ());
+ 
++  // Octave startup
++  ui->cb_restore_octave_dir->setChecked (
++                 settings->value ("restore_octave_dir",false).toBool ());
++  ui->le_octave_dir->setText (
++                 settings->value ("octave_startup_dir").toString ());
++  connect (ui->pb_octave_dir, SIGNAL (pressed ()),
++           this, SLOT (get_octave_dir ()));
++
+   // editor
+   ui->useCustomFileEditor->setChecked (settings->value ("useCustomFileEditor",
+                                                         false).toBool ());
+   ui->customFileEditor->setText (
+     settings->value ("customFileEditor").toString ());
+   ui->editor_showLineNumbers->setChecked (
+     settings->value ("editor/showLineNumbers",true).toBool () );
+ 
+@@ -497,18 +506,25 @@ settings_dialog::write_changed_settings 
+   // dock widget title bar
+   settings->setValue ("DockWidgets/widget_title_custom_style",
+                       ui->cb_widget_custom_style->isChecked ());
+   settings->setValue ("Dockwidgets/title_bg_color",
+                       _widget_title_bg_color->color ());
+   settings->setValue ("Dockwidgets/title_fg_color",
+                       _widget_title_fg_color->color ());
+ 
+-  // other settings
++  // icon size
+   settings->setValue ("toolbar_icon_size", ui->toolbar_icon_size->value ());
++
++  // Octave startup
++  settings->setValue ("restore_octave_dir",
++                      ui->cb_restore_octave_dir->isChecked ());
++  settings->setValue ("octave_startup_dir", ui->le_octave_dir->text ());
++
++  //editor
+   settings->setValue ("useCustomFileEditor",
+                       ui->useCustomFileEditor->isChecked ());
+   settings->setValue ("customFileEditor", ui->customFileEditor->text ());
+   settings->setValue ("editor/showLineNumbers",
+                       ui->editor_showLineNumbers->isChecked ());
+   settings->setValue ("editor/highlightCurrentLine",
+                       ui->editor_highlightCurrentLine->isChecked ());
+   settings->setValue ("editor/highlight_current_line_color",
+@@ -742,8 +758,17 @@ settings_dialog::write_terminal_colors (
+       color = ui->terminal_colors_box->findChild <color_picker *>(
+                 "terminal_color_"+class_chars.mid (i,1));
+       if (color)
+         settings->setValue ("terminal/color_"+class_chars.mid (i,1),
+                             color->color ());
+     }
+   settings->sync ();
+ }
++
++void
++settings_dialog::get_octave_dir ()
++{
++  QString dir = QFileDialog::getExistingDirectory(this,
++                tr("Set Octave Startup Directory"), "",
++                QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
++  ui->le_octave_dir->setText (dir);
++}
+\ No newline at end of file
+diff --git a/libgui/src/settings-dialog.h b/libgui/src/settings-dialog.h
+--- a/libgui/src/settings-dialog.h
++++ b/libgui/src/settings-dialog.h
+@@ -40,16 +40,19 @@ namespace Ui
+ class settings_dialog:public QDialog
+ {
+   Q_OBJECT public:
+   explicit settings_dialog (QWidget * parent,
+                             const QString& desired_tab = QString ());
+   ~settings_dialog ();
+   void write_changed_settings ();
+ 
++private slots:
++  void get_octave_dir ();
++
+ private:
+   Ui::settings_dialog * ui;
+ #ifdef HAVE_QSCINTILLA
+   void read_lexer_settings (QsciLexer *lexer, QSettings *settings);
+   void write_lexer_settings (QsciLexer *lexer, QSettings *settings);
+   int  get_valid_lexer_styles (QsciLexer *lexer, int styles[]);
+   enum { MaxLexerStyles = 64,
+          MaxStyleNumber = 128 };
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -53,226 +53,313 @@
+             <x>0</x>
+             <y>0</y>
+             <width>678</width>
+             <height>378</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_17">
+            <item>
+-            <layout class="QGridLayout" name="gridLayout">
+-             <item row="4" column="0">
+-              <widget class="QLabel" name="label_15">
+-               <property name="text">
+-                <string>Dock widget title bar</string>
+-               </property>
+-              </widget>
+-             </item>
+-             <item row="1" column="1">
+-              <layout class="QHBoxLayout" name="horizontalLayout_8">
+-               <item>
+-                <widget class="QComboBox" name="comboBox_language">
+-                 <property name="insertPolicy">
+-                  <enum>QComboBox::InsertAtBottom</enum>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_3">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>40</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-              </layout>
+-             </item>
+-             <item row="2" column="0">
+-              <widget class="QLabel" name="label_8">
+-               <property name="text">
+-                <string>Icon size</string>
+-               </property>
+-              </widget>
+-             </item>
+-             <item row="4" column="1">
+-              <layout class="QHBoxLayout" name="horizontalLayout_4">
+-               <item>
+-                <widget class="QCheckBox" name="cb_widget_custom_style">
+-                 <property name="text">
+-                  <string>Custom style</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_22">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeType">
+-                  <enum>QSizePolicy::Fixed</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>40</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-               <item>
+-                <widget class="QLabel" name="label_bgtitle">
+-                 <property name="enabled">
+-                  <bool>false</bool>
+-                 </property>
+-                 <property name="text">
+-                  <string>Background color</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <layout class="QHBoxLayout" name="layout_widget_bgtitle"/>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_23">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeType">
+-                  <enum>QSizePolicy::Fixed</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>12</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-               <item>
+-                <widget class="QLabel" name="label_fgtitle">
+-                 <property name="enabled">
+-                  <bool>false</bool>
+-                 </property>
+-                 <property name="text">
+-                  <string>Text color</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <layout class="QHBoxLayout" name="layout_widget_fgtitle"/>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_21">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>40</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-              </layout>
+-             </item>
+-             <item row="2" column="1">
+-              <layout class="QHBoxLayout" name="horizontalLayout_6">
+-               <item>
+-                <widget class="QSpinBox" name="toolbar_icon_size">
+-                 <property name="minimum">
+-                  <number>16</number>
+-                 </property>
+-                 <property name="maximum">
+-                  <number>32</number>
+-                 </property>
+-                 <property name="singleStep">
+-                  <number>4</number>
+-                 </property>
+-                 <property name="value">
+-                  <number>24</number>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_4">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>40</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-              </layout>
+-             </item>
+-             <item row="1" column="0">
+-              <widget class="QLabel" name="label_2">
+-               <property name="text">
+-                <string>Language (requires restart)</string>
+-               </property>
+-              </widget>
+-             </item>
+-             <item row="3" column="1">
+-              <layout class="QHBoxLayout" name="horizontalLayout_9">
+-               <item>
+-                <widget class="QRadioButton" name="general_icon_octave">
+-                 <property name="text">
+-                  <string>Octave logo only</string>
+-                 </property>
+-                 <property name="checked">
+-                  <bool>true</bool>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <widget class="QRadioButton" name="general_icon_letter">
+-                 <property name="text">
+-                  <string>Letter icons</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <widget class="QRadioButton" name="general_icon_graphic">
+-                 <property name="text">
+-                  <string>Graphic icons</string>
+-                 </property>
+-                </widget>
+-               </item>
+-               <item>
+-                <spacer name="horizontalSpacer_6">
+-                 <property name="orientation">
+-                  <enum>Qt::Horizontal</enum>
+-                 </property>
+-                 <property name="sizeHint" stdset="0">
+-                  <size>
+-                   <width>40</width>
+-                   <height>20</height>
+-                  </size>
+-                 </property>
+-                </spacer>
+-               </item>
+-              </layout>
+-             </item>
+-             <item row="3" column="0">
+-              <widget class="QLabel" name="label_9">
+-               <property name="text">
+-                <string>Icon set for dock widgets</string>
+-               </property>
+-              </widget>
+-             </item>
+-            </layout>
++            <widget class="QGroupBox" name="groupBox">
++             <property name="title">
++              <string>Interface</string>
++             </property>
++             <layout class="QVBoxLayout" name="verticalLayout_21">
++              <item>
++               <layout class="QGridLayout" name="gridLayout">
++                <item row="4" column="0">
++                 <widget class="QLabel" name="label_15">
++                  <property name="text">
++                   <string>Dock widget title bar</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="1">
++                 <layout class="QHBoxLayout" name="horizontalLayout_8">
++                  <item>
++                   <widget class="QComboBox" name="comboBox_language">
++                    <property name="insertPolicy">
++                     <enum>QComboBox::InsertAtBottom</enum>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_3">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="2" column="0">
++                 <widget class="QLabel" name="label_8">
++                  <property name="text">
++                   <string>Icon size</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="4" column="1">
++                 <layout class="QHBoxLayout" name="horizontalLayout_4">
++                  <item>
++                   <widget class="QCheckBox" name="cb_widget_custom_style">
++                    <property name="text">
++                     <string>Custom style</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_22">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeType">
++                     <enum>QSizePolicy::Fixed</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                  <item>
++                   <widget class="QLabel" name="label_bgtitle">
++                    <property name="enabled">
++                     <bool>false</bool>
++                    </property>
++                    <property name="text">
++                     <string>Background color</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <layout class="QHBoxLayout" name="layout_widget_bgtitle"/>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_23">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeType">
++                     <enum>QSizePolicy::Fixed</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>12</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                  <item>
++                   <widget class="QLabel" name="label_fgtitle">
++                    <property name="enabled">
++                     <bool>false</bool>
++                    </property>
++                    <property name="text">
++                     <string>Text color</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <layout class="QHBoxLayout" name="layout_widget_fgtitle"/>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_21">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="2" column="1">
++                 <layout class="QHBoxLayout" name="horizontalLayout_6">
++                  <item>
++                   <widget class="QSpinBox" name="toolbar_icon_size">
++                    <property name="minimum">
++                     <number>16</number>
++                    </property>
++                    <property name="maximum">
++                     <number>32</number>
++                    </property>
++                    <property name="singleStep">
++                     <number>4</number>
++                    </property>
++                    <property name="value">
++                     <number>24</number>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_4">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="1" column="0">
++                 <widget class="QLabel" name="label_2">
++                  <property name="text">
++                   <string>Language (requires restart)</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="3" column="1">
++                 <layout class="QHBoxLayout" name="horizontalLayout_9">
++                  <item>
++                   <widget class="QRadioButton" name="general_icon_octave">
++                    <property name="text">
++                     <string>Octave logo only</string>
++                    </property>
++                    <property name="checked">
++                     <bool>true</bool>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <widget class="QRadioButton" name="general_icon_letter">
++                    <property name="text">
++                     <string>Letter icons</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <widget class="QRadioButton" name="general_icon_graphic">
++                    <property name="text">
++                     <string>Graphic icons</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_6">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="3" column="0">
++                 <widget class="QLabel" name="label_9">
++                  <property name="text">
++                   <string>Icon set for dock widgets</string>
++                  </property>
++                 </widget>
++                </item>
++               </layout>
++              </item>
++             </layout>
++             <zorder></zorder>
++             <zorder></zorder>
++            </widget>
++           </item>
++           <item>
++            <widget class="QGroupBox" name="groupBox_2">
++             <property name="title">
++              <string>Octave Startup</string>
++             </property>
++             <layout class="QVBoxLayout" name="verticalLayout_22">
++              <item>
++               <widget class="QLabel" name="label_18">
++                <property name="text">
++                 <string>These preferences are applied after the startup files like .octaverc.</string>
++                </property>
++               </widget>
++              </item>
++              <item>
++               <layout class="QGridLayout" name="gridLayout_9">
++                <item row="0" column="4">
++                 <spacer name="horizontalSpacer">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>40</width>
++                    <height>20</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
++                <item row="0" column="0">
++                 <widget class="QLabel" name="label_17">
++                  <property name="text">
++                   <string>Startup path</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="0" column="1">
++                 <widget class="QCheckBox" name="cb_restore_octave_dir">
++                  <property name="text">
++                   <string>Restore last Octave directory of previous session</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="4">
++                 <spacer name="horizontalSpacer_5">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>40</width>
++                    <height>20</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
++                <item row="1" column="1">
++                 <widget class="QLineEdit" name="le_octave_dir"/>
++                </item>
++                <item row="1" column="2">
++                 <widget class="QPushButton" name="pb_octave_dir">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Minimum">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Browse</string>
++                  </property>
++                 </widget>
++                </item>
++               </layout>
++              </item>
++             </layout>
++            </widget>
+            </item>
+            <item>
+             <spacer name="verticalSpacer">
+              <property name="orientation">
+               <enum>Qt::Vertical</enum>
+              </property>
+              <property name="sizeHint" stdset="0">
+               <size>
+@@ -1941,10 +2028,42 @@
+      <y>156</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>496</x>
+      <y>156</y>
+     </hint>
+    </hints>
+   </connection>
++  <connection>
++   <sender>cb_restore_octave_dir</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>le_octave_dir</receiver>
++   <slot>setDisabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>270</x>
++     <y>255</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>270</x>
++     <y>285</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>cb_restore_octave_dir</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>pb_octave_dir</receiver>
++   <slot>setDisabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>270</x>
++     <y>255</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>467</x>
++     <y>285</y>
++    </hint>
++   </hints>
++  </connection>
+  </connections>
+ </ui>

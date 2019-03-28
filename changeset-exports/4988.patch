@@ -1,0 +1,681 @@
+# HG changeset patch
+# User jwe
+# Date 1094907939 0
+#      Sat Sep 11 13:05:39 2004 +0000
+# Node ID 352d228d409b199726a76a38832fca9e7599e7c9
+# Parent  bad4898b468eed3b535fff418005e8be59bd328d
+[project @ 2004-09-11 13:05:38 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,27 @@
++2004-09-11  David Bateman  <dbateman@free.fr>
++
++	* ov-fcn-handle.cc (octave_fcn_handle::save_ascii,
++	octave_fcn_handle::load_ascii, octave_fcn_handle::save_binary,
++	octave_fcn_handle::load_binary, octave_fcn_handle::save_hdf5,
++	octave_fcn_handle::load_hdf5): New functions. 
++	* ov-fcn-handle.h: Provide decls.
++
++	* ov-fcn-inline.cc (octave_fcn_inline::load_ascii):
++	Allow spaces in saved function.
++ 	(octave_fcn_inline::save_hdf5): Properly close all HDF5 objects.
++
++	* ls-oct-ascii.cc (read_ascii_data): Check return type of 
++	<octave_value>.load_ascii for errors reading the variables
++
++	* variables.cc (lookup_function_handle, clear_variable,
++	clear_symbol): New functions.
++	* variables.h: Provide decls.
++
+ 2004-09-10  John W. Eaton  <jwe@octave.org>
+ 
+ 	* ov-builtin.cc (octave_builtin::do_multi_index_op): Use unwind
+ 	protect frame instead of a single unwind_protect::run.
+ 	* ov-mapper.cc (octave_mapper::do_multi_index_op): Likewise.
+ 
+ 	* data.cc (fill_matrix, identity_matrix):
+ 	Also allow logical data type.
+diff --git a/src/ls-oct-ascii.cc b/src/ls-oct-ascii.cc
+--- a/src/ls-oct-ascii.cc
++++ b/src/ls-oct-ascii.cc
+@@ -372,17 +372,18 @@ read_ascii_data (std::istream& is, const
+ 	typ = tag;
+ 
+       // Special case for backward compatiablity. A small bit of cruft
+       if (SUBSTRING_COMPARE_EQ (typ, 0, 12, "string array"))
+ 	tc = octave_value (charMatrix (), true);
+       else
+ 	tc = octave_value_typeinfo::lookup_type (typ);
+ 
+-      tc.load_ascii (is);
++      if (! tc.load_ascii (is))
++	error ("load: trouble reading ascii file `%s'", filename.c_str ());
+     }
+   else
+     error ("load: failed to extract keyword specifying value type");
+ 
+   if (error_state)
+     {
+       error ("load: reading file %s", filename.c_str ());
+       return std::string ();
+diff --git a/src/ov-fcn-handle.cc b/src/ov-fcn-handle.cc
+--- a/src/ov-fcn-handle.cc
++++ b/src/ov-fcn-handle.cc
+@@ -40,16 +40,22 @@ Software Foundation, 59 Temple Place - S
+ #include "pr-output.h"
+ #include "pt-pr-code.h"
+ #include "pt-misc.h"
+ #include "pt-stmt.h"
+ #include "pt-cmd.h"
+ #include "pt-exp.h"
+ #include "pt-assign.h"
+ #include "variables.h"
++#include "parse.h"
++
++#include "byte-swap.h"
++#include "ls-oct-ascii.h"
++#include "ls-hdf5.h"
++#include "ls-utils.h"
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_fcn_handle);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_fcn_handle,
+ 				     "function handle",
+ 				     "function handle");
+ 
+ octave_value_list
+@@ -86,16 +92,362 @@ octave_fcn_handle::subsref (const std::s
+   // octave_builtin::subsref.
+ 
+   if (idx.size () > 1)
+     retval = retval(0).next_subsref (type, idx);
+ 
+   return retval;
+ }
+ 
++bool
++octave_fcn_handle::save_ascii (std::ostream& os, bool&, bool)
++{
++  os << nm << "\n";
++  if (nm == "@<anonymous>")
++    {
++      OSSTREAM buf;
++      print_raw (buf, true);
++      os << OSSTREAM_STR (buf) << "\n" << OSSTREAM_ENDS;
++      OSSTREAM_FREEZE (buf);
++    }
++
++  return true;
++}
++
++bool
++octave_fcn_handle::load_ascii (std::istream& is)
++{
++  is >> nm;
++  if (nm == "@<anonymous>")
++    {
++      char c;
++      OSSTREAM buf;
++
++      // Skip preceeding newline(s)
++      while (is.get (c) && c == '\n');
++
++      if (is)
++	{
++	  buf << c;
++
++	  // Get a line of text whitespace characters included, leaving
++	  // newline in the stream
++	  while (is.peek () != '\n')
++	    {
++	      is.get (c);
++	      if (! is)
++		break;
++	      buf << c;
++	    }
++	}
++
++      buf << OSSTREAM_ENDS;
++
++      int parse_status;
++      octave_value anon_fcn_handle = eval_string (OSSTREAM_C_STR (buf), 
++						  true, parse_status);
++      OSSTREAM_FREEZE (buf);
++
++      fcn = anon_fcn_handle.fcn_handle_value () -> fcn;
++    }
++  else
++    {
++      fcn = lookup_function (nm);
++      if (! fcn.is_function ())
++	return false;
++    }
++
++  return true;
++}
++
++bool
++octave_fcn_handle::save_binary (std::ostream& os, bool&)
++{
++  FOUR_BYTE_INT tmp = nm.length ();
++  os.write (X_CAST (char *, &tmp), 4);
++  os.write (nm.c_str (), nm.length ());
++  if (nm == "@<anonymous>")
++    {
++      OSSTREAM buf;
++      print_raw (buf, true);
++      std::string stmp = OSSTREAM_STR (buf);
++      OSSTREAM_FREEZE (buf);
++      tmp = stmp.length ();
++      os.write (X_CAST (char *, &tmp), 4);
++      os.write (stmp.c_str (), stmp.length ());
++    }
++  return true;
++}
++
++bool
++octave_fcn_handle::load_binary (std::istream& is, bool swap,
++				oct_mach_info::float_format)
++{
++  FOUR_BYTE_INT tmp;
++  if (! is.read (X_CAST (char *, &tmp), 4))
++    return false;
++  if (swap)
++    swap_bytes<4> (&tmp);
++
++  OCTAVE_LOCAL_BUFFER (char, ctmp1, tmp+1);
++  is.read (ctmp1, tmp);
++  nm = std::string (ctmp1);
++
++  if (! is)
++    return false;
++
++  if (nm == "@<anonymous>")
++    {
++      if (! is.read (X_CAST (char *, &tmp), 4))
++	return false;
++      if (swap)
++	swap_bytes<4> (&tmp);
++
++      OCTAVE_LOCAL_BUFFER (char, ctmp2, tmp+1);
++      is.read (ctmp2, tmp);
++
++      int parse_status;
++      octave_value anon_fcn_handle = eval_string (ctmp2, true, parse_status);
++
++      fcn = anon_fcn_handle.fcn_handle_value () -> fcn;
++    }
++  else
++    {
++      fcn = lookup_function (nm);
++      if (! fcn.is_function ())
++	return false;
++    }
++  return true;
++}
++
++#if defined (HAVE_HDF5)
++bool
++octave_fcn_handle::save_hdf5 (hid_t loc_id, const char *name,
++			      bool /* save_as_floats */)
++{
++  hid_t group_hid = -1;
++  group_hid = H5Gcreate (loc_id, name, 0);
++  if (group_hid < 0 ) return false;
++
++  hid_t space_hid = -1, data_hid = -1, type_hid = -1;;
++  bool retval = true;
++
++  // attach the type of the variable
++  type_hid = H5Tcopy (H5T_C_S1);
++  H5Tset_size (type_hid, nm.length () + 1);
++  if (type_hid < 0)
++    {
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  OCTAVE_LOCAL_BUFFER (hsize_t, hdims, 2);
++  hdims[0] = 0;
++  hdims[1] = 0;
++  space_hid = H5Screate_simple (0 , hdims, (hsize_t*) 0);
++  if (space_hid < 0)
++    {
++      H5Tclose (type_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  data_hid = H5Dcreate (group_hid, "nm",  type_hid, space_hid, H5P_DEFAULT);
++  if (data_hid < 0 || H5Dwrite (data_hid, type_hid, H5S_ALL, H5S_ALL,
++				H5P_DEFAULT, (void*) nm.c_str ()) < 0)
++    {
++      H5Sclose (space_hid);
++      H5Tclose (type_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++  H5Dclose (data_hid);
++
++  if (nm == "@<anonymous>")
++    {
++      OSSTREAM buf;
++      print_raw (buf, true);
++      std::string stmp = OSSTREAM_STR (buf);
++      OSSTREAM_FREEZE (buf);
++
++      // attach the type of the variable
++      H5Tset_size (type_hid, stmp.length () + 1);
++      if (type_hid < 0)
++	{
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      data_hid = H5Dcreate (group_hid, "fcn",  type_hid, space_hid,
++			    H5P_DEFAULT);
++      if (data_hid < 0 || H5Dwrite (data_hid, type_hid, H5S_ALL, H5S_ALL,
++				    H5P_DEFAULT, (void*) stmp.c_str ()) < 0)
++	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      H5Dclose (data_hid);
++    }
++
++  H5Sclose (space_hid);
++  H5Tclose (type_hid);
++  H5Gclose (group_hid);
++
++  return retval;
++}
++
++bool
++octave_fcn_handle::load_hdf5 (hid_t loc_id, const char *name,
++			      bool /* have_h5giterate_bug */)
++{
++  hid_t group_hid, data_hid, space_hid, type_hid, type_class_hid, st_id;
++  hsize_t rank;
++  int slen;
++
++  group_hid = H5Gopen (loc_id, name);
++  if (group_hid < 0 ) return false;
++
++  data_hid = H5Dopen (group_hid, "nm");
++
++  if (data_hid < 0)
++    {
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  type_hid = H5Dget_type (data_hid);
++  type_class_hid = H5Tget_class (type_hid);
++
++  if (type_class_hid != H5T_STRING)
++    {
++      H5Tclose (type_hid);
++      H5Dclose (data_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  space_hid = H5Dget_space (data_hid);
++  rank = H5Sget_simple_extent_ndims (space_hid);
++
++  if (rank != 0)
++    {
++      H5Sclose (space_hid);
++      H5Tclose (type_hid);
++      H5Dclose (data_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  slen = H5Tget_size (type_hid);
++  if (slen < 0)
++    {
++      H5Sclose (space_hid);
++      H5Tclose (type_hid);
++      H5Dclose (data_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++
++  OCTAVE_LOCAL_BUFFER (char, nm_tmp, slen);
++
++  // create datatype for (null-terminated) string to read into:
++  st_id = H5Tcopy (H5T_C_S1);
++  H5Tset_size (st_id, slen);
++
++  if (H5Dread (data_hid, st_id, H5S_ALL, H5S_ALL, H5P_DEFAULT,
++	       X_CAST (void *, nm_tmp)) < 0)
++    {
++      H5Sclose (space_hid);
++      H5Tclose (type_hid);
++      H5Gclose (group_hid);
++      return false;
++    }
++  H5Tclose (st_id);
++  H5Dclose (data_hid);
++  nm = nm_tmp;
++
++  if (nm == "@<anonymous>")
++    {
++      data_hid = H5Dopen (group_hid, "fcn");
++
++      if (data_hid < 0)
++	{
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      type_hid = H5Dget_type (data_hid);
++      type_class_hid = H5Tget_class (type_hid);
++
++      if (type_class_hid != H5T_STRING)
++	{
++	  H5Tclose (type_hid);
++	  H5Dclose (data_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      space_hid = H5Dget_space (data_hid);
++      rank = H5Sget_simple_extent_ndims (space_hid);
++
++      if (rank != 0)
++	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
++	  H5Dclose (data_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      slen = H5Tget_size (type_hid);
++      if (slen < 0)
++	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
++	  H5Dclose (data_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
++
++      OCTAVE_LOCAL_BUFFER (char, fcn_tmp, slen);
++
++      // create datatype for (null-terminated) string to read into:
++      st_id = H5Tcopy (H5T_C_S1);
++      H5Tset_size (st_id, slen);
++
++      if (H5Dread (data_hid, st_id, H5S_ALL, H5S_ALL, H5P_DEFAULT,
++		   X_CAST (void *, fcn_tmp)) < 0)
++	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
++      H5Dclose (data_hid);
++      H5Tclose (st_id);
++
++      int parse_status;
++      octave_value anon_fcn_handle = eval_string (fcn_tmp, true, parse_status);
++
++      fcn = anon_fcn_handle.fcn_handle_value () -> fcn;
++    }
++  else
++    {
++      fcn = lookup_function (nm);
++      if (! fcn.is_function ())
++	return false;
++    }
++
++  return true;
++}
++#endif
++
+ void
+ octave_fcn_handle::print (std::ostream& os, bool pr_as_read_syntax) const
+ {
+   print_raw (os, pr_as_read_syntax);
+   newline (os);
+ }
+ 
+ void
+diff --git a/src/ov-fcn-handle.h b/src/ov-fcn-handle.h
+--- a/src/ov-fcn-handle.h
++++ b/src/ov-fcn-handle.h
+@@ -74,16 +74,32 @@ public:
+ 
+   octave_function *function_value (bool = false)
+     { return fcn.function_value (); }
+ 
+   octave_fcn_handle *fcn_handle_value (bool = false) { return this; }
+ 
+   std::string fcn_name (void) const { return nm; }
+ 
++  bool save_ascii (std::ostream& os, bool& infnan_warned,
++		 bool strip_nan_and_inf);
++
++  bool load_ascii (std::istream& is);
++
++  bool save_binary (std::ostream& os, bool& save_as_floats);
++
++  bool load_binary (std::istream& is, bool swap, 
++		    oct_mach_info::float_format fmt);
++
++#if defined (HAVE_HDF5)
++  bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
++
++  bool load_hdf5 (hid_t loc_id, const char *name, bool have_h5giterate_bug);
++#endif
++
+   void print (std::ostream& os, bool pr_as_read_syntax = false) const;
+ 
+   void print_raw (std::ostream& os, bool pr_as_read_syntax = false) const;
+ 
+ private:
+ 
+   DECLARE_OCTAVE_ALLOCATOR
+ 
+diff --git a/src/ov-fcn-inline.cc b/src/ov-fcn-inline.cc
+--- a/src/ov-fcn-inline.cc
++++ b/src/ov-fcn-inline.cc
+@@ -26,16 +26,17 @@ Open Source Initiative (www.opensource.o
+ #if defined (__GNUG__) && defined (USE_PRAGMA_INTERFACE_IMPLEMENTATION)
+ #pragma implementation
+ #endif
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <istream>
+ #include <iostream>
+ 
+ #include "defun.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-fcn-inline.h"
+@@ -120,17 +121,41 @@ octave_fcn_inline::load_ascii (std::istr
+   if (extract_keyword (is, "nargs", nargs, true))
+     {
+       ifargs.resize (nargs);
+       for (int i = 0; i < nargs; i++)
+ 	is >> ifargs(i);
+       is >> nm;
+       if (nm == "0")
+ 	nm = "";
+-      is >> iftext;
++
++      char c;
++      OSSTREAM buf;
++
++      // Skip preceeding newline(s)
++      while (is.get (c) && c == '\n');
++
++      if (is)
++	{
++	  buf << c;
++
++	  // Get a line of text whitespace characters included, leaving
++	  // newline in the stream
++	  while (is.peek () != '\n')
++	    {
++	      is.get (c);
++	      if (! is)
++		break;
++	      buf << c;
++	    }
++	}
++
++      buf << OSSTREAM_ENDS;
++      iftext = OSSTREAM_STR (buf);
++      OSSTREAM_FREEZE (buf);
+ 
+       octave_fcn_inline tmp (iftext, ifargs, nm);
+       fcn = tmp.fcn;
+ 
+       return true;
+     }
+   else
+     return false;
+@@ -326,16 +351,19 @@ octave_fcn_inline::save_hdf5 (hid_t loc_
+     {
+       H5Sclose (space_hid);
+       H5Tclose (type_hid);
+       H5Gclose (group_hid);
+       return false;
+     }
+ 
+   H5Dclose (data_hid);
++  H5Sclose (space_hid);
++  H5Tclose (type_hid);
++  H5Gclose (group_hid);
+ 
+   return retval;
+ }
+ 
+ bool
+ octave_fcn_inline::load_hdf5 (hid_t loc_id, const char *name,
+ 			      bool /* have_h5giterate_bug */)
+ {
+diff --git a/src/variables.cc b/src/variables.cc
+--- a/src/variables.cc
++++ b/src/variables.cc
+@@ -892,16 +892,29 @@ lookup_user_function (const std::string&
+ 
+   if (sr)
+     retval = sr->def ();
+ 
+   return retval;
+ }
+ 
+ octave_value
++lookup_function_handle (const std::string& nm)
++{
++  octave_value retval;
++
++  symbol_record *sr = curr_sym_tab->lookup (nm, true);
++
++  if (sr && sr->def ().is_function_handle ())
++    retval = sr->def ();
++
++  return retval;
++}
++
++octave_value
+ get_global_value (const std::string& nm)
+ {
+   octave_value retval;
+ 
+   symbol_record *sr = global_sym_tab->lookup (nm);
+ 
+   if (sr)
+     {
+@@ -1916,23 +1929,34 @@ do_matlab_compatible_clear (const string
+       if (cond) \
+         { \
+           print_usage ("clear"); \
+           return retval; \
+         } \
+     } \
+   while (0)
+ 
+-
+ bool
+ clear_function (const std::string& nm)
+ {
+   return do_clear_function (nm);
+ }
+ 
++bool
++clear_variable (const std::string& nm)
++{
++  return do_clear_variable (nm);
++}
++
++bool
++clear_symbol (const std::string& nm)
++{
++  return do_clear_symbol (nm);
++}
++
+ DEFCMD (clear, args, ,
+   "-*- texinfo -*-\n\
+ @deffn {Command} clear [-x] pattern @dots{}\n\
+ Delete the names matching the given patterns from the symbol table.  The\n\
+ pattern may contain the following special characters:\n\
+ \n\
+ @table @code\n\
+ @item ?\n\
+diff --git a/src/variables.h b/src/variables.h
+--- a/src/variables.h
++++ b/src/variables.h
+@@ -84,16 +84,18 @@ extern bool lookup (symbol_record *s, bo
+ 
+ extern symbol_record *
+ lookup_by_name (const std::string& nm, bool exec_script = true);
+ 
+ extern octave_value lookup_function (const std::string& nm);
+ 
+ extern octave_value lookup_user_function (const std::string& nm);
+ 
++extern octave_value lookup_function_handle (const std::string& nm);
++
+ extern octave_value get_global_value (const std::string& nm);
+ 
+ extern void set_global_value (const std::string& nm, const octave_value& val);
+ 
+ extern std::string builtin_string_variable (const std::string&);
+ extern int builtin_real_scalar_variable (const std::string&, double&);
+ extern octave_value builtin_any_variable (const std::string&);
+ 
+@@ -115,16 +117,18 @@ bind_builtin_variable (const std::string
+ 		       symbol_record::change_function f = 0,
+ 		       const std::string& help = std::string ());
+ 
+ extern void mlock (const std::string&);
+ extern void munlock (const std::string&);
+ extern bool mislocked (const std::string&);
+ 
+ extern bool clear_function (const std::string& nm);
++extern bool clear_variable (const std::string& nm);
++extern bool clear_symbol (const std::string& nm);
+ 
+ // Symbol table for symbols at the top level.
+ extern symbol_table *top_level_sym_tab;
+ 
+ // Symbol table for the current scope.
+ extern symbol_table *curr_sym_tab;
+ 
+ // Symbol table for the current caller scope.

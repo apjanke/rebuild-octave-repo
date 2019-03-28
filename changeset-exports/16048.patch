@@ -1,0 +1,735 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1360614000 18000
+#      Mon Feb 11 15:20:00 2013 -0500
+# Branch classdef
+# Node ID 10142aad4b9fa1c5a3e1a8351e96030708536d84
+# Parent  14aa0b5a980c9c4a4731b355d2ec4ce0acbd19de
+Implement indirect method call: fun(obj, ...).
+
+* libinterp/octave-value/ov-classdef.h (class cdef_manager): New class.
+(cdef_method::cdef_method_rep::meta_subsref,
+cdef_method::cdef_method_rep::meta_is_postfix_index_handled): New
+methods.
+
+* libinterp/octave-value/ov-classdef.cc (all_packages, all_classes):
+Move static variables to class cdef_manager.
+(lookup_class (std::string, bool, bool)): Move implementation to
+method cdef_manager::do_find_class().
+(lookup_package): Move implementation to method
+cdef_manager::do_find_package().
+(make_class): Use cdef_manager::register_class.
+(make_package): Use cdef_manager::register_package and
+cdef_manager::find_package.
+(cdef_class::cdef_class_rep::meta_release): Use
+cdef_manager::unregister_class.
+(cdef_method::cdef_method_rep::meta_subsref): New method.
+(class cdef_manager): New class.
+
+* libinterp/interpfcn/symtab.cc
+(symbol_table::fcn_info::fcn_info_rep::load_class_constructor):
+Look for classdef constructor in normal m-files. Call
+find_user_function() and check whether the result is a classdef
+constructor. If it is, stash it as a constructor and restore the
+previous value of function_on_path.
+(symbol_table::fcn_info::fcn_info_rep::load_class_method): Look for
+method in classdef system, using cdef_manager::find_method_symbol().
+
+diff --git a/libinterp/interpfcn/symtab.cc b/libinterp/interpfcn/symtab.cc
+--- a/libinterp/interpfcn/symtab.cc
++++ b/libinterp/interpfcn/symtab.cc
+@@ -31,16 +31,17 @@ along with Octave; see the file COPYING.
+ #include "oct-time.h"
+ #include "singleton-cleanup.h"
+ 
+ #include "debug.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "input.h"
+ #include "load-path.h"
++#include "ov-classdef.h"
+ #include "ov-fcn.h"
+ #include "ov-usr-fcn.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pt-arg-list.h"
+ #include "symtab.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+@@ -387,67 +388,102 @@ symbol_table::fcn_info::fcn_info_rep::lo
+ 
+       if (fcn)
+         {
+           retval = octave_value (fcn);
+ 
+           class_constructors[name] = retval;
+         }
+     }
++  else
++    {
++      // Classdef constructors can be defined anywhere in the path, not
++      // necessarily in @-folders. Look for a normal function and load it.
++      // If the loaded function is a classdef constructor, store it as such
++      // and restore function_on_path to its previous value.
++
++      octave_value old_function_on_path = function_on_path;
++
++      octave_value maybe_cdef_ctor = find_user_function ();
++
++      if (maybe_cdef_ctor.is_defined ())
++        {
++          octave_function *fcn = maybe_cdef_ctor.function_value (true);
++
++          if (fcn && fcn->is_classdef_constructor ())
++            {
++              retval = maybe_cdef_ctor;
++
++              class_constructors[name] = retval;
++
++              function_on_path = old_function_on_path;
++            }
++        }
++    }
+ 
+   return retval;
+ }
+ 
+ octave_value
+ symbol_table::fcn_info::fcn_info_rep::load_class_method
+   (const std::string& dispatch_type)
+ {
+   octave_value retval;
+ 
+   if (name == dispatch_type)
+     retval = load_class_constructor ();
+   else
+     {
+-      std::string dir_name;
++      octave_function *cm = cdef_manager::find_method_symbol (name,
++                                                              dispatch_type);
+ 
+-      std::string file_name = load_path::find_method (dispatch_type, name,
+-                                                      dir_name);
++      if (cm)
++        retval = octave_value (cm);
+ 
+-      if (! file_name.empty ())
++      if (! retval.is_defined ())
+         {
+-          octave_function *fcn = load_fcn_from_file (file_name, dir_name,
+-                                                     dispatch_type);
++          std::string dir_name;
+ 
+-          if (fcn)
++          std::string file_name = load_path::find_method (dispatch_type, name,
++                                                          dir_name);
++
++          if (! file_name.empty ())
+             {
+-              retval = octave_value (fcn);
++              octave_function *fcn = load_fcn_from_file (file_name, dir_name,
++                                                         dispatch_type);
+ 
+-              class_methods[dispatch_type] = retval;
+-            }
+-        }
++              if (fcn)
++                {
++                  retval = octave_value (fcn);
+ 
+-      if (retval.is_undefined ())
+-        {
+-          // Search parent classes
++                  class_methods[dispatch_type] = retval;
++                }
++            }
+ 
+-          const std::list<std::string>& plist = parent_classes (dispatch_type);
+-
+-          std::list<std::string>::const_iterator it = plist.begin ();
+-
+-          while (it != plist.end ())
++          if (retval.is_undefined ())
+             {
+-              retval = find_method (*it);
++              // Search parent classes
+ 
+-              if (retval.is_defined ())
++              const std::list<std::string>& plist =
++                parent_classes (dispatch_type);
++
++              std::list<std::string>::const_iterator it = plist.begin ();
++
++              while (it != plist.end ())
+                 {
+-                  class_methods[dispatch_type] = retval;
+-                  break;
++                  retval = find_method (*it);
++
++                  if (retval.is_defined ())
++                    {
++                      class_methods[dispatch_type] = retval;
++                      break;
++                    }
++
++                  it++;
+                 }
+-
+-              it++;
+             }
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ void
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -20,37 +20,34 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <algorithm>
+-#include <map>
+ 
+ #include "defun.h"
+ #include "ov-builtin.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-typeinfo.h"
+ #include "pt-assign.h"
+ #include "pt-classdef.h"
+ #include "pt-funcall.h"
+ #include "pt-misc.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
++#include "singleton-cleanup.h"
+ #include "symtab.h"
+ #include "toplev.h"
+ 
+ #include "Array.cc"
+ 
+-static std::map<std::string, cdef_class> all_classes;
+-static std::map<std::string, cdef_package> all_packages;
+-
+ static void
+ gripe_method_access (const std::string& from, const cdef_method& meth)
+ {
+   octave_value acc = meth.get ("Access");
+   std::string acc_s;
+ 
+   if (acc.is_string ())
+     acc_s = acc.string_value ();
+@@ -139,51 +136,21 @@ execute_ov (octave_value val, const octa
+   std::list<octave_value_list> idx (1, args);
+ 
+   std::string type ("(");
+ 
+   return val.subsref (type, idx, nargout);
+ }
+ 
+ static cdef_class
+-lookup_class (const std::string& name, bool error_if_not_found = true)
++lookup_class (const std::string& name, bool error_if_not_found = true,
++              bool load_if_not_found = true)
+ {
+-  std::map<std::string, cdef_class>::iterator it = all_classes.find (name);
+-
+-  if (it == all_classes.end ())
+-    {
+-      // FIXME: implement this properly
+-
+-      octave_value ov_cls = symbol_table::find (name);
+-
+-      if (ov_cls.is_defined ())
+-        it = all_classes.find (name);
+-    }
+-
+-  if (it == all_classes.end ())
+-    {
+-      if (error_if_not_found)
+-	error ("class not found: %s", name.c_str ());
+-    }
+-  else
+-    {
+-      cdef_class& cls = it->second;
+-
+-      if (! cls.is_builtin ())
+-	{
+-	  // FIXME: check whether a class reload is needed
+-	}
+-
+-      if (cls.ok ())
+-	return cls;
+-      else
+-	all_classes.erase (it);
+-    }
+-
+-  return cdef_class ();
++  return cdef_manager::find_class (name, error_if_not_found,
++                                   load_if_not_found);
+ }
+ 
+ static cdef_class
+ lookup_class (const cdef_class& cls)
+ {
+   // FIXME: placeholder for the time being, the purpose
+   //        is to centralized any class update activity here.
+ 
+@@ -647,17 +614,17 @@ make_class (const std::string& name,
+             cls.mark_as_handle_class ();
+         }
+     }
+ 
+   if (error_state)
+     return cdef_class ();
+ 
+   if (! name.empty ())
+-    all_classes[name] = cls;
++    cdef_manager::register_class (cls);
+ 
+   return cls;
+ }
+ 
+ static cdef_class
+ make_class (const std::string& name, const cdef_class& super)
+ {
+   return make_class (name, std::list<cdef_class> (1, super));
+@@ -755,20 +722,23 @@ make_method (const cdef_class& cls, cons
+ static cdef_package
+ make_package (const std::string& nm,
+               const std::string& parent = std::string ())
+ {
+   cdef_package pack ("meta.package");
+ 
+   pack.set_class (cdef_class::meta_package ());
+   pack.put ("Name", nm);
+-  pack.put ("ContainingPackage", to_ov (all_packages[parent]));
++  if (parent.empty ())
++    pack.put ("ContainingPackage", Matrix ());
++  else
++    pack.put ("ContainingPackage", to_ov (cdef_manager::find_package (parent)));
+ 
+   if (! nm.empty ())
+-    all_packages[nm] = pack;
++    cdef_manager::register_package (pack);
+ 
+   return pack;
+ }
+ 
+ //----------------------------------------------------------------------------
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_classdef);
+ 
+@@ -1996,17 +1966,17 @@ cdef_class::cdef_class_rep::meta_subsref
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ cdef_class::cdef_class_rep::meta_release (void)
+ {
+-  all_classes.erase (get_name ());
++  cdef_manager::unregister_class (wrap ());
+ }
+ 
+ void
+ cdef_class::cdef_class_rep::initialize_object (cdef_object& obj)
+ {
+   // Populate the object with default property values
+ 
+   std::list<cdef_class> super_classes = lookup_classes (get ("SuperClasses").cell_value ());
+@@ -2641,34 +2611,47 @@ cdef_method::cdef_method_rep::check_acce
+   cdef_class cls (to_cdef (get ("DefiningClass")));
+ 
+   if (! error_state)
+     return ::check_access (cls, get ("Access"));
+ 
+   return false;
+ }
+ 
++octave_value_list
++cdef_method::cdef_method_rep::meta_subsref
++  (const std::string& type, const std::list<octave_value_list>& idx,
++   int nargout)
++{
++  octave_value_list retval;
++
++  switch (type[0])
++    {
++    case '(':
++      retval = execute (idx.front (), type.length () > 1 ? 1 : nargout, true);
++      break;
++
++    default:
++      error ("invalid meta.method indexing");
++      break;
++    }
++
++  if (! error_state)
++    {
++      if (type.length () > 1 && idx.size () > 1 && ! retval.empty ())
++	retval = retval(0).next_subsref (nargout, type, idx, 1);
++    }
++
++  return retval;
++}
++
+ static cdef_package
+ lookup_package (const std::string& name)
+ {
+-  std::map<std::string, cdef_package>::const_iterator it = all_packages.find (name);
+-
+-  if (it != all_packages.end ())
+-    {
+-      cdef_package pack = it->second;
+-
+-      if (pack.ok ())
+-        return pack;
+-      else
+-        error ("invalid package: %s", name.c_str ());
+-    }
+-  else
+-    error ("package not found: %s", name.c_str ());
+-
+-  return cdef_package ();
++  return cdef_manager::find_package (name);
+ }
+ 
+ static octave_value_list
+ package_fromName (const octave_value_list& args, int /* nargout */)
+ {
+   octave_value_list retval;
+ 
+   if (args.length () == 1)
+@@ -2939,16 +2922,112 @@ install_classdef (void)
+   package_meta.install_class (meta_class,       "class");
+   package_meta.install_class (meta_property,    "property");
+   package_meta.install_class (meta_method,      "method");
+   package_meta.install_class (meta_package,     "package");
+   package_meta.install_class (meta_event,       "event");
+   package_meta.install_class (meta_dynproperty, "dynproperty");
+ }
+ 
++//----------------------------------------------------------------------------
++
++cdef_manager* cdef_manager::instance = 0;
++
++void
++cdef_manager::create_instance (void)
++{
++  instance = new cdef_manager ();
++
++  if (instance)
++    singleton_cleanup_list::add (cleanup_instance);
++}
++
++cdef_class
++cdef_manager::do_find_class (const std::string& name,
++                             bool error_if_not_found, bool load_if_not_found)
++{
++  std::map<std::string, cdef_class>::iterator it = all_classes.find (name);
++
++  if (it == all_classes.end ())
++    {
++      // FIXME: implement this properly, take package prefix into account
++
++      if (load_if_not_found)
++        {
++          octave_value ov_cls = symbol_table::find (name);
++
++          if (ov_cls.is_defined ())
++            it = all_classes.find (name);
++        }
++    }
++
++  if (it == all_classes.end ())
++    {
++      if (error_if_not_found)
++	error ("class not found: %s", name.c_str ());
++    }
++  else
++    {
++      cdef_class cls = it->second;
++
++      if (! cls.is_builtin ())
++        cls = lookup_class (cls);
++
++      if (cls.ok ())
++	return cls;
++      else
++	all_classes.erase (it);
++    }
++
++  return cdef_class ();
++}
++
++octave_function*
++cdef_manager::do_find_method_symbol (const std::string& method_name,
++                                     const std::string& class_name)
++{
++  octave_function *retval = 0;
++
++  cdef_class cls = find_class (class_name, false, false);
++
++  if (cls.ok ())
++    {
++      cdef_method meth = cls.find_method (method_name);
++
++      if (meth.ok ())
++        retval = new octave_classdef_meta (meth);
++    }
++
++  return retval;
++}
++
++cdef_package
++cdef_manager::do_find_package (const std::string& name,
++                               bool error_if_not_found)
++{
++  cdef_package retval;
++
++  std::map<std::string, cdef_package>::const_iterator it
++    = all_packages.find (name);
++
++  if (it != all_packages.end ())
++    {
++      retval = it->second;
++
++      if (! retval.ok ())
++        error ("invalid package `%s'", name.c_str ());
++    }
++  else if (error_if_not_found)
++    error ("unknown package `%s'", name.c_str ());
++
++  return retval;
++}
++
++//----------------------------------------------------------------------------
++
+ DEFUN (__meta_get_package__, args, , "")
+ {
+   octave_value retval;
+ 
+   if (args.length () == 1)
+     {
+       std::string cname = args(0).string_value ();
+ 
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -18,16 +18,17 @@ You should have received a copy of the G
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_classdef_h)
+ #define octave_classdef_h 1
+ 
++#include <map>
+ #include <set>
+ #include <string>
+ 
+ #include "oct-map.h"
+ #include "oct-refcount.h"
+ #include "ov-base.h"
+ 
+ class cdef_object;
+@@ -1034,16 +1035,23 @@ private:
+ 
+     octave_value_list execute (const cdef_object& obj,
+ 			       const octave_value_list& args, int nargout,
+                                bool do_check_access = true,
+                                const std::string& who = std::string ());
+ 
+     bool is_constructor (void) const;
+ 
++    octave_value_list
++    meta_subsref (const std::string& type,
++                  const std::list<octave_value_list>& idx, int nargout);
++
++    bool meta_is_postfix_index_handled (char type) const
++      { return (type == '(' || type == '.'); }
++
+   private:
+     cdef_method_rep (const cdef_method_rep& m)
+       : cdef_meta_object_rep (m), function (m.function) { }
+ 
+     void check_method (void);
+ 
+     cdef_method wrap (void)
+       {
+@@ -1455,15 +1463,142 @@ to_cdef_ref (octave_value& val)
+ }
+ 
+ inline cdef_object
+ to_cdef (const cdef_object& obj)
+ { return obj; }
+ 
+ OCTINTERP_API void install_classdef (void);
+ 
++class
++cdef_manager
++{
++public:
++
++  static cdef_class find_class (const std::string& name,
++                                bool error_if_not_found = true,
++                                bool load_if_not_found = true)
++    {
++      if (instance_ok ())
++        return instance->do_find_class (name, error_if_not_found,
++                                        load_if_not_found);
++
++      return cdef_class ();
++    }
++
++  static octave_function* find_method_symbol (const std::string& method_name,
++                                              const std::string& class_name)
++    {
++      if (instance_ok ())
++        return instance->do_find_method_symbol (method_name, class_name);
++
++      return 0;
++    }
++
++  static cdef_package find_package (const std::string& name,
++                                    bool error_if_not_found = true)
++    {
++      if (instance_ok ())
++        return instance->do_find_package (name, error_if_not_found);
++
++      return cdef_package ();
++    }
++
++  static void register_class (const cdef_class& cls)
++    {
++      if (instance_ok ())
++        instance->do_register_class (cls);
++    }
++
++  static void unregister_class (const cdef_class& cls)
++    {
++      if (instance_ok ())
++        instance->do_unregister_class (cls);
++    }
++
++  static void register_package (const cdef_package& pkg)
++    {
++      if (instance_ok ())
++        instance->do_register_package (pkg);
++    }
++
++  static void unregister_package (const cdef_package& pkg)
++    {
++      if (instance_ok ())
++        instance->do_unregister_package (pkg);
++    }
++
++private:
++
++  cdef_manager (void) { }
++
++  cdef_manager (const cdef_manager&);
++
++  cdef_manager& operator = (const cdef_manager&);
++
++  ~cdef_manager (void) { }
++
++  static void create_instance (void);
++
++  static bool instance_ok (void)
++    {
++      bool retval = true;
++
++      if (! instance)
++        create_instance ();
++
++      if (! instance)
++        {
++          ::error ("unable to create cdef_manager!");
++
++          retval = false;
++        }
++
++      return retval;
++    }
++
++  static void cleanup_instance (void)
++    {
++      delete instance;
++
++      instance = 0;
++    }
++
++  cdef_class do_find_class (const std::string& name, bool error_if_not_found,
++                            bool load_if_not_found);
++
++  octave_function* do_find_method_symbol (const std::string& method_name,
++                                          const std::string& class_name);
++
++  cdef_package do_find_package (const std::string& name,
++                                bool error_if_not_found);
++
++  void do_register_class (const cdef_class& cls)
++    { all_classes[cls.get_name ()] = cls; }
++
++  void do_unregister_class (const cdef_class& cls)
++    { all_classes.erase(cls.get_name ()); }
++
++  void do_register_package (const cdef_package& pkg)
++    { all_packages[pkg.get_name ()] = pkg; }
++
++  void do_unregister_package (const cdef_package& pkg)
++    { all_packages.erase(pkg.get_name ()); }
++
++private:
++
++  // The single cdef_manager instance
++  static cdef_manager *instance;
++
++  // All registered/loaded classes
++  std::map<std::string, cdef_class> all_classes;
++
++  // All registered/loaded packages
++  std::map<std::string, cdef_package> all_packages;
++};
++
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/test/classdef/test_classdef.m b/test/classdef/test_classdef.m
+--- a/test/classdef/test_classdef.m
++++ b/test/classdef/test_classdef.m
+@@ -42,18 +42,17 @@
+ %!assert (isempty (q.rate));
+ %!assert (isempty (q.principle));
+ %!assert (isempty (q.term));
+ %!assert (class (p), "foo_value_class");
+ %!assert (p.term, 48);
+ %!assert (p.rate, 4.0);
+ %!assert (p.principle, 50e3);
+ %!assert (p.amount, amt, eps ())
+-%!xtest
+-%! assert (amount (p), amt, eps ())
++%!assert (amount (p), amt, eps ())
+ %!xtest
+ %! assert (properties (p), {'rate'; 'term'; 'principle'})
+ %!xtest
+ %! assert (methods (p), {'amount'; 'foo_value_class'})
+ %!assert (isempty (foo_value_class().rate))
+ %!error <property `rate' is not constant> foo_value_class.rate
+ 
+ %%  Static method and Constant Property

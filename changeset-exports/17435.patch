@@ -1,0 +1,461 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1379548477 25200
+#      Wed Sep 18 16:54:37 2013 -0700
+# Node ID 4a6a4657fdf285ba0958adce597b0f8beb8fd28a
+# Parent  c39fa414b5abe20777e349ac3365386a9d6f7ea0
+Overhaul errorbar family of functions.
+
+* scripts/plot/errorbar.m: Add %!error tests for input validation.
+
+* scripts/plot/private/__errcomm__.m: Correctly validate that numeric inputs
+are numeric.  More precise error reporting indicating the problematic argument.
+
+* scripts/plot/private/__errplot__.m: Fix automatic color cycling for matrices
+with multiple columns of data.  Check "yerr" case first in if/elseif trees
+since it is the most common.  Pull static computations out of for loop for
+performance.
+
+diff --git a/scripts/plot/errorbar.m b/scripts/plot/errorbar.m
+--- a/scripts/plot/errorbar.m
++++ b/scripts/plot/errorbar.m
+@@ -192,8 +192,29 @@ endfunction
+ %! err = x/30;
+ %! y1 = sin (x);
+ %! y2 = cos (x);
+ %! errorbar (x, y1, err, err, err, err, '~>', ...
+ %!           x, y2, err, err, err, err, '#~>-*');
+ %! legend ("X-Y errbars", "X-Y errboxes");
+ %! title ('errorbar() with X-Y errorbars and error boxes');
+ 
++## Invisible figure used for tests
++%!shared hf, hax
++%! hf = figure ("visible", "off");
++%! hax = axes;
++
++%!error errorbar ()
++%!error errorbar (1)
++%!error <data argument 1 must be numeric> errorbar (hax, {1}, 2)
++%!error <data argument 2 must be numeric> errorbar (hax, 1, {2})
++%!error <size of argument 2 does not match others> errorbar (hax, 1, 1:2)
++%!error <size of argument 3 does not match others> errorbar (hax, 1, 2, 3:4)
++%!error <too many arguments to plot> errorbar (1,2,3,4,5,6,7)
++
++%!error <2 column errorplot is only valid for xerr> errorbar (1,2, "~>")
++%!error <6 columns only valid for xyerr and boxxy> errorbar (1,2,3,4,5,6, "~")
++%!error <error plot requires 2, 3, 4, or 6 arguments> errorbar (1,2,3,4,5)
++
++## Close figure used for testing
++%!test
++%! close (hf);
++
+diff --git a/scripts/plot/private/__errcomm__.m b/scripts/plot/private/__errcomm__.m
+--- a/scripts/plot/private/__errcomm__.m
++++ b/scripts/plot/private/__errcomm__.m
+@@ -26,54 +26,54 @@
+ ## Keywords: errorbar, plotting
+ 
+ function retval = __errcomm__ (caller, hax, varargin)
+ 
+   if (nargin < 4)
+     print_usage (caller);
+   endif
+ 
+-  nargs = length (varargin);
+   retval = [];
++  data = cell (6,1);
++  nargs = numel (varargin);
+   k = 1;
+-  data = cell (6,1);
+   while (k <= nargs)
+-    a = varargin{k++};
+-    if (isvector (a))
+-      a = a(:);
+-    elseif (ismatrix (a))
+-      ;
+-    else
+-      usage ("%s (...)", caller);
++    arg = varargin{k++};
++    if (! ismatrix (arg))
++      error ("%s: data argument %d must be numeric", caller, k-1);
+     endif
+-    sz = size (a);
++    if (isvector (arg))
++      arg = arg(:);
++    endif
++    sz = size (arg);
+     ndata = 1;
+-    data{ndata} = a;
++    data{ndata} = arg;
+     while (k <= nargs)
+-      a = varargin{k++};
+-      if (ischar (a) || iscellstr (a))
+-        retval = [retval; __errplot__(a, hax, data{1:ndata})];
++      arg = varargin{k++};
++      if (ischar (arg) || iscellstr (arg))
++        retval(end+1,1) = __errplot__(arg, hax, data{1:ndata});
+         break;
+-      elseif (isvector (a))
+-        a = a(:);
+-      elseif (ismatrix (a))
+-        ;
+-      else
+-        error ("%s: wrong argument types", caller);
++      endif
++      if (! ismatrix (arg))
++        error ("%s: data argument %d must be numeric", caller, k-1);
+       endif
+-      if (size (a) != sz)
+-        error ("%s: argument sizes do not match", caller);
++      if (isvector (arg))
++        arg = arg(:);
+       endif
+-      data{++ndata} = a;
++      if (any (size (arg) != sz))
++        error ("%s: size of argument %d does not match others", caller, k-1);
++      endif
++      data{++ndata} = arg;
+       if (ndata > 6)
+         error ("%s: too many arguments to plot", caller);
+       endif
+     endwhile
+   endwhile
+ 
+-  if (! (ischar (a) || iscellstr (a)))
++  ## No format code found, use yerrorbar
++  if (! (ischar (arg) || iscellstr (arg)))
+     retval = [retval; __errplot__("~", hax, data{1:ndata})];
+   endif
+ 
+   drawnow ();
+ 
+ endfunction
+ 
+diff --git a/scripts/plot/private/__errplot__.m b/scripts/plot/private/__errplot__.m
+--- a/scripts/plot/private/__errplot__.m
++++ b/scripts/plot/private/__errplot__.m
+@@ -22,158 +22,164 @@
+ ## @end deftypefn
+ 
+ ## Created: 18.7.2000
+ ## Author: Teemu Ikonen <tpikonen@pcu.helsinki.fi>
+ ## Keywords: errorbar, plotting
+ 
+ function h = __errplot__ (fstr, hax, varargin)
+ 
+-  [fmt, valid] = __pltopt__ ("__errplot__", fstr);
+-
+-  [len, nplots] = size (varargin{1});
+-  h = [];
++  fmt = __pltopt__ ("__errplot__", fstr);
+ 
+-  for i = 1:nplots
+-    ## Set the plot type based on linestyle.
+-
+-    if (strcmp (fmt.errorstyle, "~"))
++  ## Set the plot type based on linestyle.
++  switch (fmt.errorstyle) 
++    case "~"
+       ifmt = "yerr";
+-    elseif (strcmp (fmt.errorstyle, ">"))
++    case ">"
+       ifmt = "xerr";
+-    elseif (strcmp (fmt.errorstyle, "~>"))
++    case "~>"
+       ifmt = "xyerr";
+-    elseif (strcmp (fmt.errorstyle, "#"))
++    case "#"
+       ifmt = "box";
+-    elseif (strcmp (fmt.errorstyle, "#~"))
++    case "#~"
+       ifmt = "boxy";
+-    elseif (strcmp (fmt.errorstyle, "#~>"))
++    case "#~>"
+       ifmt = "boxxy";
++    otherwise
++      ifmt = "yerr";
++  endswitch
++
++  h = [];
++  nplots = columns (varargin{1});
++  for i = 1:nplots
++
++    if (isempty (fmt.color))
++      lc = __next_line_color__ ();
+     else
+-      ifmt = "yerr";
++      lc = fmt.color ();
++    endif
++    if (isempty (fmt.marker) && isempty (fmt.linestyle))
++      [ls, mk] = __next_line_style__ ();
++    else
++      ls = fmt.linestyle;
++      mk = fmt.marker;
+     endif
+ 
++    ## Must occur after __next_line_color__ in order to work correctly.
+     hg = hggroup ("parent", hax);
+     h = [h; hg];
+     args = __add_datasource__ ("__errplot__", hg,
+                                {"x", "y", "l", "u", "xl", "xu"});
+ 
+-    if (isempty (fmt.color))
+-      fmt.color = __next_line_color__ ();
+-    endif
+-    if (isempty (fmt.marker) && isempty (fmt.linestyle))
+-      [fmt.linestyle, fmt.marker] = __next_line_style__ ();
+-    endif
+-    hl = [(__line__ (hg, "linestyle", fmt.linestyle, "marker", fmt.marker,
+-                   "color", fmt.color)),
+-          (__line__ (hg, "linestyle", "-", "marker", "none",
+-                   "color", fmt.color))];
++    hl = [(__line__ (hg, "color", lc, "linestyle", ls, "marker", mk)),
++          (__line__ (hg, "color", lc, "linestyle", "-", "marker", "none"))];
+ 
+     switch (numel (varargin))
+       case 2
+         ydata = varargin{1}(:,i);
+         xdata = 1:numel (ydata);
+-        if (strcmp (ifmt, "xerr") || strcmp (ifmt, "box"))
++        if (strcmp (ifmt, "yerr") || strcmp (ifmt, "boxy"))
++          ldata  = varargin{2}(:,i);
++          udata  = ldata;
++          xldata = [];
++          xudata = [];
++        elseif (strcmp (ifmt, "xerr") || strcmp (ifmt, "box"))
+           xldata = varargin{2}(:,i);
+           xudata = ldata;
+-          ldata = [];
+-          udata = [];
+-        elseif (strcmp (ifmt, "yerr") || strcmp (ifmt, "boxy"))
+-          ldata = varargin{2}(:,i);
+-          udata = ldata;
+-          xldata = [];
+-          xudata = [];
++          ldata  = [];
++          udata  = [];
+         else
+           error ("errorbar: 2 column errorplot is only valid for xerr or yerr");
+         endif
+       case 3
+-        if (strcmp (ifmt, "boxxy") || strcmp (ifmt, "xyerr"))
+-          ydata = varargin{1}(:,i);
+-          xdata = 1:numel (ydata);
++        if (strcmp (ifmt, "yerr") || strcmp (ifmt, "boxy"))
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
++          ldata  = varargin{3}(:,i);
++          udata  = ldata;
++          xldata = [];
++          xudata = [];
++        elseif (strcmp (ifmt, "xyerr") || strcmp (ifmt, "boxxy"))
++          ydata  = varargin{1}(:,i);
++          xdata  = 1:numel (ydata);
+           xldata = varargin{2}(:,i);
+           xudata = xldata;
+-          ldata = varargin{3}(:,i);
+-          udata = ldata;
+-        elseif (strcmp (ifmt, "xerr") || strcmp (ifmt, "box"))
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
+-          xldata = varargin{3}(:,i);
+-          xudata = xldata;
+-          ldata = [];
+-          udata = [];
+-        else # yerr or boxy
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
+-          ldata = varargin{3}(:,i);
+-          udata = ldata;
+-          xldata = [];
+-          xudata = [];
+-        endif
+-      case 4
+-        if (strcmp (ifmt, "boxxy") || strcmp (ifmt, "xyerr"))
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
++          ldata  = varargin{3}(:,i);
++          udata  = ldata;
++        else  # xerr or box
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
+           xldata = varargin{3}(:,i);
+           xudata = xldata;
+-          ldata = varargin{4}(:,i);
+-          udata = ldata;
+-        elseif (strcmp (ifmt, "xerr") || strcmp (ifmt, "box"))
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
++          ldata  = [];
++          udata  = [];
++        endif
++      case 4
++        if (strcmp (ifmt, "yerr") || strcmp (ifmt, "boxy"))
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
++          ldata  = varargin{3}(:,i);
++          udata  = varargin{4}(:,i);
++          xldata = [];
++          xudata = [];
++        elseif (strcmp (ifmt, "xyerr") || strcmp (ifmt, "boxxy"))
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
++          xldata = varargin{3}(:,i);
++          xudata = xldata;
++          ldata  = varargin{4}(:,i);
++          udata  = ldata;
++        else  # xerr or box
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
+           xldata = varargin{3}(:,i);
+           xudata = varargin{4}(:,i);
+-          ldata = [];
+-          udata = [];
+-        else # yerr or boxy
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
+-          ldata = varargin{3}(:,i);
+-          udata = varargin{4}(:,i);
+-          xldata = [];
+-          xudata = [];
++          ldata  = [];
++          udata  = [];
+         endif
+-      case 6 # boxxy, xyerr
+-        if (strcmp (ifmt, "boxxy") || strcmp (ifmt, "xyerr"))
+-          xdata = varargin{1}(:,i);
+-          ydata = varargin{2}(:,i);
++      case 6  # xyerr, boxxy
++        if (strcmp (ifmt, "xyerr") || strcmp (ifmt, "boxxy"))
++          xdata  = varargin{1}(:,i);
++          ydata  = varargin{2}(:,i);
+           xldata = varargin{3}(:,i);
+           xudata = varargin{4}(:,i);
+-          ldata = varargin{5}(:,i);
+-          udata = varargin{6}(:,i);
++          ldata  = varargin{5}(:,i);
++          udata  = varargin{6}(:,i);
+         else
+-          error ("errorbar: error plot with 6 columns only valid for boxxy and xyerr");
++          error ("errorbar: error plot with 6 columns only valid for xyerr and boxxy");
+         endif
+       otherwise
+         error ("errorbar: error plot requires 2, 3, 4, or 6 arguments");
+     endswitch
+ 
+     addproperty ("xdata", hg, "data", xdata(:));
+     addproperty ("ydata", hg, "data", ydata(:));
+     addproperty ("ldata", hg, "data", ldata(:));
+     addproperty ("udata", hg, "data", udata(:));
+     addproperty ("xldata", hg, "data", xldata(:));
+     addproperty ("xudata", hg, "data", xudata(:));
+     addproperty ("format", hg, "string", ifmt);
+ 
+     addproperty ("color", hg, "linecolor", get (hl(1), "color"));
++    addproperty ("linestyle", hg, "linelinestyle", get (hl(1), "linestyle"));
+     addproperty ("linewidth", hg, "linelinewidth", get (hl(1), "linewidth"));
+-    addproperty ("linestyle", hg, "linelinestyle", get (hl(1), "linestyle"));
+     addproperty ("marker", hg, "linemarker", get (hl(1), "marker"));
++    addproperty ("markeredgecolor", hg, "linemarkerfacecolor",
++                 get (hl(1), "markeredgecolor"));
+     addproperty ("markerfacecolor", hg, "linemarkerfacecolor",
+                  get (hl(1), "markerfacecolor"));
+-    addproperty ("markeredgecolor", hg, "linemarkerfacecolor",
+-                 get (hl(1), "markeredgecolor"));
+     addproperty ("markersize", hg, "linemarkersize",
+                  get (hl(1), "markersize"));
+ 
+     fcn = {@update_props, hl};
+     addlistener (hg, "color", fcn);
++    addlistener (hg, "linestyle", fcn);
+     addlistener (hg, "linewidth", fcn);
+-    addlistener (hg, "linestyle", fcn);
+     addlistener (hg, "marker", fcn);
++    addlistener (hg, "markeredgecolor", fcn);
+     addlistener (hg, "markerfacecolor", fcn);
+     addlistener (hg, "markersize", fcn);
+ 
+     fcn = {@update_data, hl};
+     addlistener (hg, "xdata", fcn);
+     addlistener (hg, "ydata", fcn);
+     addlistener (hg, "ldata", fcn);
+     addlistener (hg, "udata", fcn);
+@@ -245,17 +251,17 @@ function [xdata, ydata] = errorbar_data 
+     if (! any (n))
+       n = ydata < 0;
+     endif
+     logdata = log (abs (ydata(n)));
+     ry = exp (0.01 * (max (logdata) - min (logdata)));
+     ylo = ydata/ry;
+     yhi = ydata*ry;
+   endif
+-  nans = NaN + xdata(:);
++  nans = NaN + xdata(:);  # fast way to do NaN (size (xdata(:)))
+   if (strcmp (ifmt, "yerr"))
+     xdata = [xdata, xdata, nans, ...
+              xlo, xhi, nans, ...
+              xlo, xhi, nans];
+     ydata = [ydata-ldata, ydata+udata, nans, ...
+              ydata+udata, ydata+udata, nans, ...
+              ydata-ldata, ydata-ldata, nans];
+   elseif (strcmp (ifmt, "xerr"))
+@@ -284,49 +290,49 @@ function [xdata, ydata] = errorbar_data 
+     [x1, y1] = errorbar_data (xdata, ydata, ldata, udata,
+                               xldata, xudata, "xerr", xscale, yscale);
+     [x2, y2] = errorbar_data (xdata, ydata, ldata, udata,
+                               xldata, xudata, "yerr", xscale, yscale);
+     xdata = [x1; x2];
+     ydata = [y1; y2];
+     return;
+   else
+-    error ("errorbar: valid error bar types are xerr, yerr, boxxy, and xyerr");
++    error ("errorbar: valid error bar types are xerr, yerr, xyerr, box, boxy, boxxy");
+   endif
+ 
+   xdata = xdata.'(:);
+   ydata = ydata.'(:);
+ 
+ endfunction
+ 
+-function update_props (hg, dummy, hl)
++function update_props (hg, ~, hl)
+   set (hl, "color", get (hg, "color"),
+-           "linewidth", get (hg, "linewidth"));,
++           "linewidth", get (hg, "linewidth"));
+   set (hl(1), "linestyle", get (hg, "linestyle"),
+               "marker", get (hg, "marker"),
+-              "markersize", get (hg, "markersize"),
++              "markeredgecolor", get (hg, "markeredgecolor"),
+               "markerfacecolor", get (hg, "markerfacecolor"),
+-              "markeredgecolor", get (hg, "markeredgecolor"));
++              "markersize", get (hg, "markersize"));
+ endfunction
+ 
+-function update_data (hg, dummy, hl)
++function update_data (hg, ~, hl)
+ 
+   if (strcmp (get (hg, "type"), "axes"))
+     hax = hg;
+     hg = ancestor (hl(1), "hggroup");
+   else
+     hax = ancestor (hg, "axes");
+   endif
+   xscale = get (hax, "xscale");
+   yscale = get (hax, "yscale");
+ 
+-  xdata = get (hg, "xdata");
+-  ydata = get (hg, "ydata");
+-  ldata = get (hg, "ldata");
+-  udata = get (hg, "udata");
++  xdata  = get (hg, "xdata");
++  ydata  = get (hg, "ydata");
++  ldata  = get (hg, "ldata");
++  udata  = get (hg, "udata");
+   xldata = get (hg, "xldata");
+   xudata = get (hg, "xudata");
+   ifmt = get (hg, "format");
+ 
+   set (hl(1), "xdata", xdata);
+   set (hl(1), "ydata", ydata);
+ 
+   [errorbar_xdata, errorbar_ydata] = ...

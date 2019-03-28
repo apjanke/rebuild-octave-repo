@@ -1,0 +1,538 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1458518563 0
+#      Mon Mar 21 00:02:43 2016 +0000
+# Node ID 2ee20a290d61944459d4368d6f21fecc0fbaed15
+# Parent  e626d8a3427ee8a4dd509c74a749ece2cda2fb5f
+pkg build: complete rewrite of the logic behind binary packages.
+
+* pkg/private/build.m: this functions prepares a "binary" package.  This
+rewrite is triggered to fix bug #45369 (do not move installed PKG_ADD and
+PKG_DEL files into root of the binary package) but changes the whole
+underlying logic of binary packages.
+Previously, "pkg build" would install a package into a specific directory
+and then created a package by making a tarball of it.  This worked because
+the build files would go into a arch dependent directory inside inst/ which
+is just copied.  Anyway, this is a complex process and sometimes almost
+impossible because all files besides the .m and .oct files need to be moved
+back to their original place.  The main current problem is with PKG_ADD and
+PKG_DEL files (see bugs #45362, #45091, and #45369).
+In addition, it can also lead to duplication of PKG_ADD commands (because the
+process of installing a package parses .m files for PKG_ADD directives so they
+will appear on a PKG_ADD file.  During installation of the binary package, the
+PKG_ADD directives would be readded to the file).
+Another issue is that it only works because the arch dependent directory is
+nested within the arch independent directory.  Since that should not be, it
+will stop work once that gets fixed.
+Anyway, the whole reason for a "binary" package is to avoid a build which may
+require mkoctfile and C++ compilers (in theory it could also avoid generating
+doc-cache but in practice that is currently not done).  So all we have to do
+is: do the build, remove the configure and Makefile, repackage everything with
+the oct and mex files.
+* pkg/private/repackage.m: remove unused function (it was used by build()) to
+create a binary package from an installed package.
+* pkg/private/configure_make.m: split into two parts.  The first (which remains
+configure_make()) only really calls configure and make (and is used by build()).
+The rest is moved to the new function copy_built_files().  The split allows this
+function to be used by build.
+* pkg/private/copy_built_files.m: new function with the code moved from
+configure_make (it is used in install() only).
+* pkg/private/install.m: add call to copy_built_files which was previously
+part of configure_make.
+* pkg.m: adjust call to build().
+* pkg/module.mk: remove repackage.m; add copy_built_files.m.
+
+diff --git a/scripts/pkg/module.mk b/scripts/pkg/module.mk
+--- a/scripts/pkg/module.mk
++++ b/scripts/pkg/module.mk
+@@ -1,15 +1,16 @@
+ FCN_FILE_DIRS += \
+   scripts/pkg \
+   scripts/pkg/private
+ 
+ scripts_pkg_PRIVATE_FCN_FILES = \
+   scripts/pkg/private/build.m \
+   scripts/pkg/private/configure_make.m \
++  scripts/pkg/private/copy_built_files.m \
+   scripts/pkg/private/copy_files.m \
+   scripts/pkg/private/create_pkgadddel.m \
+   scripts/pkg/private/default_prefix.m \
+   scripts/pkg/private/describe.m \
+   scripts/pkg/private/dirempty.m \
+   scripts/pkg/private/extract_pkg.m \
+   scripts/pkg/private/finish_installation.m \
+   scripts/pkg/private/fix_depends.m \
+@@ -29,17 +30,16 @@ scripts_pkg_PRIVATE_FCN_FILES = \
+   scripts/pkg/private/load_package_dirs.m \
+   scripts/pkg/private/load_packages.m \
+   scripts/pkg/private/load_packages_and_dependencies.m \
+   scripts/pkg/private/packinfo_copy_file.m \
+   scripts/pkg/private/parse_pkg_idx.m \
+   scripts/pkg/private/prepare_installation.m \
+   scripts/pkg/private/print_package_description.m \
+   scripts/pkg/private/rebuild.m \
+-  scripts/pkg/private/repackage.m \
+   scripts/pkg/private/save_order.m \
+   scripts/pkg/private/shell.m \
+   scripts/pkg/private/uninstall.m \
+   scripts/pkg/private/unload_packages.m \
+   scripts/pkg/private/verify_directory.m \
+   scripts/pkg/private/write_index.m
+ 
+ scripts_pkg_FCN_FILES = scripts/pkg/pkg.m
+diff --git a/scripts/pkg/pkg.m b/scripts/pkg/pkg.m
+--- a/scripts/pkg/pkg.m
++++ b/scripts/pkg/pkg.m
+@@ -522,17 +522,17 @@ function [local_packages, global_package
+           clear ("local_packages");
+         endif
+       endif
+ 
+     case "build"
+       if (numel (files) < 2)
+         error ("pkg: build action requires build directory and at least one filename");
+       endif
+-      build (files, deps, auto, verbose);
++      build (files{1}, files(2:end), verbose);
+ 
+     case "describe"
+       if (isempty (files))
+         error ("pkg: describe action requires at least one package or 'all'");
+       endif
+       ## FIXME: name of the output variables is inconsistent with their content
+       if (nargout)
+         [local_packages, global_packages] = describe (files, verbose,
+diff --git a/scripts/pkg/private/build.m b/scripts/pkg/private/build.m
+--- a/scripts/pkg/private/build.m
++++ b/scripts/pkg/private/build.m
+@@ -13,52 +13,72 @@
+ ## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ ## General Public License for more details.
+ ##
+ ## You should have received a copy of the GNU General Public License
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <http://www.gnu.org/licenses/>.
+ 
+ ## -*- texinfo -*-
+-## @deftypefn {} {} build (@var{files}, @var{handle_deps}, @var{autoload}, @var{verbose})
+-## Undocumented internal function.
++## @deftypefn {} {} build (@var{builddir}, @var{tarballs}, @var{verbose})
++## Prepare binary packages from Octave source packages.
++##
++## Boils down to (for each in @var{tarballs}):
++##
++## @enumerate
++## @item untar the tarball in @var{builddir};
++## @item build anything necessary (configure and make);
++## @item repackage specifying the build arch in the tarball filename.
++## @end enumerate
++##
+ ## @end deftypefn
+ 
+-function build (files, handle_deps, autoload, verbose)
+-  if (length (files) < 1)
+-    error ("insufficient number of files");
++function build (builddir, tarballs, verbose)
++  if (nargin != 3)
++    print_usage ();
+   endif
+-  builddir = files{1};
++
+   if (! exist (builddir, "dir"))
+     warning ("creating build directory %s", builddir);
+     [status, msg] = mkdir (builddir);
+     if (status != 1)
+       error ("could not create installation directory: %s", msg);
+     endif
+   endif
+-  [builddir, status] = canonicalize_file_name (builddir);
+-  if (status != 0)
+-    error ("cannot find directory %s", builddir);
+-  endif
+-  installdir = fullfile (builddir, "install");
+-  if (! exist (installdir, "dir"))
+-    [status, msg] = mkdir (installdir);
+-    if (status != 1)
+-      error ("could not create installation directory: %s", msg);
++
++  for i = 1:numel(tarballs)
++    filelist = unpack (tarballs{i}, builddir);
++    [~, root_idx] = min (cellfun ("numel", filelist));
++    package_root = filelist{root_idx};
++    build_root = fullfile (builddir, filelist{root_idx});
++
++    desc = get_description (fullfile (build_root, "DESCRIPTION"));
++
++    ## If there is no configure or Makefile within src/, there is nothing
++    ## to do to prepare a "binary" package.  We only repackage to add more
++    ## info on the filename (version and arch).
++    if (! exist (fullfile (build_root, "src", "configure"), "file")
++        && ! exist (fullfile (build_root, "src", "Makefile"), "file"))
++      arch_abi = "any-none";
++    else
++      arch_abi = getarch ();
++      configure_make (desc, build_root, verbose);
++      unlink (fullfile (build_root, "src", "configure"));
++      unlink (fullfile (build_root, "src", "Makefile"));
+     endif
+-  endif
+-  files(1) = [];
+-  buildlist = fullfile (builddir, "octave_packages");
+-  install (files, handle_deps, autoload, installdir, installdir, verbose,
+-           buildlist, "", false);
+-  unwind_protect
+-    repackage (builddir, buildlist);
+-  unwind_protect_cleanup
+-    unload_packages ({"all"}, handle_deps, buildlist, "");
+-    if (exist (installdir, "dir"))
+-      rmdir (installdir, "s");
+-    endif
+-    if (exist (buildlist, "file"))
+-      unlink (buildlist);
+-    endif
+-  end_unwind_protect
++    tfile = [desc.name "-" desc.version "-" arch_abi ".tar"];
++
++    init_wd = pwd ();
++    unwind_protect
++      chdir (builddir);
++      try
++        tar (tfile, package_root);
++        rmdir (package_root, "s");
++        gzip (tfile);
++        unlink (tfile);
++      catch
++        warning ("failed to create and compress %s", tfile);
++      end_try_catch
++    unwind_protect_cleanup
++      chdir (init_wd);
++    end_unwind_protect
++  endfor
+ endfunction
+-
+diff --git a/scripts/pkg/private/configure_make.m b/scripts/pkg/private/configure_make.m
+--- a/scripts/pkg/private/configure_make.m
++++ b/scripts/pkg/private/configure_make.m
+@@ -91,91 +91,10 @@ function configure_make (desc, packdir, 
+       [status, output] = shell (sprintf ("%s make --jobs %i --directory '%s'",
+                                          scenv, jobs, src), verbose);
+       if (status != 0)
+         rmdir (desc.dir, "s");
+         disp (output);
+         error ("pkg: error running `make' for the %s package.", desc.name);
+       endif
+     endif
+-
+-    ## Copy files to "inst" and "inst/arch" (this is instead of 'make
+-    ## install').
+-    files = fullfile (src, "FILES");
+-    instdir = fullfile (packdir, "inst");
+-    archdir = fullfile (packdir, "inst", getarch ());
+-
+-    ## Get filenames.
+-    if (exist (files, "file"))
+-      [fid, msg] = fopen (files, "r");
+-      if (fid < 0)
+-        error ("couldn't open %s: %s", files, msg);
+-      endif
+-      filenames = char (fread (fid))';
+-      fclose (fid);
+-      if (filenames(end) == "\n")
+-        filenames(end) = [];
+-      endif
+-      filenames = strtrim (ostrsplit (filenames, "\n"));
+-      delete_idx = [];
+-      for i = 1:length (filenames)
+-        if (! all (isspace (filenames{i})))
+-          filenames{i} = fullfile (src, filenames{i});
+-        else
+-          delete_idx(end+1) = i;
+-        endif
+-      endfor
+-      filenames(delete_idx) = [];
+-    else
+-      m = dir (fullfile (src, "*.m"));
+-      oct = dir (fullfile (src, "*.oct"));
+-      mex = dir (fullfile (src, "*.mex"));
+-
+-      filenames = cellfun (@(x) fullfile (src, x),
+-                           {m.name, oct.name, mex.name},
+-                           "uniformoutput", false);
+-    endif
+-
+-    ## Split into architecture dependent and independent files.
+-    if (isempty (filenames))
+-      idx = [];
+-    else
+-      idx = cellfun ("is_architecture_dependent", filenames);
+-    endif
+-    archdependent = filenames(idx);
+-    archindependent = filenames(! idx);
+-
+-    ## Copy the files.
+-    if (! all (isspace ([filenames{:}])))
+-        if (! exist (instdir, "dir"))
+-          mkdir (instdir);
+-        endif
+-        if (! all (isspace ([archindependent{:}])))
+-          if (verbose)
+-            printf ("copyfile");
+-            printf (" %s", archindependent{:});
+-            printf ("%s\n", instdir);
+-          endif
+-          [status, output] = copyfile (archindependent, instdir);
+-          if (status != 1)
+-            rmdir (desc.dir, "s");
+-            error ("Couldn't copy files from 'src' to 'inst': %s", output);
+-          endif
+-        endif
+-        if (! all (isspace ([archdependent{:}])))
+-          if (verbose)
+-            printf ("copyfile");
+-            printf (" %s", archdependent{:});
+-            printf (" %s\n", archdir);
+-          endif
+-          if (! exist (archdir, "dir"))
+-            mkdir (archdir);
+-          endif
+-          [status, output] = copyfile (archdependent, archdir);
+-          if (status != 1)
+-            rmdir (desc.dir, "s");
+-            error ("Couldn't copy files from 'src' to 'inst': %s", output);
+-          endif
+-        endif
+-    endif
+   endif
+ endfunction
+-
+diff --git a/scripts/pkg/private/copy_built_files.m b/scripts/pkg/private/copy_built_files.m
+new file mode 100644
+--- /dev/null
++++ b/scripts/pkg/private/copy_built_files.m
+@@ -0,0 +1,110 @@
++## Copyright (C) 2005-2015 Søren Hauberg
++## Copyright (C) 2010 VZLU Prague, a.s.
++##
++## This file is part of Octave.
++##
++## Octave is free software; you can redistribute it and/or modify it
++## under the terms of the GNU General Public License as published by
++## the Free Software Foundation; either version 3 of the License, or (at
++## your option) any later version.
++##
++## Octave is distributed in the hope that it will be useful, but
++## WITHOUT ANY WARRANTY; without even the implied warranty of
++## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++## General Public License for more details.
++##
++## You should have received a copy of the GNU General Public License
++## along with Octave; see the file COPYING.  If not, see
++## <http://www.gnu.org/licenses/>.
++
++## -*- texinfo -*-
++## @deftypefn {} {} copy_built_files (@var{desc}, @var{packdir}, @var{verbose})
++## Undocumented internal function.
++## @end deftypefn
++
++function copy_built_files (desc, packdir, verbose)
++
++  src = fullfile (packdir, "src");
++  if (! exist (src, "dir"))
++    return
++  endif
++
++  ## Copy files to "inst" and "inst/arch" (this is instead of 'make install').
++  files = fullfile (src, "FILES");
++  instdir = fullfile (packdir, "inst");
++  archdir = fullfile (packdir, "inst", getarch ());
++
++  ## Get filenames.
++  if (exist (files, "file"))
++    [fid, msg] = fopen (files, "r");
++    if (fid < 0)
++      error ("couldn't open %s: %s", files, msg);
++    endif
++    filenames = char (fread (fid))';
++    fclose (fid);
++    if (filenames(end) == "\n")
++      filenames(end) = [];
++    endif
++    filenames = strtrim (ostrsplit (filenames, "\n"));
++    delete_idx = [];
++    for i = 1:length (filenames)
++      if (! all (isspace (filenames{i})))
++        filenames{i} = fullfile (src, filenames{i});
++      else
++        delete_idx(end+1) = i;
++      endif
++    endfor
++    filenames(delete_idx) = [];
++  else
++    m = dir (fullfile (src, "*.m"));
++    oct = dir (fullfile (src, "*.oct"));
++    mex = dir (fullfile (src, "*.mex"));
++
++    filenames = cellfun (@(x) fullfile (src, x),
++                         {m.name, oct.name, mex.name},
++                         "uniformoutput", false);
++  endif
++
++  ## Split into architecture dependent and independent files.
++  if (isempty (filenames))
++    idx = [];
++  else
++    idx = cellfun ("is_architecture_dependent", filenames);
++  endif
++  archdependent = filenames(idx);
++  archindependent = filenames(! idx);
++
++  ## Copy the files.
++  if (! all (isspace ([filenames{:}])))
++      if (! exist (instdir, "dir"))
++        mkdir (instdir);
++      endif
++      if (! all (isspace ([archindependent{:}])))
++        if (verbose)
++          printf ("copyfile");
++          printf (" %s", archindependent{:});
++          printf ("%s\n", instdir);
++        endif
++        [status, output] = copyfile (archindependent, instdir);
++        if (status != 1)
++          rmdir (desc.dir, "s");
++          error ("Couldn't copy files from 'src' to 'inst': %s", output);
++        endif
++      endif
++      if (! all (isspace ([archdependent{:}])))
++        if (verbose)
++          printf ("copyfile");
++          printf (" %s", archdependent{:});
++          printf (" %s\n", archdir);
++        endif
++        if (! exist (archdir, "dir"))
++          mkdir (archdir);
++        endif
++        [status, output] = copyfile (archdependent, archdir);
++        if (status != 1)
++          rmdir (desc.dir, "s");
++          error ("Couldn't copy files from 'src' to 'inst': %s", output);
++        endif
++      endif
++  endif
++endfunction
+diff --git a/scripts/pkg/private/install.m b/scripts/pkg/private/install.m
+--- a/scripts/pkg/private/install.m
++++ b/scripts/pkg/private/install.m
+@@ -185,16 +185,17 @@ function install (files, handle_deps, au
+ 
+   ## Prepare each package for installation.
+   try
+     for i = 1:length (descriptions)
+       desc = descriptions{i};
+       pdir = packdirs{i};
+       prepare_installation (desc, pdir);
+       configure_make (desc, pdir, verbose);
++      copy_built_files (desc, pdir, verbose);
+     endfor
+   catch
+     ## Something went wrong, delete tmpdirs.
+     for i = 1:length (tmpdirs)
+       rmdir (tmpdirs{i}, "s");
+     endfor
+     rethrow (lasterror ());
+   end_try_catch
+diff --git a/scripts/pkg/private/repackage.m b/scripts/pkg/private/repackage.m
+deleted file mode 100644
+--- a/scripts/pkg/private/repackage.m
++++ /dev/null
+@@ -1,90 +0,0 @@
+-## Copyright (C) 2005-2015 Søren Hauberg
+-## Copyright (C) 2010 VZLU Prague, a.s.
+-##
+-## This file is part of Octave.
+-##
+-## Octave is free software; you can redistribute it and/or modify it
+-## under the terms of the GNU General Public License as published by
+-## the Free Software Foundation; either version 3 of the License, or (at
+-## your option) any later version.
+-##
+-## Octave is distributed in the hope that it will be useful, but
+-## WITHOUT ANY WARRANTY; without even the implied warranty of
+-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-## General Public License for more details.
+-##
+-## You should have received a copy of the GNU General Public License
+-## along with Octave; see the file COPYING.  If not, see
+-## <http://www.gnu.org/licenses/>.
+-
+-## -*- texinfo -*-
+-## @deftypefn {} {} repackage (@var{builddir}, @var{buildlist})
+-## Undocumented internal function.
+-## @end deftypefn
+-
+-function repackage (builddir, buildlist)
+-  packages = installed_packages (buildlist, buildlist);
+-
+-  wd = pwd ();
+-  for i = 1 : length (packages)
+-    pack = packages{i};
+-    unwind_protect
+-      cd (builddir);
+-      mkdir (pack.name);
+-      mkdir (fullfile (pack.name, "inst"));
+-      copyfile (fullfile (pack.dir, "*"), fullfile (pack.name, "inst"));
+-      movefile (fullfile (pack.name, "inst","packinfo", "*"), pack.name);
+-      if (exist (fullfile (pack.name, "inst","packinfo", ".autoload"), "file"))
+-        unlink (fullfile (pack.name, "inst","packinfo", ".autoload"));
+-      endif
+-      rmdir (fullfile (pack.name, "inst", "packinfo"));
+-      if (exist (fullfile (pack.name, "inst", "doc"), "dir"))
+-        movefile (fullfile (pack.name, "inst", "doc"), pack.name);
+-      endif
+-      if (exist (fullfile (pack.name, "inst", "bin"), "dir"))
+-        movefile (fullfile (pack.name, "inst", "bin"), pack.name);
+-      endif
+-      archdir = fullfile (pack.archprefix, [pack.name "-" pack.version],
+-                          getarch ());
+-      if (exist (archdir, "dir"))
+-        if (exist (fullfile (pack.name, "inst", "PKG_ADD"), "file"))
+-          unlink (fullfile (pack.name, "inst", "PKG_ADD"));
+-        endif
+-        if (exist (fullfile (pack.name, "inst", "PKG_DEL"), "file"))
+-          unlink (fullfile (pack.name, "inst", "PKG_DEL"));
+-        endif
+-        if (exist (fullfile (archdir, "PKG_ADD"), "file"))
+-          movefile (fullfile (archdir, "PKG_ADD"),
+-                    fullfile (pack.name, "PKG_ADD"));
+-        endif
+-        if (exist (fullfile (archdir, "PKG_DEL"), "file"))
+-          movefile (fullfile (archdir, "PKG_DEL"),
+-                    fullfile (pack.name, "PKG_DEL"));
+-        endif
+-      else
+-        if (exist (fullfile (pack.name, "inst", "PKG_ADD"), "file"))
+-          movefile (fullfile (pack.name, "inst", "PKG_ADD"),
+-                    fullfile (pack.name, "PKG_ADD"));
+-        endif
+-        if (exist (fullfile (pack.name, "inst", "PKG_DEL"), "file"))
+-          movefile (fullfile (pack.name, "inst", "PKG_DEL"),
+-                    fullfile (pack.name, "PKG_DEL"));
+-        endif
+-      endif
+-      tfile = [pack.name "-" pack.version ".tar"];
+-      tar (tfile, pack.name);
+-      try
+-        gzip (tfile);
+-        unlink (tfile);
+-      catch
+-        warning ("failed to compress %s", tfile);
+-      end_try_catch
+-    unwind_protect_cleanup
+-      if (exist (pack.name, "dir"))
+-        rmdir (pack.name, "s");
+-      endif
+-      cd (wd);
+-    end_unwind_protect
+-  endfor
+-endfunction
+-

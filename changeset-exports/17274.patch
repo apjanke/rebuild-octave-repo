@@ -1,0 +1,291 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1376876367 14400
+#      Sun Aug 18 21:39:27 2013 -0400
+# Node ID 0a09d4b4076709bc9e8f72a571d5a578cb79150d
+# Parent  9d584be736fc1ec461a8ad82d8ac5f9ec5fc2e5e
+Combine successive TeX super- and subscript elements.
+
+* libinterp/corefcn/oct-tex-parser.yy (combined_script_element): New
+rule. Add %nonassoc statements to control precedence and resolve
+shoft/reduce conflicts.
+* libinterp/corefcn/txt-eng.h (class text_element_combined): New class.
+(text_processor::visit(text_element_combined)): New method.
+* libinterp/corefcn/txt-eng-ft.h
+(ft_render::visit(text_element_combined)): Likewise.
+* libinterp/corefcn/txt-eng-ft.cc (ft_render::push_new_line): Reset
+xoffset/yoffset in MODE_BBOX mode.
+(ft_render::process_character): Use xoffset as the current X
+advancement and update the line bbox accordingly.
+(ft_render::visit(text_element_combined)): New method.
+
+diff --git a/libinterp/corefcn/oct-tex-parser.yy b/libinterp/corefcn/oct-tex-parser.yy
+--- a/libinterp/corefcn/oct-tex-parser.yy
++++ b/libinterp/corefcn/oct-tex-parser.yy
+@@ -60,24 +60,27 @@ static void yyerror (text_parser_tex& pa
+ %token FONTNAME FONTSIZE
+ %token COLOR COLOR_RGB
+ %token START END SUPER SUB
+ %token<ch> CH ID
+ %token<num> NUM
+ 
+ %type<str> simple_string identifier
+ %type<e_base> string_element symbol_element
+-%type<e_base> superscript_element subscript_element
++%type<e_base> superscript_element subscript_element combined_script_element
+ %type<e_base> font_modifier_element fontname_element fontsize_element color_element
+ %type<e_list> string_element_list scoped_string_element_list
+ 
+ /* Make sure there's no memory leak on parse error. */
+ %destructor { } <ch> <num>
+ %destructor { delete $$; } <*>
+ 
++%nonassoc SCRIPT
++%nonassoc SUB SUPER
++
+ %nonassoc STR
+ %nonassoc CH
+ 
+ %start string
+ 
+ %%
+ 
+ simple_string			: CH
+@@ -139,32 +142,39 @@ string_element			: simple_string %prec S
+ 				| scoped_string_element_list
+ 				  /* This is just to avoid a warning in bison. */
+ 				  { $$ = $1; }
+ 				| symbol_element
+ 				| font_modifier_element
+ 				| fontsize_element
+ 				| fontname_element
+ 				| color_element
+-				| superscript_element
+-				| subscript_element
++				| superscript_element %prec SCRIPT
++				| subscript_element %prec SCRIPT
++				| combined_script_element
+ 				;
+ 
+ superscript_element		: SUPER CH
+ 				  { $$ = new text_element_superscript ($2); }
+ 				| SUPER scoped_string_element_list
+ 				  { $$ = new text_element_superscript ($2); }
+ 				;
+ 
+ subscript_element		: SUB CH
+ 				  { $$ = new text_element_subscript ($2); }
+ 				| SUB scoped_string_element_list
+ 				  { $$ = new text_element_subscript ($2); }
+ 				;
+ 
++combined_script_element		: subscript_element superscript_element
++				  { $$ = new text_element_combined ($1, $2); }
++				| superscript_element subscript_element
++				  { $$ = new text_element_combined ($1, $2); }
++				;
++
+ string_element_list		: string_element
+ 				  { $$ = new text_element_list ($1); }
+ 				| string_element_list string_element
+ 				  { $1->push_back ($2); $$ = $1; }
+ 				;
+ 
+ scoped_string_element_list	: START string_element_list END
+ 				  { $$ = $2; }
+diff --git a/libinterp/corefcn/txt-eng-ft.cc b/libinterp/corefcn/txt-eng-ft.cc
+--- a/libinterp/corefcn/txt-eng-ft.cc
++++ b/libinterp/corefcn/txt-eng-ft.cc
+@@ -349,16 +349,18 @@ ft_render::push_new_line (void)
+ 
+               Matrix bb (1, 5, 0.0);
+ 
+               bb(1) = desc;
+               bb(3) = asc - desc;
+               bb(4) = h;
+ 
+               line_bbox.push_back (bb);
++
++              xoffset = yoffset = 0;
+             }
+         }
+       break;
+ 
+     case MODE_RENDER:
+         {
+           // Move to the next line bbox, adjust xoffset based on alignment
+           // and yoffset based on the old and new line bbox.
+@@ -604,22 +606,24 @@ ft_render::process_character (FT_ULong c
+                   // the next glyph. That is, "delta.x" is usually < 0.
+                   if (previous)
+                     {
+                       FT_Vector delta;
+ 
+                       FT_Get_Kerning (face, previous, glyph_index,
+                                       FT_KERNING_DEFAULT, &delta);
+ 
+-                      bb(2) += (delta.x >> 6);
++                      xoffset += (delta.x >> 6);
+                     }
+ 
+-                  // Extend current line bounding box by the width of the
+-                  // current glyph.
+-                  bb(2) += (face->glyph->advance.x >> 6);
++                  // Extend current X offset box by the width of the current
++                  // glyph. Then extend the line bounding box if necessary.
++
++                  xoffset += (face->glyph->advance.x >> 6);
++                  bb(2) = xmax (bb(2), xoffset);
+                 }
+               break;
+             }
+         }
+     }
+ 
+   return glyph_index;
+ }
+@@ -776,16 +780,32 @@ ft_render::visit (text_element_symbol& e
+ 
+   if (code != text_element_symbol::invalid_code && font.is_valid ())
+     process_character (code);
+   else if (font.is_valid ())
+     ::warning ("ignoring unknown symbol: %s", e.string_value ().c_str ());
+ }
+ 
+ void
++ft_render::visit (text_element_combined& e)
++{
++  int saved_xoffset = xoffset;
++  int max_xoffset = xoffset;
++
++  for (text_element_combined::iterator it = e.begin (); it != e.end (); ++it)
++    {
++      xoffset = saved_xoffset;
++      (*it)->accept (*this);
++      max_xoffset = xmax (xoffset, max_xoffset);
++    }
++
++  xoffset = max_xoffset;
++}
++
++void
+ ft_render::reset (void)
+ {
+   set_mode (MODE_BBOX);
+   set_color (Matrix (1, 3, 0.0));
+ }
+ 
+ void
+ ft_render::set_color (Matrix c)
+diff --git a/libinterp/corefcn/txt-eng-ft.h b/libinterp/corefcn/txt-eng-ft.h
+--- a/libinterp/corefcn/txt-eng-ft.h
++++ b/libinterp/corefcn/txt-eng-ft.h
+@@ -70,16 +70,18 @@ public:
+   void visit (text_element_fontsize& e);
+ 
+   void visit (text_element_fontname& e);
+ 
+   void visit (text_element_fontstyle& e);
+ 
+   void visit (text_element_symbol& e);
+ 
++  void visit (text_element_combined& e);
++
+   void reset (void);
+ 
+   uint8NDArray get_pixels (void) const { return pixels; }
+ 
+   Matrix get_boundingbox (void) const { return bbox; }
+ 
+   uint8NDArray render (text_element* elt, Matrix& box,
+                        int rotation = ROTATION_0);
+diff --git a/libinterp/corefcn/txt-eng.h b/libinterp/corefcn/txt-eng.h
+--- a/libinterp/corefcn/txt-eng.h
++++ b/libinterp/corefcn/txt-eng.h
+@@ -31,16 +31,17 @@ along with Octave; see the file COPYING.
+ #include "dMatrix.h"
+ 
+ class text_element;
+ class text_element_string;
+ class text_element_symbol;
+ class text_element_list;
+ class text_element_subscript;
+ class text_element_superscript;
++class text_element_combined;
+ class text_element_fontname;
+ class text_element_fontsize;
+ class text_element_fontstyle;
+ class text_element_color;
+ 
+ class text_processor;
+ 
+ class
+@@ -176,16 +177,31 @@ private:
+   text_element* elem;
+ 
+ private:
+   text_element_superscript (void);
+ };
+ 
+ class
+ OCTINTERP_API
++text_element_combined : public text_element_list
++{
++public:
++  text_element_combined (text_element* e)
++    : text_element_list (e) { }
++
++  text_element_combined (text_element* e1, text_element* e2)
++    : text_element_list(e1)
++    { push_back (e2); }
++
++  void accept (text_processor& p);
++};
++
++class
++OCTINTERP_API
+ text_element_fontstyle : public text_element
+ {
+ public:
+   enum fontstyle
+     {
+       normal,
+       bold,
+       italic,
+@@ -310,16 +326,18 @@ public:
+     }
+ 
+   virtual void visit (text_element_subscript& e)
+     { e.get_element ()->accept (*this); }
+ 
+   virtual void visit (text_element_superscript& e)
+     { e.get_element ()->accept (*this); }
+ 
++  virtual void visit (text_element_combined&) { }
++
+   virtual void visit (text_element_fontstyle&) { }
+ 
+   virtual void visit (text_element_fontname&) { }
+ 
+   virtual void visit (text_element_fontsize&) { }
+ 
+   virtual void visit (text_element_color&) { }
+ 
+@@ -336,16 +354,17 @@ inline void \
+ cls::accept (text_processor& p) \
+ { p.visit (*this); }
+ 
+ TEXT_ELEMENT_ACCEPT(text_element_string)
+ TEXT_ELEMENT_ACCEPT(text_element_symbol)
+ TEXT_ELEMENT_ACCEPT(text_element_list)
+ TEXT_ELEMENT_ACCEPT(text_element_subscript)
+ TEXT_ELEMENT_ACCEPT(text_element_superscript)
++TEXT_ELEMENT_ACCEPT(text_element_combined)
+ TEXT_ELEMENT_ACCEPT(text_element_fontstyle)
+ TEXT_ELEMENT_ACCEPT(text_element_fontname)
+ TEXT_ELEMENT_ACCEPT(text_element_fontsize)
+ TEXT_ELEMENT_ACCEPT(text_element_color)
+ 
+ class
+ OCTINTERP_API
+ text_parser

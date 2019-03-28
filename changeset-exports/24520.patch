@@ -1,0 +1,2865 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1514983931 18000
+#      Wed Jan 03 07:52:11 2018 -0500
+# Node ID c5c11b07598ad6dc376f76b02ae378a24b0a800c
+# Parent  6c31b03769082721e7feacd873546cebd2b76e76
+refactor signal handling (bug #52757)
+
+Given that any library code may now be multi-threaded it is not likely
+to be save to jump out of a signal handler when executing a call to a
+library function.  We are almost assured to fail if the call to
+siglongjmp occurs in a different thread from the corresponding call to
+sigsetjmp.
+
+Similarly, we should avoid calling the interrupt signal handler
+function in an arbitrary thread.  This is already done by default on
+Windows systems.  On Posix systems, we now set up a separate thread to
+handle asynchronous signals (not just SIGINT).  We no longer attempt
+to jump out of the signal handler.  Instead, we only set global status
+variables and respond to them in octave_quit.  This means that some
+external library functions are no longer interruptible.  If that
+becomes important, then we will need to look for other alternatives
+such as setting up worker threads that can be canceled when a SIGINT
+is detected.
+
+* sighandlers.cc (interrupt_manager, base_interrupt_manager,
+w32_interrupt_manager, posix_interrupt_manager): Delete classes and
+all uses.
+(respond_to_pending_signals): Rename from signal_handler.  Change all
+uses.  Take action on more signals.
+(generic_sig_handler): Simply record that a signal was caught and add
+it to the list of caught signals.
+(deadly_sig_handler): New function.
+(fpe_sig_handler): Rename from sigfpe_handler.  Don't make specific to
+Alpha systems.  Simply warn that an exception has occurred.
+(sigint_handler): Simply record that an interrupt signal was caught.
+(sigterm_handler, sigpipe_handler): Delete.
+(install_signal_handlers): Rework actions for various signals.
+(Vsigquit_dumps_octave_core): New static variable.
+(Fsigquit_dumps_octave_core): New function.
+
+* io.txi: Document sigquit_dumps_octave_core.
+
+* f77-fcn.h, f77-fcn.c (xSTRINGIZE, STRINGIZE, F77_XFCN_ERROR):
+Delete macros.
+(F77_XFCN): Don't do setjmp/longjmp exception handling.
+(f77_exception_encountered): Delete global variable.
+(XSTOPX): Don't set f77_exception_encountered.  If message is empty,
+report "unknown error in fortran subroutine".
+* eigs-base.cc, gsvd.cc: Delete all direct uses of
+f77_exception_encountered.
+* liboctave/util/f77-extern.cc: Delete file.
+* liboctave/util/module.mk: Update.
+
+* cmd-edit.h, cmd-edit.cc (command_editor::interrupt_exception): New class.
+(command_editor::handle_interrupt_signal): New static function.
+(command_editor::do_handle_interrupt_signal): New virtual function.
+(command_editor::event_hanlder): Call handle_interrupt_signal if
+octave_interrupt_state is not zero.
+(command_editor::instance_ok): Set event hook here.
+(command_editor::add_event_hook): Not here.
+(command_editor::remove_event_hook): Never remove event hook.
+(gnu_readline::do_handle_interrupt_signal): New function.
+(gnu_readline::do_readline): Retry if an interrupt exception occurs
+inside readline.
+
+* oct-rl-edit.h, oct-rl-edit.c (octave_rl_recover_from_interrupt):
+New function.
+
+* quit.h, cquit.c (current_context, octave_save_current_context,
+octave_restore_current_context, octave_jump_to_enclosing_context,
+octave_interrupt_immediately, octave_jmp_buf): Delete.
+* quit.h: Don't include <setjmp.h>
+(octave_set_current_context): Delete macro.
+(octave_exit_exception_status, octave_exit_exception_safe_to_return):
+Mark as deprecated.
+(BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_1): Delete.
+(BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_2): Delete.
+(BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE,
+END_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE): Define to only create a
+dummy do-while scope.
+(BEGIN_INTERRUPT_WITH_EXCEPTIONS, END_INTERRUPT_WITH_EXCEPTIONS):
+Define to only create a dummy scope.
+* interpreter.cc (interpreter::recover_from_exception):
+Don't reset octave_interrupt_immediately.
+
+* main-cli.cc (main): Call octave_block_async_signals.
+* main.in.cc (main): Call octave_block_async_signals initially.
+Only in install signal handlers and unblock signals if starting
+managed subprocess.
+
+* main-window.cc (octave_interpreter::executed):
+Don't unblock interrupt signals.
+
+* signal-wrappers.h, signal-wrappers.c
+(signal_watcher, octave_async_signals, block_or_unblock_signal_by_name): New static functions.
+(octave_set_default_signal_handler,
+octave_set_default_signal_handler_by_name,
+octave_block_signal_by_name, octave_unblock_signal_by_name,
+octave_create_interrupt_watcher_thread, octave_block_async_signals,
+octave_unblock_async_signals): New functions.
+(octave_block_interrupt_signal, octave_unblock_interrupt_signal):
+Treat SIGBREAK as an interrupt signal.
+(octave_block_child): Also handle SIGCLD the same as SIGCHLD.
+(print_sigset, print_sigmask): New static functions.
+(octave_show_sigmask): New function.
+
+diff --git a/doc/interpreter/io.txi b/doc/interpreter/io.txi
+--- a/doc/interpreter/io.txi
++++ b/doc/interpreter/io.txi
+@@ -247,16 +247,18 @@ By default this file is named @samp{octa
+ into memory with the @code{load} command.  While the default behavior
+ most often is reasonable it can be changed through the following
+ functions.
+ 
+ @DOCSTRING(crash_dumps_octave_core)
+ 
+ @DOCSTRING(sighup_dumps_octave_core)
+ 
++@DOCSTRING(sigquit_dumps_octave_core)
++
+ @DOCSTRING(sigterm_dumps_octave_core)
+ 
+ @DOCSTRING(octave_core_file_options)
+ 
+ @DOCSTRING(octave_core_file_limit)
+ 
+ @DOCSTRING(octave_core_file_name)
+ 
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -88,18 +88,16 @@ octave_interpreter::octave_interpreter (
+   : QObject (), m_thread_manager (), m_app_context (app_context)
+ { }
+ 
+ void
+ octave_interpreter::execute (void)
+ {
+   m_thread_manager.register_current_thread ();
+ 
+-  octave_thread_manager::unblock_interrupt_signal ();
+-
+   // The application context owns the interpreter.
+ 
+   octave::interpreter& interp = m_app_context->create_interpreter ();
+ 
+   int exit_status = 0;
+ 
+   try
+     {
+diff --git a/libinterp/corefcn/gl2ps-print.cc b/libinterp/corefcn/gl2ps-print.cc
+--- a/libinterp/corefcn/gl2ps-print.cc
++++ b/libinterp/corefcn/gl2ps-print.cc
+@@ -435,25 +435,27 @@ namespace octave
+             if (nread)
+               {
+                 if (! header_found && std::strncmp (str, "/SBCR", 5) == 0)
+                   {
+                     header_found = true;
+                     nwrite = std::fwrite (fcn, 1, strlen (fcn), fp);
+                     if (nwrite != strlen (fcn))
+                       {
+-                        octave::signal_handler ();
++                        // FIXME: is this the best thing to do here?
++                        respond_to_pending_signals ();
+                         error ("gl2ps_renderer::draw: internal pipe error");
+                       }
+                   }
+ 
+                 nwrite = std::fwrite (str, 1, nread, fp);
+                 if (nwrite != nread)
+                   {
+-                    signal_handler ();   // Clear SIGPIPE signal
++                    // FIXME: is this the best thing to do here?
++                    respond_to_pending_signals ();   // Clear SIGPIPE signal
+                     error ("gl2ps_renderer::draw: internal pipe error");
+                   }
+               }
+           }
+       }
+     else
+       opengl_renderer::draw (go);
+   }
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -834,17 +834,17 @@ namespace octave
+     std::string code_to_eval = options.code_to_eval ();
+ 
+     unwind_protect frame;
+ 
+     octave_save_signal_mask ();
+ 
+     can_interrupt = true;
+ 
+-    octave_signal_hook = signal_handler;
++    octave_signal_hook = respond_to_pending_signals;
+     octave_interrupt_hook = nullptr;
+     octave_bad_alloc_hook = nullptr;
+ 
+     catch_interrupts ();
+ 
+     octave_initialized = true;
+ 
+     frame.add_method (this, &interpreter::interactive, m_interactive);
+@@ -878,17 +878,17 @@ namespace octave
+     const cmdline_options& options = m_app_context->options ();
+ 
+     unwind_protect frame;
+ 
+     octave_save_signal_mask ();
+ 
+     can_interrupt = true;
+ 
+-    octave_signal_hook = signal_handler;
++    octave_signal_hook = respond_to_pending_signals;
+     octave_interrupt_hook = nullptr;
+     octave_bad_alloc_hook = nullptr;
+ 
+     catch_interrupts ();
+ 
+     octave_initialized = true;
+ 
+     frame.add_method (this, &interpreter::interactive, m_interactive);
+@@ -932,17 +932,17 @@ namespace octave
+   {
+     if (! m_app_context)
+       return 0;
+ 
+     octave_save_signal_mask ();
+ 
+     can_interrupt = true;
+ 
+-    octave_signal_hook = signal_handler;
++    octave_signal_hook = respond_to_pending_signals;
+     octave_interrupt_hook = nullptr;
+     octave_bad_alloc_hook = nullptr;
+ 
+     catch_interrupts ();
+ 
+     octave_initialized = true;
+ 
+     // The big loop.
+@@ -1244,17 +1244,16 @@ namespace octave
+       }
+ 
+     return retval;
+   }
+ 
+   void interpreter::recover_from_exception (void)
+   {
+     can_interrupt = true;
+-    octave_interrupt_immediately = 0;
+     octave_interrupt_state = 0;
+     octave_signal_caught = 0;
+     octave_exception_state = octave_no_exception;
+     octave_restore_signal_mask ();
+     catch_interrupts ();
+   }
+ 
+   // Functions to call when the interpreter exits.
+diff --git a/libinterp/corefcn/sighandlers.cc b/libinterp/corefcn/sighandlers.cc
+--- a/libinterp/corefcn/sighandlers.cc
++++ b/libinterp/corefcn/sighandlers.cc
+@@ -69,279 +69,25 @@ namespace octave
+   // TRUE means we should try to enter the debugger on SIGINT.
+   bool Vdebug_on_interrupt = false;
+ 
+   // Allow users to avoid writing octave-workspace for SIGHUP (sent by
+   // closing gnome-terminal, for example).  Note that this variable has
+   // no effect if Vcrash_dumps_octave_core is FALSE.
+   static bool Vsighup_dumps_octave_core = true;
+ 
++  // Similar to Vsighup_dumps_octave_core, but for SIGQUIT signal.
++  static bool Vsigquit_dumps_octave_core = true;
++
+   // Similar to Vsighup_dumps_octave_core, but for SIGTERM signal.
+   static bool Vsigterm_dumps_octave_core = true;
+ 
+   // List of signals we have caught since last call to signal_handler.
+   static bool *signals_caught = nullptr;
+ 
+-  // Forward declarations.
+-  static void user_terminate (int sig_number);
+-  static void user_abort (int sig_number);
+-
+-  class
+-  base_interrupt_manager
+-  {
+-  public:
+-
+-    base_interrupt_manager (void) { }
+-
+-    // No copying!
+-
+-    base_interrupt_manager (const base_interrupt_manager&) = delete;
+-
+-    base_interrupt_manager& operator = (const base_interrupt_manager&) = delete;
+-
+-    virtual ~base_interrupt_manager (void) = default;
+-
+-    virtual void do_jump_to_enclosing_context (void) = 0;
+-
+-    virtual void do_user_terminate (int sig_number) = 0;
+-
+-    virtual void do_user_abort (int sig_number) = 0;
+-
+-    virtual void do_raise_sigint (void) = 0;
+-  };
+-
+-#if defined (OCTAVE_USE_WINDOWS_API)
+-
+-  class
+-  w32_interrupt_manager : public base_interrupt_manager
+-  {
+-  public:
+-
+-    w32_interrupt_manager (void)
+-      : thread (0), thread_id (0)
+-    {
+-      thread_id = GetCurrentThreadId ();
+-
+-      DuplicateHandle (GetCurrentProcess (), GetCurrentThread (),
+-                       GetCurrentProcess (), &thread, 0, FALSE,
+-                       DUPLICATE_SAME_ACCESS);
+-    }
+-
+-    // No copying!
+-
+-    w32_interrupt_manager (const w32_interrupt_manager&) = delete;
+-
+-    w32_interrupt_manager& operator = (const w32_interrupt_manager&) = delete;
+-
+-    ~w32_interrupt_manager (void) = default;
+-
+-    static void jump_to_enclosing_context_sync (void)
+-    {
+-#if defined (_MSC_VER)
+-      _fpreset ();
+-#endif
+-      ::octave_jump_to_enclosing_context ();
+-    }
+-
+-    void do_jump_to_enclosing_context (void)
+-    {
+-      bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
+-
+-      if (is_interrupt_thread)
+-        jump_to_enclosing_context_sync ();
+-      else
+-        {
+-
+-          CONTEXT threadContext;
+-
+-          SuspendThread (thread);
+-          threadContext.ContextFlags = CONTEXT_CONTROL;
+-          GetThreadContext (thread, &threadContext);
+-
+-#if (defined (__MINGW64__) || defined (_WIN64))
+-          threadContext.Rip = reinterpret_cast<DWORD64> (jump_to_enclosing_context_sync);
+-#else
+-          threadContext.Eip = reinterpret_cast<DWORD> (jump_to_enclosing_context_sync);
+-#endif
+-
+-          SetThreadContext (thread, &threadContext);
+-
+-          ResumeThread (thread);
+-        }
+-    }
+-
+-    void do_user_terminate (int sig_number)
+-    {
+-      bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
+-
+-      if (is_interrupt_thread)
+-        user_terminate (sig_number);
+-      else
+-        {
+-          SuspendThread (thread);
+-          user_terminate (sig_number);
+-          ResumeThread (thread);
+-        }
+-    }
+-
+-    void do_user_abort (int sig_number)
+-    {
+-      bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
+-
+-      if (is_interrupt_thread)
+-        user_abort (sig_number);
+-      else
+-        {
+-          SuspendThread (thread);
+-          user_abort (sig_number);
+-          ResumeThread (thread);
+-        }
+-    }
+-
+-    void do_raise_sigint (void)
+-    {
+-      bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
+-
+-      if (is_interrupt_thread)
+-        octave_raise_wrapper (SIGINT);
+-      else
+-        {
+-          SuspendThread (thread);
+-          octave_raise_wrapper (SIGINT);
+-          ResumeThread (thread);
+-        }
+-    }
+-
+-  private:
+-
+-    // A handle to the thread that is running the octave interpreter.
+-    HANDLE thread;
+-
+-    // The ID of the thread that is running the octave interpreter.
+-    DWORD thread_id;
+-  };
+-
+-#endif
+-
+-  class
+-  posix_interrupt_manager : public base_interrupt_manager
+-  {
+-  public:
+-
+-    posix_interrupt_manager (void)
+-      : base_interrupt_manager ()
+-    { }
+-
+-    // No copying!
+-
+-    posix_interrupt_manager (const posix_interrupt_manager&) = delete;
+-
+-    posix_interrupt_manager&
+-    operator = (const posix_interrupt_manager&) = delete;
+-
+-    ~posix_interrupt_manager (void) = default;
+-
+-    void do_jump_to_enclosing_context (void)
+-    {
+-      ::octave_jump_to_enclosing_context ();
+-    }
+-
+-    void do_user_terminate (int sig_number)
+-    {
+-      user_terminate (sig_number);
+-    }
+-
+-    void do_user_abort (int sig_number)
+-    {
+-      user_abort (sig_number);
+-    }
+-
+-    void do_raise_sigint (void)
+-    {
+-      octave_raise_wrapper (SIGINT);
+-    }
+-  };
+-
+-  class
+-  interrupt_manager
+-  {
+-  public:
+-
+-    ~interrupt_manager (void) = default;
+-
+-    static bool init (void) { return instance_ok (); }
+-
+-    static void jump_to_enclosing_context (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_jump_to_enclosing_context ();
+-    }
+-
+-    static void user_terminate (int sig_number)
+-    {
+-      if (instance_ok ())
+-        instance->do_user_terminate (sig_number);
+-    }
+-
+-    static void user_abort (int sig_number)
+-    {
+-      if (instance_ok ())
+-        instance->do_user_abort (sig_number);
+-    }
+-
+-    static void raise_sigint (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_raise_sigint ();
+-    }
+-
+-  private:
+-
+-    interrupt_manager (void) { }
+-
+-    // No copying!
+-
+-    interrupt_manager (const interrupt_manager&) = delete;
+-
+-    interrupt_manager& operator = (const interrupt_manager&) = delete;
+-
+-    static bool instance_ok (void)
+-    {
+-      bool retval = true;
+-
+-      if (! instance)
+-        {
+-          instance = create_instance ();
+-
+-          if (instance)
+-            singleton_cleanup_list::add (cleanup_instance);
+-        }
+-
+-      if (! instance)
+-        error ("unable to create interrupt_manager");
+-
+-      return retval;
+-    }
+-
+-    static base_interrupt_manager * create_instance (void)
+-    {
+-#if defined (OCTAVE_USE_WINDOWS_API)
+-      return new w32_interrupt_manager ();
+-#else
+-      return new posix_interrupt_manager ();
+-#endif
+-    }
+-
+-    static void cleanup_instance (void) { delete instance; instance = nullptr; }
+-
+-    static base_interrupt_manager *instance;
+-  };
+-
+-  base_interrupt_manager *interrupt_manager::instance = nullptr;
+-
+   static void
+   my_friendly_exit (int sig, bool save_vars = true)
+   {
+     std::cerr << "fatal: caught signal "
+               << octave_strsignal_wrapper (sig)
+               << " -- stopping myself..." << std::endl;
+ 
+     if (save_vars)
+@@ -351,62 +97,153 @@ namespace octave
+ 
+     throw exit_exception (1);
+   }
+ 
+   // Called from octave_quit () to actually do something about the signals
+   // we have caught.
+ 
+   void
+-  signal_handler (void)
++  respond_to_pending_signals (void)
+   {
+     // The list of signals is relatively short, so we will just go
+     // linearly through the list.
+ 
+-    static int sigchld;
+-    static int sigfpe;
++    // Interrupt signals are currently handled separately.
++
++    static int sigint;
++    static const bool have_sigint
++      = octave_get_sig_number ("SIGINT", &sigint);
++
++    static int sigbreak;
++    static const bool have_sigbreak
++    = octave_get_sig_number ("SIGBREAK", &sigbreak);
++
++    // Termination signals.
++
+     static int sighup;
++    static const bool have_sighup
++      = octave_get_sig_number ("SIGHUP", &sighup);
++
++    static int sigquit;
++    static const bool have_sigquit
++      = octave_get_sig_number ("SIGQUIT", &sigquit);
++
+     static int sigterm;
+-    static int sigpipe;
++    static const bool have_sigterm
++      = octave_get_sig_number ("SIGTERM", &sigterm);
++
++    // Alarm signals.
++
++    static int sigalrm;
++    static const bool have_sigalrm
++      = octave_get_sig_number ("SIGALRM", &sigalrm);
++
++    // I/O signals.
++
++    static int sigio;
++    static const bool have_sigio
++      = octave_get_sig_number ("SIGIO", &sigio);
++
++    static int siglost;
++    static const bool have_siglost
++      = octave_get_sig_number ("SIGLOST", &siglost);
+ 
+-    static const bool have_sigchld = octave_get_sig_number ("SIGCHLD", &sigchld);
+-    static const bool have_sigfpe = octave_get_sig_number ("SIGFPE", &sigfpe);
+-    static const bool have_sighup = octave_get_sig_number ("SIGHUP", &sighup);
+-    static const bool have_sigterm = octave_get_sig_number ("SIGTERM", &sigterm);
+-    static const bool have_sigpipe = octave_get_sig_number ("SIGPIPE", &sigpipe);
++    static int sigpipe;
++    static const bool have_sigpipe
++      = octave_get_sig_number ("SIGPIPE", &sigpipe);
++
++    // Job control signals.
++
++    static int sigchld;
++    static const bool have_sigchld
++      = octave_get_sig_number ("SIGCHLD", &sigchld);
++
++    static int sigcld;
++    static const bool have_sigcld
++      = octave_get_sig_number ("SIGCLD", &sigcld);
++
++    // Resource limit signals.
++
++    static int sigxcpu;
++    static const bool have_sigxcpu
++      = octave_get_sig_number ("SIGXCPU", &sigxcpu);
+ 
+-    for (int i = 0; i < octave_num_signals (); i++)
++    static int sigxfsz;
++    static const bool have_sigxfsz
++      = octave_get_sig_number ("SIGXFSZ", &sigxfsz);
++
++    // User signals.
++
++    static int sigusr1;
++    static const bool have_sigusr1
++      = octave_get_sig_number ("SIGUSR1", &sigusr1);
++
++    static int sigusr2;
++    static const bool have_sigusr2
++      = octave_get_sig_number ("SIGUSR2", &sigusr2);
++
++    for (int sig = 0; sig < octave_num_signals (); sig++)
+       {
+-        if (signals_caught[i])
++        if (signals_caught[sig])
+           {
+-            signals_caught[i] = false;
++            signals_caught[sig] = false;
+ 
+-            if (have_sigchld && i == sigchld)
++            if ((have_sigchld && sig == sigchld)
++                || (have_sigcld && sig == sigcld))
+               {
++                // FIXME: should we block or ignore?
+                 volatile interrupt_handler saved_interrupt_handler
+                   = ignore_interrupts ();
+ 
+                 void *context = octave_block_child ();
+ 
+                 child_list::wait ();
+ 
+                 set_interrupt_handler (saved_interrupt_handler);
+ 
+                 octave_unblock_child (context);
+ 
+                 child_list::reap ();
+               }
+-            else if (have_sigfpe && i == sigfpe)
+-              std::cerr << "warning: floating point exception" << std::endl;
+-            else if (have_sighup && i == sighup)
++            else if (have_sigpipe && sig == sigpipe)
++              {
++                std::cerr << "warning: broken pipe" << std::endl;
++
++                // Don't loop forever on account of this.
++                // FIXME: is this really needed?  Does it do anything
++                // useful now?
++
++                if (pipe_handler_error_count++ > 100
++                    && octave_interrupt_state >= 0)
++                  octave_interrupt_state++;
++              }
++            else if (have_sighup && sig == sighup)
+               my_friendly_exit (sighup, Vsighup_dumps_octave_core);
+-            else if (have_sigterm && i == sigterm)
++            else if (have_sigquit && sig == sigquit)
++              my_friendly_exit (sigquit, Vsigquit_dumps_octave_core);
++            else if (have_sigterm && sig == sigterm)
+               my_friendly_exit (sigterm, Vsigterm_dumps_octave_core);
+-            else if (have_sigpipe && i == sigpipe)
+-              std::cerr << "warning: broken pipe" << std::endl;
++            else if ((have_sigalrm && sig == sigalrm)
++                     || (have_sigio && sig == sigio)
++                     || (have_siglost && sig == siglost)
++                     || (have_sigxcpu && sig == sigxcpu)
++                     || (have_sigxfsz && sig == sigxfsz)
++                     || (have_sigusr1 && sig == sigusr1)
++                     || (have_sigusr2 && sig == sigusr2))
++              std::cerr << "warning: ignoring signal: "
++                        << octave_strsignal_wrapper (sig)
++                        << std::endl;
++            else if ((have_sigint && sig == sigint)
++                     || (have_sigbreak && sig == sigbreak))
++              /* handled separately; do nothing */;
++            else
++              std::cerr << "warning: ignoring unexpected signal: "
++                        << octave_strsignal_wrapper (sig)
++                        << std::endl;
+           }
+       }
+   }
+ 
+   sig_handler *
+   set_signal_handler (int sig, sig_handler *handler, bool restart_syscalls)
+   {
+     return octave_set_signal_handler_internal (sig, handler, restart_syscalls);
+@@ -418,182 +255,104 @@ namespace octave
+   {
+     return octave_set_signal_handler_by_name (signame, handler,
+                                               restart_syscalls);
+   }
+ 
+   static void
+   generic_sig_handler (int sig)
+   {
++    // FIXME: this function may execute in a separate signal handler or
++    // signal watcher thread so it should probably be more careful about
++    // how it accesses global objects.
++
+     octave_signal_caught = 1;
+ 
+     signals_caught[sig] = true;
++
++    static int sigint;
++    static const bool have_sigint
++      = octave_get_sig_number ("SIGINT", &sigint);
++
++    static int sigbreak;
++    static const bool have_sigbreak
++      = octave_get_sig_number ("SIGBREAK", &sigbreak);
++
++    if ((have_sigint && sig == sigint)
++        || (have_sigbreak && sig == sigbreak))
++      octave_interrupt_state++;
+   }
+ 
+-#if defined (__alpha__)
+   static void
+-  sigfpe_handler (int sig)
++  deadly_sig_handler (int sig)
+   {
+-    if (can_interrupt && octave_interrupt_state >= 0)
+-      {
+-        octave_signal_caught = 1;
++    std::cerr << "fatal: caught signal "
++              << octave_strsignal_wrapper (sig)
++              << " -- stopping myself..." << std::endl;
+ 
+-        signals_caught[sig] = true;
++    octave_set_default_signal_handler (sig);
+ 
+-        octave_interrupt_state++;
+-      }
++    octave_raise_wrapper (sig);
+   }
+-#endif
+-
+-  // Handle SIGHUP and SIGTERM.
+ 
+   static void
+-  user_terminate (int sig_number)
++  fpe_sig_handler (int)
+   {
+-    if (! octave_initialized)
+-      exit (1);
+-
+-    octave_signal_caught = 1;
++    // FIXME: is there something better we can do?
+ 
+-    signals_caught[sig_number] = true;
+-
+-    if (octave_interrupt_immediately)
+-      {
+-        // Try to get to a place where it is safe to throw an
+-        // exception.
+-
+-        interrupt_manager::jump_to_enclosing_context ();
+-      }
++    std::cerr << "warning: floating point exception" << std::endl;
+   }
+ 
+   // Handle SIGINT.
+   //
+   // This also has to work for SIGBREAK (on systems that have it), so we
+   // use the value of sig, instead of just assuming that it is called
+   // for SIGINT only.
+ 
+   static void
+-  user_abort (int sig_number)
++  sigint_handler (int)
+   {
+     if (! octave_initialized)
+       exit (1);
+ 
+     if (can_interrupt)
+       {
+-        if (Vdebug_on_interrupt)
+-          {
+-            if (! octave_debug_on_interrupt_state)
+-              {
+-                tree_evaluator::debug_mode = true;
+-                octave_debug_on_interrupt_state = true;
+-
+-                return;
+-              }
+-            else
+-              {
+-                // Clear the flag and do normal interrupt stuff.
+-
+-                tree_evaluator::debug_mode
+-                  = bp_table::have_breakpoints () || Vdebugging;
+-                octave_debug_on_interrupt_state = false;
+-              }
+-          }
+-
+-        if (octave_interrupt_immediately)
+-          {
+-            if (octave_interrupt_state == 0)
+-              octave_interrupt_state = 1;
+-
+-            // Try to get to a place where it is safe to throw an
+-            // exception.
+-
+-            interrupt_manager::jump_to_enclosing_context ();
+-          }
+-        else
+-          {
+-            // If we are already cleaning up from a previous interrupt,
+-            // take note of the fact that another interrupt signal has
+-            // arrived.
+-
+-            if (octave_interrupt_state < 0)
+-              octave_interrupt_state = 0;
+-
+-            octave_signal_caught = 1;
+-            octave_interrupt_state++;
+-
+-            if (application::interactive ()
+-                && ! application::forced_interactive ()
+-                && octave_interrupt_state == 2)
+-              std::cerr << "Press Control-C again to abort." << std::endl;
+-
+-            if (octave_interrupt_state >= 3)
+-              my_friendly_exit (sig_number, true);
+-          }
++        octave_signal_caught = 1;
++        octave_interrupt_state++;
+       }
+   }
+ 
+-  static void
+-  sigterm_handler (int sig)
+-  {
+-    interrupt_manager::user_terminate (sig);
+-  }
+-
+-  static void
+-  sigint_handler (int sig)
+-  {
+-    interrupt_manager::user_abort (sig);
+-  }
+-
+-  static void
+-  sigpipe_handler (int sig)
+-  {
+-    octave_signal_caught = 1;
+-
+-    signals_caught[sig] = true;
+-
+-    // Don't loop forever on account of this.
+-
+-    if (pipe_handler_error_count++ > 100 && octave_interrupt_state >= 0)
+-      octave_interrupt_state++;
+-  }
+-
+   interrupt_handler
+   catch_interrupts (void)
+   {
+     interrupt_handler retval;
+ 
+-    interrupt_manager::init ();
+-
+     retval.int_handler = set_signal_handler ("SIGINT", sigint_handler);
+     retval.brk_handler = set_signal_handler ("SIGBREAK", sigint_handler);
+ 
+     return retval;
+   }
+ 
+   interrupt_handler
+   ignore_interrupts (void)
+   {
+     interrupt_handler retval;
+ 
+-    interrupt_manager::init ();
+-
+     retval.int_handler = set_signal_handler ("SIGINT", SIG_IGN);
+     retval.brk_handler = set_signal_handler ("SIGBREAK", SIG_IGN);
+ 
+     return retval;
+   }
+ 
+   interrupt_handler
+   set_interrupt_handler (const volatile interrupt_handler& h,
+                          bool restart_syscalls)
+   {
+     interrupt_handler retval;
+ 
+-    interrupt_manager::init ();
+-
+     retval.int_handler = set_signal_handler ("SIGINT", h.int_handler,
+                                              restart_syscalls);
+ 
+     retval.brk_handler = set_signal_handler ("SIGBREAK", h.brk_handler,
+                                              restart_syscalls);
+ 
+     return retval;
+   }
+@@ -604,73 +363,78 @@ namespace octave
+   install_signal_handlers (void)
+   {
+     if (! signals_caught)
+       signals_caught = new bool [octave_num_signals ()];
+ 
+     for (int i = 0; i < octave_num_signals (); i++)
+       signals_caught[i] = false;
+ 
++    // Interrupt signals.
++
+     catch_interrupts ();
+ 
+-    set_signal_handler ("SIGABRT", generic_sig_handler);
+-    set_signal_handler ("SIGALRM", generic_sig_handler);
+-    set_signal_handler ("SIGBUS", generic_sig_handler);
+-    set_signal_handler ("SIGCHLD", generic_sig_handler);
++    // Program Error signals.  These are most likely unrecoverable for
++    // us.
+ 
+-    // SIGCLD
+-    // SIGCONT
+-
+-    set_signal_handler ("SIGEMT", generic_sig_handler);
++    set_signal_handler ("SIGABRT", deadly_sig_handler);
++    set_signal_handler ("SIGBUS", deadly_sig_handler);
++    set_signal_handler ("SIGEMT", deadly_sig_handler);
++    set_signal_handler ("SIGILL", deadly_sig_handler);
++    // SIGIOT is normally another name for SIGABRT.
++    set_signal_handler ("SIGIOT", deadly_sig_handler);
++    set_signal_handler ("SIGSEGV", deadly_sig_handler);
++    set_signal_handler ("SIGSYS", deadly_sig_handler);
++    set_signal_handler ("SIGTRAP", deadly_sig_handler);
+ 
+-#if defined (__alpha__)
+-    set_signal_handler ("SIGFPE", sigfpe_handler);
+-#else
+-    set_signal_handler ("SIGFPE", generic_sig_handler);
+-#endif
++    // Handle SIGFPE separately.
++
++    set_signal_handler ("SIGFPE", fpe_sig_handler);
+ 
+-    set_signal_handler ("SIGHUP", sigterm_handler);
+-    set_signal_handler ("SIGILL", generic_sig_handler);
++    // Handle other signals for which the default action is to terminate
++    // the program.
+ 
+-    // SIGINFO
+-    // SIGINT
++    // Termination signals.
++
++    set_signal_handler ("SIGHUP", generic_sig_handler);
++    set_signal_handler ("SIGQUIT", generic_sig_handler);
++    set_signal_handler ("SIGTERM", generic_sig_handler);
+ 
+-    set_signal_handler ("SIGIOT", generic_sig_handler);
+-    set_signal_handler ("SIGLOST", generic_sig_handler);
+-    set_signal_handler ("SIGPIPE", sigpipe_handler);
+-    set_signal_handler ("SIGPOLL", SIG_IGN);
++    // Alarm signals.
+ 
+-    // SIGPROF
+-    // SIGPWR
++    set_signal_handler ("SIGALRM", generic_sig_handler);
++    set_signal_handler ("SIGVTALRM", generic_sig_handler);
++    set_signal_handler ("SIGPROF", generic_sig_handler);
+ 
+-    set_signal_handler ("SIGQUIT", generic_sig_handler);
+-    set_signal_handler ("SIGSEGV", generic_sig_handler);
++    // I/O signals.
++
++    set_signal_handler ("SIGLOST", generic_sig_handler);
++    set_signal_handler ("SIGPIPE", generic_sig_handler);
+ 
+-    // SIGSTOP
++    // Job control signals.  We only recognize signals about child
++    // processes.
++
++    set_signal_handler ("SIGCHLD", generic_sig_handler);
++    set_signal_handler ("SIGCLD", generic_sig_handler);
++
++    // Resource limit signals.
+ 
+-    set_signal_handler ("SIGSYS", generic_sig_handler);
+-    set_signal_handler ("SIGTERM", sigterm_handler);
+-    set_signal_handler ("SIGTRAP", generic_sig_handler);
++    // FIXME: does it really make sense to try to handle the CPU limit
++    // signal?
+ 
+-    // SIGTSTP
+-    // SIGTTIN
+-    // SIGTTOU
+-    // SIGURG
++    set_signal_handler ("SIGXCPU", generic_sig_handler);
++    set_signal_handler ("SIGXFSZ", generic_sig_handler);
++
++    // User signals.
+ 
+     set_signal_handler ("SIGUSR1", generic_sig_handler);
+     set_signal_handler ("SIGUSR2", generic_sig_handler);
+-    set_signal_handler ("SIGVTALRM", generic_sig_handler);
+-    set_signal_handler ("SIGIO", SIG_IGN);
+ 
+-#if 0
+-    set_signal_handler ("SIGWINCH", sigwinch_handler);
+-#endif
+-
+-    set_signal_handler ("SIGXCPU", generic_sig_handler);
+-    set_signal_handler ("SIGXFSZ", generic_sig_handler);
++    // This does nothing on Windows systems.
++    octave_create_interrupt_watcher_thread (generic_sig_handler);
+   }
+ 
+   static void
+   set_sig_struct_field (octave_scalar_map& m, const char *signame)
+   {
+     int signum;
+ 
+     // The names in the struct do not include the leading "SIG" prefix.
+@@ -808,16 +572,47 @@ The original variable value is restored 
+ %! assert (orig_val, old_val);
+ %! assert (sighup_dumps_octave_core (), ! orig_val);
+ %! sighup_dumps_octave_core (orig_val);
+ %! assert (sighup_dumps_octave_core (), orig_val);
+ 
+ %!error (sighup_dumps_octave_core (1, 2))
+ */
+ 
++DEFUN (sigquit_dumps_octave_core, args, nargout,
++       doc: /* -*- texinfo -*-
++@deftypefn  {} {@var{val} =} sigquit_dumps_octave_core ()
++@deftypefnx {} {@var{old_val} =} sigquit_dumps_octave_core (@var{new_val})
++@deftypefnx {} {} sigquit_dumps_octave_core (@var{new_val}, "local")
++Query or set the internal variable that controls whether Octave tries
++to save all current variables to the file @file{octave-workspace} if it
++receives a quit signal.
++
++When called from inside a function with the @qcode{"local"} option, the
++variable is changed locally for the function and any subroutines it calls.
++The original variable value is restored when exiting the function.
++@end deftypefn */)
++{
++  return set_internal_variable (octave::Vsigquit_dumps_octave_core,
++                                args, nargout,
++                                "sigquit_dumps_octave_core");
++}
++
++/*
++%!test
++%! orig_val = sigquit_dumps_octave_core ();
++%! old_val = sigquit_dumps_octave_core (! orig_val);
++%! assert (orig_val, old_val);
++%! assert (sigquit_dumps_octave_core (), ! orig_val);
++%! sigquit_dumps_octave_core (orig_val);
++%! assert (sigquit_dumps_octave_core (), orig_val);
++
++%!error (sigquit_dumps_octave_core (1, 2))
++*/
++
+ DEFUN (sigterm_dumps_octave_core, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} sigterm_dumps_octave_core ()
+ @deftypefnx {} {@var{old_val} =} sigterm_dumps_octave_core (@var{new_val})
+ @deftypefnx {} {} sigterm_dumps_octave_core (@var{new_val}, "local")
+ Query or set the internal variable that controls whether Octave tries
+ to save all current variables to the file @file{octave-workspace} if it
+ receives a terminate signal.
+diff --git a/libinterp/corefcn/sighandlers.h b/libinterp/corefcn/sighandlers.h
+--- a/libinterp/corefcn/sighandlers.h
++++ b/libinterp/corefcn/sighandlers.h
+@@ -61,17 +61,17 @@ namespace octave
+                       bool restart_syscalls = true);
+ 
+   extern OCTINTERP_API sig_handler *
+   set_signal_handler (const char *signame, sig_handler *h,
+                       bool restart_syscalls = true);
+ 
+   extern OCTINTERP_API void install_signal_handlers (void);
+ 
+-  extern OCTINTERP_API void signal_handler (void);
++  extern OCTINTERP_API void respond_to_pending_signals (void);
+ 
+   extern OCTINTERP_API interrupt_handler catch_interrupts (void);
+ 
+   extern OCTINTERP_API interrupt_handler ignore_interrupts (void);
+ 
+   extern OCTINTERP_API interrupt_handler
+   set_interrupt_handler (const volatile interrupt_handler& h,
+                          bool restart_syscalls = true);
+diff --git a/liboctave/numeric/eigs-base.cc b/liboctave/numeric/eigs-base.cc
+--- a/liboctave/numeric/eigs-base.cc
++++ b/liboctave/numeric/eigs-base.cc
+@@ -144,19 +144,16 @@ vector_product (const Matrix& m, const d
+   F77_INT nr = octave::to_f77_int (m.rows ());
+   F77_INT nc = octave::to_f77_int (m.cols ());
+ 
+   F77_XFCN (dgemv, DGEMV, (F77_CONST_CHAR_ARG2 ("N", 1),
+                            nr, nc, 1.0,  m.data (), nr,
+                            x, 1, 0.0, y, 1
+                            F77_CHAR_ARG_LEN (1)));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler) ("eigs: unrecoverable error in dgemv");
+-
+   return true;
+ }
+ 
+ static bool
+ vector_product (const SparseComplexMatrix& m, const Complex *x,
+                 Complex *y)
+ {
+   octave_idx_type nc = m.cols ();
+@@ -179,19 +176,16 @@ vector_product (const ComplexMatrix& m, 
+ 
+   F77_XFCN (zgemv, ZGEMV, (F77_CONST_CHAR_ARG2 ("N", 1),
+                            nr, nc, 1.0, F77_CONST_DBLE_CMPLX_ARG (m.data ()),
+                            nr,
+                            F77_CONST_DBLE_CMPLX_ARG (x), 1, 0.0,
+                            F77_DBLE_CMPLX_ARG (y), 1
+                            F77_CHAR_ARG_LEN (1)));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler) ("eigs: unrecoverable error in zgemv");
+-
+   return true;
+ }
+ 
+ static bool
+ make_cholb (Matrix& b, Matrix& bt, ColumnVector& permB)
+ {
+   octave_idx_type info;
+   octave::math::chol<Matrix> fact (b, info);
+@@ -764,20 +758,16 @@ EigsRealSymmetricMatrix (const M& m, con
+         (ido, F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dsaupd");
+-
+       if (disp > 0 && ! octave::math::isnan (workl[iptr (5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -850,20 +840,16 @@ EigsRealSymmetricMatrix (const M& m, con
+ 
+   F77_FUNC (dseupd, DSEUPD)
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, d, z, n, sigma,
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2), k, tol, presid, p, v, n, iparam,
+      ipntr, workd, workl, lwork, info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1)
+      F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dseupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = octave::numeric_limits<double>::NaN ();
+       F77_INT k2 = ip(4) / 2;
+       if (typ != "SM" && typ != "BE" && ! (typ == "SA" && rvec))
+         {
+           for (F77_INT i = 0; i < k2; i++)
+@@ -1044,20 +1030,16 @@ EigsRealSymmetricMatrixShift (const M& m
+       F77_FUNC (dsaupd, DSAUPD)
+         (ido, F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dsaupd");
+-
+       if (disp > 0 && ! octave::math::isnan (workl[iptr (5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -1167,20 +1149,16 @@ EigsRealSymmetricMatrixShift (const M& m
+ 
+   F77_FUNC (dseupd, DSEUPD)
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, d, z, n, sigma,
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+      k, tol, presid, p, v, n, iparam, ipntr, workd, workl, lwork, info2
+      F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dseupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = octave::numeric_limits<double>::NaN ();
+       F77_INT k2 = ip(4) / 2;
+       for (F77_INT i = 0; i < k2; i++)
+         {
+           double dtmp = d[i];
+@@ -1337,20 +1315,16 @@ EigsRealSymmetricFunc (EigsFunc fun, oct
+         (ido, F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dsaupd");
+-
+       if (disp > 0 && ! octave::math::isnan (workl[iptr (5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -1423,20 +1397,16 @@ EigsRealSymmetricFunc (EigsFunc fun, oct
+ 
+   F77_FUNC (dseupd, DSEUPD)
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, d, z, n, sigma,
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+      k, tol, presid, p, v, n, iparam, ipntr, workd, workl, lwork, info2
+      F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dseupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = octave::numeric_limits<double>::NaN ();
+       F77_INT k2 = ip(4) / 2;
+       if (typ != "SM" && typ != "BE")
+         {
+           for (F77_INT i = 0; i < k2; i++)
+@@ -1635,20 +1605,16 @@ EigsRealNonSymmetricMatrix (const M& m, 
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+       // k is not changed
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dnaupd");
+-
+       if (disp > 0 && ! octave::math::isnan(workl[iptr(5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -1735,20 +1701,16 @@ EigsRealNonSymmetricMatrix (const M& m, 
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, dr, di, z, n, sigmar,
+      sigmai, workev,  F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2), k, tol, presid, p, v, n, iparam,
+      ipntr, workd, workl, lwork, info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1)
+      F77_CHAR_ARG_LEN(2));
+   // on exit, if (and only if) rvec == true, k may have been increased by one
+   // and be equal to ip(4), see dngets.
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dneupd");
+-
+   if (! rvec && ip(4) > k)
+     k = ip(4);
+ 
+   eig_val.resize (k);
+   Complex *d = eig_val.fortran_vec ();
+ 
+   if (info2 == 0)
+     {
+@@ -1979,20 +1941,16 @@ EigsRealNonSymmetricMatrixShift (const M
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+       // k is not changed
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dnaupd");
+-
+       if (disp > 0 && ! octave::math::isnan (workl[iptr (5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -2116,20 +2074,16 @@ EigsRealNonSymmetricMatrixShift (const M
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, dr, di, z, n, sigmar,
+      sigmai, workev,  F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2), k, tol, presid, p, v, n, iparam,
+      ipntr, workd, workl, lwork, info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1)
+      F77_CHAR_ARG_LEN(2));
+   // On exit, if (and only if) rvec == true, k may have been increased by one
+   // and be equal to ip(4), see dngets.
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dneupd");
+-
+   if (! rvec && ip(4) > k)
+     k = ip(4);
+ 
+   eig_val.resize (k);
+   Complex *d = eig_val.fortran_vec ();
+ 
+   if (info2 == 0)
+     {
+@@ -2342,20 +2296,16 @@ EigsRealNonSymmetricFunc (EigsFunc fun, 
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, presid, p, v, n, iparam,
+          ipntr, workd, workl, lwork, tmp_info
+          F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+       // k is not changed
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in dnaupd");
+-
+       if (disp > 0 && ! octave::math::isnan(workl[iptr(5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -2442,20 +2392,16 @@ EigsRealNonSymmetricFunc (EigsFunc fun, 
+     (rvec, F77_CONST_CHAR_ARG2 ("A", 1), sel, dr, di, z, n, sigmar,
+      sigmai, workev,  F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2), k, tol, presid, p, v, n, iparam,
+      ipntr, workd, workl, lwork, info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1)
+      F77_CHAR_ARG_LEN(2));
+   // On exit, if (and only if) rvec == true, k may have been increased by one
+   // and be equal to ip(4), see dngets.
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in dneupd");
+-
+   if (! rvec && ip(4) > k)
+     k = ip(4);
+ 
+   eig_val.resize (k);
+   Complex *d = eig_val.fortran_vec ();
+ 
+   if (info2 == 0)
+     {
+@@ -2704,20 +2650,16 @@ EigsComplexNonSymmetricMatrix (const M& 
+          F77_CONST_CHAR_ARG2 (typ.c_str (), 2),
+          k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+          iparam, ipntr,
+          F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+          tmp_info F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in znaupd");
+-
+       if (disp > 0 && ! octave::math::isnan (workl[iptr (5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -2795,20 +2737,16 @@ EigsComplexNonSymmetricMatrix (const M& 
+      F77_DBLE_CMPLX_ARG (workev),
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+      k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+      iparam, ipntr,
+      F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+      info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in zneupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = Complex (octave::numeric_limits<double>::NaN (),
+                         octave::numeric_limits<double>::NaN ());
+ 
+       F77_INT k2 = ip(4) / 2;
+       for (F77_INT i = 0; i < k2; i++)
+@@ -2997,20 +2935,16 @@ EigsComplexNonSymmetricMatrixShift (cons
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+          iparam, ipntr,
+          F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+          tmp_info F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in znaupd");
+-
+       if (disp > 0 && ! octave::math::isnan(workl[iptr(5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -3126,20 +3060,16 @@ EigsComplexNonSymmetricMatrixShift (cons
+      F77_DBLE_CMPLX_ARG (workev),
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+      k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+      iparam, ipntr,
+      F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+      info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in zneupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = Complex (octave::numeric_limits<double>::NaN (),
+                         octave::numeric_limits<double>::NaN ());
+ 
+       F77_INT k2 = ip(4) / 2;
+       for (F77_INT i = 0; i < k2; i++)
+@@ -3309,20 +3239,16 @@ EigsComplexNonSymmetricFunc (EigsComplex
+          F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+          k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+          iparam, ipntr,
+          F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+          tmp_info F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+       info = tmp_info;
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler)
+-          ("eigs: unrecoverable exception encountered in znaupd");
+-
+       if (disp > 0 && ! octave::math::isnan(workl[iptr(5)-1]))
+         {
+           if (iter++)
+             {
+               os << "Iteration " << iter - 1 <<
+                  ": a few Ritz values of the " << p << "-by-" <<
+                  p << " matrix\n";
+               if (ido == 99) // convergence
+@@ -3401,20 +3327,16 @@ EigsComplexNonSymmetricFunc (EigsComplex
+      F77_DBLE_CMPLX_ARG (workev),
+      F77_CONST_CHAR_ARG2 (&bmat, 1), n,
+      F77_CONST_CHAR_ARG2 ((typ.c_str ()), 2),
+      k, tol, F77_DBLE_CMPLX_ARG (presid), p, F77_DBLE_CMPLX_ARG (v), n,
+      iparam, ipntr,
+      F77_DBLE_CMPLX_ARG (workd), F77_DBLE_CMPLX_ARG (workl), lwork, rwork,
+      info2 F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(1) F77_CHAR_ARG_LEN(2));
+ 
+-  if (f77_exception_encountered)
+-    (*current_liboctave_error_handler)
+-      ("eigs: unrecoverable exception encountered in zneupd");
+-
+   if (info2 == 0)
+     {
+       for (F77_INT i = ip(4); i < k; i++)
+         d[i] = Complex (octave::numeric_limits<double>::NaN (),
+                         octave::numeric_limits<double>::NaN ());
+ 
+       F77_INT k2 = ip(4) / 2;
+       for (F77_INT i = 0; i < k2; i++)
+diff --git a/liboctave/numeric/gsvd.cc b/liboctave/numeric/gsvd.cc
+--- a/liboctave/numeric/gsvd.cc
++++ b/liboctave/numeric/gsvd.cc
+@@ -277,19 +277,16 @@ namespace octave
+       real_matrix beta (n, 1);
+ 
+       std::vector<F77_INT> iwork (n);
+ 
+       gsvd<T>::ggsvd (jobu, jobv, jobq, m, n, p, k, l,
+                       tmp_dataA, m, tmp_dataB, p, alpha, beta, u,
+                       nrow_u, v, nrow_v, q, nrow_q, work, iwork.data (), info);
+ 
+-      if (f77_exception_encountered)
+-        (*current_liboctave_error_handler) ("unrecoverable error in *ggsvd");
+-
+       if (info < 0)
+         (*current_liboctave_error_handler) ("*ggsvd.f: argument %d illegal",
+                                             -info);
+       else
+         {
+           if (info > 0)
+             (*current_liboctave_error_handler)
+               ("*ggsvd.f: Jacobi-type procedure failed to converge.");
+diff --git a/liboctave/util/cmd-edit.cc b/liboctave/util/cmd-edit.cc
+--- a/liboctave/util/cmd-edit.cc
++++ b/liboctave/util/cmd-edit.cc
+@@ -190,16 +190,18 @@ namespace octave
+     bool do_filename_completion_desired (bool);
+ 
+     bool do_filename_quoting_desired (bool);
+ 
+     bool do_prefer_env_winsize (bool);
+ 
+     void do_interrupt (bool);
+ 
++    void do_handle_interrupt_signal (void);
++
+     static int operate_and_get_next (int, int);
+ 
+     static int history_search_backward (int, int);
+ 
+     static int history_search_forward (int, int);
+ 
+   private:
+ 
+@@ -282,30 +284,41 @@ namespace octave
+   gnu_readline::do_readline (const std::string& prompt, bool& eof)
+   {
+     std::string retval;
+ 
+     eof = false;
+ 
+     const char *p = prompt.c_str ();
+ 
+-    BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE;
+-
+-    char *line = ::octave_rl_readline (p);
+-
+-    if (line)
++    while (true)
+       {
+-        retval = line;
++        try
++          {
++            char *line = ::octave_rl_readline (p);
++
++            if (line)
++              {
++                retval = line;
+ 
+-        free (line);
++                free (line);
++              }
++            else
++              eof = true;
++
++            break;
++          }
++        catch (command_editor::interrupt_exception&)
++          {
++            // Is this right?
++            std::cout << "\n";
++
++            // Try again...
++          }
+       }
+-    else
+-      eof = true;
+-
+-    END_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE;
+ 
+     return retval;
+   }
+ 
+   void
+   gnu_readline::do_set_input_stream (FILE *f)
+   {
+     ::octave_rl_set_input_stream (f);
+@@ -777,16 +790,27 @@ namespace octave
+   }
+ 
+   void
+   gnu_readline::do_interrupt (bool arg)
+   {
+     ::octave_rl_done (arg);
+   }
+ 
++  void
++  gnu_readline::do_handle_interrupt_signal (void)
++  {
++    octave_signal_caught = 0;
++    octave_interrupt_state = 0;
++
++    ::octave_rl_recover_from_interrupt ();
++
++    throw command_editor::interrupt_exception ();
++  }
++
+   int
+   gnu_readline::operate_and_get_next (int /* count */, int /* c */)
+   {
+     // Accept the current line.
+ 
+     command_editor::accept_line ();
+ 
+     // Find the current line, and find the next line to use.
+@@ -1059,17 +1083,21 @@ namespace octave
+   {
+     bool retval = true;
+ 
+     if (! instance)
+       {
+         make_command_editor ();
+ 
+         if (instance)
+-          singleton_cleanup_list::add (cleanup_instance);
++          {
++            instance->set_event_hook (event_handler);
++
++            singleton_cleanup_list::add (cleanup_instance);
++          }
+       }
+ 
+     if (! instance)
+       (*current_liboctave_error_handler)
+         ("unable to create command history object!");
+ 
+     return retval;
+   }
+@@ -1126,16 +1154,19 @@ namespace octave
+       }
+ 
+     return 0;
+   }
+ 
+   int
+   command_editor::event_handler (void)
+   {
++    if (octave_interrupt_state)
++      handle_interrupt_signal ();
++
+     event_hook_lock.lock ();
+ 
+     std::set<event_hook_fcn> hook_set (event_hook_set);
+ 
+     event_hook_lock.unlock ();
+ 
+     for (event_hook_fcn f : hook_set)
+       {
+@@ -1534,39 +1565,29 @@ namespace octave
+       }
+   }
+ 
+   void
+   command_editor::add_event_hook (event_hook_fcn f)
+   {
+     autolock guard (event_hook_lock);
+ 
+-    if (instance_ok ())
+-      {
+-        event_hook_set.insert (f);
+-
+-        instance->set_event_hook (event_handler);
+-      }
++    event_hook_set.insert (f);
+   }
+ 
+   void
+   command_editor::remove_event_hook (event_hook_fcn f)
+   {
+     autolock guard (event_hook_lock);
+ 
+-    if (instance_ok ())
+-      {
+-        auto p = event_hook_set.find (f);
++    auto p = event_hook_set.find (f);
+ 
+-        if (p != event_hook_set.end ())
+-          event_hook_set.erase (p);
++    if (p != event_hook_set.end ())
++      event_hook_set.erase (p);
+ 
+-        if (event_hook_set.empty ())
+-          instance->restore_event_hook ();
+-      }
+   }
+ 
+   void
+   command_editor::run_event_hooks (void)
+   {
+     event_handler ();
+   }
+ 
+@@ -1624,16 +1645,23 @@ namespace octave
+         instance->interrupted = arg;
+       }
+     else
+       retval = false;
+ 
+     return retval;
+   }
+ 
++  void
++  command_editor::handle_interrupt_signal (void)
++  {
++    if (instance_ok ())
++      instance->do_handle_interrupt_signal ();
++  }
++
+   // Return a string which will be printed as a prompt.  The string may
+   // contain special characters which are decoded as follows:
+   //
+   //      \a      bell (ascii 07)
+   //      \d      the date
+   //      \e      escape (ascii 033)
+   //      \h      the hostname up to the first '.'
+   //      \H      the hostname
+diff --git a/liboctave/util/cmd-edit.h b/liboctave/util/cmd-edit.h
+--- a/liboctave/util/cmd-edit.h
++++ b/liboctave/util/cmd-edit.h
+@@ -35,16 +35,18 @@ along with Octave; see the file COPYING.
+ namespace octave
+ {
+   class
+   OCTAVE_API
+   command_editor
+   {
+   protected:
+ 
++    class interrupt_exception { };
++
+     command_editor (void)
+       : command_number (0), interrupted (false), initial_input () { }
+ 
+   public:
+ 
+     typedef int (*startup_hook_fcn) (void);
+ 
+     typedef int (*pre_input_hook_fcn) (void);
+@@ -215,16 +217,18 @@ namespace octave
+ 
+     static std::set<event_hook_fcn> event_hook_set;
+ 
+     // The real thing.
+     static command_editor *instance;
+ 
+     static void cleanup_instance (void) { delete instance; instance = nullptr; }
+ 
++    static void handle_interrupt_signal (void);
++
+   protected:
+ 
+     // To use something other than the GNU readline library, derive a new
+     // class from command_editor, overload these functions as
+     // necessary, and make instance point to the new class.
+ 
+     virtual void do_set_name (const std::string&) { }
+ 
+@@ -345,16 +349,18 @@ namespace octave
+     virtual bool do_filename_completion_desired (bool) { return false; }
+ 
+     virtual bool do_filename_quoting_desired (bool) { return false; }
+ 
+     virtual bool do_prefer_env_winsize (bool) { return false; }
+ 
+     virtual void do_interrupt (bool) { }
+ 
++    virtual void do_handle_interrupt_signal (void) { }
++
+     int do_insert_initial_input (void);
+ 
+     int read_octal (const std::string& s);
+ 
+     void error (int);
+ 
+     void error (const std::string&);
+ 
+diff --git a/liboctave/util/cquit.c b/liboctave/util/cquit.c
+--- a/liboctave/util/cquit.c
++++ b/liboctave/util/cquit.c
+@@ -24,43 +24,26 @@ along with Octave; see the file COPYING.
+ #  include "config.h"
+ #endif
+ 
+ #include <signal.h>
+ #include <string.h>
+ 
+ #include "quit.h"
+ 
+-octave_jmp_buf current_context;
+-
+-void
+-octave_save_current_context (void *save_buf)
+-{
+-  memcpy (save_buf, current_context, sizeof (octave_jmp_buf));
+-}
+-
+-void
+-octave_restore_current_context (void *save_buf)
+-{
+-  memcpy (current_context, save_buf, sizeof (octave_jmp_buf));
+-}
+-
+-void
+-octave_jump_to_enclosing_context (void)
+-{
+-#if defined (OCTAVE_HAVE_SIG_JUMP)
+-  siglongjmp (current_context, 1);
+-#else
+-  longjmp (current_context, 1);
+-#endif
+-}
+-
+-sig_atomic_t octave_interrupt_immediately = 0;
+-
+ sig_atomic_t octave_interrupt_state = 0;
+ 
+ sig_atomic_t octave_exception_state = 0;
+ 
++#if defined (HAVE_PRAGMA_GCC_DIAGNOSTIC)
++#  pragma GCC diagnostic push
++#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
++#endif
++
+ sig_atomic_t octave_exit_exception_status = 0;
+ 
+ sig_atomic_t octave_exit_exception_safe_to_return = 0;
+ 
++#if defined (HAVE_PRAGMA_GCC_DIAGNOSTIC)
++#  pragma GCC diagnostic pop
++#endif
++
+ volatile sig_atomic_t octave_signal_caught = 0;
+diff --git a/liboctave/util/f77-extern.cc b/liboctave/util/f77-extern.cc
+deleted file mode 100644
+--- a/liboctave/util/f77-extern.cc
++++ /dev/null
+@@ -1,34 +0,0 @@
+-/*
+-
+-Copyright (C) 1996-2017 John W. Eaton
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
+-(at your option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but
+-WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if defined (HAVE_CONFIG_H)
+-#  include "config.h"
+-#endif
+-
+-#include "f77-fcn.h"
+-#include "lo-error.h"
+-
+-// This whole file is a kluge just to avoid unresolved symbol errors
+-// when creating shared versions of liboctave.
+-
+-// So we can check to see if an exception has occurred.
+-int f77_exception_encountered = 0;
+diff --git a/liboctave/util/f77-fcn.c b/liboctave/util/f77-fcn.c
+--- a/liboctave/util/f77-fcn.c
++++ b/liboctave/util/f77-fcn.c
+@@ -53,18 +53,19 @@ F77_FUNC (xstopx, XSTOPX) (octave_cray_f
+ F77_FUNC (xstopx, XSTOPX) (const char *s, F77_CHAR_ARG_LEN_TYPE slen)
+ #endif
+ {
+ #if defined (F77_USES_CRAY_CALLING_CONVENTION)
+   const char *s = desc.const_ptr = ptr_arg;
+   unsigned long slen = desc.mask.len;
+ #endif
+ 
+-  f77_exception_encountered = 1;
++  /* Skip printing message if it is just a single blank character.  */
++  if (! (s && slen > 0 && ! (slen == 1 && *s == ' ')))
++    {
++      s = "unknown error in fortran subroutine";
++      slen = strlen (s);
++    }
+ 
+-  /* Skip printing message if it is just a single blank character.  */
+-  if (s && slen > 0 && ! (slen == 1 && *s == ' '))
+-    (*current_liboctave_error_handler) ("%.*s", slen, s);
+-
+-  octave_jump_to_enclosing_context ();
++  (*current_liboctave_error_handler) ("%.*s", slen, s);
+ 
+   F77_NORETURN (0)
+ }
+diff --git a/liboctave/util/f77-fcn.h b/liboctave/util/f77-fcn.h
+--- a/liboctave/util/f77-fcn.h
++++ b/liboctave/util/f77-fcn.h
+@@ -31,65 +31,23 @@ along with Octave; see the file COPYING.
+ #if defined (__cplusplus)
+ #  include <limits>
+ #endif
+ 
+ #if defined (__cplusplus)
+ extern "C" {
+ #endif
+ 
+-/* Hack to stringize macro results. */
+-#define xSTRINGIZE(x) #x
+-#define STRINGIZE(x) xSTRINGIZE(x)
+-
+-/* How to print an error for the F77_XFCN macro. */
+-
+-#define F77_XFCN_ERROR(f, F)                            \
+-  (*current_liboctave_error_handler)                    \
+-    ("exception encountered in Fortran subroutine %s",  \
+-     STRINGIZE (F77_FUNC (f, F)))
+-
+-/* This can be used to call a Fortran subroutine that might call
+-   XSTOPX.  XSTOPX will call lonjmp with current_context.  Once back
+-   here, we'll restore the previous context and return.  We may also
+-   end up here if an interrupt is processed when the Fortran
+-   subroutine is called.  In that case, we resotre the context and go
+-   to the top level. */
++/* This macro is obsolete.  */
+ 
+-#define F77_XFCN(f, F, args)                                            \
+-  do                                                                    \
+-    {                                                                   \
+-      octave_jmp_buf saved_context;                                     \
+-      sig_atomic_t saved_octave_interrupt_immediately = octave_interrupt_immediately; \
+-      f77_exception_encountered = 0;                                    \
+-      octave_save_current_context (saved_context);                      \
+-      if (octave_set_current_context)                                   \
+-        {                                                               \
+-          octave_interrupt_immediately = saved_octave_interrupt_immediately; \
+-          octave_restore_current_context (saved_context);               \
+-          if (f77_exception_encountered)                                \
+-            F77_XFCN_ERROR (f, F);                                      \
+-          else                                                          \
+-            octave_rethrow_exception ();                                \
+-        }                                                               \
+-      else                                                              \
+-        {                                                               \
+-          octave_interrupt_immediately++;                               \
+-          F77_FUNC (f, F) args;                                         \
+-          octave_interrupt_immediately--;                               \
+-          octave_restore_current_context (saved_context);               \
+-        }                                                               \
+-    }                                                                   \
+-  while (0)
+-
+-/* So we can check to see if an exception has occurred. */
+-OCTAVE_API extern int f77_exception_encountered;
++#define F77_XFCN(f, F, args)                    \
++  F77_FUNC (f, F) args
+ 
+ #if ! defined (F77_FCN)
+-#define F77_FCN(f, F) F77_FUNC (f, F)
++#  define F77_FCN(f, F) F77_FUNC (f, F)
+ #endif
+ 
+ /*
+ 
+ The following macros are used for handling Fortran <-> C calling
+ conventions.  They are defined below for three different types of
+ systems, Cray (possibly now obsolete), Visual Fortran, and gfortran.
+ Note that we don't attempt to handle Fortran functions, we always use
+diff --git a/liboctave/util/module.mk b/liboctave/util/module.mk
+--- a/liboctave/util/module.mk
++++ b/liboctave/util/module.mk
+@@ -71,17 +71,16 @@ UTIL_SRC = \
+   %reldir%/glob-match.cc \
+   %reldir%/kpse.cc \
+   %reldir%/lo-array-errwarn.cc \
+   %reldir%/lo-array-gripes.cc \
+   %reldir%/lo-hash.cc \
+   %reldir%/lo-ieee.cc \
+   %reldir%/lo-regexp.cc \
+   %reldir%/lo-utils.cc \
+-  %reldir%/f77-extern.cc \
+   %reldir%/quit.cc \
+   %reldir%/oct-base64.cc \
+   %reldir%/oct-glob.cc \
+   %reldir%/oct-inttypes.cc \
+   %reldir%/oct-mutex.cc \
+   %reldir%/oct-shlib.cc \
+   %reldir%/oct-sparse.cc \
+   %reldir%/oct-string.cc \
+diff --git a/liboctave/util/oct-rl-edit.c b/liboctave/util/oct-rl-edit.c
+--- a/liboctave/util/oct-rl-edit.c
++++ b/liboctave/util/oct-rl-edit.c
+@@ -466,9 +466,17 @@ octave_rl_ctrl (char c)
+ }
+ 
+ int
+ octave_rl_meta (char c)
+ {
+   return META (c);
+ }
+ 
++void
++octave_rl_recover_from_interrupt (void)
++{
++  rl_free_line_state ();
++  rl_cleanup_after_signal ();
++  rl_reset_after_signal ();
++}
++
+ #endif
+diff --git a/liboctave/util/oct-rl-edit.h b/liboctave/util/oct-rl-edit.h
+--- a/liboctave/util/oct-rl-edit.h
++++ b/liboctave/util/oct-rl-edit.h
+@@ -177,13 +177,15 @@ extern void octave_rl_initialize (void);
+ extern int octave_rl_history_search_forward (int, int);
+ 
+ extern int octave_rl_history_search_backward (int, int);
+ 
+ extern int octave_rl_ctrl (char);
+ 
+ extern int octave_rl_meta (char);
+ 
++extern void octave_rl_recover_from_interrupt (void);
++
+ #if defined (__cplusplus)
+ }
+ #endif
+ 
+ #endif
+diff --git a/liboctave/util/quit.h b/liboctave/util/quit.h
+--- a/liboctave/util/quit.h
++++ b/liboctave/util/quit.h
+@@ -20,49 +20,25 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if ! defined (octave_quit_h)
+ #define octave_quit_h 1
+ 
+ #include "octave-config.h"
+ 
+-#include <setjmp.h>
+-
+ /* The signal header is just needed for the sig_atomic_t type.  */
+ #if defined (__cplusplus)
+ #  include <csignal>
+ #  include <string>
+ extern "C" {
+ #else
+ #  include <signal.h>
+ #endif
+ 
+-#if defined (OCTAVE_HAVE_SIG_JUMP)
+-
+-typedef sigjmp_buf octave_jmp_buf;
+-
+-#define octave_set_current_context sigsetjmp (current_context, 1)
+-
+-#else
+-
+-typedef jmp_buf octave_jmp_buf;
+-
+-#define octave_set_current_context setjmp (current_context)
+-
+-#endif
+-
+-OCTAVE_API extern octave_jmp_buf current_context;
+-
+-OCTAVE_API extern void octave_save_current_context (void *);
+-
+-OCTAVE_API extern void octave_restore_current_context (void *);
+-
+-OCTAVE_NORETURN OCTAVE_API extern void octave_jump_to_enclosing_context (void);
+-
+ #if defined (__cplusplus)
+ 
+ namespace octave
+ {
+   class
+   execution_exception
+   {
+   public:
+@@ -159,29 +135,29 @@ typedef octave::interrupt_exception octa
+ enum octave_exception
+ {
+   octave_no_exception = 0,
+   octave_exec_exception = 1,
+   octave_alloc_exception = 3,
+   octave_quit_exception = 4
+ };
+ 
+-OCTAVE_API extern sig_atomic_t octave_interrupt_immediately;
+-
+ /*
+   > 0: interrupt pending
+     0: no interrupt pending
+   < 0: handling interrupt
+ */
+ OCTAVE_API extern sig_atomic_t octave_interrupt_state;
+ 
+ OCTAVE_API extern sig_atomic_t octave_exception_state;
+ 
++OCTAVE_DEPRECATED (4.4, "see the Octave documentation for other options")
+ OCTAVE_API extern sig_atomic_t octave_exit_exception_status;
+ 
++OCTAVE_DEPRECATED (4.4, "see the Octave documentation for other options")
+ OCTAVE_API extern sig_atomic_t octave_exit_exception_safe_to_return;
+ 
+ OCTAVE_API extern volatile sig_atomic_t octave_signal_caught;
+ 
+ OCTAVE_API extern void octave_handle_signal (void);
+ 
+ OCTAVE_NORETURN OCTAVE_API extern void octave_throw_interrupt_exception (void);
+ 
+@@ -221,100 +197,44 @@ inline void octave_quit (void)
+         {                                       \
+           octave_signal_caught = 0;             \
+           octave_handle_signal ();              \
+         }                                       \
+     }                                           \
+   while (0)
+ #endif
+ 
+-/* Normally, you just want to use
+-
+-     BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE;
+-     ... some code that calls a "foreign" function ...
+-     END_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE;
+-
+-   but sometimes it is useful to do something like
+-
+-     BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_1;
+-     ... custom code here, normally ending in a call to
+-         octave_rethrow_exception ...
+-     BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_2;
+-
+-   so that you can perform extra clean up operations before throwing
+-   the interrupt exception.  */
++/* The following macros are obsolete.  Interrupting immediately by
++   calling siglongjmp or similar from a signal handler is asking for
++   trouble.  We need another way to handle that situation.  Rather
++   than remove them, however, please leave them in place until we can
++   either find a replacement or determine that a given block of code
++   does not need special treatment.  They are defined to create a
++   dummy do-while block to match the previous definitions.  */
+ 
+ #define BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE     \
+-  BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_1;        \
+-  octave_rethrow_exception ();                          \
+-  BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_2
++  do                                                    \
++    {
+ 
+-#define BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_1           \
+-  do                                                            \
+-    {                                                           \
+-      octave_jmp_buf saved_context;                             \
+-                                                                \
+-      octave_save_current_context (saved_context);              \
+-                                                                \
+-      if (octave_set_current_context)                           \
+-        {                                                       \
+-          octave_restore_current_context (saved_context)
+-
+-#define BEGIN_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE_2   \
+-        }                                               \
+-      else                                              \
+-        {                                               \
+-          octave_interrupt_immediately++
+-
+-#define END_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE               \
+-          octave_interrupt_immediately--;                       \
+-          octave_restore_current_context (saved_context);       \
+-          octave_quit ();                                       \
+-        }                                                       \
+-    }                                                           \
++#define END_INTERRUPT_IMMEDIATELY_IN_FOREIGN_CODE       \
++    }                                                   \
+   while (0)
+ 
+ #if defined (__cplusplus)
+ 
+-#define BEGIN_INTERRUPT_WITH_EXCEPTIONS                                 \
+-  sig_atomic_t saved_octave_interrupt_immediately = octave_interrupt_immediately; \
+-                                                                        \
+-  try                                                                   \
+-    {                                                                   \
+-      octave_interrupt_immediately = 0;
++/* Likewise, these are obsolete.  They are defined to create a
++   dummy scope to match the previous versions that created a try-catch
++   block.  */
+ 
+-#define END_INTERRUPT_WITH_EXCEPTIONS                                   \
+-    }                                                                   \
+-  catch (const octave::interrupt_exception&)                            \
+-    {                                                                   \
+-      octave_interrupt_immediately = saved_octave_interrupt_immediately; \
+-      octave_jump_to_enclosing_context ();                              \
+-    }                                                                   \
+-  catch (const octave::execution_exception&)                            \
+-    {                                                                   \
+-      octave_interrupt_immediately = saved_octave_interrupt_immediately; \
+-      octave_exception_state = octave_exec_exception;                   \
+-      octave_jump_to_enclosing_context ();                              \
+-    }                                                                   \
+-  catch (const std::bad_alloc&)                                         \
+-    {                                                                   \
+-      octave_interrupt_immediately = saved_octave_interrupt_immediately; \
+-      octave_exception_state = octave_alloc_exception;                  \
+-      octave_jump_to_enclosing_context ();                              \
+-    }                                                                   \
+-  catch (const octave::exit_exception& ex)                              \
+-    {                                                                   \
+-      octave_interrupt_immediately = saved_octave_interrupt_immediately; \
+-      octave_exception_state = octave_quit_exception;                   \
+-      octave_exit_exception_status = ex.exit_status ();                 \
+-      octave_exit_exception_safe_to_return = ex.safe_to_return ();      \
+-      octave_jump_to_enclosing_context ();                              \
+-    }                                                                   \
+-                                                                        \
+-  octave_interrupt_immediately = saved_octave_interrupt_immediately
++#define BEGIN_INTERRUPT_WITH_EXCEPTIONS         \
++  {
++
++#define END_INTERRUPT_WITH_EXCEPTIONS           \
++  }
++
+ #endif
+ 
+ #if defined (__cplusplus)
+ }
+ 
+ /* These should only be declared for C++ code, and should also be
+    outside of any extern "C" block.  */
+ 
+diff --git a/liboctave/wrappers/signal-wrappers.c b/liboctave/wrappers/signal-wrappers.c
+--- a/liboctave/wrappers/signal-wrappers.c
++++ b/liboctave/wrappers/signal-wrappers.c
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ // functions.
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <sys/types.h>
+ #include <signal.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ 
+ #if defined (__WIN32__) && ! defined (__CYGWIN__)
+ #  include <windows.h>
+ #else
+ #  include <pthread.h>
+ #endif
+@@ -383,40 +384,57 @@ octave_set_signal_handler_by_name (const
+ {
+   int sig;
+ 
+   return (octave_get_sig_number (signame, &sig)
+           ? octave_set_signal_handler_internal (sig, handler, restart_syscalls)
+           : 0);
+ }
+ 
++octave_sig_handler *
++octave_set_default_signal_handler (int sig)
++{
++  return octave_set_signal_handler_internal (sig, SIG_DFL, true);
++}
++
++octave_sig_handler *
++octave_set_default_signal_handler_by_name (const char *signame)
++{
++  return octave_set_signal_handler_by_name (signame, SIG_DFL, true);
++}
++
+ int
+ octave_num_signals (void)
+ {
+   return NSIG;
+ }
+ 
+ typedef struct
+ {
+   sigset_t nvar;
+   sigset_t ovar;
+ } sigset_info;
+ 
+ void *
+ octave_block_child (void)
+ {
+-#if defined (SIGCHLD)
++#if defined (SIGCHLD) || defined (SIGCLD)
+ 
+   sigset_info *context = (sigset_info *) malloc (sizeof (sigset_info));
+ 
+   if (context)
+     {
++      sigemptyset (&(context->ovar));
+       sigemptyset (&(context->nvar));
++#if defined (SIGCHLD)
+       sigaddset (&(context->nvar), SIGCHLD);
+-      sigemptyset (&(context->ovar));
++#endif
++#if defined (SIGCLD)
++      sigaddset (&(context->nvar), SIGCLD);
++#endif
+       sigprocmask (SIG_BLOCK, &(context->nvar), &(context->ovar));
+     }
+ 
+   return context;
+ 
+ #else
+ 
+   return 0;
+@@ -436,50 +454,80 @@ octave_unblock_child (void *context_arg)
+       free (context);
+     }
+ }
+ 
+ static void
+ block_or_unblock_signal (int how, int sig)
+ {
+ #if ! defined (__WIN32__) || defined (__CYGWIN__)
++
+   // Blocking/unblocking signals at thread level is only supported
+   // on platform with fully compliant POSIX threads. This is not
+   // supported on Win32. Moreover, we have to make sure that SIGINT
+   // handler is not installed before calling AllocConsole: installing
+   // a SIGINT handler internally calls SetConsoleCtrlHandler, which
+   // must be called after AllocConsole to be effective.
+ 
+   sigset_t signal_mask;
+ 
+   sigemptyset (&signal_mask);
+ 
+   sigaddset (&signal_mask, sig);
+ 
+   pthread_sigmask (how, &signal_mask, 0);
++
+ #else
+ 
+   octave_unused_parameter (how);
+   octave_unused_parameter (sig);
+ 
+ #endif
+ }
+ 
+ void
+ octave_block_interrupt_signal (void)
+ {
+   block_or_unblock_signal (SIG_BLOCK, SIGINT);
++
++#if defined (SIGBREAK)
++  block_or_unblock_signal (SIG_BLOCK, SIGBREAK);
++#endif
+ }
+ 
+ void
+ octave_unblock_interrupt_signal (void)
+ {
+   block_or_unblock_signal (SIG_UNBLOCK, SIGINT);
++
++#if defined (SIGBREAK)
++  block_or_unblock_signal (SIG_UNBLOCK, SIGBREAK);
++#endif
+ }
+ 
++static void
++block_or_unblock_signal_by_name (int how, const char *signame)
++{
++  int sig;
++
++  if (octave_get_sig_number (signame, &sig))
++    block_or_unblock_signal (how, sig);
++}
++
++void
++octave_block_signal_by_name (const char *signame)
++{
++  block_or_unblock_signal_by_name (SIG_BLOCK, signame);
++}
++
++void
++octave_unblock_signal_by_name (const char *signame)
++{
++  block_or_unblock_signal_by_name (SIG_UNBLOCK, signame);
++}
+ 
+ /* Allow us to save the signal mask and then restore it to the most
+    recently saved value.  This is necessary when using the POSIX signal
+    handling interface on some systems calling longjmp out of the signal
+    handler to get to the top level on an interrupt doesn't restore the
+    original signal mask.  Alternatively, we could use
+    sigsetjmp/siglongjmp, but saving and restoring the signal mask
+    ourselves works ok and seems simpler just now.  */
+@@ -493,13 +541,207 @@ octave_save_signal_mask (void)
+ }
+ 
+ void
+ octave_restore_signal_mask (void)
+ {
+   sigprocmask (SIG_SETMASK, &octave_signal_mask, 0);
+ }
+ 
++static const sigset_t *
++octave_async_signals (void)
++{
++  static bool initialized = false;
++  static sigset_t sigmask;
++
++  if (! initialized)
++    {
++      sigemptyset (&sigmask);
++
++      // The signals listed here should match the list of signals that
++      // we handle in the signal handler thread.
++
++      // Interrupt signals.
++
++#if defined (SIGINT)
++      sigaddset (&sigmask, SIGINT);
++#endif
++
++#if defined (SIGBREAK)
++      sigaddset (&sigmask, SIGBREAK);
++#endif
++
++      // Termination signals.
++
++#if defined (SIGHUP)
++      sigaddset (&sigmask, SIGHUP);
++#endif
++
++#if defined (SIGQUIT)
++      sigaddset (&sigmask, SIGQUIT);
++#endif
++
++#if defined (SIGTERM)
++      sigaddset (&sigmask, SIGTERM);
++#endif
++
++      // Alarm signals.
++
++#if defined (SIGALRM)
++      sigaddset (&sigmask, SIGALRM);
++#endif
++
++#if defined (SIGVTALRM)
++      sigaddset (&sigmask, SIGVTALRM);
++#endif
++
++      // I/O signals.
++
++#if defined (SIGLOST)
++      sigaddset (&sigmask, SIGLOST);
++#endif
++
++#if defined (SIGPIPE)
++      sigaddset (&sigmask, SIGPIPE);
++#endif
++
++      // Job control signals.
++
++#if defined (SIGCHLD)
++      sigaddset (&sigmask, SIGCHLD);
++#endif
++
++#if defined (SIGCLD)
++      sigaddset (&sigmask, SIGCLD);
++#endif
++
++      // Resource limit signals.
++
++#if defined (SIGXCPU)
++      sigaddset (&sigmask, SIGXCPU);
++#endif
++
++#if defined (SIGXFSZ)
++      sigaddset (&sigmask, SIGXFSZ);
++#endif
++
++      initialized = true;
++    }
++
++  return &sigmask;
++}
++
++void
++octave_block_async_signals (void)
++{
++#if ! defined (__WIN32__) || defined (__CYGWIN__)
++  pthread_sigmask (SIG_BLOCK, octave_async_signals (), 0);
++#endif
++}
++
++void
++octave_unblock_async_signals (void)
++{
++#if ! defined (__WIN32__) || defined (__CYGWIN__)
++  pthread_sigmask (SIG_UNBLOCK, octave_async_signals (), 0);
++#endif
++}
++
+ int
+ octave_raise_wrapper (int signum)
+ {
+   return raise (signum);
+ }
++
++static void *
++signal_watcher (void *arg)
++{
++  octave_sig_handler *handler = (octave_sig_handler *) arg;
++
++  octave_unblock_async_signals ();
++
++  const sigset_t *async_signals = octave_async_signals ();
++
++  while (1)
++    {
++      int sig_caught;
++
++      if (sigwait (async_signals, &sig_caught))
++        {
++          // FIXME: what else should we do?
++          abort ();
++        }
++
++      // Let handler have complete control over what to do.
++      (*handler) (sig_caught);
++    }
++}
++
++void
++octave_create_interrupt_watcher_thread (octave_sig_handler *handler)
++{
++#if ! defined (__WIN32__)
++  pthread_t sighandler_thread_id;
++
++  if (pthread_create (&sighandler_thread_id, 0, signal_watcher, handler))
++    {
++      // FIXME: what else should we do?
++      abort ();
++    }
++#else
++  octave_unblock_async_signals ();
++
++  octave_unused_parameter (handler);
++#endif
++}
++
++#if ! defined (__WIN32__)
++static void
++print_sigset (FILE *of, const char *prefix, const sigset_t *sigset)
++{
++  int sig;
++  int cnt = 0;
++
++  for (sig = 1; sig < NSIG; sig++)
++    {
++      if (sigismember (sigset, sig))
++        {
++          cnt++;
++          fprintf (of, "%ld: %s%d (%s)\n", pthread_self (), prefix, sig,
++                   strsignal (sig));
++        }
++    }
++
++  if (cnt == 0)
++    fprintf (of, "%ld: %s<empty signal set>\n", pthread_self (), prefix);
++}
++
++static int
++print_sigmask (FILE *of, const char *msg)
++{
++  sigset_t sigmask;
++
++  if (msg)
++    fprintf (of, "%s", msg);
++
++  if (pthread_sigmask (SIG_BLOCK, NULL, &sigmask) == -1)
++    return -1;
++
++  print_sigset (of, "\t\t", &sigmask);
++
++  return 0;
++}
++#endif
++
++void
++octave_show_sigmask (const char *msg)
++{
++#if ! defined (__WIN32__)
++  if (! msg)
++    msg = "signal mask\n";
++
++  print_sigmask (stderr, msg);
++#else
++  octave_unused_parameter (msg);
++
++  fputs ("no signal mask on Windows systems\n", stderr);
++#endif
++}
+diff --git a/liboctave/wrappers/signal-wrappers.h b/liboctave/wrappers/signal-wrappers.h
+--- a/liboctave/wrappers/signal-wrappers.h
++++ b/liboctave/wrappers/signal-wrappers.h
+@@ -38,38 +38,58 @@ typedef void octave_sig_handler (int);
+ extern int octave_kill_wrapper (pid_t pid, int signum);
+ 
+ extern char * octave_strsignal_wrapper (int signum);
+ 
+ extern bool octave_have_kill (void);
+ 
+ extern bool octave_get_sig_number (const char *signame, int *signum);
+ 
++octave_sig_handler *
++octave_set_signal_handler_internal (int sig, octave_sig_handler *handler,
++                                    bool restart_syscalls);
++
+ extern octave_sig_handler *
+ octave_set_signal_handler_by_name (const char *signame,
+                                    octave_sig_handler *handler,
+                                    bool restart_syscalls);
+ 
+-octave_sig_handler *
+-octave_set_signal_handler_internal (int sig, octave_sig_handler *handler,
+-                                    bool restart_syscalls);
++extern octave_sig_handler *
++octave_set_default_signal_handler (int sig);
++
++extern octave_sig_handler *
++octave_set_default_signal_handler_by_name (const char *signame);
+ 
+ extern int octave_num_signals (void);
+ 
+ extern void * octave_block_child (void);
+ 
+ extern void octave_unblock_child (void *context);
+ 
+ extern void octave_block_interrupt_signal (void);
+ 
+ extern void octave_unblock_interrupt_signal (void);
+ 
++extern void octave_block_signal_by_name (const char *signame);
++
++extern void octave_unblock_signal_by_name (const char *signame);
++
+ extern void octave_save_signal_mask (void);
+ 
+ extern void octave_restore_signal_mask (void);
+ 
++extern void octave_block_async_signals (void);
++
++extern void octave_unblock_async_signals (void);
++
+ extern int octave_raise_wrapper (int signum);
+ 
++extern void
++octave_create_interrupt_watcher_thread (octave_sig_handler *handler);
++
++// This can be useful for debugging.
++extern void octave_show_sigmask (const char *);
++
+ #if defined __cplusplus
+ }
+ #endif
+ 
+ #endif
+diff --git a/src/main-cli.cc b/src/main-cli.cc
+--- a/src/main-cli.cc
++++ b/src/main-cli.cc
+@@ -29,16 +29,17 @@ along with Octave; see the file COPYING.
+ #include <iostream>
+ #include <string>
+ 
+ #include "liboctave-build-info.h"
+ 
+ #include "liboctinterp-build-info.h"
+ 
+ #include "oct-env.h"
++#include "signal-wrappers.h"
+ 
+ #include "defaults.h"
+ #include "octave.h"
+ #include "octave-build-info.h"
+ #include "sysdep.h"
+ 
+ static void
+ check_hg_versions (void)
+@@ -78,14 +79,16 @@ check_hg_versions (void)
+     exit (1);
+ }
+ 
+ int
+ main (int argc, char **argv)
+ {
+   check_hg_versions ();
+ 
++  octave_block_async_signals ();
++
+   octave::sys::env::set_program_name (argv[0]);
+ 
+   octave::cli_application app (argc, argv);
+ 
+   return app.execute ();
+ }
+diff --git a/src/main.in.cc b/src/main.in.cc
+--- a/src/main.in.cc
++++ b/src/main.in.cc
+@@ -87,16 +87,20 @@ gui_driver_set_signal_handler (const cha
+                                octave_sig_handler *handler)
+ {
+   octave_set_signal_handler_by_name (signame, handler, false);
+ }
+ 
+ static void
+ install_signal_handlers (void)
+ {
++  // FIXME: do we need to handle and forward all the signals that Octave
++  // handles, or is it sufficient to only forward things like SIGINT,
++  // SIGBREAK, SIGABRT, SIGQUIT, and possibly a few others?
++
+   gui_driver_set_signal_handler ("SIGINT", gui_driver_sig_handler);
+   gui_driver_set_signal_handler ("SIGBREAK", gui_driver_sig_handler);
+   gui_driver_set_signal_handler ("SIGABRT", gui_driver_sig_handler);
+   gui_driver_set_signal_handler ("SIGALRM", gui_driver_sig_handler);
+   gui_driver_set_signal_handler ("SIGBUS", gui_driver_sig_handler);
+ 
+   // SIGCHLD
+   // SIGCLD
+@@ -324,32 +328,40 @@ main (int argc, char **argv)
+     }
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+   file += ".exe";
+ #endif
+ 
+   new_argv[0] = strsave (file.c_str ());
+ 
++  // The Octave interpreter may be multithreaded.  If so, we attempt to
++  // ensure that signals are delivered to the main interpreter thread
++  // and no others by blocking signals before we exec the Octave
++  // interpreter executable.  When that process starts, it will unblock
++  // signals in the main interpreter thread.  When running the GUI as a
++  // subprocess, we also unblock signals that the parent process handles
++  // so we can forward them to the child.
++
++  octave_block_async_signals ();
++
+ #if defined (HAVE_OCTAVE_QT_GUI) && ! defined (OCTAVE_USE_WINDOWS_API)
+ 
+   if (gui_libs && start_gui)
+     {
+       // Fork and exec when starting the GUI so that we will call
+       // setsid to give up the controlling terminal (if any) and so that
+       // the GUI process will be in a separate process group.
+       //
+       // The GUI process must be in a separate process group so that we
+       // can send an interrupt signal to all child processes when
+       // interrupting the interpreter.  See also bug #49609 and the
+       // function pthread_thread_manager::interrupt in the file
+       // libgui/src/thread-manager.cc.
+ 
+-      install_signal_handlers ();
+-
+       gui_pid = octave_fork_wrapper ();
+ 
+       if (gui_pid < 0)
+         {
+           std::cerr << "octave: fork failed!" << std::endl;
+ 
+           retval = 1;
+         }
+@@ -365,16 +377,20 @@ main (int argc, char **argv)
+             }
+           else
+             retval = octave_exec (file, new_argv);
+         }
+       else
+         {
+           // Parent.  Forward signals to child while waiting for it to exit.
+ 
++          install_signal_handlers ();
++
++          octave_unblock_async_signals ();
++
+           int status;
+ 
+           while (true)
+             {
+               octave_waitpid_wrapper (gui_pid, &status, 0);
+ 
+               if (caught_signal > 0)
+                 {

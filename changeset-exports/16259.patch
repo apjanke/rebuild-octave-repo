@@ -1,0 +1,1350 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1363025919 14400
+#      Mon Mar 11 14:18:39 2013 -0400
+# Node ID 0b5ab09dfce46f625fc3e639b3ea596941f3b0a8
+# Parent  db7f07b22b9b8174045ef3e9802e446077aaaa8b
+2/10 commits reworking the lexer
+
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -58,33 +58,16 @@ private:
+ 
+ // For communication between the lexer and parser.
+ 
+ class
+ lexical_feedback
+ {
+ public:
+ 
+-  // Did eat_whitespace or eat_continuation eat a space or tab, or a
+-  // newline, or both?
+-  //
+-  // Functions that return this type will return a logical OR of the
+-  // following values:
+-  //
+-  //  NO_WHITESPACE  no spaces to eat
+-  //  SPACE_OR_TAB   space or tab in input
+-  //  NEWLINE        bare new line in input
+-
+-  enum whitespace_type
+-    {
+-      NO_WHITESPACE = 1,
+-      SPACE_OR_TAB = 2,
+-      NEWLINE = 4
+-    };
+-
+   // Track nesting of square brackets, curly braces, and parentheses.
+ 
+   class bbp_nesting_level
+   {
+   private:
+ 
+     enum bracket_type
+       {
+@@ -239,18 +222,17 @@ public:
+     // No copying!
+ 
+     token_cache (const token_cache&);
+ 
+     token_cache& operator = (const token_cache&);
+   };
+   
+   lexical_feedback (void)
+-    : end_of_input (false), convert_spaces_to_comma (true),
+-      do_comma_insert (false), at_beginning_of_statement (true),
++    : end_of_input (false), at_beginning_of_statement (true),
+       looking_at_anon_fcn_args (false), looking_at_return_list (false),
+       looking_at_parameter_list (false), looking_at_decl_list (false),
+       looking_at_initializer_expression (false),
+       looking_at_matrix_or_assign_lhs (false),
+       looking_for_object_index (false), 
+       looking_at_indirect_ref (false), parsing_class_method (false),
+       maybe_classdef_get_set_method (false), parsing_classdef (false),
+       quote_is_transpose (false), force_script (false),
+@@ -284,23 +266,16 @@ public:
+ 
+   bool previous_token_is_binop (void) const;
+ 
+   bool previous_token_may_be_command (void) const;
+ 
+   // true means that we have encountered eof on the input stream.
+   bool end_of_input;
+ 
+-  // true means that we should convert spaces to a comma inside a
+-  // matrix definition.
+-  bool convert_spaces_to_comma;
+-
+-  // gag.  stupid kludge so that [[1,2][3,4]] will work.
+-  bool do_comma_insert;
+-
+   // true means we are at the beginning of a statement, where a
+   // command name is possible.
+   bool at_beginning_of_statement;
+ 
+   // true means we are parsing an anonymous function argument list.
+   bool looking_at_anon_fcn_args;
+ 
+   // true means we're parsing the return list for a function.
+@@ -494,66 +469,44 @@ public:
+   int read (char *buf, unsigned int max_size);
+ 
+   int handle_end_of_input (void);
+ 
+   char *flex_yytext (void);
+ 
+   int flex_yyleng (void);
+ 
+-  void do_comma_insert_check (void);
+-
+   int text_yyinput (void);
+ 
+   void xunput (char c, char *buf);
+ 
+   void xunput (char c);
+ 
+-  void fixup_column_count (char *s);
+-
+   bool inside_any_object_index (void);
+ 
+   int is_keyword_token (const std::string& s);
+ 
+   bool is_variable (const std::string& name);
+ 
+-  bool next_token_is_sep_op (void);
+-
+-  bool next_token_is_postfix_unary_op (bool spc_prev);
+-
+-  bool next_token_is_bin_op (bool spc_prev);
+-
+-  void scan_for_comments (const char *text);
+-
+-  int eat_whitespace (void);
+-
+   bool whitespace_is_significant (void);
+ 
+   void handle_number (void);
+ 
+   void handle_continuation (void);
+ 
+   void finish_comment (octave_comment_elt::comment_type typ,
+                        bool looking_at_continuation = false);
+ 
+   bool have_continuation (bool trailing_comments_ok = true);
+ 
+   bool have_ellipsis_continuation (bool trailing_comments_ok = true);
+ 
+-  int eat_continuation (void);
+-
+   int handle_string (char delim);
+ 
+-  bool next_token_is_assign_op (void);
+-
+-  bool next_token_is_index_op (void);
+-
+-  int handle_close_bracket (bool spc_gobbled, int bracket_type);
+-
+-  void maybe_unput_comma (int spc_gobbled);
++  int handle_close_bracket (int bracket_type);
+ 
+   bool next_token_can_follow_bin_op (void);
+ 
+   bool looks_like_command_arg (void);
+ 
+   int handle_superclass_identifier (void);
+ 
+   int handle_meta_identifier (void);
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -189,18 +189,16 @@ ANY_INCLUDING_NL (.|{NL})
+ %}
+ 
+ <COMMAND_START>{NL} {
+     curr_lexer->lexer_debug ("<COMMAND_START>{NL}");
+ 
+     curr_lexer->input_line_number++;
+     curr_lexer->current_input_column = 1;
+ 
+-    curr_lexer->quote_is_transpose = false;
+-    curr_lexer->convert_spaces_to_comma = true;
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = true;
+ 
+     curr_lexer->pop_start_state ();
+ 
+     return curr_lexer->count_token ('\n');
+   }
+ 
+@@ -273,65 +271,51 @@ ANY_INCLUDING_NL (.|{NL})
+ // after seeing a ']' character...
+ 
+ // FIXME -- we need to handle block comments here.
+ %}
+ 
+ <MATRIX_START>\] {
+     curr_lexer->lexer_debug ("<MATRIX_START>\\]");
+ 
+-    curr_lexer->scan_for_comments (yytext);
+-    curr_lexer->fixup_column_count (yytext);
+-
+     curr_lexer->looking_at_object_index.pop_front ();
+ 
+     curr_lexer->looking_for_object_index = true;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+-    int c = yytext[yyleng-1];
+-    bool cont_is_spc = (curr_lexer->eat_continuation () != octave_lexer::NO_WHITESPACE);
+-    bool spc_gobbled = (cont_is_spc || c == ' ' || c == '\t');
+-    int tok_to_return = curr_lexer->handle_close_bracket (spc_gobbled, ']');
++    int tok_to_return = curr_lexer->handle_close_bracket (']');
+ 
+     return curr_lexer->count_token (']');
+   }
+ 
+ %{
+ // FIXME -- we need to handle block comments here.
+ %}
+ 
+ <MATRIX_START>\} {
+     curr_lexer->lexer_debug ("<MATRIX_START>\\}*");
+ 
+-    curr_lexer->scan_for_comments (yytext);
+-    curr_lexer->fixup_column_count (yytext);
+-
+     curr_lexer->looking_at_object_index.pop_front ();
+ 
+     curr_lexer->looking_for_object_index = true;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+-    int c = yytext[yyleng-1];
+-    bool cont_is_spc = (curr_lexer->eat_continuation () != octave_lexer::NO_WHITESPACE);
+-    bool spc_gobbled = (cont_is_spc || c == ' ' || c == '\t');
+-    int tok_to_return = curr_lexer->handle_close_bracket (spc_gobbled, '}');
++    int tok_to_return = curr_lexer->handle_close_bracket ('}');
+ 
+     return curr_lexer->count_token ('}');
+   }
+ 
+ \[ {
+     curr_lexer->lexer_debug ("\\[");
+ 
+     curr_lexer->nesting_level.bracket ();
+ 
+     curr_lexer->looking_at_object_index.push_front (false);
+ 
+     curr_lexer->current_input_column += yyleng;
+-    curr_lexer->quote_is_transpose = false;
+-    curr_lexer->convert_spaces_to_comma = true;
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+     if (curr_lexer->defining_func
+         && ! curr_lexer->parsed_function_name.top ())
+       curr_lexer->looking_at_return_list = true;
+     else
+       curr_lexer->looking_at_matrix_or_assign_lhs = true;
+@@ -569,26 +553,28 @@ ANY_INCLUDING_NL (.|{NL})
+ // End of file.
+ %}
+ 
+ <<EOF>> {
+    return curr_lexer->handle_end_of_input ();
+   }
+ 
+ %{
+-// Identifiers.  Truncate the token at the first space or tab but
+-// don't write directly on yytext.
++// Identifiers.
+ %}
+ 
+ {IDENT} {
+     curr_lexer->lexer_debug ("{IDENT}");
+ 
++    int tok = curr_lexer->previous_token_value ();
++
+     if (curr_lexer->whitespace_is_significant ()
+         && curr_lexer->space_follows_previous_token ()
+-        && ! curr_lexer->previous_token_is_binop ())
++        && ! (tok == '[' || tok == '{'
++              || curr_lexer->previous_token_is_binop ()))
+       {
+         yyless (0);
+         unput (',');
+       }
+     else
+       {
+         if (curr_lexer->previous_token_may_be_command ())
+           {
+@@ -645,18 +631,16 @@ ANY_INCLUDING_NL (.|{NL})
+ // Function handles and superclass references
+ %}
+ 
+ "@" {
+     curr_lexer->lexer_debug ("@");
+ 
+     curr_lexer->current_input_column++;
+ 
+-    curr_lexer->quote_is_transpose = false;
+-    curr_lexer->convert_spaces_to_comma = false;
+     curr_lexer->looking_at_function_handle++;
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+     return curr_lexer->count_token ('@');
+ 
+   }
+ 
+@@ -667,19 +651,16 @@ ANY_INCLUDING_NL (.|{NL})
+ %}
+ 
+ {NL} {
+     curr_lexer->lexer_debug ("{NL}");
+ 
+     curr_lexer->input_line_number++;
+     curr_lexer->current_input_column = 1;
+ 
+-    curr_lexer->quote_is_transpose = false;
+-    curr_lexer->convert_spaces_to_comma = true;
+-
+     if (curr_lexer->nesting_level.none ())
+       {
+         curr_lexer->at_beginning_of_statement = true;
+         return curr_lexer->count_token ('\n');
+       }
+     else if (curr_lexer->nesting_level.is_paren ())
+       {
+         curr_lexer->at_beginning_of_statement = false;
+@@ -794,29 +775,26 @@ ANY_INCLUDING_NL (.|{NL})
+ ";"     { return curr_lexer->handle_op (";", ';', true, true); }
+ 
+ "," {
+     return curr_lexer->handle_op
+       (",", ',', true, ! curr_lexer->looking_at_object_index.front ());
+   }
+ 
+ ".'" {
+-    curr_lexer->do_comma_insert_check ();
+     return curr_lexer->handle_op (".'", TRANSPOSE, true, false);
+   }
+ 
+ "++" {
+-    curr_lexer->do_comma_insert_check ();
+     return curr_lexer->handle_incompatible_op
+       ("++", PLUS_PLUS, true, false, true);
+   }
+ 
+ "--" {
+     ;
+-    curr_lexer->do_comma_insert_check ();
+     return curr_lexer->handle_incompatible_op
+       ("--", MINUS_MINUS, true, false, true);
+   }
+ 
+ "(" {
+     curr_lexer->lexer_debug ("(");
+ 
+     // If we are looking for an object index, then push TRUE for
+@@ -840,28 +818,22 @@ ANY_INCLUDING_NL (.|{NL})
+ ")" {
+     curr_lexer->lexer_debug (")");
+ 
+     curr_lexer->nesting_level.remove ();
+     curr_lexer->current_input_column++;
+ 
+     curr_lexer->looking_at_object_index.pop_front ();
+ 
+-    curr_lexer->quote_is_transpose = true;
+-    curr_lexer->convert_spaces_to_comma
+-      = (curr_lexer->nesting_level.is_bracket_or_brace ()
+-         && ! curr_lexer->looking_at_anon_fcn_args);
+     curr_lexer->looking_for_object_index = true;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+     if (curr_lexer->looking_at_anon_fcn_args)
+       curr_lexer->looking_at_anon_fcn_args = false;
+ 
+-    curr_lexer->do_comma_insert_check ();
+-
+     return curr_lexer->count_token (')');
+   }
+ 
+ "." {
+     curr_lexer->lexer_debug (".");
+ 
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = false;
+@@ -1105,23 +1077,20 @@ ANY_INCLUDING_NL (.|{NL})
+     curr_lexer->lexer_debug ("{");
+ 
+     curr_lexer->nesting_level.brace ();
+ 
+     curr_lexer->looking_at_object_index.push_front
+       (curr_lexer->looking_for_object_index);
+ 
+     curr_lexer->current_input_column += yyleng;
+-    curr_lexer->quote_is_transpose = false;
+-    curr_lexer->convert_spaces_to_comma = true;
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = false;
+ 
+     curr_lexer->decrement_promptflag ();
+-    curr_lexer->eat_whitespace ();
+ 
+     curr_lexer->braceflag++;
+ 
+     curr_lexer->push_start_state (MATRIX_START);
+ 
+     return curr_lexer->count_token ('{');
+   }
+ 
+@@ -1501,31 +1470,28 @@ lexical_feedback::init (void)
+   // index.
+   looking_at_object_index.push_front (false);
+ }
+ 
+ void
+ lexical_feedback::reset (void)
+ {
+   end_of_input = false;
+-  convert_spaces_to_comma = true;
+-  do_comma_insert = false;
+   at_beginning_of_statement = true;
+   looking_at_anon_fcn_args = false;
+   looking_at_return_list = false;
+   looking_at_parameter_list = false;
+   looking_at_decl_list = false;
+   looking_at_initializer_expression = false;
+   looking_at_matrix_or_assign_lhs = false;
+   looking_for_object_index = false; 
+   looking_at_indirect_ref = false;
+   parsing_class_method = false;
+   maybe_classdef_get_set_method = false;
+   parsing_classdef = false;
+-  quote_is_transpose = false;
+   force_script = false;
+   reading_fcn_file = false;
+   reading_script_file = false;
+   reading_classdef_file = false;
+   input_line_number = 1;
+   current_input_column = 1;
+   bracketflag = 0;
+   braceflag = 0;
+@@ -1779,37 +1745,16 @@ octave_lexer::flex_yytext (void)
+ }
+ 
+ int
+ octave_lexer::flex_yyleng (void)
+ {
+   return yyget_leng (scanner);
+ }
+ 
+-// GAG.
+-//
+-// If we're reading a matrix and the next character is '[', make sure
+-// that we insert a comma ahead of it.
+-
+-void
+-octave_lexer::do_comma_insert_check (void)
+-{
+-  bool spc_gobbled = (eat_continuation () != octave_lexer::NO_WHITESPACE);
+-
+-  int c = text_yyinput ();
+-
+-  xunput (c);
+-
+-  if (spc_gobbled)
+-    xunput (' ');
+-
+-  do_comma_insert = (! looking_at_object_index.front ()
+-                     && bracketflag && c == '[');
+-}
+-
+ int
+ octave_lexer::text_yyinput (void)
+ {
+   int c = yyinput (scanner);
+ 
+   if (lexer_debug_flag)
+     {
+       std::cerr << "I: ";
+@@ -1865,35 +1810,16 @@ octave_lexer::xunput (char c, char *buf)
+ void
+ octave_lexer::xunput (char c)
+ {
+   char *yytxt = flex_yytext ();
+ 
+   xunput (c, yytxt);
+ }
+ 
+-// If we read some newlines, we need figure out what column we're
+-// really looking at.
+-
+-void
+-octave_lexer::fixup_column_count (char *s)
+-{
+-  char c;
+-  while ((c = *s++) != '\0')
+-    {
+-      if (c == '\n')
+-        {
+-          input_line_number++;
+-          current_input_column = 1;
+-        }
+-      else
+-        current_input_column++;
+-    }
+-}
+-
+ bool
+ octave_lexer::inside_any_object_index (void)
+ {
+   bool retval = false;
+ 
+   for (std::list<bool>::const_iterator i = looking_at_object_index.begin ();
+        i != looking_at_object_index.end (); i++)
+     {
+@@ -2142,352 +2068,16 @@ octave_lexer::is_keyword_token (const st
+ bool
+ octave_lexer::is_variable (const std::string& name)
+ {
+   return (symbol_table::is_variable (name)
+           || (pending_local_variables.find (name)
+               != pending_local_variables.end ()));
+ }
+ 
+-// Recognize separators.  If the separator is a CRLF pair, it is
+-// replaced by a single LF.
+-
+-bool
+-octave_lexer::next_token_is_sep_op (void)
+-{
+-  bool retval = false;
+-
+-  int c = text_yyinput ();
+-
+-  retval = match_any (c, ",;\n]");
+-
+-  xunput (c);
+-
+-  return retval;
+-}
+-
+-// Try to determine if the next token should be treated as a postfix
+-// unary operator.  This is ugly, but it seems to do the right thing.
+-
+-bool
+-octave_lexer::next_token_is_postfix_unary_op (bool spc_prev)
+-{
+-  bool un_op = false;
+-
+-  int c0 = text_yyinput ();
+-
+-  if (c0 == '\'' && ! spc_prev)
+-    {
+-      un_op = true;
+-    }
+-  else if (c0 == '.')
+-    {
+-      int c1 = text_yyinput ();
+-      un_op = (c1 == '\'');
+-      xunput (c1);
+-    }
+-  else if (c0 == '+')
+-    {
+-      int c1 = text_yyinput ();
+-      un_op = (c1 == '+');
+-      xunput (c1);
+-    }
+-  else if (c0 == '-')
+-    {
+-      int c1 = text_yyinput ();
+-      un_op = (c1 == '-');
+-      xunput (c1);
+-    }
+-
+-  xunput (c0);
+-
+-  return un_op;
+-}
+-
+-// Try to determine if the next token should be treated as a binary
+-// operator.
+-//
+-// This kluge exists because whitespace is not always ignored inside
+-// the square brackets that are used to create matrix objects (though
+-// spacing only really matters in the cases that can be interpreted
+-// either as binary ops or prefix unary ops: currently just +, -).
+-//
+-// Note that a line continuation directly following a + or - operator
+-// (e.g., the characters '[' 'a' ' ' '+' '\' LFD 'b' ']') will be
+-// parsed as a binary operator.
+-
+-bool
+-octave_lexer::next_token_is_bin_op (bool spc_prev)
+-{
+-  bool bin_op = false;
+-
+-  int c0 = text_yyinput ();
+-
+-  switch (c0)
+-    {
+-    case '+':
+-    case '-':
+-      {
+-        int c1 = text_yyinput ();
+-
+-        switch (c1)
+-          {
+-          case '+':
+-          case '-':
+-            // Unary ops, spacing doesn't matter.
+-            break;
+-
+-          case '=':
+-            // Binary ops, spacing doesn't matter.
+-            bin_op = true;
+-            break;
+-
+-          default:
+-            // Could be either, spacing matters.
+-            bin_op = looks_like_bin_op (spc_prev, c1);
+-            break;
+-          }
+-
+-        xunput (c1);
+-      }
+-      break;
+-
+-    case ':':
+-    case '/':
+-    case '\\':
+-    case '^':
+-      // Always a binary op (may also include /=, \=, and ^=).
+-      bin_op = true;
+-      break;
+-
+-    // .+ .- ./ .\ .^ .* .**
+-    case '.':
+-      {
+-        int c1 = text_yyinput ();
+-
+-        if (match_any (c1, "+-/\\^*"))
+-          // Always a binary op (may also include .+=, .-=, ./=, ...).
+-          bin_op = true;
+-        else if (! isdigit (c1) && c1 != ' ' && c1 != '\t' && c1 != '.')
+-          // A structure element reference is a binary op.
+-          bin_op = true;
+-
+-        xunput (c1);
+-      }
+-      break;
+-
+-    // = == & && | || * **
+-    case '=':
+-    case '&':
+-    case '|':
+-    case '*':
+-      // Always a binary op (may also include ==, &&, ||, **).
+-      bin_op = true;
+-      break;
+-
+-    // < <= <> > >=
+-    case '<':
+-    case '>':
+-      // Always a binary op (may also include <=, <>, >=).
+-      bin_op = true;
+-      break;
+-
+-    // ~= !=
+-    case '~':
+-    case '!':
+-      {
+-        int c1 = text_yyinput ();
+-
+-        // ~ and ! can be unary ops, so require following =.
+-        if (c1 == '=')
+-          bin_op = true;
+-
+-        xunput (c1);
+-      }
+-      break;
+-
+-    default:
+-      break;
+-    }
+-
+-  xunput (c0);
+-
+-  return bin_op;
+-}
+-
+-// FIXME -- we need to handle block comments here.
+-
+-void
+-octave_lexer::scan_for_comments (const char *text)
+-{
+-  std::string comment_buf;
+-
+-  bool in_comment = false;
+-  bool beginning_of_comment = false;
+-
+-  int len = strlen (text);
+-  int i = 0;
+-
+-  while (i < len)
+-    {
+-      char c = text[i++];
+-
+-      switch (c)
+-        {
+-        case '%':
+-        case '#':
+-          if (in_comment)
+-            {
+-              if (! beginning_of_comment)
+-                comment_buf += static_cast<char> (c);
+-            }
+-          else
+-            {
+-              maybe_gripe_matlab_incompatible_comment (c);
+-              in_comment = true;
+-              beginning_of_comment = true;
+-            }
+-          break;
+-
+-        case '\n':
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              octave_comment_buffer::append (comment_buf);
+-              comment_buf.resize (0);
+-              in_comment = false;
+-              beginning_of_comment = false;
+-            }
+-          break;
+-
+-        default:
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              beginning_of_comment = false;
+-            }
+-          break;
+-        }
+-    }
+-
+-  if (! comment_buf.empty ())
+-    octave_comment_buffer::append (comment_buf);
+-}
+-
+-// Discard whitespace, including comments and continuations.
+-
+-// FIXME -- we need to handle block comments here.
+-
+-int
+-octave_lexer::eat_whitespace (void)
+-{
+-  int retval = octave_lexer::NO_WHITESPACE;
+-
+-  std::string comment_buf;
+-
+-  bool in_comment = false;
+-  bool beginning_of_comment = false;
+-
+-  int c = 0;
+-
+-  while ((c = text_yyinput ()) != EOF)
+-    {
+-      current_input_column++;
+-
+-      switch (c)
+-        {
+-        case ' ':
+-        case '\t':
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              beginning_of_comment = false;
+-            }
+-          retval |= octave_lexer::SPACE_OR_TAB;
+-          break;
+-
+-        case '\n':
+-          retval |= octave_lexer::NEWLINE;
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              octave_comment_buffer::append (comment_buf);
+-              comment_buf.resize (0);
+-              in_comment = false;
+-              beginning_of_comment = false;
+-            }
+-          current_input_column = 0;
+-          break;
+-
+-        case '#':
+-        case '%':
+-          if (in_comment)
+-            {
+-              if (! beginning_of_comment)
+-                comment_buf += static_cast<char> (c);
+-            }
+-          else
+-            {
+-              maybe_gripe_matlab_incompatible_comment (c);
+-              in_comment = true;
+-              beginning_of_comment = true;
+-            }
+-          break;
+-
+-        case '.':
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              beginning_of_comment = false;
+-              break;
+-            }
+-          else
+-            {
+-              if (have_ellipsis_continuation ())
+-                break;
+-              else
+-                goto done;
+-            }
+-
+-        case '\\':
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              beginning_of_comment = false;
+-              break;
+-            }
+-          else
+-            {
+-              if (have_continuation ())
+-                break;
+-              else
+-                goto done;
+-            }
+-
+-        default:
+-          if (in_comment)
+-            {
+-              comment_buf += static_cast<char> (c);
+-              beginning_of_comment = false;
+-              break;
+-            }
+-          else
+-            goto done;
+-        }
+-    }
+-
+-  if (! comment_buf.empty ())
+-    octave_comment_buffer::append (comment_buf);
+-
+- done:
+-  xunput (c);
+-  current_input_column--;
+-  return retval;
+-}
+-
+ bool
+ octave_lexer::whitespace_is_significant (void)
+ {
+   return (nesting_level.is_bracket ()
+           || (nesting_level.is_brace ()
+               && ! looking_at_object_index.front ()));
+ }
+ 
+@@ -2526,27 +2116,23 @@ octave_lexer::handle_number (void)
+ 
+       delete [] tmp;
+     }
+ 
+   // If yytext doesn't contain a valid number, we are in deep doo doo.
+ 
+   assert (nread == 1);
+ 
+-  quote_is_transpose = true;
+-  convert_spaces_to_comma = true;
+   looking_for_object_index = false;
+   at_beginning_of_statement = false;
+ 
+   push_token (new token (NUM, value, yytxt, input_line_number,
+                          current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+-
+-  do_comma_insert_check ();
+ }
+ 
+ void
+ octave_lexer::handle_continuation (void)
+ {
+   char *yytxt = flex_yytext ();
+   int yylng = flex_yyleng ();
+ 
+@@ -2609,18 +2195,16 @@ octave_lexer::finish_comment (octave_com
+ 
+   if (copyright)
+     typ = octave_comment_elt::copyright;
+ 
+   octave_comment_buffer::append (comment_text, typ);
+ 
+   comment_text = "";
+ 
+-  quote_is_transpose = false;
+-  convert_spaces_to_comma = true;
+   at_beginning_of_statement = true;
+ 
+   if (! looking_at_continuation)
+     xunput ('\n');
+ }
+ 
+ // We have seen a backslash and need to find out if it should be
+ // treated as a continuation character.  If so, this eats it, up to
+@@ -2737,35 +2321,16 @@ octave_lexer::have_ellipsis_continuation
+         }
+     }
+   else
+     xunput (c1);
+ 
+   return false;
+ }
+ 
+-// See if we have a continuation line.  If so, eat it and the leading
+-// whitespace on the next line.
+-
+-int
+-octave_lexer::eat_continuation (void)
+-{
+-  int retval = octave_lexer::NO_WHITESPACE;
+-
+-  int c = text_yyinput ();
+-
+-  if ((c == '.' && have_ellipsis_continuation ())
+-      || (c == '\\' && have_continuation ()))
+-    retval = eat_whitespace ();
+-  else
+-    xunput (c);
+-
+-  return retval;
+-}
+-
+ int
+ octave_lexer::handle_string (char delim)
+ {
+   std::ostringstream buf;
+ 
+   int bos_line = input_line_number;
+   int bos_col = current_input_column;
+ 
+@@ -2821,19 +2386,16 @@ octave_lexer::handle_string (char delim)
+                   std::string s;
+                   xunput (c);
+ 
+                   if (delim == '\'')
+                     s = buf.str ();
+                   else
+                     s = do_string_escapes (buf.str ());
+ 
+-                  quote_is_transpose = true;
+-                  convert_spaces_to_comma = true;
+-
+                   if (delim == '"')
+                     gripe_matlab_incompatible ("\" used as string delimiter");
+                   else if (delim == '\'')
+                     gripe_single_quote_string ();
+ 
+                   looking_for_object_index = true;
+                   at_beginning_of_statement = false;
+ 
+@@ -2851,110 +2413,18 @@ octave_lexer::handle_string (char delim)
+         }
+ 
+       escape_pending = 0;
+     }
+ 
+   return LEXICAL_ERROR;
+ }
+ 
+-bool
+-octave_lexer::next_token_is_assign_op (void)
+-{
+-  bool retval = false;
+-
+-  int c0 = text_yyinput ();
+-
+-  switch (c0)
+-    {
+-    case '=':
+-      {
+-        int c1 = text_yyinput ();
+-        xunput (c1);
+-        if (c1 != '=')
+-          retval = true;
+-      }
+-      break;
+-
+-    case '+':
+-    case '-':
+-    case '*':
+-    case '/':
+-    case '\\':
+-    case '&':
+-    case '|':
+-      {
+-        int c1 = text_yyinput ();
+-        xunput (c1);
+-        if (c1 == '=')
+-          retval = true;
+-      }
+-      break;
+-
+-    case '.':
+-      {
+-        int c1 = text_yyinput ();
+-        if (match_any (c1, "+-*/\\"))
+-          {
+-            int c2 = text_yyinput ();
+-            xunput (c2);
+-            if (c2 == '=')
+-              retval = true;
+-          }
+-        xunput (c1);
+-      }
+-      break;
+-
+-    case '>':
+-      {
+-        int c1 = text_yyinput ();
+-        if (c1 == '>')
+-          {
+-            int c2 = text_yyinput ();
+-            xunput (c2);
+-            if (c2 == '=')
+-              retval = true;
+-          }
+-        xunput (c1);
+-      }
+-      break;
+-
+-    case '<':
+-      {
+-        int c1 = text_yyinput ();
+-        if (c1 == '<')
+-          {
+-            int c2 = text_yyinput ();
+-            xunput (c2);
+-            if (c2 == '=')
+-              retval = true;
+-          }
+-        xunput (c1);
+-      }
+-      break;
+-
+-    default:
+-      break;
+-    }
+-
+-  xunput (c0);
+-
+-  return retval;
+-}
+-
+-bool
+-octave_lexer::next_token_is_index_op (void)
+-{
+-  int c = text_yyinput ();
+-  xunput (c);
+-  return c == '(' || c == '{';
+-}
+-
+ int
+-octave_lexer::handle_close_bracket (bool spc_gobbled, int bracket_type)
++octave_lexer::handle_close_bracket (int bracket_type)
+ {
+   int retval = bracket_type;
+ 
+   if (! nesting_level.none ())
+     {
+       nesting_level.remove ();
+ 
+       if (bracket_type == ']')
+@@ -2962,61 +2432,19 @@ octave_lexer::handle_close_bracket (bool
+       else if (bracket_type == '}')
+         braceflag--;
+       else
+         panic_impossible ();
+     }
+ 
+   pop_start_state ();
+ 
+-  quote_is_transpose = true;
+-  convert_spaces_to_comma = true;
+-
+   return retval;
+ }
+ 
+-void
+-octave_lexer::maybe_unput_comma (int spc_gobbled)
+-{
+-  if (nesting_level.is_bracket ()
+-      || (nesting_level.is_brace ()
+-          && ! looking_at_object_index.front ()))
+-    {
+-      int bin_op = next_token_is_bin_op (spc_gobbled);
+-
+-      int postfix_un_op = next_token_is_postfix_unary_op (spc_gobbled);
+-
+-      int c1 = text_yyinput ();
+-      int c2 = text_yyinput ();
+-
+-      xunput (c2);
+-      xunput (c1);
+-
+-      int sep_op = next_token_is_sep_op ();
+-
+-      int dot_op = (c1 == '.'
+-                    && (isalpha (c2) || isspace (c2) || c2 == '_'));
+-
+-      if (postfix_un_op || bin_op || sep_op || dot_op)
+-        return;
+-
+-      int index_op = (c1 == '(' || c1 == '{');
+-
+-      // If there is no space before the indexing op, we don't insert
+-      // a comma.
+-
+-      if (index_op && ! spc_gobbled)
+-        return;
+-
+-      maybe_warn_separator_insert (',');
+-
+-      xunput (',');
+-    }
+-}
+-
+ bool
+ octave_lexer::next_token_can_follow_bin_op (void)
+ {
+   std::stack<char> buf;
+ 
+   int c = EOF;
+ 
+   // Skip whitespace in current statement on current line
+@@ -3274,18 +2702,16 @@ octave_lexer::looks_like_command_arg (vo
+   xunput (c0);
+ 
+   return retval;
+ }
+ 
+ int
+ octave_lexer::handle_superclass_identifier (void)
+ {
+-  eat_continuation ();
+-
+   std::string pkg;
+   char *yytxt = flex_yytext ();
+   std::string meth = strip_trailing_whitespace (yytxt);
+   size_t pos = meth.find ("@");
+   std::string cls = meth.substr (pos).substr (1);
+   meth = meth.substr (0, pos - 1);
+ 
+   pos = cls.find (".");
+@@ -3304,27 +2730,24 @@ octave_lexer::handle_superclass_identifi
+     }
+ 
+   push_token (new token (SUPERCLASSREF,
+                          meth.empty () ? 0 : &(symbol_table::insert (meth)),
+                          cls.empty () ? 0 : &(symbol_table::insert (cls)),
+                          pkg.empty () ? 0 : &(symbol_table::insert (pkg)),
+                          input_line_number, current_input_column));
+ 
+-  convert_spaces_to_comma = true;
+   current_input_column += flex_yyleng ();
+ 
+   return SUPERCLASSREF;
+ }
+ 
+ int
+ octave_lexer::handle_meta_identifier (void)
+ {
+-  eat_continuation ();
+-
+   std::string pkg;
+   char *yytxt = flex_yytext ();
+   std::string cls = strip_trailing_whitespace (yytxt).substr (1);
+   size_t pos = cls.find (".");
+ 
+   if (pos != std::string::npos)
+     {
+       pkg = cls.substr (pos).substr (1);
+@@ -3338,17 +2761,16 @@ octave_lexer::handle_meta_identifier (vo
+       return LEXICAL_ERROR;
+     }
+ 
+   push_token (new token (METAQUERY,
+                          cls.empty () ? 0 : &(symbol_table::insert (cls)),
+                          pkg.empty () ? 0 : &(symbol_table::insert (pkg)),
+                          input_line_number, current_input_column));
+ 
+-  convert_spaces_to_comma = true;
+   current_input_column += flex_yyleng ();
+ 
+   return METAQUERY;
+ }
+ 
+ // Figure out exactly what kind of token to return when we have seen
+ // an identifier.  Handles keywords.  Return -1 if the identifier
+ // should be ignored.
+@@ -3366,25 +2788,19 @@ octave_lexer::handle_identifier (void)
+ 
+   // If we are expecting a structure element, avoid recognizing
+   // keywords and other special names and return STRUCT_ELT, which is
+   // a string that is also a valid identifier.  But first, we have to
+   // decide whether to insert a comma.
+ 
+   if (looking_at_indirect_ref)
+     {
+-      //      do_comma_insert_check ();
+-
+-      //      maybe_unput_comma (spc_gobbled);
+-
+       push_token (new token (STRUCT_ELT, tok, input_line_number,
+                              current_input_column));
+ 
+-      quote_is_transpose = true;
+-      convert_spaces_to_comma = true;
+       looking_for_object_index = true;
+ 
+       current_input_column += flex_yyleng ();
+ 
+       at_beginning_of_statement = false;
+ 
+       return STRUCT_ELT;
+     }
+@@ -3410,36 +2826,32 @@ octave_lexer::handle_identifier (void)
+           return LEXICAL_ERROR;
+         }
+       else
+         {
+           push_token (new token (FCN_HANDLE, tok, input_line_number,
+                                  current_input_column));
+ 
+           current_input_column += flex_yyleng ();
+-          quote_is_transpose = false;
+-          convert_spaces_to_comma = true;
+           looking_for_object_index = true;
+ 
+           at_beginning_of_statement = false;
+ 
+           return FCN_HANDLE;
+         }
+     }
+ 
+   // If we have a regular keyword, return it.
+   // Keywords can be followed by identifiers.
+ 
+   if (kw_token)
+     {
+       if (kw_token >= 0)
+         {
+           current_input_column += flex_yyleng ();
+-          quote_is_transpose = false;
+-          convert_spaces_to_comma = true;
+           looking_for_object_index = false;
+         }
+ 
+       return kw_token;
+     }
+ 
+   // See if we have a plot keyword (title, using, with, or clear).
+ 
+@@ -3860,18 +3272,16 @@ octave_lexer::handle_op_internal (const 
+   lexer_debug (pattern);
+ 
+   if (! compat)
+     gripe_matlab_incompatible_operator (flex_yytext ());
+ 
+   push_token (new token (tok, input_line_number, current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+-  quote_is_transpose = qit;
+-  convert_spaces_to_comma = convert;
+   looking_for_object_index = false;
+   at_beginning_of_statement = bos;
+ 
+   return count_token (tok);
+ }
+ 
+ int
+ octave_lexer::handle_token (const std::string& name, int tok)
+@@ -3886,18 +3296,16 @@ int
+ octave_lexer::handle_token (int tok, token *tok_val)
+ {
+   if (! tok_val)
+     tok_val = new token (tok, input_line_number, current_input_column);
+ 
+   push_token (tok_val);
+ 
+   current_input_column += flex_yyleng ();
+-  quote_is_transpose = false;
+-  convert_spaces_to_comma = true;
+ 
+   return count_token_internal (tok);
+ }
+ 
+ int
+ octave_lexer::count_token (int tok)
+ {
+   token *tok_val = new token (tok, input_line_number, current_input_column);
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -497,20 +497,17 @@ cell_or_matrix_row
+ fcn_handle      : '@' FCN_HANDLE
+                   {
+                     $$ = curr_parser.make_fcn_handle ($2);
+                     curr_lexer->looking_at_function_handle--;
+                   }
+                 ;
+ 
+ anon_fcn_handle : '@' param_list statement
+-                  {
+-                    curr_lexer->quote_is_transpose = false;
+-                    $$ = curr_parser.make_anon_fcn_handle ($2, $3);
+-                  }
++                  { $$ = curr_parser.make_anon_fcn_handle ($2, $3); }
+                 ;
+ 
+ primary_expr    : identifier
+                   { $$ = $1; }
+                 | constant
+                   { $$ = $1; }
+                 | fcn_handle
+                   { $$ = $1; }
+@@ -1028,20 +1025,17 @@ param_list_beg  : '('
+ param_list_end  : ')'
+                   {
+                     curr_lexer->looking_at_parameter_list = false;
+                     curr_lexer->looking_for_object_index = false;
+                   }
+                 ;
+ 
+ param_list      : param_list_beg param_list1 param_list_end
+-                  {
+-                    curr_lexer->quote_is_transpose = false;
+-                    $$ = $2;
+-                  }
++                  { $$ = $2; }
+                 | param_list_beg error
+                   {
+                     curr_parser.bison_error ("invalid parameter list");
+                     $$ = 0;
+                     ABORT_PARSE;
+                   }
+                 ;
+ 

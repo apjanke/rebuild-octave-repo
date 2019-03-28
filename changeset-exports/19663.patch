@@ -1,0 +1,2679 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1423246014 18000
+#      Fri Feb 06 13:06:54 2015 -0500
+# Node ID dfea01b3425f4be1866b0f3021d0c4fec9f0bed4
+# Parent  c728ae4d179067ebb19a6b8744216b02e56016e0
+more mouse interaction features for Qt plotting widget
+
+* graphics.in.h, graphics.cc (figure::properties::__mouse_mode__,
+figure::properties::__pan_mode__, figure::properties::__rotate_mode__,
+figure::properties::__zoom_mode__): New properties.
+(figure::properties::set___mouse_mode__): New function.
+(axes::properties::pan, axes::properties::rotate3d,
+axes::properties::zoom): New functions.  Handle zoom, and pan modes.
+(axes::properties::clear_zoom_stack): New arg, do_unzoom.
+Conditionally call unzoom.
+(axes::properties::unzoom): Also restore view property.
+(axes::properties::rotate_view): Conditionall save state to zoom stack.
+
+(axes::properties::push_zoom_stack): New function.
+(axes::properties::pan, axes::properties::rotate3d):
+Delete properties.
+(axes::properties::update_xlim, axes::properties::update_ylim,
+axes::properties::update_zlim): Don't clear zoom stack.  Delete
+do_clr_zoom argument.
+(axes::properties::set_pan, axes::properties::set_rotate3d): Delete.
+(F__zoom__): New function.
+* Canvas.h, Canvas.cc (Canvas::toggleAxes, Canvas::toggleGrid):
+New pure virtual functions.
+(Canvas::setCursor, Canvas::canvasToggleAxes,
+Canvas::canvasToggleGrid, Canvas::canvasMouseDoubleClickEvent,
+Canvas::canvasWheelEvent): New functions.
+(zoom_enabled, pan_enabled, pan_mode, rotate_enabled, rotate_mode):
+New static functions.
+(Canvas::canvasMouseMoveEvent): Call axes::properties::rotate3d to do
+rotation.  Handle panning.
+(Canvas::canvasMousePressEvent): Also handle "unzoom" action when in
+pan and rotate modes.
+(Canvas::canvasMouseReleaseEvent): Zoom by factor if mouse has not
+moved from mouse press event.
+* Figure.h, Figure.cc (MouseMode): New enum value, TextMode.
+(Figure::m_mouseMode, Figure::m_lastMouseMode): Delete member
+variables.
+(Figure::mouseMode, Figure::setMouseMode): Get info from and save info
+to figure properties.
+(Figure::updateFigureToolBarAndMenuBar, Figure::toggleAxes,
+Figure::toggleGrid): New functions.
+(Figure::m_mouseModeGroup): New member variable.
+(Figure::createFigureToolBarAndMenuBar): Add actions for toggling Axes
+and Grid.  Maintain pointer to MouseModeActionGroup.
+(mouse_mode_to_string, mouse_mode_from_string): New functions.
+* GLCanvas.h, GLCanvas.cc (GLCanvas::toggleAxes, GLCanvas::ToggleGrid,
+GLCanvas::mouseDoubleClickEvent, GLCanvas::wheelEvent): New functions.
+* MouseModeActionGroup.h, MouseModeActionGroup.cc
+(MouseModeActionGroup::mouseMode): Delete.
+(MouseModeActionGroup::setMode): New function.
+(MouseModeActionGroup::MouseModeActionGroup): Also include action to
+insert text in the list.
+
+* figure.m: Set default pan, rotate, and zoom mode properties for the
+figure object.
+* pan.m, rotate3d.m, zoom.m: Improve compatibility with Matlab.  Set
+mode properties for figure.
+* __init_fltk__.cc: Cope with changes to graphics properties.
+
+diff --git a/libgui/graphics/Canvas.cc b/libgui/graphics/Canvas.cc
+--- a/libgui/graphics/Canvas.cc
++++ b/libgui/graphics/Canvas.cc
+@@ -20,18 +20,21 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <QApplication>
++#include <QBitmap>
++#include <QCursor>
+ #include <QList>
+ #include <QMouseEvent>
++#include <QWheelEvent>
+ #include <QRectF>
+ 
+ #include "Backend.h"
+ #include "Canvas.h"
+ #include "ContextMenu.h"
+ #include "GLCanvas.h"
+ #include "QtHandlesUtils.h"
+ 
+@@ -46,16 +49,43 @@ void Canvas::redraw (bool sync)
+     qWidget ()->update ();
+ }
+ 
+ void Canvas::blockRedraw (bool block)
+ {
+   m_redrawBlocked = block;
+ }
+ 
++void Canvas::setCursor (MouseMode mode)
++{
++  QWidget *w = qWidget ();
++
++  if (w)
++    {
++      static QCursor origCursor = w->cursor ();
++
++      switch (mode)
++        {
++        case PanMode:
++        case RotateMode:
++          w->setCursor (Qt::OpenHandCursor);
++          break;
++
++        case ZoomMode:
++          // FIXME: distinguish zoom in/out.
++          w->setCursor (QBitmap (":/images/zoom.png"));
++          break;
++
++        default:
++          w->setCursor (origCursor);
++          break;
++        }
++    }
++}
++
+ void Canvas::updateCurrentPoint(const graphics_object& fig,
+                                 const graphics_object& obj, QMouseEvent* event)
+ {
+   gh_manager::post_set (fig.get_handle (), "currentpoint",
+                         Utils::figureCurrentPoint (fig, event), false);
+ 
+   Matrix children = obj.get_properties ().get_children ();
+   octave_idx_type num_children = children.numel ();
+@@ -81,16 +111,84 @@ void Canvas::updateCurrentPoint(const gr
+           cp(1,0) = p2(0); cp(1,1) = p2(1); cp(1,2) = p2(2);
+ 
+           gh_manager::post_set (childObj.get_handle (), "currentpoint", cp,
+                                 false);
+         }
+     }
+ }
+ 
++void Canvas::canvasToggleAxes (const graphics_handle& handle)
++{
++  gh_manager::auto_lock lock;
++
++  graphics_object go = gh_manager::get_object (handle);
++
++  if (go.valid_object ())
++    {
++      figure::properties& fp = Utils::properties<figure> (go);
++
++      graphics_handle ah = fp.get_currentaxes ();
++
++      graphics_object ax = gh_manager::get_object (ah);
++
++      if (ax.valid_object ())
++        {
++          axes::properties& ap = Utils::properties<axes> (ax);
++
++          if (ap.handlevisibility_is ("on"))
++            {
++              ap.set_visible (! ap.is_visible ());
++
++              redraw (true);
++            }
++        }
++    }
++}
++
++void Canvas::canvasToggleGrid (const graphics_handle& handle)
++{
++  gh_manager::auto_lock lock;
++
++  graphics_object go = gh_manager::get_object (handle);
++
++  if (go.valid_object ())
++    {
++      figure::properties& fp = Utils::properties<figure> (go);
++
++      graphics_handle ah = fp.get_currentaxes ();
++
++      graphics_object ax = gh_manager::get_object (ah);
++
++      if (ax.valid_object ())
++        {
++          axes::properties& ap = Utils::properties<axes> (ax);
++
++          if (ap.handlevisibility_is ("on") && ap.is_visible ())
++            {
++              std::string tmp;
++
++              // If any grid is off, then turn them all on.  If they are all
++              // on, then turn them off.
++
++              std::string state = ((ap.get_xgrid () == "off"
++                                    || ap.get_ygrid () == "off"
++                                    || ap.get_zgrid () == "off")
++                                   ? "on" : "off");
++
++              ap.set_xgrid (state);
++              ap.set_ygrid (state);
++              ap.set_zgrid (state);
++
++              redraw (true);
++            }
++        }
++    }
++}
++
+ void Canvas::canvasPaintEvent (void)
+ {
+   if (! m_redrawBlocked)
+     {
+       gh_manager::auto_lock lock;
+ 
+       draw (m_handle);
+ 
+@@ -106,70 +204,49 @@ void Canvas::canvasMouseMoveEvent (QMous
+ 
+   if (m_mouseMode != NoMode && ax.valid_object ())
+     {
+       axes::properties& ap = Utils::properties<axes> (ax);
+ 
+       switch (m_mouseMode)
+         {
+         case RotateMode:
+-            {
+-              Matrix bb = ap.get_boundingbox (true);
+-              Matrix view = ap.get_view ().matrix_value ();
++          {
++            ap.rotate3d (m_mouseCurrent.x (), event->x (),
++                         m_mouseCurrent.y (), event->y ());
+ 
+-              // Compute new view angles
+-              view(0) += ((m_mouseCurrent.x () - event->x ())
+-                          * (180.0 / bb(2)));
+-              view(1) += ((event->y () - m_mouseCurrent.y ())
+-                          * (180.0 / bb(3)));
+-
+-              // Clipping
+-              view(1) = std::min (view(1), 90.0);
+-              view(1) = std::max (view(1), -90.0);
+-              if (view(0) > 180.0)
+-                view(0) -= 360.0;
+-              else if (view(0) < -180.0)
+-                view(0) += 360.0;
++            // Update current mouse position
++            m_mouseCurrent = event->pos ();
+ 
+-              // Snapping
+-              double snapMargin = 1.0;
+-              for (int a = -90; a <= 90; a += 90)
+-                if ((a - snapMargin) < view(1)
+-                    && view(1) < (a + snapMargin))
+-                  {
+-                    view(1) = a;
+-                    break;
+-                  }
+-              for (int a = -180; a <= 180; a += 180)
+-                if ((a - snapMargin) < view(0)
+-                    && view(0) < (a + snapMargin))
+-                  {
+-                    if (a == 180)
+-                      view(0) = -180;
+-                    else
+-                      view(0) = a;
+-                    break;
+-                  }
++            // Force immediate redraw
++            redraw (true);
++          }
++          break;
+ 
+-              // Update axes properties
+-              ap.set_view (view);
+-
+-              // Update current mouse position
+-              m_mouseCurrent = event->pos ();
+-
+-              // Force immediate redraw
+-              redraw (true);
+-            }
+-          break;
+         case ZoomMode:
+-          m_mouseCurrent = event->pos();
++          m_mouseCurrent = event->pos ();
+           redraw (true);
+           break;
++
+         case PanMode:
+-          break;
++          {
++            ColumnVector p0 = ap.pixel2coord (m_mouseCurrent.x (),
++                                              m_mouseCurrent.y ());
++            ColumnVector p1 = ap.pixel2coord (event->x (),
++                                              event->y ());
++
++            ap.translate_view ("both", p0(0), p1(0), p0(1), p1(1));
++
++            // Update current mouse position
++            m_mouseCurrent = event->pos ();
++
++            // Force immediate redraw
++            redraw (true);
++          }
++
+         default:
+           break;
+         }
+     }
+   else if (m_mouseMode == NoMode)
+     {
+       graphics_object obj = gh_manager::get_object (m_handle);
+ 
+@@ -179,16 +256,149 @@ void Canvas::canvasMouseMoveEvent (QMous
+ 
+           updateCurrentPoint (figObj, obj, event);
+           gh_manager::post_callback (figObj.get_handle (),
+                                      "windowbuttonmotionfcn");
+         }
+     }
+ }
+ 
++static bool
++pan_enabled (const graphics_object figObj)
++{
++  // Getting pan mode property:
++  octave_value ov_pm
++    = Utils::properties<figure> (figObj).get___pan_mode__ ();
++
++  octave_scalar_map pm = ov_pm.scalar_map_value ();
++
++  return pm.contents ("Enable").string_value () == "on";
++}
++
++static std::string
++pan_mode (const graphics_object figObj)
++{
++  // Getting pan mode property:
++  octave_value ov_pm
++    = Utils::properties<figure> (figObj).get___pan_mode__ ();
++
++  octave_scalar_map pm = ov_pm.scalar_map_value ();
++
++  return pm.contents ("Motion").string_value ();
++}
++
++static bool
++rotate_enabled (const graphics_object figObj)
++{
++  // Getting rotate mode property:
++  octave_value ov_rm
++    = Utils::properties<figure> (figObj).get___rotate_mode__ ();
++
++  octave_scalar_map rm = ov_rm.scalar_map_value ();
++
++  return rm.contents ("Enable").string_value () == "on";
++}
++
++static bool
++zoom_enabled (const graphics_object figObj)
++{
++  // Getting zoom mode property:
++  octave_value ov_zm
++    = Utils::properties<figure> (figObj).get___zoom_mode__ ();
++
++  octave_scalar_map zm = ov_zm.scalar_map_value ();
++
++  return zm.contents ("Enable").string_value () == "on";
++}
++
++static std::string
++zoom_mode (const graphics_object figObj)
++{
++  // Getting zoom mode property:
++  octave_value ov_zm
++    = Utils::properties<figure> (figObj).get___zoom_mode__ ();
++
++  octave_scalar_map zm = ov_zm.scalar_map_value ();
++
++  return zm.contents ("Motion").string_value ();
++}
++
++static std::string
++zoom_direction (const graphics_object figObj)
++{
++  // Getting zoom mode property:
++  octave_value ov_zm
++    = Utils::properties<figure> (figObj).get___zoom_mode__ ();
++
++  octave_scalar_map zm = ov_zm.scalar_map_value ();
++
++  return zm.contents ("Direction").string_value ();
++}
++
++void Canvas::canvasMouseDoubleClickEvent (QMouseEvent* event)
++{
++  if (event->buttons () != Qt::LeftButton)
++    return;
++
++  gh_manager::auto_lock lock;
++  graphics_object obj = gh_manager::get_object (m_handle);
++
++  if (obj.valid_object ())
++    {
++      graphics_object axesObj;
++
++      Matrix children = obj.get_properties ().get_children ();
++      octave_idx_type num_children = children.numel ();
++
++      for (int i = 0; i < num_children; i++)
++	{
++	  graphics_object childObj (gh_manager::get_object (children(i)));
++
++          if (childObj.isa ("axes"))
++            {
++              graphics_object go = selectFromAxes (childObj, event->pos ());
++
++              if (go)
++                {
++                  axesObj = childObj;
++                  break;
++                }
++            }
++        }
++
++      bool redrawFigure = true;
++
++      if (axesObj)
++        {
++          graphics_object figObj (obj.get_ancestor ("figure"));
++
++          if (axesObj.get_properties ().handlevisibility_is ("on"))
++            {
++              Utils::properties<figure> (figObj)
++                .set_currentaxes (axesObj.get_handle ().as_octave_value ());
++
++              if (pan_enabled (figObj) || rotate_enabled (figObj)
++                  || zoom_enabled (figObj))
++                {
++                  axes::properties& ap =
++                    Utils::properties<axes> (axesObj);
++
++                  ap.clear_zoom_stack ();
++                  ap.set_xlimmode ("auto");
++                  ap.set_ylimmode ("auto");
++                  ap.set_zlimmode ("auto");
++                }
++            }
++
++          if (redrawFigure)
++            redraw (false);
++        }
++    }
++}
++
+ void Canvas::canvasMousePressEvent (QMouseEvent* event)
+ {
+   gh_manager::auto_lock lock;
+   graphics_object obj = gh_manager::get_object (m_handle);
+ 
+   if (obj.valid_object ())
+     {
+       graphics_object figObj (obj.get_ancestor ("figure"));
+@@ -280,30 +490,34 @@ void Canvas::canvasMousePressEvent (QMou
+           gh_manager::post_callback (figObj.get_handle (),
+                                      "windowbuttondownfcn");
+           gh_manager::post_callback (currentObj.get_handle (),
+                                      "buttondownfcn");
+           if (event->button () == Qt::RightButton)
+             ContextMenu::executeAt (currentObj.get_properties (),
+                                     event->globalPos ());
+           break;
++
++        case TextMode:
++          // Handle text insertion here.
++          break;
++
++        case PanMode:
+         case RotateMode:
+         case ZoomMode:
+-        case PanMode:
+           if (axesObj)
+             {
+               if (event->buttons () == Qt::LeftButton
+                   && event->modifiers () == Qt::NoModifier)
+                 {
+                   m_mouseAnchor = m_mouseCurrent = event->pos ();
+                   m_mouseAxes = axesObj.get_handle ();
+                   m_mouseMode = newMouseMode;
+                 }
+-              else if (newMouseMode == ZoomMode
+-                       && event->modifiers () == Qt::NoModifier)
++              else if (event->modifiers () == Qt::NoModifier)
+                 {
+                   switch (event->buttons ())
+                     {
+                     case Qt::RightButton:
+                       Utils::properties<axes> (axesObj).unzoom ();
+                       break;
+                     case Qt::MidButton:
+                         {
+@@ -324,41 +538,56 @@ void Canvas::canvasMousePressEvent (QMou
+         default:
+           break;
+         }
+     }
+ }
+ 
+ void Canvas::canvasMouseReleaseEvent (QMouseEvent* event)
+ {
+-  if (m_mouseMode == ZoomMode
+-      && m_mouseAxes.ok ()
+-      && m_mouseAnchor != event->pos ())
++  if (m_mouseMode == ZoomMode && m_mouseAxes.ok ())
+     {
+       gh_manager::auto_lock lock;
+       graphics_object ax = gh_manager::get_object (m_mouseAxes);
+ 
+       if (ax.valid_object ())
+         {
+           axes::properties& ap = Utils::properties<axes> (ax);
+ 
+-          ColumnVector p0 = ap.pixel2coord (m_mouseAnchor.x (),
+-                                            m_mouseAnchor.y ());
+-          ColumnVector p1 = ap.pixel2coord (event->x (),
+-                                            event->y ());
++          graphics_object obj = gh_manager::get_object (m_handle);
++
++          graphics_object figObj (obj.get_ancestor ("figure"));
++
++          std::string zm = zoom_mode (figObj);
++
++          if (m_mouseAnchor == event->pos ())
++            {
++              // FIXME: check direction here.
++
++              double factor = 2.0;
+ 
+-          Matrix xl (1, 2, 0.0);
+-          Matrix yl (1, 2, 0.0);
++              ap.zoom (zm, factor);
++            }
++          else
++            {
++              ColumnVector p0 = ap.pixel2coord (m_mouseAnchor.x (),
++                                                m_mouseAnchor.y ());
++              ColumnVector p1 = ap.pixel2coord (event->x (),
++                                                event->y ());
+ 
+-          xl(0) = std::min (p0(0), p1(0));
+-          xl(1) = std::max (p0(0), p1(0));
+-          yl(0) = std::min (p0(1), p1(1));
+-          yl(1) = std::max (p0(1), p1(1));
++              Matrix xl (1, 2, 0.0);
++              Matrix yl (1, 2, 0.0);
+ 
+-          ap.zoom (xl, yl);
++              xl(0) = std::min (p0(0), p1(0));
++              xl(1) = std::max (p0(0), p1(0));
++              yl(0) = std::min (p0(1), p1(1));
++              yl(1) = std::max (p0(1), p1(1));
++
++              ap.zoom (zm, xl, yl);
++            }
+ 
+           redraw (false);
+         }
+     }
+   else if (m_mouseMode == NoMode)
+     {
+       gh_manager::auto_lock lock;
+       graphics_object obj = gh_manager::get_object (m_handle);
+@@ -372,16 +601,121 @@ void Canvas::canvasMouseReleaseEvent (QM
+                                      "windowbuttonupfcn");
+         }
+     }
+ 
+   m_mouseAxes = graphics_handle ();
+   m_mouseMode = NoMode;
+ }
+ 
++void Canvas::canvasWheelEvent (QWheelEvent* event)
++{
++  gh_manager::auto_lock lock;
++  graphics_object obj = gh_manager::get_object (m_handle);
++
++  if (obj.valid_object ())
++    {
++      std::string mode;
++
++      graphics_object axesObj;
++
++      Matrix children = obj.get_properties ().get_children ();
++      octave_idx_type num_children = children.numel ();
++
++      for (int i = 0; i < num_children; i++)
++	{
++	  graphics_object childObj (gh_manager::get_object (children(i)));
++
++          if (childObj.isa ("axes"))
++            {
++              graphics_object go = selectFromAxes (childObj, event->pos ());
++
++              if (go)
++                {
++                  axesObj = childObj;
++                  break;
++                }
++            }
++        }
++
++      if (axesObj)
++        {
++          MouseMode newMouseMode = NoMode;
++
++          graphics_object figObj (obj.get_ancestor ("figure"));
++
++          Figure* fig = dynamic_cast<Figure*> (Backend::toolkitObject (figObj));
++
++          if (fig)
++            newMouseMode = fig->mouseMode ();
++
++          if (axesObj.get_properties ().handlevisibility_is ("on"))
++            {
++              Utils::properties<figure> (figObj)
++                .set_currentaxes (axesObj.get_handle ().as_octave_value ());
++
++              if (zoom_enabled (figObj))
++                {
++                  newMouseMode = ZoomMode;
++
++                  mode = zoom_mode (figObj);
++                }
++              else if (pan_enabled (figObj))
++                {
++                  newMouseMode = PanMode;
++
++                  mode = pan_mode (figObj);
++                }
++            }
++
++          bool redrawFigure = true;
++
++          switch (newMouseMode)
++            {
++            case ZoomMode:
++              {
++                axes::properties& ap = Utils::properties<axes> (axesObj);
++
++                double factor = event->delta () > 0 ? 2.0 : 0.5;
++
++                ap.zoom (mode, factor);
++
++#if 0
++                Matrix view = ap.get_view ().matrix_value ();
++                if (view(1) != 90)
++                  {
++                    Matrix zlimits = ap.get_zlim ().matrix_value ();
++                    zlimits = factor * zlimits;
++                    ap.set_zlim (zlimits);
++                  }
++#endif
++              }
++              break;
++
++            case PanMode:
++              {
++                axes::properties& ap = Utils::properties<axes> (axesObj);
++
++                double factor = event->delta () > 0 ? 0.1 : -0.1;
++
++                ap.pan (mode, factor);
++              }
++              break;
++
++            default:
++              redrawFigure = false;
++              break;
++            }
++
++          if (redrawFigure)
++            redraw (false);
++        }
++    }
++}
++
+ bool Canvas::canvasKeyPressEvent (QKeyEvent* event)
+ {
+   if (m_eventMask & KeyPress)
+     {
+       octave_scalar_map eventData = Utils::makeKeyEventStruct (event);
+ 
+       gh_manager::post_set (m_handle, "currentcharacter",
+                             eventData.getfield ("Character"), false);
+diff --git a/libgui/graphics/Canvas.h b/libgui/graphics/Canvas.h
+--- a/libgui/graphics/Canvas.h
++++ b/libgui/graphics/Canvas.h
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ #include <QPoint>
+ 
+ #include "graphics.h"
+ 
+ #include "Figure.h"
+ 
+ class QKeyEvent;
+ class QMouseEvent;
++class QWheelEvent;
+ class QWidget;
+ 
+ namespace QtHandles
+ {
+ 
+ class Canvas
+ {
+ public:
+@@ -50,40 +51,49 @@ public:
+ 
+   void redraw (bool sync = false);
+   void blockRedraw (bool block = true);
+ 
+   void addEventMask (int m) { m_eventMask |= m; }
+   void clearEventMask (int m) { m_eventMask &= (~m); }
+   void setEventMask (int m) { m_eventMask = m; }
+ 
++  void setCursor (MouseMode mode);
++
+   virtual QWidget* qWidget (void) = 0;
+ 
+   static Canvas* create (const std::string& name, QWidget* parent,
+                          const graphics_handle& handle);
+ 
++  virtual void toggleAxes (const graphics_handle& handle) = 0;
++  virtual void toggleGrid (const graphics_handle& handle) = 0;
++
+ protected:
+   virtual void draw (const graphics_handle& handle) = 0;
+   virtual void drawZoomBox (const QPoint& p1, const QPoint& p2) = 0;
+   virtual void resize (int x, int y, int width, int height) = 0;
+   virtual graphics_object selectFromAxes (const graphics_object& ax,
+                                           const QPoint& pt) = 0;
+ 
+ protected:
+   Canvas (const graphics_handle& handle)
+     : m_handle (handle),
+       m_redrawBlocked (false),
+       m_mouseMode (NoMode),
+       m_eventMask (0)
+     { }
+ 
++  void canvasToggleAxes (const graphics_handle& handle);
++  void canvasToggleGrid (const graphics_handle& handle);
+   void canvasPaintEvent (void);
++  void canvasMouseDoubleClickEvent (QMouseEvent* event);
+   void canvasMouseMoveEvent (QMouseEvent* event);
+   void canvasMousePressEvent (QMouseEvent* event);
+   void canvasMouseReleaseEvent (QMouseEvent* event);
++  void canvasWheelEvent (QWheelEvent* event);
+   bool canvasKeyPressEvent (QKeyEvent* event);
+   bool canvasKeyReleaseEvent (QKeyEvent* event);
+ 
+   void updateCurrentPoint (const graphics_object& fig,
+                            const graphics_object& obj, QMouseEvent *event);
+ 
+ private:
+   graphics_handle m_handle;
+diff --git a/libgui/graphics/Figure.cc b/libgui/graphics/Figure.cc
+--- a/libgui/graphics/Figure.cc
++++ b/libgui/graphics/Figure.cc
+@@ -99,19 +99,19 @@ static QRect boundingBoxToRect (const Ma
+ }
+ 
+ Figure* Figure::create (const graphics_object& go)
+ {
+   return new Figure (go, new FigureWindow ());
+ }
+ 
+ Figure::Figure (const graphics_object& go, FigureWindow* win)
+-     : Object (go, win), m_blockUpdates (false), m_mouseMode (NoMode),
+-       m_lastMouseMode (NoMode), m_figureToolBar (0), m_menuBar (0),
+-       m_innerRect (), m_outerRect ()
++     : Object (go, win), m_blockUpdates (false), m_figureToolBar (0),
++       m_menuBar (0), m_innerRect (), m_outerRect (),
++       m_mouseModeGroup (0)
+ {
+   m_container = new Container (win);
+   win->setCentralWidget (m_container);
+ 
+   figure::properties& fp = properties<figure> ();
+ 
+   createFigureToolBarAndMenuBar ();
+ 
+@@ -158,28 +158,94 @@ Figure::Figure (const graphics_object& g
+   win->addReceiver (this);
+   m_container->addReceiver (this);
+ }
+ 
+ Figure::~Figure (void)
+ {
+ }
+ 
++static std::string mouse_mode_to_string (MouseMode mode)
++{
++  switch (mode)
++    {
++    case NoMode:
++      return "none";
++
++    case RotateMode:
++      return "rotate";
++
++    case ZoomMode:
++      return "zoom";
++
++    case PanMode:
++      return "pan";
++
++    case TextMode:
++      return "text";
++
++    case SelectMode:
++      return "select";
++
++    default:
++      break;
++    }
++
++  return "none";
++}
++
++static MouseMode mouse_mode_from_string (const std::string& mode)
++{
++  if (mode == "none")
++    return NoMode;
++  else if (mode == "rotate")
++    return RotateMode;
++  else if (mode == "zoom")
++    return ZoomMode;
++  else if (mode == "pan")
++    return PanMode;
++  else if (mode == "text")
++    return TextMode;
++  else if (mode == "select")
++    return SelectMode;
++  else
++    return NoMode;
++}
++
++MouseMode Figure::mouseMode (void)
++{
++  gh_manager::auto_lock lock;
++
++  const figure::properties& fp = properties<figure> ();
++
++  std::string mode = fp.get___mouse_mode__ ();
++
++  return mouse_mode_from_string (mode);
++}
++
+ void Figure::createFigureToolBarAndMenuBar (void)
+ {
+   QMainWindow* win = qWidget<QMainWindow> ();
+ 
+   m_figureToolBar = win->addToolBar (tr ("Figure ToolBar"));
+   m_figureToolBar->setMovable (false);
+   m_figureToolBar->setFloatable (false);
+ 
+-  MouseModeActionGroup* mouseModeGroup = new MouseModeActionGroup (win);
+-  connect (mouseModeGroup, SIGNAL (modeChanged (MouseMode)),
++  m_mouseModeGroup = new MouseModeActionGroup (win);
++  connect (m_mouseModeGroup, SIGNAL (modeChanged (MouseMode)),
+            SLOT (setMouseMode (MouseMode)));
+-  m_figureToolBar->addActions (mouseModeGroup->actions ());
++  m_figureToolBar->addActions (m_mouseModeGroup->actions ());
++
++  QAction *toggle_axes = m_figureToolBar->addAction ("Axes");
++  connect (toggle_axes, SIGNAL (triggered (void)),
++           this, SLOT (toggleAxes (void)));
++
++  QAction *toggle_grid = m_figureToolBar->addAction ("Grid");
++  connect (toggle_grid, SIGNAL (triggered (void)),
++           this, SLOT (toggleGrid (void)));
+ 
+   m_menuBar = new MenuBar (win);
+   win->setMenuBar (m_menuBar);
+ 
+   QMenu* fileMenu = m_menuBar->addMenu (tr ("&File"));
+   fileMenu->menuAction ()->setObjectName ("builtinMenu");
+   fileMenu->addAction (tr ("&New Figure"), this, SLOT (fileNewFigure (void)));
+   fileMenu->addAction (tr ("&Open..."))->setEnabled (false);
+@@ -194,27 +260,37 @@ void Figure::createFigureToolBarAndMenuB
+   editMenu->menuAction ()->setObjectName ("builtinMenu");
+   editMenu->addAction (tr ("Cop&y"), this, SLOT (editCopy (void)),
+                        Qt::CTRL|Qt::Key_C)->setEnabled (false);
+   editMenu->addAction (tr ("Cu&t"), this, SLOT (editCut (void)),
+                        Qt::CTRL|Qt::Key_X)->setEnabled (false);
+   editMenu->addAction (tr ("&Paste"), this, SLOT (editPaste(void)),
+                        Qt::CTRL|Qt::Key_V)->setEnabled (false);
+   editMenu->addSeparator ();
+-  editMenu->addActions (mouseModeGroup->actions ());
++  editMenu->addActions (m_mouseModeGroup->actions ());
+ 
+   QMenu* helpMenu = m_menuBar->addMenu (tr ("&Help"));
+   helpMenu->menuAction ()->setObjectName ("builtinMenu");
+   helpMenu->addAction (tr ("&About QtHandles"), this,
+                        SLOT (helpAboutQtHandles (void)));
+   helpMenu->addAction (tr ("About &Qt"), qApp, SLOT (aboutQt (void)));
+ 
+   m_menuBar->addReceiver (this);
+ }
+ 
++void Figure::updateFigureToolBarAndMenuBar (void)
++{
++  if (m_mouseModeGroup)
++    {
++      m_blockUpdates = true;
++      m_mouseModeGroup->setMode (mouseMode ());
++      m_blockUpdates = false;
++    }
++}
++
+ Container* Figure::innerContainer (void)
+ {
+   return m_container;
+ }
+ 
+ void Figure::redraw (void)
+ {
+   Canvas* canvas = m_container->canvas (m_handle);
+@@ -228,16 +304,18 @@ void Figure::redraw (void)
+   foreach (QFrame* frame,
+            qWidget<QWidget> ()->findChildren<QFrame*> ("UIPanel"))
+     {
+       Object* obj = Object::fromQObject (frame);
+ 
+       if (obj)
+         obj->slotRedraw ();
+     }
++
++  updateFigureToolBarAndMenuBar ();
+ }
+ 
+ void Figure::beingDeleted (void)
+ {
+   Canvas* canvas = m_container->canvas (m_handle.value (), false);
+ 
+   if (canvas)
+     canvas->blockRedraw (true);
+@@ -337,24 +415,16 @@ void Figure::showFigureToolBar (bool vis
+         r.adjust (0, -dy, 0, 0);
+ 
+       m_blockUpdates = true;
+       qWidget<QWidget> ()->setGeometry (r);
+       m_figureToolBar->setVisible (visible);
+       m_blockUpdates = false;
+ 
+       updateBoundingBox (false);
+-
+-      if (visible)
+-        m_mouseMode = m_lastMouseMode;
+-      else
+-        {
+-          m_lastMouseMode = m_mouseMode;
+-          m_mouseMode = NoMode;
+-        }
+     }
+ }
+ 
+ void Figure::showMenuBar (bool visible)
+ {
+   int h1 = m_menuBar->sizeHint ().height ();
+ 
+   foreach (QAction* a, m_menuBar->actions ())
+@@ -595,16 +665,33 @@ void Figure::eventNotifyAfter (QObject* 
+ }
+ 
+ void Figure::helpAboutQtHandles (void)
+ {
+   QMessageBox::about (qWidget<QMainWindow> (), tr ("About QtHandles"),
+                       ABOUT_TEXT);
+ }
+ 
++void Figure::setMouseMode (MouseMode mode)
++{
++  if (m_blockUpdates)
++    return;
++
++  gh_manager::auto_lock lock;
++
++  figure::properties& fp = properties<figure> ();
++
++  fp.set___mouse_mode__ (mouse_mode_to_string (mode));
++
++  Canvas* canvas = m_container->canvas (m_handle);
++
++  if (canvas)
++    canvas->setCursor (mode);
++}
++
+ void Figure::fileNewFigure (void)
+ {
+ }
+ 
+ void Figure::fileCloseFigure (void)
+ {
+   qWidget<QMainWindow> ()->close ();
+ }
+@@ -669,9 +756,25 @@ void Figure::showCustomToolBar (QToolBar
+     }
+ }
+ 
+ void Figure::updateContainer (void)
+ {
+   redraw ();
+ }
+ 
++void Figure::toggleAxes (void)
++{
++  Canvas* canvas = m_container->canvas (m_handle);
++
++  if (canvas)
++    canvas->toggleAxes (m_handle);
++}
++  
++void Figure::toggleGrid (void)
++{
++  Canvas* canvas = m_container->canvas (m_handle);
++
++  if (canvas)
++    canvas->toggleGrid (m_handle);
++}
++  
+ }; // namespace QtHandles
+diff --git a/libgui/graphics/Figure.h b/libgui/graphics/Figure.h
+--- a/libgui/graphics/Figure.h
++++ b/libgui/graphics/Figure.h
+@@ -32,44 +32,50 @@ along with Octave; see the file COPYING.
+ class QMainWindow;
+ class QToolBar;
+ 
+ namespace QtHandles
+ {
+ 
+ enum MouseMode
+ {
++  // NOTE: These values must match the order of the buttons in the
++  // MouseModeActionGroup object.
++
+   NoMode        = 0,
+   RotateMode    = 1,
+   ZoomMode      = 2,
+   PanMode       = 3,
+-  SelectMode    = 4
++  TextMode      = 4,
++  SelectMode    = 5
+ };
+ 
+ class Container;
+ class FigureWindow;
+ class MenuBar;
+ class ToolBar;
+ 
++class MouseModeActionGroup;
++
+ class Figure :
+   public Object,
+   public MenuContainer,
+   public GenericEventNotifyReceiver
+ {
+   Q_OBJECT
+ 
+   friend class ToolBar;
+ 
+ public:
+   Figure (const graphics_object& go, FigureWindow* win);
+   ~Figure (void);
+ 
+   static Figure* create (const graphics_object& go);
+ 
+-  MouseMode mouseMode (void) { return m_mouseMode; }
++  MouseMode mouseMode (void);
+ 
+   Container* innerContainer (void);
+   QWidget* menu (void);
+ 
+   bool eventNotifyBefore (QObject* watched, QEvent* event);
+   void eventNotifyAfter (QObject* watched, QEvent* event);
+ 
+ protected:
+@@ -88,37 +94,41 @@ protected:
+ 
+ private:
+   void createFigureToolBarAndMenuBar (void);
+   void showFigureToolBar (bool visible);
+   void showMenuBar (bool visible);
+   void addCustomToolBar (QToolBar* bar, bool visible);
+   void showCustomToolBar (QToolBar* bar, bool visible);
+ 
++  void updateFigureToolBarAndMenuBar (void);
++
+   static void updateBoundingBoxHelper (void*);
+ 
+ private slots:
+-  void setMouseMode (MouseMode mode) { m_mouseMode = mode; }
++  void setMouseMode (MouseMode mode);
+   void fileNewFigure (void);
+   void fileCloseFigure (void);
+   void editCopy (void);
+   void editCut (void);
+   void editPaste (void);
+   void helpAboutQtHandles (void);
+   void updateMenuBar (void);
+   void updateContainer (void);
++  void toggleAxes (void);
++  void toggleGrid (void);
+ 
+ signals:
+   void asyncUpdate (void);
+ 
+ private:
+   Container* m_container;
+   bool m_blockUpdates;
+-  MouseMode m_mouseMode, m_lastMouseMode;
+   QToolBar* m_figureToolBar;
+   MenuBar* m_menuBar;
+   QRect m_innerRect;
+   QRect m_outerRect;
++  MouseModeActionGroup* m_mouseModeGroup;
+ };
+ 
+ }; // namespace QtHandles
+ 
+ #endif
+diff --git a/libgui/graphics/GLCanvas.cc b/libgui/graphics/GLCanvas.cc
+--- a/libgui/graphics/GLCanvas.cc
++++ b/libgui/graphics/GLCanvas.cc
+@@ -55,16 +55,26 @@ void GLCanvas::draw (const graphics_hand
+     {
+       opengl_renderer r;
+ 
+       r.set_viewport (width (), height ());
+       r.draw(go);
+     }
+ }
+ 
++void GLCanvas::toggleAxes (const graphics_handle& gh)
++{
++  canvasToggleAxes (gh);
++}
++
++void GLCanvas::toggleGrid (const graphics_handle& gh)
++{
++  canvasToggleGrid (gh);
++}
++
+ graphics_object GLCanvas::selectFromAxes (const graphics_object& ax,
+                                           const QPoint& pt)
+ {
+   makeCurrent ();
+ 
+   if (ax)
+     {
+       opengl_selector s;
+@@ -114,31 +124,41 @@ void GLCanvas::drawZoomBox (const QPoint
+   glPopMatrix ();
+ }
+ 
+ void GLCanvas::paintGL (void)
+ {
+   canvasPaintEvent ();
+ }
+ 
++void GLCanvas::mouseDoubleClickEvent (QMouseEvent* xevent)
++{
++  canvasMouseDoubleClickEvent (xevent);
++}
++
+ void GLCanvas::mouseMoveEvent (QMouseEvent* xevent)
+ {
+   canvasMouseMoveEvent (xevent);
+ }
+ 
+ void GLCanvas::mousePressEvent (QMouseEvent* xevent)
+ {
+   canvasMousePressEvent (xevent);
+ }
+ 
+ void GLCanvas::mouseReleaseEvent (QMouseEvent* xevent)
+ {
+   canvasMouseReleaseEvent (xevent);
+ }
+ 
++void GLCanvas::wheelEvent (QWheelEvent* xevent)
++{
++  canvasWheelEvent (xevent);
++}
++
+ void GLCanvas::keyPressEvent (QKeyEvent* xevent)
+ {
+   if (! canvasKeyPressEvent (xevent))
+     QGLWidget::keyPressEvent (xevent);
+ }
+ 
+ void GLCanvas::keyReleaseEvent (QKeyEvent* xevent)
+ {
+diff --git a/libgui/graphics/GLCanvas.h b/libgui/graphics/GLCanvas.h
+--- a/libgui/graphics/GLCanvas.h
++++ b/libgui/graphics/GLCanvas.h
+@@ -32,27 +32,31 @@ namespace QtHandles
+ 
+ class GLCanvas : public QGLWidget, public Canvas
+ {
+ public:
+   GLCanvas (QWidget* parent, const graphics_handle& handle);
+   ~GLCanvas (void);
+ 
+   void draw (const graphics_handle& handle);
++  void toggleAxes (const graphics_handle& handle);
++  void toggleGrid (const graphics_handle& handle);
+   void drawZoomBox (const QPoint& p1, const QPoint& p2);
+   void resize (int /* x */, int /* y */,
+                int /* width */, int /* height */) { }
+   graphics_object selectFromAxes (const graphics_object& ax,
+                                   const QPoint& pt);
+   QWidget* qWidget (void) { return this; }
+ 
+ protected:
+   void paintGL (void);
++  void mouseDoubleClickEvent (QMouseEvent* event);
+   void mouseMoveEvent (QMouseEvent* event);
+   void mousePressEvent (QMouseEvent* event);
+   void mouseReleaseEvent (QMouseEvent* event);
++  void wheelEvent (QWheelEvent* event);
+   void keyPressEvent (QKeyEvent* event);
+   void keyReleaseEvent (QKeyEvent* event);
+ };
+ 
+ }; // namespace QtHandles
+ 
+ #endif
+diff --git a/libgui/graphics/MouseModeActionGroup.cc b/libgui/graphics/MouseModeActionGroup.cc
+--- a/libgui/graphics/MouseModeActionGroup.cc
++++ b/libgui/graphics/MouseModeActionGroup.cc
+@@ -37,20 +37,23 @@ MouseModeActionGroup::MouseModeActionGro
+   : QObject (xparent), m_current (0)
+ {
+   m_actions.append (new QAction (QIcon (":/images/rotate.png"),
+                                  tr ("Rotate"), this));
+   m_actions.append (new QAction (QIcon (":/images/zoom.png"),
+                                  tr ("Zoom"), this));
+   m_actions.append (new QAction (QIcon (":/images/pan.png"),
+                                  tr ("Pan"), this));
++  m_actions.append (new QAction (QIcon::fromTheme ("insert-text"),
++                                 tr ("Insert Text"), this));
+   m_actions.append (new QAction (QIcon (":/images/select.png"),
+                                  tr ("Select"), this));
+-  m_actions[2]->setEnabled (false);
++
+   m_actions[3]->setEnabled (false);
++  m_actions[4]->setEnabled (false);
+ 
+   foreach (QAction* a, m_actions)
+     {
+       a->setCheckable (true);
+       connect (a, SIGNAL (toggled (bool)), this, SLOT (actionToggled (bool)));
+     }
+ }
+ 
+@@ -78,16 +81,15 @@ void MouseModeActionGroup::actionToggled
+           for (int j = 0; j < m_actions.size (); j++)
+             if (j != i)
+               m_actions[j]->setChecked (false);
+           emit modeChanged (static_cast<MouseMode> (i+1));
+         }
+     }
+ }
+ 
+-MouseMode MouseModeActionGroup::mouseMode (void) const
++void MouseModeActionGroup::setMode (MouseMode mode)
+ {
+-  int i = (m_current ? -1 : m_actions.indexOf (m_current));
+-
+-  return static_cast<MouseMode> (i+1);
++  for (int i = 0; i < m_actions.size (); i++)
++    m_actions[i]->setChecked (i == mode - 1);
+ }
+-
++  
+ };
+diff --git a/libgui/graphics/MouseModeActionGroup.h b/libgui/graphics/MouseModeActionGroup.h
+--- a/libgui/graphics/MouseModeActionGroup.h
++++ b/libgui/graphics/MouseModeActionGroup.h
+@@ -37,17 +37,18 @@ class MouseModeActionGroup : public QObj
+ {
+   Q_OBJECT
+ 
+ public:
+   MouseModeActionGroup (QObject* parent = 0);
+   ~MouseModeActionGroup (void);
+ 
+   QList<QAction*> actions (void) const { return m_actions; }
+-  MouseMode mouseMode (void) const;
++
++  void setMode (MouseMode mode);
+ 
+ signals:
+   void modeChanged (MouseMode mode);
+ 
+ private slots:
+   void actionToggled (bool checked);
+ 
+ private:
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -1804,16 +1804,42 @@ figure::properties::set_toolkit (const g
+   __plot_stream__ = Matrix ();
+ 
+   if (toolkit)
+     initialize_r (get___myhandle__ ());
+ 
+   mark_modified ();
+ }
+ 
++void
++figure::properties::set___mouse_mode__ (const octave_value& val)
++{
++  if (! error_state)
++    {
++      if (__mouse_mode__.set (val, true))
++        {
++          std::string mode = __mouse_mode__.current_value ();
++
++          octave_scalar_map pm = get___pan_mode__ ().scalar_map_value ();
++          pm.setfield ("Enable", mode == "pan" ? "on" : "off");
++          set___pan_mode__ (pm);
++
++          octave_scalar_map rm = get___rotate_mode__ ().scalar_map_value ();
++          rm.setfield ("Enable", mode == "rotate" ? "on" : "off");
++          set___rotate_mode__ (rm);
++
++          octave_scalar_map zm = get___zoom_mode__ ().scalar_map_value ();
++          zm.setfield ("Enable", mode == "zoom" ? "on" : "off");
++          set___zoom_mode__ (zm);
++
++          mark_modified ();
++        }
++    }
++}
++
+ // ---------------------------------------------------------------------
+ 
+ void
+ property_list::set (const caseless_str& name, const octave_value& val)
+ {
+   size_t offset = 0;
+ 
+   size_t len = name.length ();
+@@ -5036,18 +5062,16 @@ axes::properties::set_defaults (base_gra
+   xset (xlabel.handle_value (), "autopos_tag", "xlabel");
+   xset (ylabel.handle_value (), "autopos_tag", "ylabel");
+   xset (zlabel.handle_value (), "autopos_tag", "zlabel");
+   xset (title.handle_value (), "autopos_tag", "title");
+ 
+   update_transform ();
+   sync_positions ();
+   override_defaults (obj);
+-  // Disable rotate3d and select pan for 2D axes
+-  set_rotate3d (get_rotate3d ());
+ }
+ 
+ void
+ axes::properties::delete_text_child (handle_property& hp)
+ {
+   graphics_handle h = hp.handle_value ();
+ 
+   if (h.ok ())
+@@ -6483,37 +6507,16 @@ axes::properties::set_linestyleorder (co
+ {
+   if (!error_state)
+     {
+       linestyleorder.set (convert_linestyleorder_string (v), false);
+     }
+ }
+ 
+ void
+-axes::properties::set_rotate3d (const octave_value& v)
+-{
+-  graphics_object parent_obj =
+-    gh_manager::get_object (get_parent ());
+-
+-  int ndim = calc_dimensions (parent_obj);
+-  rotate3d.set (v, false, false);
+-  if (rotate3d_is ("on"))
+-    {
+-      // Disable rotate3d for 2D plots
+-      if (ndim == 2)
+-        {
+-          rotate3d.set ("off", false, false);
+-          pan.set ("on", false, false);
+-        }
+-      else
+-        pan.set ("off", false, false);
+-    }
+-}
+-
+-void
+ axes::properties::set_units (const octave_value& v)
+ {
+   if (! error_state)
+     {
+       caseless_str old_units = get_units ();
+       if (units.set (v, true))
+         {
+           update_units (old_units);
+@@ -7559,17 +7562,18 @@ do_zoom (double val, double factor, cons
+ 
+   new_lims(0) = lo;
+   new_lims(1) = hi;
+ 
+   return new_lims;
+ }
+ 
+ void
+-axes::properties::zoom_about_point (double x, double y, double factor,
++axes::properties::zoom_about_point (const std::string& mode,
++                                    double x, double y, double factor,
+                                     bool push_to_zoom_stack)
+ {
+   // FIXME: Do we need error checking here?
+   Matrix xlims = get_xlim ().matrix_value ();
+   Matrix ylims = get_ylim ().matrix_value ();
+ 
+   // Get children axes limits
+   Matrix kids = get_children ();
+@@ -7583,39 +7587,80 @@ axes::properties::zoom_about_point (doub
+   double maxy = -octave_Inf;
+   double min_pos_y = octave_Inf;
+   double max_neg_y = -octave_Inf;
+   get_children_limits (miny, maxy, min_pos_y, max_neg_y, kids, 'y');
+ 
+   xlims = do_zoom (x, factor, xlims, xscale_is ("log"));
+   ylims = do_zoom (y, factor, ylims, yscale_is ("log"));
+ 
+-  zoom (xlims, ylims, push_to_zoom_stack);
+-}
+-
+-void
+-axes::properties::zoom (const Matrix& xl, const Matrix& yl,
++  zoom (mode, xlims, ylims, push_to_zoom_stack);
++}
++
++void
++axes::properties::zoom (const std::string& mode, double factor,
++                        bool push_to_zoom_stack)
++{
++  // FIXME: Do we need error checking here?
++  Matrix xlims = get_xlim ().matrix_value ();
++  Matrix ylims = get_ylim ().matrix_value ();
++
++  double x = (xlims(0) + xlims(1)) / 2;
++  double y = (ylims(0) + ylims(1)) / 2;
++
++  zoom_about_point (mode, x, y, factor, push_to_zoom_stack);
++}
++
++void
++axes::properties::push_zoom_stack (void)
++{
++  // FIXME: Maybe make the size of the undo stack configurable.  A limit
++  // of 500 elements means 100 pan, rotate, or zoom actions are stored
++  // and may be undone.
++
++  if (zoom_stack.size () >= 500)
++    {
++      for (int i = 0; i < 5; i++)
++        zoom_stack.pop_back ();
++    }
++
++  zoom_stack.push_front (xlimmode.get ());
++  zoom_stack.push_front (xlim.get ());
++  zoom_stack.push_front (ylimmode.get ());
++  zoom_stack.push_front (ylim.get ());
++  zoom_stack.push_front (view.get ());
++}
++
++void
++axes::properties::zoom (const std::string& mode,
++                        const Matrix& xl, const Matrix& yl,
+                         bool push_to_zoom_stack)
+ {
+   if (push_to_zoom_stack)
+-    {
+-      zoom_stack.push_front (xlimmode.get ());
+-      zoom_stack.push_front (xlim.get ());
+-      zoom_stack.push_front (ylimmode.get ());
+-      zoom_stack.push_front (ylim.get ());
+-    }
+-
+-  xlim = xl;
+-  xlimmode = "manual";
+-  ylim = yl;
+-  ylimmode = "manual";
++    push_zoom_stack ();
++
++  if (mode == "horizontal" || mode == "both")
++    {
++      xlim = xl;
++      xlimmode = "manual";
++    }
++
++  if (mode == "vertical" || mode == "both")
++    {
++      ylim = yl;
++      ylimmode = "manual";
++    }
+ 
+   update_transform ();
+-  update_xlim (false);
+-  update_ylim (false);
++
++  if (mode == "horizontal" || mode == "both")
++    update_xlim ();
++
++  if (mode == "vertical" || mode == "both")
++    update_ylim ();
+ }
+ 
+ static Matrix
+ do_translate (double x0, double x1, const Matrix& lims, bool is_logscale)
+ {
+   Matrix new_lims = lims;
+ 
+   double lo = lims(0);
+@@ -7669,17 +7714,19 @@ do_translate (double x0, double x1, cons
+ 
+   new_lims(0) = lo;
+   new_lims(1) = hi;
+ 
+   return new_lims;
+ }
+ 
+ void
+-axes::properties::translate_view (double x0, double x1, double y0, double y1)
++axes::properties::translate_view (const std::string& mode,
++                                  double x0, double x1, double y0, double y1,
++                                  bool push_to_zoom_stack)
+ {
+   // FIXME: Do we need error checking here?
+   Matrix xlims = get_xlim ().matrix_value ();
+   Matrix ylims = get_ylim ().matrix_value ();
+ 
+   // Get children axes limits
+   Matrix kids = get_children ();
+   double minx = octave_Inf;
+@@ -7692,64 +7739,147 @@ axes::properties::translate_view (double
+   double maxy = -octave_Inf;
+   double min_pos_y = octave_Inf;
+   double max_neg_y = -octave_Inf;
+   get_children_limits (miny, maxy, min_pos_y, max_neg_y, kids, 'y');
+ 
+   xlims = do_translate (x0, x1, xlims, xscale_is ("log"));
+   ylims = do_translate (y0, y1, ylims, yscale_is ("log"));
+ 
+-  zoom (xlims, ylims, false);
+-}
+-
+-void
+-axes::properties::rotate_view (double delta_el, double delta_az)
+-{
++  zoom (mode, xlims, ylims, push_to_zoom_stack);
++}
++
++void
++axes::properties::pan (const std::string& mode, double factor,
++                       bool push_to_zoom_stack)
++{
++  // FIXME: Do we need error checking here?
++  Matrix xlims = get_xlim ().matrix_value ();
++  Matrix ylims = get_ylim ().matrix_value ();
++
++  double x0 = (xlims(0) + xlims(1)) / 2;
++  double y0 = (ylims(0) + ylims(1)) / 2;
++
++  double x1 = x0 + (xlims(1) - xlims(0)) * factor;
++  double y1 = y0 + (ylims(1) - ylims(0)) * factor;
++
++  translate_view (mode, x0, x1, y0, y1, push_to_zoom_stack);
++}
++
++void
++axes::properties::rotate3d (double x0, double x1, double y0, double y1,
++                            bool push_to_zoom_stack)
++{
++  if (push_to_zoom_stack)
++    push_zoom_stack ();
++
++  Matrix bb = get_boundingbox (true);
++  Matrix new_view = get_view ().matrix_value ();
++
++  // Compute new view angles
++  new_view(0) += ((x0 - x1) * (180.0 / bb(2)));
++  new_view(1) += ((y1 - y0) * (180.0 / bb(3)));
++
++  // Clipping
++  new_view(1) = std::min (new_view(1), 90.0);
++  new_view(1) = std::max (new_view(1), -90.0);
++  if (new_view(0) > 180.0)
++    new_view(0) -= 360.0;
++  else if (new_view(0) < -180.0)
++    new_view(0) += 360.0;
++
++  // Snapping
++  double snapMargin = 1.0;
++  for (int a = -90; a <= 90; a += 90)
++    {
++      if ((a - snapMargin) < new_view(1)
++          && new_view(1) < (a + snapMargin))
++        {
++          new_view(1) = a;
++          break;
++        }
++    }
++
++  for (int a = -180; a <= 180; a += 180)
++    if ((a - snapMargin) < new_view(0)
++        && new_view(0) < (a + snapMargin))
++      {
++        if (a == 180)
++          new_view(0) = -180;
++        else
++          new_view(0) = a;
++        break;
++      }
++
++  // Update axes properties
++  set_view (new_view);
++}
++
++void
++axes::properties::rotate_view (double delta_el, double delta_az,
++                               bool push_to_zoom_stack)
++{
++  if (push_to_zoom_stack)
++    push_zoom_stack ();
++
+   Matrix v = get_view ().matrix_value ();
+ 
+   v(1) += delta_el;
+ 
+   if (v(1) > 90)
+     v(1) = 90;
+   if (v(1) < -90)
+     v(1) = -90;
+ 
+   v(0) = fmod (v(0) - delta_az + 720,360);
+ 
+   set_view (v);
++
+   update_transform ();
+ }
+ 
+ void
+ axes::properties::unzoom (void)
+ {
+-  if (zoom_stack.size () >= 4)
+-    {
++  if (zoom_stack.size () >= 5)
++    {
++      view = zoom_stack.front ();
++      zoom_stack.pop_front ();
++
+       ylim = zoom_stack.front ();
+       zoom_stack.pop_front ();
++
+       ylimmode = zoom_stack.front ();
+       zoom_stack.pop_front ();
++
+       xlim = zoom_stack.front ();
+       zoom_stack.pop_front ();
++
+       xlimmode = zoom_stack.front ();
+       zoom_stack.pop_front ();
+ 
+       update_transform ();
+-      update_xlim (false);
+-      update_ylim (false);
+-    }
+-}
+-
+-void
+-axes::properties::clear_zoom_stack (void)
+-{
+-  while (zoom_stack.size () > 4)
++
++      update_xlim ();
++      update_ylim ();
++
++      update_view ();
++    }
++}
++
++void
++axes::properties::clear_zoom_stack (bool do_unzoom)
++{
++  size_t items_to_leave_on_stack = do_unzoom ? 5 : 0;
++
++  while (zoom_stack.size () > items_to_leave_on_stack)
+     zoom_stack.pop_front ();
+ 
+-  unzoom ();
++  if (do_unzoom)
++    unzoom ();
+ }
+ 
+ void
+ axes::reset_default_properties (void)
+ {
+   // empty list of local defaults
+   default_properties = property_list ();
+ 
+@@ -11653,8 +11783,79 @@ In all cases, typing CTRL-C stops progra
+       else
+         error ("waitfor: invalid handle value.");
+     }
+   else
+     print_usage ();
+ 
+   return octave_value ();
+ }
++
++DEFUN (__zoom__, args, ,
++       "-*- texinfo -*-\n\
++@deftypefn  {Built-in Function} {} __zoom__ (@var{axes}, @var{mode}, @var{factor})\n\
++@deftypefnx  {Built-in Function} {} __zoom__ (@var{axes}, \"out\")\n\
++@deftypefnx  {Built-in Function} {} __zoom__ (@var{axes}, \"reset\")\n\
++Undocumented internal function.\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  int nargin = args.length ();
++
++  if (nargin != 2 && nargin != 3)
++    {
++      print_usage ();
++      return retval;
++    }
++
++  double h = args(0).double_value ();
++
++  if (error_state)
++    return retval;
++
++  gh_manager::auto_lock guard;
++
++  graphics_handle handle = gh_manager::lookup (h);
++
++  if (! handle.ok ())
++    {
++      error ("__zoom__: invalid handle");
++      return retval;
++    }
++
++  graphics_object ax = gh_manager::get_object (handle);
++
++  axes::properties& ax_props =
++    dynamic_cast<axes::properties&> (ax.get_properties ());
++
++  if (nargin == 2)
++    {
++      std::string opt = args(1).string_value ();
++
++      if (error_state)
++        return retval;
++
++      if (opt == "out" || opt == "reset")
++        {
++          if (opt == "out")
++            {
++              ax_props.clear_zoom_stack ();
++              Vdrawnow_requested = true;
++            }
++          else
++            ax_props.clear_zoom_stack (false);
++
++        }
++    }
++  else
++    {
++      std::string mode = args(1).string_value ();
++      double factor = args(2).scalar_value ();
++
++      if (error_state)
++        return retval;
++
++      ax_props.zoom (mode, factor);
++    }
++
++  return retval;
++}
+diff --git a/libinterp/corefcn/graphics.in.h b/libinterp/corefcn/graphics.in.h
+--- a/libinterp/corefcn/graphics.in.h
++++ b/libinterp/corefcn/graphics.in.h
+@@ -3448,16 +3448,20 @@ public:
+       callback_property windowscrollwheelfcn , Matrix ()
+       radio_property windowstyle , "{normal}|modal|docked"
+       string_property wvisual , ""
+       radio_property wvisualmode , "{auto}|manual"
+       string_property xdisplay , ""
+       string_property xvisual , ""
+       radio_property xvisualmode , "{auto}|manual"
+       // Octave-specific properties
++      radio_property __mouse_mode__ hS , "{none}|pan|rotate|select|text|zoom"
++      any_property __pan_mode__ h , Matrix ()
++      any_property __rotate_mode__ h , Matrix ()
++      any_property __zoom_mode__ h , Matrix ()
+       bool_property __enhanced__ h , "on"
+       string_property __graphics_toolkit__ s , gtk_manager::default_toolkit ()
+       any_property __guidata__ h , Matrix ()
+       any_property __plot_stream__ h , Matrix ()
+     END_PROPERTIES
+ 
+   protected:
+     void init (void)
+@@ -3747,24 +3751,39 @@ public:
+     bool get_nearhoriz (void) const { return nearhoriz; }
+ 
+     ColumnVector pixel2coord (double px, double py) const
+     { return get_transform ().untransform (px, py, (x_zlim(0)+x_zlim(1))/2); }
+ 
+     ColumnVector coord2pixel (double x, double y, double z) const
+     { return get_transform ().transform (x, y, z); }
+ 
+-    void zoom_about_point (double x, double y, double factor,
+-                           bool push_to_zoom_stack = true);
+-    void zoom (const Matrix& xl, const Matrix& yl,
++    void zoom_about_point (const std::string& mode, double x, double y,
++                           double factor, bool push_to_zoom_stack = true);
++    void zoom (const std::string& mode, double factor,
++               bool push_to_zoom_stack = true);
++    void zoom (const std::string& mode, const Matrix& xl, const Matrix& yl,
+                bool push_to_zoom_stack = true);
+-    void translate_view (double x0, double x1, double y0, double y1);
+-    void rotate_view (double delta_az, double delta_el);
++
++    void translate_view (const std::string& mode,
++                         double x0, double x1, double y0, double y1,
++                         bool push_to_zoom_stack = true);
++
++    void pan (const std::string& mode, double factor,
++              bool push_to_zoom_stack = true);
++
++    void rotate3d (double x0, double x1, double y0, double y1,
++                   bool push_to_zoom_stack = true);
++
++    void rotate_view (double delta_az, double delta_el,
++                      bool push_to_zoom_stack = true);
++
+     void unzoom (void);
+-    void clear_zoom_stack (void);
++    void push_zoom_stack (void);
++    void clear_zoom_stack (bool do_unzoom = true);
+ 
+     void update_units (const caseless_str& old_units);
+ 
+     void update_fontunits (const caseless_str& old_fontunits);
+ 
+   private:
+     scaler sx, sy, sz;
+     Matrix x_render, x_render_inv;
+@@ -3787,23 +3806,16 @@ public:
+     ft_render text_renderer;
+ #endif
+ 
+     void set_text_child (handle_property& h, const std::string& who,
+                          const octave_value& v);
+ 
+     void delete_text_child (handle_property& h);
+ 
+-    void set_pan (const octave_value& val)
+-    {
+-      pan.set (val, false, false);
+-      if (pan_is ("on") || pan_is ("xon") || pan_is ("yon"))
+-        rotate3d.set ("off", false, false);
+-    }
+-
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+     // Programming note: Keep property list sorted if new ones are added.
+ 
+     BEGIN_PROPERTIES (axes)
+       radio_property activepositionproperty , "{outerposition}|position"
+       row_vector_property alim m , default_lim ()
+       radio_property alimmode , "{auto}|manual"
+@@ -3837,22 +3849,20 @@ public:
+       radio_property layer u , "{bottom}|top"
+       // FIXME: should be kind of string array.
+       any_property linestyleorder S , "-"
+       double_property linewidth , 0.5
+       radio_property minorgridlinestyle , "-|--|{:}|-.|none"
+       double_property mouse_wheel_zoom , 0.05
+       radio_property nextplot , "add|replacechildren|{replace}"
+       array_property outerposition u , default_axes_outerposition ()
+-      radio_property pan s , "{on}|xon|yon|off"
+       array_property plotboxaspectratio mu , Matrix (1, 3, 1.0)
+       radio_property plotboxaspectratiomode u , "{auto}|manual"
+       array_property position u , default_axes_position ()
+       radio_property projection , "{orthographic}|perspective"
+-      radio_property rotate3d S , "{off}|on"
+       radio_property tickdir mu , "{in}|out"
+       radio_property tickdirmode u , "{auto}|manual"
+       array_property ticklength u , default_axes_ticklength ()
+       array_property tightinset r , Matrix (1, 4, 0.0)
+       handle_property title SOf , gh_manager::make_graphics_handle ("text", __myhandle__, false, false, false)
+       // FIXME: uicontextmenu should be moved here.
+       radio_property units SU , "{normalized}|inches|centimeters|points|pixels|characters"
+       array_property view u , default_axes_view ()
+@@ -4158,66 +4168,58 @@ public:
+ 
+     Matrix calc_tightbox (const Matrix& init_pos);
+ 
+   public:
+     Matrix get_axis_limits (double xmin, double xmax,
+                             double min_pos, double max_neg,
+                             bool logscale);
+ 
+-    void update_xlim (bool do_clr_zoom = true)
++    void update_xlim ()
+     {
+       if (xtickmode.is ("auto"))
+         calc_ticks_and_lims (xlim, xtick, xmtick, xlimmode.is ("auto"),
+                              xscale.is ("log"));
+       if (xticklabelmode.is ("auto"))
+         calc_ticklabels (xtick, xticklabel, xscale.is ("log"));
+ 
+       fix_limits (xlim);
+ 
+       update_xscale ();
+ 
+-      if (do_clr_zoom)
+-        zoom_stack.clear ();
+-
+       update_axes_layout ();
+     }
+ 
+-    void update_ylim (bool do_clr_zoom = true)
++    void update_ylim (void)
+     {
+       if (ytickmode.is ("auto"))
+         calc_ticks_and_lims (ylim, ytick, ymtick, ylimmode.is ("auto"),
+                              yscale.is ("log"));
+       if (yticklabelmode.is ("auto"))
+         calc_ticklabels (ytick, yticklabel, yscale.is ("log"));
+ 
+       fix_limits (ylim);
+ 
+       update_yscale ();
+ 
+-      if (do_clr_zoom)
+-        zoom_stack.clear ();
+-
+       update_axes_layout ();
+     }
+ 
+     void update_zlim (void)
+     {
+       if (ztickmode.is ("auto"))
+         calc_ticks_and_lims (zlim, ztick, zmtick, zlimmode.is ("auto"),
+                              zscale.is ("log"));
+       if (zticklabelmode.is ("auto"))
+         calc_ticklabels (ztick, zticklabel, zscale.is ("log"));
+ 
+       fix_limits (zlim);
+ 
+       update_zscale ();
+ 
+-      zoom_stack.clear ();
+-
+       update_axes_layout ();
+     }
+ 
+   };
+ 
+ private:
+   properties xproperties;
+ 
+diff --git a/libinterp/dldfcn/__init_fltk__.cc b/libinterp/dldfcn/__init_fltk__.cc
+--- a/libinterp/dldfcn/__init_fltk__.cc
++++ b/libinterp/dldfcn/__init_fltk__.cc
+@@ -965,19 +965,19 @@ private:
+ 
+   void button_press (Fl_Widget* widg, void*)
+   {
+     if (widg == autoscale)
+       axis_auto ();
+     else if (widg == togglegrid)
+       toggle_grid ();
+     else if (widg == panzoom)
+-      set_on_ax_obj ("pan", "on");
++      fp.set___mouse_mode__ ("pan");
+     else if (widg == rotate)
+-      set_on_ax_obj ("rotate3d", "on");
++      fp.set___mouse_mode__ ("rotate");
+     else if (widg == help)
+       fl_message ("%s", help_text);
+   }
+ 
+   void set_on_ax_obj (const std::string& name, const std::string& value)
+   {
+     // ax_obj is the last clicked axes object
+     if (ax_obj && ax_obj.isa ("axes"))
+@@ -1295,16 +1295,46 @@ private:
+ 
+     // update outerposition
+     fp.set_boundingbox (bb, false, false);
+ 
+     // update position
+     fp.set_boundingbox (outerposition2position (bb), true, false);
+   }
+ 
++  bool pan_enabled (void)
++  {
++    // Getting pan mode property:
++    octave_value ov_pm = fp.get___pan_mode__ ();
++
++    octave_scalar_map pm = ov_pm.scalar_map_value ();
++
++    return pm.contents ("Enable").string_value () == "on";
++  }
++
++  std::string pan_mode (void)
++  {
++    // Getting pan mode property:
++    octave_value ov_pm = fp.get___pan_mode__ ();
++
++    octave_scalar_map pm = ov_pm.scalar_map_value ();
++
++    return pm.contents ("Motion").string_value ();
++  }
++
++  bool rotate_enabled (void)
++  {
++    // Getting rotate mode property:
++    octave_value ov_rm = fp.get___rotate_mode__ ();
++
++    octave_scalar_map rm = ov_rm.scalar_map_value ();
++
++    return rm.contents ("Enable").string_value () == "on";
++  }
++
+   int handle (int event)
+   {
+     if (event == FL_FOCUS)
+       return 1;
+ 
+     graphics_handle gh;
+ 
+     if (!fp.is_beingdeleted ())
+@@ -1358,22 +1388,22 @@ private:
+ 
+                 case 'g':
+                 case 'G':
+                   toggle_grid ();
+                   return 1;
+ 
+                 case 'p':
+                 case 'P':
+-                  set_on_ax_obj ("pan", "on");
++                  fp.set___mouse_mode__ ("pan");
+                   return 1;
+ 
+                 case 'r':
+                 case 'R':
+-                  set_on_ax_obj ("rotate3d", "on");
++                  fp.set___mouse_mode__ ("rotate");
+                   return 1;
+                 }
+             }
+             break;
+ 
+           case FL_KEYUP:
+             {
+               int e_key = Fl::event_key ();
+@@ -1478,37 +1508,33 @@ private:
+                   {
+                     axes::properties& ap =
+                       dynamic_cast<axes::properties&>
+                       (ax_obj.get_properties ());
+ 
+                     // Don't pan or rotate legend
+                     if (ap.get_tag ().compare ("legend") < 0)
+                       {
+-                        if (ap.rotate3d_is ("on"))
++                        if (rotate_enabled ())
+                           view2status (ax_obj);
+                         else
+                           pixel2status (ax_obj, pos_x, pos_y,
+                                         Fl::event_x (),
+                                         Fl::event_y () - menu_dy ());
+ 
+                         double x0, y0, x1, y1;
+                         Matrix pos = fp.get_boundingbox (true);
+                         pixel2pos (ax_obj, pos_x, pos_y, x0, y0);
+                         pixel2pos (ax_obj, Fl::event_x (),
+                                            Fl::event_y () - menu_dy (),
+                                            x1, y1);
+ 
+-                        if (ap.pan_is ("on"))
+-                          ap.translate_view (x0, x1, y0, y1);
+-                        else if (ap.pan_is ("xon"))
+-                          ap.translate_view (x0, x1, y1, y1);
+-                        else if (ap.pan_is ("yon"))
+-                          ap.translate_view (x1, x1, y0, y1);
+-                        else if (ap.rotate3d_is ("on"))
++                        if (pan_enabled ())
++                          ap.translate_view ("both", x0, x1, y0, y1);
++                        else if (rotate_enabled ())
+                           {
+                             double daz, del;
+                             daz = (Fl::event_x () - pos_x) / pos(2) * 360;
+                             del = (Fl::event_y () - menu_dy () - pos_y)
+                                   / pos(3) * 360;
+                             ap.rotate_view (del, daz);
+                           }
+                       }
+@@ -1564,17 +1590,17 @@ private:
+                     (Fl::event_dy () > 0) ? 1 / (1.0 - Vwheel_zoom_speed)
+                                           : 1.0 - Vwheel_zoom_speed;
+ 
+                   // Get the point we're zooming about.
+                   double x1, y1;
+                   pixel2pos (ax, Fl::event_x (), Fl::event_y () - menu_dy (),
+                              x1, y1);
+ 
+-                  ap.zoom_about_point (x1, y1, factor, false);
++                  ap.zoom_about_point ("both", x1, y1, factor, false);
+                   mark_modified ();
+                   return 1;
+                 }
+             }
+ 
+           case FL_RELEASE:
+             if (fp.get_windowbuttonupfcn ().is_defined ())
+               {
+@@ -1627,17 +1653,17 @@ private:
+                                 yl(0) = y0;
+                                 yl(1) = y1;
+                               }
+                             else
+                               {
+                                 yl(0) = y1;
+                                 yl(1) = y0;
+                               }
+-                            ap.zoom (xl, yl);
++                            ap.zoom ("both", xl, yl);
+                           }
+                         mark_modified ();
+                         return 1;
+                       }
+                   }
+               }
+             break;
+           }
+diff --git a/scripts/plot/util/figure.m b/scripts/plot/util/figure.m
+--- a/scripts/plot/util/figure.m
++++ b/scripts/plot/util/figure.m
+@@ -80,16 +80,17 @@ function h = figure (varargin)
+     if (init_new_figure || cf != f)
+       drawnow ();
+     endif
+   endif
+ 
+   if (init_new_figure)
+     f = __go_figure__ (f, varargin{:});
+     __add_default_menu__ (f);
++    __add_default_mouse_modes__ (f);
+   elseif (nargs > 0)
+     set (f, varargin{:});
+   endif
+ 
+   set (0, "currentfigure", f);
+   ## When switching to figure N, make figure visible and on top of stack,
+   ## unless visibility is explicitly switched off
+   if (! init_new_figure && ! any (strcmpi (varargin(1:2:end), "visible")
+@@ -98,16 +99,32 @@ function h = figure (varargin)
+   endif
+ 
+   if (nargout > 0)
+     h = f;
+   endif
+ 
+ endfunction
+ 
++function __add_default_mouse_modes__ (fig)
++
++  set (fig, "__pan_mode__", struct ("Enable", "off",
++                                    "Motion", "both",
++                                    "FigureHandle", fig));
++
++  set (fig, "__rotate_mode__", struct ("Enable", "off",
++                                       "RotateStyle", "box",
++                                       "FigureHandle", fig));
++
++  set (fig, "__zoom_mode__", struct ("Enable", "off",
++                                     "Motion", "both",
++                                     "Direction", "in",
++                                     "FigureHandle", fig));
++
++endfunction
+ 
+ %!test
+ %! hf = figure ("visible", "off");
+ %! unwind_protect
+ %!   assert (hf, gcf);
+ %!   assert (isfigure (hf));
+ %!   hf2 = figure (hf, "visible", "off");
+ %!   assert (hf, hf2);
+diff --git a/scripts/plot/util/pan.m b/scripts/plot/util/pan.m
+--- a/scripts/plot/util/pan.m
++++ b/scripts/plot/util/pan.m
+@@ -14,65 +14,104 @@
+ ##
+ ## You should have received a copy of the GNU General Public License
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <http://www.gnu.org/licenses/>.
+ 
+ ## -*- texinfo -*-
+ ## @deftypefn  {Command} {} pan
+ ## @deftypefnx {Command} {} pan on
++## @deftypefnx {Command} {} pan off
+ ## @deftypefnx {Command} {} pan xon
+ ## @deftypefnx {Command} {} pan yon
+-## @deftypefnx {Command} {} pan off
+-## @deftypefnx {Function File} {} pan (@var{hax}, @dots{})
+-## Control panning mode of interactive graph in GUI.
++## @deftypefnx {Function File} {} pan (@var{hfig}, @var{option})
++## Control the interactive panning mode of a figure in the GUI.
+ ##
+-## The function state input may be either @qcode{"on"}, @qcode{"xon"},
+-## @qcode{"yon"} or @qcode{"off"}.
++## Given the option @qcode{"on"} or @qcode{"off"}, set the interactive
++## pan mode on or off.
+ ##
+-## If it is omitted the current state is toggled (@qcode{"xon"} and
+-## @qcode{"yon"} are treated as @qcode{"on"}).
++## With no arguments, toggle the current pan mode on or off.
+ ##
+-## @qcode{"xon"} limits panning to the x-axis, @qcode{"yon"} to the
+-## y-axis.
+-##
+-## If the first argument @var{hax} is an axes handle, then operate on
+-## this axis rather than the current axes returned by @code{gca}.
++## Given the option @qcode{"xon"} or @qcode{"yon"}, enable pan mode
++## for the x or y axis only.
+ ##
+-## To query the current mode use the @code{get}
+-## function.  For example:
++## If the first argument @var{hfig} is a figure, then operate on
++## the given figure rather than the current figure as returned by
++## @code{gcf}.
+ ##
+-## @example
+-## mode = get (gca, "pan");
+-## @end example
+ ## @seealso{rotate3d, zoom}
+ ## @end deftypefn
+ 
+ function pan (varargin)
+ 
+-  if (numel (varargin) > 0 && isaxes (varargin{1}))
+-    hax = varargin{1};
+-    varargin(1) = [];
+-  else
+-    hax = gca ();
++  hfig = NaN;
++
++  nargs = nargin;
++
++  if (nargs > 2)
++    print_usage ();
++  endif
++
++  if (nargin == 1 && nargout > 0 && isfigure (varargin{1}))
++    error ("pan_object_handle = pan (hfig): not implemented");
+   endif
+ 
+-  toolkit = get (ancestor (hax, "figure"), "__graphics_toolkit__");
+-  if (! strcmp (toolkit, "fltk"))
+-    warning ("pan: Only implemented for graphics_toolkit FLTK");
++  if (nargs == 2)
++    hfig = varargin{1};
++    if (isfigure (hfig))
++      varargin(1) = [];
++      nargs--;
++    else
++      error ("pan: expecting figure handle as first argument");
++    endif
++  endif
++
++  if (isnan (hfig))
++    hfig = gcf ();
+   endif
+ 
+-  if (numel (varargin) > 1)
+-    print_usage ();
+-  elseif (numel (varargin) == 0)
+-    # toggle
+-    m = get (hax, "pan");
+-    if (findstr (m, "on") > 0)
+-      set (hax, "pan", "off");
++  if (nargs == 0)
++    pm = get (hfig, "__pan_mode__");
++    if (strcmp (pm.Enable, "on"))
++      pm.Enable = "off";
+     else
+-      set (hax, "pan", "on");
++      pm.Enable = "on";
+     endif
+-  elseif (numel (varargin) == 1)
+-    set (hax, "pan", varargin{1});
++    set (hfig, "__pan_mode__", pm);
++  elseif (nargs == 1)
++    arg = varargin{1};
++    if (ischar (arg))
++      switch (arg)
++        case {"on", "off", "xon", "yon"}
++          pm = get (hfig, "__pan_mode__");
++          switch (arg)
++            case {"on", "off"}
++              pm.Enable = arg;
++              pm.Motion = "both";
++            case "xon"
++              pm.Enable = "on";
++              pm.Motion = "horizontal";
++            case "yon"
++              pm.Enable = "on";
++              pm.Motion = "vertical";
++          endswitch
++          set (hfig, "__pan_mode__", pm);
++          if (strcmp (arg, "off"))
++            set (hfig, "__mouse_mode__", "none");
++          else
++            ## FIXME: Is there a better way other than calling these
++            ## functions to set the other mouse mode Enable fields to
++            ## "off"?
++            rotate3d ("off");
++            zoom ("off");
++            set (hfig, "__mouse_mode__", "pan");
++          endif
++
++        otherwise
++          error ("pan: unrecognized option '%s'", arg);
++      endswitch
++    else
++      error ("pan: wrong type argument '%s'", class (arg));
++    endif
+   endif
+ 
+ endfunction
+ 
+diff --git a/scripts/plot/util/rotate3d.m b/scripts/plot/util/rotate3d.m
+--- a/scripts/plot/util/rotate3d.m
++++ b/scripts/plot/util/rotate3d.m
+@@ -15,60 +15,92 @@
+ ## You should have received a copy of the GNU General Public License
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <http://www.gnu.org/licenses/>.
+ 
+ ## -*- texinfo -*-
+ ## @deftypefn  {Command} {} rotate3d
+ ## @deftypefnx {Command} {} rotate3d on
+ ## @deftypefnx {Command} {} rotate3d off
+-## @deftypefnx {Function File} {} rotate3d (@var{hax}, @dots{})
+-## Control 3-D rotation mode of interactive graph in GUI.
++## @deftypefnx {Function File} {} rotate3d (@var{hfig}, @var{option})
++## Control the interactive 3-D rotation mode of a figure in the GUI.
+ ##
+-## The function state input may be either @qcode{"on"} or @qcode{"off"}
+-## and can only be set for 3-D plots.
++## Given the option @qcode{"on"} or @qcode{"off"}, set the interactive
++## rotate mode on or off.
+ ##
+-## If the first argument @var{hax} is an axes handle, then operate on
+-## this axis rather than the current axes returned by @code{gca}.
++## With no arguments, toggle the current rotate mode on or off.
+ ##
+-## To query the current mode use the @code{get} function.  For example:
++## If the first argument @var{hfig} is a figure, then operate on
++## the given figure rather than the current figure as returned by
++## @code{gcf}.
+ ##
+-## @example
+-## mode = get (gca, "rotate3d");
+-## @end example
+ ## @seealso{pan, zoom}
+ ## @end deftypefn
+ 
+ function rotate3d (varargin)
+ 
+-  if (numel (varargin) > 0 && isaxes (varargin{1}))
+-    hax = varargin{1};
+-    varargin(1) = [];
+-  else
+-    hax = gca ();
++  hfig = NaN;
++
++  nargs = nargin;
++
++  if (nargs > 2)
++    print_usage ();
++  endif
++
++  if (nargin == 1 && nargout > 0 && isfigure (varargin{1}))
++    error ("rotate_object_handle = rotate3d (hfig): not implemented");
+   endif
+ 
+-  toolkit = get (ancestor (hax, "figure"), "__graphics_toolkit__");
+-  if (! strcmp (toolkit, "fltk"))
+-    warning ("rotate3d: Only implemented for graphics_toolkit FLTK");
++  if (nargs == 2)
++    hfig = varargin{1};
++    if (isfigure (hfig))
++      varargin(1) = [];
++      nargs--;
++    else
++      error ("rotate3d: expecting figure handle as first argument");
++    endif
++  endif
++
++  if (isnan (hfig))
++    hfig = gcf ();
+   endif
+ 
+-  ndims = __calc_dimensions__ (hax);
+-  if (ndims == 2)
+-    warning ("rotate3d: Only available for 3D plots");
+-  else
+-    if (numel (varargin) > 1)
+-      print_usage ();
+-    elseif (numel (varargin) == 0)
+-      # toggle
+-      m = get (hax, "pan");
+-      if (strcmp (get (hax, "rotate3d"), "on"))
+-        set (hax, "rotate3d", "off");
+-      else
+-        set (hax, "rotate3d", "on");
+-      endif
+-    elseif (numel (varargin) == 1)
+-      set (hax, "rotate3d", varargin{1});
++  if (nargs == 0)
++    rm = get (hfig, "__rotate_mode__");
++    if (strcmp (rm.Enable, "on"))
++      rm.Enable = "off";
++    else
++      rm.Enable = "on";
++    endif
++    set (hfig, "__rotate_mode__", rm);
++  elseif (nargs == 1)
++    arg = varargin{1};
++    if (ischar (arg))
++      switch (arg)
++        case {"on", "off"}
++          rm = get (hfig, "__rotate_mode__");
++          switch (arg)
++            case {"on", "off"}
++              rm.Enable = arg;
++              rm.Motion = "both";
++          endswitch
++          set (hfig, "__rotate_mode__", rm);
++          if (strcmp (arg, "off"))
++            set (hfig, "__mouse_mode__", "none");
++          else
++            ## FIXME: Is there a better way other than calling these
++            ## functions to set the other mouse mode Enable fields to
++            ## "off"?
++            pan ("off");
++            zoom ("off");
++            set (hfig, "__mouse_mode__", "rotate");
++          endif
++
++        otherwise
++          error ("rotate3d: unrecognized option '%s'", arg);
++      endswitch
++    else
++      error ("rotate3d: wrong type argument '%s'", class (arg));
+     endif
+   endif
+ 
+ endfunction
+ 
+diff --git a/scripts/plot/util/zoom.m b/scripts/plot/util/zoom.m
+--- a/scripts/plot/util/zoom.m
++++ b/scripts/plot/util/zoom.m
+@@ -12,42 +12,55 @@
+ ## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ ## General Public License for more details.
+ ##
+ ## You should have received a copy of the GNU General Public License
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <http://www.gnu.org/licenses/>.
+ 
+ ## -*- texinfo -*-
+-## @deftypefn  {Command} {} zoom (@var{factor})
++## @deftypefn {Command} {} zoom
++## @deftypefnx  {Command} {} zoom (@var{factor})
++## @deftypefnx {Command} {} zoom on
++## @deftypefnx {Command} {} zoom off
++## @deftypefnx {Command} {} zoom xon
++## @deftypefnx {Command} {} zoom yon
+ ## @deftypefnx {Command} {} zoom out
+ ## @deftypefnx {Command} {} zoom reset
+-## Zoom the current axes object.
++## @deftypefnx {Command} {} zoom (@var{hfig}, @var{option})
++## Zoom the current axes object or control the interactive zoom mode of
++## a figure in the GUI.
+ ##
+ ## Given a numeric argument greater than zero, zoom by the given factor.
+ ## If the zoom factor is greater than one, zoom in on the plot.  If the
+ ## factor is less than one, zoom out.  If the zoom factor is a two- or
+ ## three-element vector, then the elements specify the zoom factors for
+ ## the x, y, and z axes respectively.
+ ##
++## Given the option @qcode{"on"} or @qcode{"off"}, set the interactive
++## zoom mode on or off.
++##
++## With no arguments, toggle the current zoom mode on or off.
++##
++## Given the option @qcode{"xon"} or @qcode{"yon"}, enable zoom mode
++## for the x or y axis only.
++##
+ ## Given the option @qcode{"out"}, zoom to the initial zoom setting.
+ ##
+ ## Given the option @qcode{"reset"}, store the current zoom setting so
+ ## that @code{zoom out} will return to this zoom level.
+ ##
++## If the first argument @var{hfig} is a figure, then operate on
++## the given figure rather than the current figure as returned by
++## @code{gcf}.
++##
+ ## @seealso{pan, rotate3d}
+ ## @end deftypefn
+ 
+ ## Eventually we need to also support these features:
+-## @deftypefn {Command} {} zoom
+-## @deftypefnx {Command} {} zoom on
+-## @deftypefnx {Command} {} zoom off
+-## @deftypefnx {Command} {} zoom xon
+-## @deftypefnx {Command} {} zoom yon
+-## @deftypefnx {Command} {} zoom (@var{hfig}, @var{option})
+ ## @deftypefnx {Command} {zoom_object_handle =} zoom (@var{hfig})
+ 
+ function zoom (varargin)
+ 
+   hfig = NaN;
+ 
+   nargs = nargin;
+ 
+@@ -69,72 +82,93 @@ function zoom (varargin)
+     endif
+   endif
+ 
+   if (isnan (hfig))
+     hfig = gcf ();
+   endif
+ 
+   if (nargs == 0)
+-    error ("zoom: toggling zoom mode is not implemented");
++    zm = get (hfig, "__zoom_mode__");
++    if (strcmp (zm.Enable, "on"))
++      zm.Enable = "off";
++    else
++      zm.Enable = "on";
++    endif
++    set (hfig, "__zoom_mode__", zm);
+   elseif (nargs == 1)
+     arg = varargin{1};
+     if (isnumeric (arg))
+       factor = arg;
+       switch (numel (factor))
+-        case 3
+-          xfactor = factor(1);
+-          yfactor = factor(2);
+-          zfactor = factor(3);
+         case 2
+           xfactor = factor(1);
+           yfactor = factor(2);
+-          zfactor = 1;
+         case 1
+-          xfactor = yfactor = zfactor = factor;
++          xfactor = yfactor = factor;
+         otherwise
+           error ("zoom: invalid factor");
+       endswitch
+-      if (xfactor < 0 || yfactor < 0 || zfactor < 0)
++      if (xfactor < 0 || yfactor < 0)
+         error ("zoom: factor must be greater than 1");
+-      elseif (xfactor == 1 && yfactor == 1 && zfactor == 1)
++      elseif (xfactor == 1 && yfactor == 1)
+         return;
+       endif
+       cax = get (hfig, "currentaxes");
+       if (! isempty (cax))
+-        limits = axis ();
+-        initial_zoom = getappdata (cax, "initial_zoom");
+-        if (isempty (initial_zoom))
+-          setappdata (cax, "__initial_zoom__", limits);
++        if (xfactor != 1)
++          if (yfactor != 1)
++            mode = "both";
++          else
++            mode = "horizontal";
++          endif
++        else
++          if (yfactor != 1)
++            mode = "vertical";
++          endif
+         endif
+-        limits(1:2) /= xfactor;
+-        limits(3:4) /= yfactor;
+-        if (numel (limits) > 4)
+-          limits(5:6) /= zfactor;
+-        endif
+-        axis (cax, limits);
++        __zoom__ (cax, mode, factor);
+       endif
+     elseif (ischar (arg))
+       switch (arg)
+         case {"on", "off", "xon", "yon"}
+-          error ("zoom %s: not implemented", arg);
++          zm = get (hfig, "__zoom_mode__");
++          switch (arg)
++            case {"on", "off"}
++              zm.Enable = arg;
++              zm.Motion = "both";
++            case "xon"
++              zm.Enable = "on";
++              zm.Motion = "horizontal";
++            case "yon"
++              zm.Enable = "on";
++              zm.Motion = "vertical";
++          endswitch
++          set (hfig, "__zoom_mode__", zm);
++          if (strcmp (arg, "off"))
++            set (hfig, "__mouse_mode__", "none");
++          else
++            ## FIXME: Is there a better way other than calling these
++            ## functions to set the other mouse mode Enable fields to
++            ## "off"?
++            pan ("off");
++            rotate3d ("off");
++            set (hfig, "__mouse_mode__", "zoom");
++          endif
+ 
+         case "out"
+           cax = get (hfig, "currentaxes");
+           if (! isempty (cax))
+-            initial_zoom = getappdata (cax, "__initial_zoom__");
+-            if (! isempty (initial_zoom))
+-              axis (cax, initial_zoom);
+-            endif
++            __zoom__ (cax, "out");
+           endif
+ 
+         case "reset"
+           cax = get (hfig, "currentaxes");
+           if (! isempty (cax))
+-            setappdata (cax, "__initial_zoom__", axis ());
++            __zoom__ (cax, "reset");
+           endif
+ 
+         otherwise
+           error ("zoom: unrecognized option '%s'", arg);
+       endswitch
+     else
+       error ("zoom: wrong type argument '%s'", class (arg));
+     endif

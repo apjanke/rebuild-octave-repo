@@ -1,0 +1,220 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1468613335 14400
+#      Fri Jul 15 16:08:55 2016 -0400
+# Node ID fdbe2eab2aefba8a13d1dbbe5efe1f94ee34f67b
+# Parent  d4f385635257dea90f75af90a2eb0d26450c87e5
+fix profiler initialization (bug #46315)
+
+* profile.m: When turning profiler on, just enable it, don't reset it.
+* profiler.cc
+(profile_data_accumulator::profile_data_accumulator):
+Create new call tree on initialization.  Initialize active_fcn to 0.
+(profile_data_accumulator::~profile_data_accumulator):
+Always delete call_tree.
+(profile_data_accumulator::set_acive): Simply set enabled flag.
+(profile_data_accumulator::enter_function): Don't call
+add_current_time if active_fcn isn't valid.  If active_fcn isn't set,
+set it to call_tree.
+(profile_data_accumulator::exit_function): Don't to anything if there
+is no active_fcn.
+(profile_data_accumulator::add_current_time): Likewise.
+(profile_data_accumulator::reset): Reinitialize call_tree and active_fcn.
+
+diff --git a/libinterp/corefcn/profiler.cc b/libinterp/corefcn/profiler.cc
+--- a/libinterp/corefcn/profiler.cc
++++ b/libinterp/corefcn/profiler.cc
+@@ -171,114 +171,106 @@ profile_data_accumulator::tree_node::get
+   retval.assign ("NumCalls", rv_calls);
+   retval.assign ("Children", rv_children);
+ 
+   return retval;
+ }
+ 
+ profile_data_accumulator::profile_data_accumulator ()
+   : known_functions (), fcn_index (),
+-    enabled (false), call_tree (0), last_time (-1.0)
+-{}
++    enabled (false), call_tree (new tree_node (0, 0)),
++    active_fcn (0), last_time (-1.0)
++{ }
+ 
+ profile_data_accumulator::~profile_data_accumulator ()
+ {
+-  if (call_tree)
+-    delete call_tree;
++  delete call_tree;
+ }
+ 
+ void
+ profile_data_accumulator::set_active (bool value)
+ {
+-  if (value)
+-    {
+-      // Create a call-tree top-node if there isn't yet one.
+-      if (! call_tree)
+-        call_tree = new tree_node (0, 0);
+-
+-      // Let the top-node be the active one.  This ensures we have a clean
+-      // fresh start collecting times.
+-      active_fcn = call_tree;
+-    }
+-  else
+-    {
+-      // Make sure we start with fresh timing if we're re-enabled later.
+-      last_time = -1.0;
+-    }
+-
+   enabled = value;
+ }
+ 
+ void
+ profile_data_accumulator::enter_function (const std::string& fcn)
+ {
+   // The enter class will check and only call us if the profiler is active.
+   assert (is_active ());
+   assert (call_tree);
+ 
+   // If there is already an active function, add to its time before
+   // pushing the new one.
+-  if (active_fcn != call_tree)
++  if (active_fcn && active_fcn != call_tree)
+     add_current_time ();
+ 
+   // Map the function's name to its index.
+   octave_idx_type fcn_idx;
+   fcn_index_map::iterator pos = fcn_index.find (fcn);
+   if (pos == fcn_index.end ())
+     {
+       known_functions.push_back (fcn);
+       fcn_idx = known_functions.size ();
+       fcn_index[fcn] = fcn_idx;
+     }
+   else
+     fcn_idx = pos->second;
+ 
++  if (! active_fcn)
++    active_fcn = call_tree;
++
+   active_fcn = active_fcn->enter (fcn_idx);
++
+   last_time = query_time ();
+ 
+ }
+ 
+ void
+ profile_data_accumulator::exit_function (const std::string& fcn)
+ {
+-  assert (call_tree);
+-  // FIXME: This assert statements doesn't make sense if profile() is called
+-  //        from within a function hierarchy to begin with.  See bug #39587.
+-  //assert (active_fcn != call_tree);
++  if (active_fcn)
++    {
++      assert (call_tree);
++      // FIXME: This assert statements doesn't make sense if profile() is called
++      //        from within a function hierarchy to begin with.  See bug #39587.
++      //assert (active_fcn != call_tree);
+ 
+-  // Usually, if we are disabled this function is not even called.  But the
+-  // call disabling the profiler is an exception.  So also check here
+-  // and only record the time if enabled.
+-  if (is_active ())
+-    add_current_time ();
++      // Usually, if we are disabled this function is not even called.  But the
++      // call disabling the profiler is an exception.  So also check here
++      // and only record the time if enabled.
++      if (is_active ())
++        add_current_time ();
+ 
+-  fcn_index_map::iterator pos = fcn_index.find (fcn);
+-  // FIXME: This assert statements doesn't make sense if profile() is called
+-  //        from within a function hierarchy to begin with.  See bug #39587.
+-  //assert (pos != fcn_index.end ());
+-  active_fcn = active_fcn->exit (pos->second);
++      fcn_index_map::iterator pos = fcn_index.find (fcn);
++      // FIXME: This assert statements doesn't make sense if profile() is called
++      //        from within a function hierarchy to begin with.  See bug #39587.
++      //assert (pos != fcn_index.end ());
++      active_fcn = active_fcn->exit (pos->second);
+ 
+-  // If this was an "inner call", we resume executing the parent function
+-  // up the stack.  So note the start-time for this!
+-  last_time = query_time ();
++      // If this was an "inner call", we resume executing the parent function
++      // up the stack.  So note the start-time for this!
++      last_time = query_time ();
++    }
+ }
+ 
+ void
+ profile_data_accumulator::reset (void)
+ {
+   if (is_active ())
+     error ("Can't reset active profiler.");
+ 
+   known_functions.clear ();
+   fcn_index.clear ();
+ 
+   if (call_tree)
+     {
+       delete call_tree;
+-      call_tree = 0;
++      call_tree = new tree_node (0, 0);
++      active_fcn = 0;
+     }
+ 
+   last_time = -1.0;
+ }
+ 
+ octave_value
+ profile_data_accumulator::get_flat (void) const
+ {
+@@ -377,21 +369,22 @@ profile_data_accumulator::query_time (vo
+   volatile double dnow = now.double_value ();
+ 
+   return dnow;
+ }
+ 
+ void
+ profile_data_accumulator::add_current_time (void)
+ {
+-  const double t = query_time ();
+-  assert (last_time >= 0.0 && last_time <= t);
++  if (active_fcn)
++    {
++      const double t = query_time ();
+ 
+-  assert (call_tree && active_fcn != call_tree);
+-  active_fcn->add_time (t - last_time);
++      active_fcn->add_time (t - last_time);
++    }
+ }
+ 
+ profile_data_accumulator profiler;
+ 
+ // Enable or disable the profiler data collection.
+ DEFUN (__profiler_enable__, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} __profiler_enable__ ()
+diff --git a/scripts/profiler/profile.m b/scripts/profiler/profile.m
+--- a/scripts/profiler/profile.m
++++ b/scripts/profiler/profile.m
+@@ -64,17 +64,16 @@
+ function retval = profile (option)
+ 
+   if (nargin != 1)
+     print_usage ();
+   endif
+ 
+   switch (option)
+     case "on"
+-      __profiler_reset__ ();
+       __profiler_enable__ (true);
+ 
+     case "off"
+       __profiler_enable__ (false);
+ 
+     case "clear"
+       __profiler_reset__ ();
+ 

@@ -1,0 +1,227 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1217524274 14400
+#      Thu Jul 31 13:11:14 2008 -0400
+# Node ID ff9e7873f8ea2008610dfcb93b820757e320ccc3
+# Parent  ea3cd9791703b00e36994e3f55eccd2e176d139d
+improve handling of command-style names in matrix_or_assign_lhs context
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,23 @@
++2008-07-31  John W. Eaton  <jwe@octave.org>
++
++	* parse.y (assign_lhs): Call force_local_variable on all elements
++	of lexer_flags.pending_local_variables here, then clear the set.
++	(matrix): Clear lexer_flags.pending_local_variable here.
++	* lex.l (lexical_feedback::init): Clear it.
++	(force_local_variable): No longer static.
++	(is_variable): Also return true for names in the
++	lexer_flags.pending_local_variables.
++	(handle_identifier): If we are parsing a matrix list, mark
++	identifiers as pending local variables rather than forcing them to
++	be local variables immediately.
++	* lex.h (lexical_feedback::pending_local_variables): New data member.
++	(force_local_variable): Provide decl.
++
+ 2008-07-30  John W. Eaton  <jwe@octave.org>
+ 
+ 	* ov-intx.h, ov.cc: Style fixes.
+ 
+ 	* gripes.cc (gripe_truncated_conversion): Use the warning ID
+ 	Octave:int-convert-overflow.
+ 
+ 2008-07-30  Jaroslav Hajek <highegg@gmail.com>
+diff --git a/src/lex.h b/src/lex.h
+--- a/src/lex.h
++++ b/src/lex.h
+@@ -47,16 +47,18 @@ extern void restore_input_buffer (void *
+ // Delete a buffer (for unwind-prot).
+ extern void delete_input_buffer (void *buf);
+ 
+ // Is the given string a keyword?
+ extern bool is_keyword (const std::string& s);
+ 
+ extern void prep_lexer_for_script (void);
+ 
++extern void force_local_variable (const std::string& name);
++
+ // For communication between the lexer and parser.
+ 
+ class
+ lexical_feedback
+ {
+ public:
+ 
+   lexical_feedback (void) { init (); }
+@@ -122,16 +124,19 @@ public:
+   int parsing_nested_function;
+ 
+   // TRUE means we are parsing a class method.
+   bool parsing_class_method;
+ 
+   // Return transpose or start a string?
+   bool quote_is_transpose;
+ 
++  // Set of identifiers that might be local variable names.
++  std::set<std::string> pending_local_variables;
++
+ private:
+ 
+   lexical_feedback (const lexical_feedback&);
+ 
+   lexical_feedback& operator = (const lexical_feedback&);
+ };
+ 
+ class
+diff --git a/src/lex.l b/src/lex.l
+--- a/src/lex.l
++++ b/src/lex.l
+@@ -34,16 +34,17 @@ along with Octave; see the file COPYING.
+ %{
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <cctype>
+ #include <cstring>
+ 
++#include <set>
+ #include <sstream>
+ #include <string>
+ #include <stack>
+ 
+ #ifdef HAVE_UNISTD_H
+ #ifdef HAVE_SYS_TYPES_H
+ #include <sys/types.h>
+ #endif
+@@ -1198,20 +1199,22 @@ is_keyword_token (const std::string& s)
+     }
+ 
+   return 0;
+ }
+ 
+ static bool
+ is_variable (const std::string& name)
+ {
+-  return symbol_table::is_variable (name);
++  return (symbol_table::is_variable (name)
++	  || (lexer_flags.pending_local_variables.find (name)
++	      != lexer_flags.pending_local_variables.end ()));
+ }
+ 
+-static void
++void
+ force_local_variable (const std::string& name)
+ {
+   octave_value& val = symbol_table::varref (name);
+ 
+   if (! val.is_defined ())
+     val = Matrix ();
+ }
+ 
+@@ -2489,21 +2492,24 @@ handle_identifier (void)
+   // something like [ab,cd] = foo (), force the symbol to be inserted
+   // as a variable in the current symbol table.
+ 
+   if (is_command_name (tok) && ! is_variable (tok))
+     {
+       if (next_tok_is_eq
+ 	  || lexer_flags.looking_at_return_list
+ 	  || (lexer_flags.looking_at_parameter_list
+-	      && ! lexer_flags.looking_at_initializer_expression)
+-	  || lexer_flags.looking_at_matrix_or_assign_lhs)
++	      && ! lexer_flags.looking_at_initializer_expression))
+ 	{
+ 	  force_local_variable (tok);
+ 	}
++      else if (lexer_flags.looking_at_matrix_or_assign_lhs)
++	{
++	  lexer_flags.pending_local_variables.insert (tok);
++	}
+       else if (! (next_tok_is_paren || lexer_flags.looking_at_object_index))
+ 	{
+ 	  BEGIN (COMMAND_START);
+ 	}
+ 
+       if (is_rawcommand_name (tok) && ! lexer_flags.looking_at_object_index)
+ 	{
+ 	  lexer_flags.doing_rawcommand = true;
+@@ -2584,16 +2590,19 @@ lexical_feedback::init (void)
+   // Not initially doing any plotting or setting of plot attributes.
+   doing_rawcommand = false;
+ 
+   // Not initially looking at indirect references.
+   looking_at_indirect_ref = false;
+ 
+   // Quote marks strings intially.
+   quote_is_transpose = false;
++
++  // Set of identifiers that might be local variable names is empty.
++  pending_local_variables.clear ();
+ }
+ 
+ bool
+ is_keyword (const std::string& s)
+ {
+   return octave_kw_hash::in_word_set (s.c_str (), s.length ()) != 0;
+ }
+ 
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -574,26 +574,29 @@ constant	: NUM
+ 		| string
+ 		  { $$ = $1; }
+ 		;
+ 
+ matrix		: '[' ']'
+ 		  {
+ 		    $$ = new tree_constant (octave_value (Matrix ()));
+ 		    lexer_flags.looking_at_matrix_or_assign_lhs = false;
++		    lexer_flags.pending_local_variables.clear ();
+ 		  }
+ 		| '[' ';' ']'
+ 		  {
+ 		    $$ = new tree_constant (octave_value (Matrix ()));
+ 		    lexer_flags.looking_at_matrix_or_assign_lhs = false;
++		    lexer_flags.pending_local_variables.clear ();
+ 		  }
+ 		| '[' matrix_rows ']'
+ 		  {
+ 		    $$ = finish_matrix ($2);
+ 		    lexer_flags.looking_at_matrix_or_assign_lhs = false;
++		    lexer_flags.pending_local_variables.clear ();
+ 		  }
+ 		;
+ 
+ matrix_rows	: matrix_rows1
+ 		  { $$ = $1; }
+ 		| matrix_rows1 ';'	// Ignore trailing semicolon.
+ 		  { $$ = $1; }
+ 		;
+@@ -830,16 +833,23 @@ assign_lhs	: simple_expr
+ 		  {
+ 		    $$ = new tree_argument_list ($1);
+ 		    $$->mark_as_simple_assign_lhs ();
+ 		  }
+ 		| '[' arg_list CLOSE_BRACE
+ 		  {
+ 		    $$ = $2;
+ 		    lexer_flags.looking_at_matrix_or_assign_lhs = false;
++		    for (std::set<std::string>::const_iterator p = lexer_flags.pending_local_variables.begin ();
++			 p != lexer_flags.pending_local_variables.end ();
++			 p++)
++		      {
++			force_local_variable (*p);
++		      }
++		    lexer_flags.pending_local_variables.clear ();
+ 		  }
+ 		;
+ 
+ assign_expr	: assign_lhs '=' expression
+ 		  { $$ = make_assign_op ('=', $1, $2, $3); }
+ 		| assign_lhs ADD_EQ expression
+ 		  { $$ = make_assign_op (ADD_EQ, $1, $2, $3); }
+ 		| assign_lhs SUB_EQ expression

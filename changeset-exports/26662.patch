@@ -1,0 +1,677 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1548960337 0
+#      Thu Jan 31 18:45:37 2019 +0000
+# Node ID 05fc703b419a14b3bd1a1a1a47b2d5ac7e5069b5
+# Parent  cf9e10ce3351d3b57711f16eca110c9412598ede
+update handling of command-style function call syntax in eval
+
+* lex.h, lex.ll (lexical_feedback::m_allow_command_syntax):
+New data member.
+(lexical_feedback::reset): Reset it.
+(lexical_feedback::previous_token_may_be_command,
+base_lexer::looks_like_command_arg): Return false immediately if
+m_allow_command_syntax is false.
+(base_lexer::is_variable): Check if name is a variable if parsing in
+top level scope.
+
+* parse.h, oct-parse.yy (base_parser::disallow_command_syntax):
+New function.
+(word_list_command): Mark index expression as a word list command.
+
+* pt-eval.cc (tree_evaluator::eval_string): If nargout > 0, don't
+allow evaluated code to be parsed as a command-style function call.
+(tree_evaluator::visit_index_expression): Error if identifier is a
+variable and index expression is a command-style function call.
+
+* pt-idx.h, pt-idx.cc (tree_index_expression::m_word_list_cmd):
+New member variable.
+(tree_index_expression::mark_word_list_cmd,
+tree_index_expression::is_word_list_cmd): New functions.
+
+* clearvars.m: Avoid evaluating command-style function call when
+assigning result of call to eval.
+
+* test/eval-command.tst: New file.
+* bug-38565.tst, bug-38576.tst: Delete obsolete tests.
+* test/module.mk: Update.
+
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -254,16 +254,17 @@ namespace octave
+ 
+     private:
+ 
+       std::deque<token *> m_buffer;
+     };
+ 
+     lexical_feedback (void)
+       : m_end_of_input (false),
++        m_allow_command_syntax (true),
+         m_at_beginning_of_statement (true),
+         m_looking_at_anon_fcn_args (false),
+         m_looking_at_return_list (false),
+         m_looking_at_parameter_list (false),
+         m_looking_at_decl_list (false),
+         m_looking_at_initializer_expression (false),
+         m_looking_at_matrix_or_assign_lhs (false),
+         m_looking_for_object_index (false),
+@@ -339,16 +340,19 @@ namespace octave
+     void maybe_mark_previous_token_as_variable (void);
+ 
+     void mark_as_variable (const std::string& nm);
+     void mark_as_variables (const std::list<std::string>& lst);
+ 
+     // true means that we have encountered eof on the input stream.
+     bool m_end_of_input;
+ 
++    // true means command syntax is allowed.
++    bool m_allow_command_syntax;
++
+     // true means we are at the beginning of a statement, where a
+     // command name is possible.
+     bool m_at_beginning_of_statement;
+ 
+     // true means we are parsing an anonymous function argument list.
+     bool m_looking_at_anon_fcn_args;
+ 
+     // true means we're parsing the return list for a function.
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -2080,16 +2080,17 @@ namespace octave
+     // index.
+     m_looking_at_object_index.push_front (false);
+   }
+ 
+   void
+   lexical_feedback::reset (void)
+   {
+     m_end_of_input = false;
++    m_allow_command_syntax = true;
+     m_at_beginning_of_statement = true;
+     m_looking_at_anon_fcn_args = false;
+     m_looking_at_return_list = false;
+     m_looking_at_parameter_list = false;
+     m_looking_at_decl_list = false;
+     m_looking_at_initializer_expression = false;
+     m_looking_at_matrix_or_assign_lhs = false;
+     m_looking_for_object_index = false;
+@@ -2192,16 +2193,19 @@ namespace octave
+   {
+     const token *tok = m_tokens.front ();
+     return tok ? tok->iskeyword () : false;
+   }
+ 
+   bool
+   lexical_feedback::previous_token_may_be_command (void) const
+   {
++    if (! m_allow_command_syntax)
++      return false;
++
+     const token *tok = m_tokens.front ();
+     return tok ? tok->may_be_command () : false;
+   }
+ 
+   void
+   lexical_feedback::maybe_mark_previous_token_as_variable (void)
+   {
+     token *tok = m_tokens.front ();
+@@ -2468,18 +2472,19 @@ namespace octave
+ 
+     return retval;
+   }
+ 
+   bool
+   base_lexer::is_variable (const std::string& name,
+                            const symbol_scope& /*scope*/)
+   {
+-    return (/* (scope && scope.is_variable (name))
+-            || */ (m_pending_local_variables.find (name)
++    return ((m_interpreter.at_top_level ()
++             && m_interpreter.is_variable (name))
++            || (m_pending_local_variables.find (name)
+                 != m_pending_local_variables.end ()));
+   }
+ 
+   // Handle keywords.  Return -1 if the keyword should be ignored.
+ 
+   int
+   base_lexer::is_keyword_token (const std::string& s)
+   {
+@@ -2942,16 +2947,19 @@ namespace octave
+     pop_start_state ();
+ 
+     return count_token (bracket_type);
+   }
+ 
+   bool
+   base_lexer::looks_like_command_arg (void)
+   {
++    if (! m_allow_command_syntax)
++      return false;
++
+     bool space_before = space_follows_previous_token ();
+     bool space_after = looking_at_space ();
+ 
+     return (space_before && ! space_after
+             && previous_token_may_be_command ());
+   }
+ 
+   int
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -479,16 +479,17 @@ statement       : expression
+ word_list_cmd   : identifier word_list
+                   {
+                     $$ = parser.make_index_expression ($1, $2, '(');
+                     if (! $$)
+                       {
+                         // make_index_expression deleted $1 and $2.
+                         YYABORT;
+                       }
++                    $$->mark_word_list_cmd ();
+                   }
+                 ;
+ 
+ word_list       : string
+                   { $$ = new octave::tree_argument_list ($1); }
+                 | word_list string
+                   {
+                     $1->append ($2);
+@@ -4309,16 +4310,22 @@ namespace octave
+     set_stmt_print_flag (list, sep, warn_missing_semi);
+ 
+     list->append (stmt);
+ 
+     return list;
+   }
+ 
+   void
++  base_parser::disallow_command_syntax (void)
++  {
++    m_lexer.m_allow_command_syntax = false;
++  }
++
++  void
+   base_parser::bison_error (const std::string& str, int l, int c)
+   {
+     int err_line = l < 0 ? m_lexer.m_input_line_number : l;
+     int err_col = c < 0 ? m_lexer.m_current_input_column - 1 : c;
+ 
+     std::ostringstream output_buf;
+ 
+     if (m_lexer.m_reading_fcn_file || m_lexer.m_reading_script_file
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -404,16 +404,21 @@ namespace octave
+     // Create a statement list.
+     tree_statement_list * make_statement_list (tree_statement *stmt);
+ 
+     // Append a statement to an existing statement list.
+     tree_statement_list *
+     append_statement_list (tree_statement_list *list, char sep,
+                            tree_statement *stmt, bool warn_missing_semi);
+ 
++    // Don't allow parsing command syntax.  If the parser/lexer is
++    // reset, this setting is also reset to the default (allow command
++    // syntax).
++    void disallow_command_syntax (void);
++
+     // Generic error messages.
+     void bison_error (const std::string& s, int l = -1, int c = -1);
+ 
+     // Contains error message if Bison-generated parser returns non-zero
+     // status.
+     std::string m_parse_error_msg;
+ 
+     // Have we found an explicit end to a function?
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -205,16 +205,25 @@ namespace octave
+     octave_value_list retval;
+ 
+     parser eval_parser (eval_str, m_interpreter);
+ 
+     do
+       {
+         eval_parser.reset ();
+ 
++        // If we are looking at
++        //
++        //   val = eval ("code");
++        //
++        // then don't allow code to be parsed as a command.
++
++        if (nargout > 0)
++          eval_parser.disallow_command_syntax ();
++
+         parse_status = eval_parser.run ();
+ 
+         if (parse_status == 0)
+           {
+             if (eval_parser.m_stmt_list)
+               {
+                 tree_statement *stmt = nullptr;
+ 
+@@ -2145,17 +2154,24 @@ namespace octave
+     octave_value base_expr_val;
+ 
+     tree_expression *expr = idx_expr.expression ();
+ 
+     if (expr->is_identifier () && type[beg] == '(')
+       {
+         tree_identifier *id = dynamic_cast<tree_identifier *> (expr);
+ 
+-        if (! is_variable (expr))
++        bool is_var = is_variable (expr);
++
++        std::string nm =  id->name ();
++
++        if (is_var && idx_expr.is_word_list_cmd ())
++          error ("%s used as variable and later as function", nm.c_str ());
++
++        if (! is_var)
+           {
+             octave_value_list first_args;
+ 
+             tree_argument_list *al = *p_args;
+ 
+             if (al && al->length () > 0)
+               {
+                 // Function calls inside an argument list can't have
+diff --git a/libinterp/parse-tree/pt-idx.cc b/libinterp/parse-tree/pt-idx.cc
+--- a/libinterp/parse-tree/pt-idx.cc
++++ b/libinterp/parse-tree/pt-idx.cc
+@@ -40,41 +40,41 @@ along with Octave; see the file COPYING.
+ #include "errwarn.h"
+ 
+ namespace octave
+ {
+   // Index expressions.
+ 
+   tree_index_expression::tree_index_expression (int l, int c)
+     : tree_expression (l, c), m_expr (nullptr), m_args (0), m_type (),
+-      m_arg_nm (), m_dyn_field () { }
++      m_arg_nm (), m_dyn_field (), m_word_list_cmd (false) { }
+ 
+   tree_index_expression::tree_index_expression (tree_expression *e,
+                                                 tree_argument_list *lst,
+                                                 int l, int c, char t)
+     : tree_expression (l, c), m_expr (e), m_args (0), m_type (),
+-      m_arg_nm (), m_dyn_field ()
++      m_arg_nm (), m_dyn_field (), m_word_list_cmd (false)
+   {
+     append (lst, t);
+   }
+ 
+   tree_index_expression::tree_index_expression (tree_expression *e,
+                                                 const std::string& n,
+                                                 int l, int c)
+     : tree_expression (l, c), m_expr (e), m_args (0), m_type (),
+-      m_arg_nm (), m_dyn_field ()
++      m_arg_nm (), m_dyn_field (), m_word_list_cmd (false)
+   {
+     append (n);
+   }
+ 
+   tree_index_expression::tree_index_expression (tree_expression *e,
+                                                 tree_expression *df,
+                                                 int l, int c)
+     : tree_expression (l, c), m_expr (e), m_args (0), m_type (),
+-      m_arg_nm (), m_dyn_field ()
++      m_arg_nm (), m_dyn_field (), m_word_list_cmd (false)
+   {
+     append (df);
+   }
+ 
+   void
+   tree_index_expression::append (tree_argument_list *lst, char t)
+   {
+     m_args.push_back (lst);
+diff --git a/libinterp/parse-tree/pt-idx.h b/libinterp/parse-tree/pt-idx.h
+--- a/libinterp/parse-tree/pt-idx.h
++++ b/libinterp/parse-tree/pt-idx.h
+@@ -84,16 +84,20 @@ namespace octave
+     std::list<tree_argument_list *> arg_lists (void) { return m_args; }
+ 
+     std::string type_tags (void) { return m_type; }
+ 
+     std::list<string_vector> arg_names (void) { return m_arg_nm; }
+ 
+     std::list<tree_expression *> dyn_fields (void) { return m_dyn_field; }
+ 
++    void mark_word_list_cmd (void) { m_word_list_cmd = true; }
++
++    bool is_word_list_cmd (void) const { return m_word_list_cmd; }
++
+     bool lvalue_ok (void) const { return m_expr->lvalue_ok (); }
+ 
+     bool rvalue_ok (void) const { return true; }
+ 
+     octave_lvalue lvalue (tree_evaluator& tw);
+ 
+     tree_index_expression * dup (symbol_scope& scope) const;
+ 
+@@ -120,15 +124,18 @@ namespace octave
+ 
+     // The names of the arguments.  Used for constant struct element
+     // references.
+     std::list<string_vector> m_arg_nm;
+ 
+     // The list of dynamic field names, if any.
+     std::list<tree_expression *> m_dyn_field;
+ 
++    // TRUE if this expression was parsed as a word list command.
++    bool m_word_list_cmd;
++
+     tree_index_expression (int l, int c);
+ 
+     octave_map make_arg_struct (void) const;
+   };
+ }
+ 
+ #endif
+diff --git a/scripts/miscellaneous/clearvars.m b/scripts/miscellaneous/clearvars.m
+--- a/scripts/miscellaneous/clearvars.m
++++ b/scripts/miscellaneous/clearvars.m
+@@ -122,19 +122,19 @@ function clearvars (varargin)
+       vars(numvar).var_name = [ '\<' regexptranslate("wildcard", arg) '\>' ];
+     else
+       vars(numvar).var_name = arg;
+     endif
+ 
+   endfor
+ 
+   if (global_mode)
+-    varlist = evalin ("caller", "who global");
++    varlist = evalin ("caller", "who ('global')");
+   else
+-    varlist = evalin ("caller", "who");
++    varlist = evalin ("caller", "who ()");
+   endif
+ 
+   ## evalin will cause the automatic creation of 'ans' variable (bug #53339).
+   ## Determine if it needs to be removed at the end of the function.
+   clear_ans = ! any (strcmp (varlist, "ans"));
+ 
+   if (numvar == 0 || all ([vars.except]))
+     ## For wildcard, select all variables in list
+@@ -146,29 +146,29 @@ function clearvars (varargin)
+ 
+   if (numvar > 0 && any ([vars.except]))
+     ptn = strjoin ({ vars([vars.except]).var_name }, '|');
+     idx_except = ! cellfun (@isempty, regexp (varlist, ptn));
+     idx_clear(idx_except) = false;
+   endif
+ 
+   varlist = varlist(idx_clear);
+-  names = strjoin (varlist, " ");
++  names = strjoin (varlist, "', '");
+ 
+   if (! isempty (names))
+     if (global_mode)
+-      evalin ("caller", ["clear -global " names]);
++      evalin ("caller", ["clear ('-global', '", names, "')"]);
+     else
+-      evalin ("caller", ["clear " names]);
++      evalin ("caller", ["clear ('", names, "')"]);
+     endif
+   endif
+ 
+   ## Clean up automatic variable "ans" if necessary
+   if (clear_ans)
+-    evalin ("caller", "clear ans");
++    evalin ("caller", "clear ('ans')");
+   endif
+ 
+ endfunction
+ 
+ 
+ ## Tests must be done in a function namespace;
+ ## Otherwise, they interfere with the BIST environment itself.
+ %!function __test_local_vars__ ()
+diff --git a/test/bug-38565.tst b/test/bug-38565.tst
+deleted file mode 100644
+--- a/test/bug-38565.tst
++++ /dev/null
+@@ -1,27 +0,0 @@
+-## Copyright (C) 2013-2019 John W. Eaton
+-##
+-## This file is part of Octave.
+-##
+-## Octave is free software: you can redistribute it and/or modify it
+-## under the terms of the GNU General Public License as published by
+-## the Free Software Foundation, either version 3 of the License, or
+-## (at your option) any later version.
+-##
+-## Octave is distributed in the hope that it will be useful, but
+-## WITHOUT ANY WARRANTY; without even the implied warranty of
+-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-## GNU General Public License for more details.
+-##
+-## You should have received a copy of the GNU General Public License
+-## along with Octave; see the file COPYING.  If not, see
+-## <https://www.gnu.org/licenses/>.
+-
+-%!function r = f (x)
+-%!  if (ischar (x))
+-%!    r = x;
+-%!  else
+-%!    error ("expecting character string");
+-%!  endif
+-%!endfunction
+-
+-%!assert (eval ("f 10;"), "10")
+diff --git a/test/bug-38576.tst b/test/eval-command.tst
+rename from test/bug-38576.tst
+rename to test/eval-command.tst
+--- a/test/bug-38576.tst
++++ b/test/eval-command.tst
+@@ -11,28 +11,144 @@
+ ## WITHOUT ANY WARRANTY; without even the implied warranty of
+ ## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ ## GNU General Public License for more details.
+ ##
+ ## You should have received a copy of the GNU General Public License
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <https://www.gnu.org/licenses/>.
+ 
+-%!function r = f1 ()
+-%!  ls = svd (1);
+-%!  r = eval ("ls -1;");
++%!function r = sigma (opt)
++%!  global sigma_call;
++%!  if (nargin == 0)
++%!    sigma_call = "function";
++%!    r = 1;
++%!  elseif (ischar (opt))
++%!    sigma_call = "command";
++%!    r = 1;
++%!  else
++%!    sigma_call = "unexpected";
++%!  endif
++%!endfunction
++%!
++%!function f1 ()
++%!  ## ERROR; sigma used as variable and later parsed as command
++%!  sigma = svd (1);
++%!  eval ("sigma -1;");
++%!endfunction
++%!
++%!function f1a ()
++%!  ## Assignment of eval result means eval code is not parsed as command.
++%!  sigma = svd (1);
++%!  val = eval ("sigma -1;");
+ %!endfunction
+-%!function r = f2 ()
+-%!  [u,ls,v] = svd (1);
+-%!  r = eval ("ls -1;");
++%!
++%!function f2 ()
++%!  ## ERROR; sigma used as variable and later parsed as command
++%!  [u, sigma, v] = svd (1);
++%!  eval ("sigma -1;");
++%!endfunction
++%!
++%!function f2a ()
++%!  ## Assignment of eval result means eval code is not parsed as command.
++%!  [u, sigma, v] = svd (1);
++%!  val = eval ("sigma -1;");
++%!endfunction
++%!
++%!function f3 (sigma)
++%!  ## No assignment of eval result means eval code is parsed as command.
++%!  ## If f3 is called with a value for sigma, it will be used.  Otherwise,
++%!  ## search for the function sigma and call with no arguments.
++%!  eval ("sigma -1;");
++%!endfunction
++%!
++%!function f3a (sigma)
++%!  ## Assignment of eval result means eval code is not parsed as command.
++%!  val = eval ("sigma -1;");
++%!endfunction
++%!
++%!function f4 ()
++%!  ## No assignment of eval result means eval code is parsed as command.
++%!  eval ("sigma -1;");
++%!endfunction
++%!
++%!function f4a ()
++%!  ## Assignment of eval result means eval code is not parsed as command.
++%!  val = eval ("sigma -1;");
+ %!endfunction
+-%!function r = f3 (ls)
+-%!  r = eval ("ls -1;");
+-%!endfunction
+-
+-%!test
+-%! ## Windows systems can't run "ls -1"
+-%! if (! ispc ())
+-%!   assert (f1 (), 0);
+-%!   assert (f2 (), 0);
+-%!   assert (ischar (f3 ()), true);
+-%!   assert (f3 (1), 0);
+-%! endif
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! ## Matlab complains about sigma previously being used as a variable
++%! ## before being used as a command.
++%! fail ("f1 ()", "used as variable and later as function");
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f1a ();
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! ## Matlab complains about sigma previously being used as a variable
++%! ## before being used as a command.
++%! fail ("f2 ()", "used as variable and later as function");
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f2a ();
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f3 ();
++%! assert (sigma_call, "command");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f3a ();
++%! assert (sigma_call, "function");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! ## NOTE: this result disagrees with Matlab, which evaluates sigma
++%! ## as a command-style function even though there is a variable named
++%! ## sigma defined in the workspace prior to evaluating the function
++%! ## call (compare with f1() and f2() above).
++%! fail ("f3 (1)", "used as variable and later as function");
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f3a (1);
++%! assert (sigma_call, "none");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f4 ();
++%! assert (sigma_call, "command");
++%! clear -global sigma_call
++%!
++%!test <55610>
++%! global sigma_call;
++%! sigma_call = "none";
++%! f4a ();
++%! assert (sigma_call, "function");
++%! clear -global sigma_call
+diff --git a/test/module.mk b/test/module.mk
+--- a/test/module.mk
++++ b/test/module.mk
+@@ -3,18 +3,16 @@
+ %canon_reldir%_CLEANFILES =
+ %canon_reldir%_DISTCLEANFILES =
+ %canon_reldir%_MAINTAINERCLEANFILES =
+ 
+ TEST_FILES += \
+   %reldir%/fntests.m \
+   %reldir%/args.tst \
+   %reldir%/bug-31371.tst \
+-  %reldir%/bug-38565.tst \
+-  %reldir%/bug-38576.tst \
+   %reldir%/bug-45969.tst \
+   %reldir%/bug-45972.tst \
+   %reldir%/bug-46330.tst \
+   %reldir%/bug-49904.tst \
+   %reldir%/bug-53579.tst \
+   %reldir%/bug-53599.tst \
+   %reldir%/bug-54490.tst \
+   %reldir%/bug-55308.tst \
+@@ -22,16 +20,17 @@ TEST_FILES += \
+   %reldir%/bug-55322.tst \
+   %reldir%/colormaps.tst \
+   %reldir%/command.tst \
+   %reldir%/complex.tst \
+   %reldir%/deprecate-props.tst \
+   %reldir%/diag-perm.tst \
+   %reldir%/error.tst \
+   %reldir%/eval-catch.tst \
++  %reldir%/eval-command.tst \
+   %reldir%/for.tst \
+   %reldir%/func.tst \
+   %reldir%/global.tst \
+   %reldir%/if.tst \
+   %reldir%/index.tst \
+   %reldir%/integer.tst \
+   %reldir%/io.tst \
+   %reldir%/jit.tst \

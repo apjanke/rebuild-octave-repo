@@ -1,0 +1,471 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1362175562 28800
+#      Fri Mar 01 14:06:02 2013 -0800
+# Node ID 0303fda3e929218fde2427d9ef1968762747bf8f
+# Parent  8650eec57e9f05c718d6d2d04886ec8005ddfafc
+Fix range behavior with -0 endpoints (bug #38423)
+
+* libinterp/interpfcn/pr-output.cc(octave_print_internal): print base
+or limit of range rather than using expression base+i*increment
+which can destroy the signbit of base/limit.
+
+* liboctave/array/Range.cc(Range constructor): Move trivial 2-line constructor
+to .h file.
+
+* liboctave/array/Range.cc(matrix_value, checkelem): Return base for first
+element of array.  Return limit of range for end of array if appropriate.
+
+* liboctave/array/Range.cc(elem): Move function from Range.h  Return base for
+first element of array.  Return limit of range for end of array if appropriate.
+
+* liboctave/array/Range.cc(_rangeindex_helper, index): Return base for first
+element of array.  Return limit of range for end of array if appropriate.
+
+* liboctave/array/Range.cc(min, max): Use '<=' or '>=' tests to
+return base or limit if appropriate.
+
+* liboctave/array/Range.cc(is_sorted): Place more common test first in
+if/else if/else tree.
+
+* liboctave/array/Range.cc(operator <<): Return base for first
+element of array.  Return limit of range for end of array if appropriate.
+
+liboctave/array/Range.h(Range constructor): Put trivial 2-line constructor
+in .h file.
+
+liboctave/array/Range.h(elem): Move function which has become more complicated
+to Range.cc.
+
+* test/range.tst: Add %!tests for corner cases of base and limit of range.
+
+diff --git a/libinterp/interpfcn/pr-output.cc b/libinterp/interpfcn/pr-output.cc
+--- a/libinterp/interpfcn/pr-output.cc
++++ b/libinterp/interpfcn/pr-output.cc
+@@ -2719,24 +2719,27 @@ octave_print_internal (std::ostream& os,
+                                  extra_indent);
+ 
+               os << std::setw (extra_indent) << "";
+ 
+               for (octave_idx_type i = col; i < lim; i++)
+                 {
+                   octave_quit ();
+ 
+-                  double val = base + i * increment;
++                  double val;
++                  if (i == 0)
++                    val = base;
++                  else
++                    val = base + i * increment;
+ 
+                   if (i == num_elem - 1)
+                     {
+                       // See the comments in Range::matrix_value.
+-
+-                      if ((increment > 0 && val > limit)
+-                          || (increment < 0 && val < limit))
++                      if ((increment > 0 && val >= limit)
++                          || (increment < 0 && val <= limit))
+                         val = limit;
+                     }
+ 
+                   os << "  ";
+ 
+                   pr_float (os, val, fw, scale);
+                 }
+ 
+diff --git a/liboctave/array/Range.cc b/liboctave/array/Range.cc
+--- a/liboctave/array/Range.cc
++++ b/liboctave/array/Range.cc
+@@ -31,24 +31,16 @@ along with Octave; see the file COPYING.
+ 
+ #include "Range.h"
+ #include "lo-error.h"
+ #include "lo-mappers.h"
+ #include "lo-math.h"
+ #include "lo-utils.h"
+ #include "Array-util.h"
+ 
+-Range::Range (double b, double i, octave_idx_type n)
+-  : rng_base (b), rng_limit (b + (n-1) * i), rng_inc (i),
+-    rng_nelem (n), cache ()
+-{
+-  if (! xfinite (b) || ! xfinite (i))
+-    rng_nelem = -2;
+-}
+-
+ bool
+ Range::all_elements_are_ints (void) const
+ {
+   // If the base and increment are ints, the final value in the range
+   // will also be an integer, even if the limit is not. If there is one
+   // or fewer elements only the base needs to be an integer
+ 
+   return (! (xisnan (rng_base) || xisnan (rng_inc))
+@@ -59,49 +51,108 @@ Range::all_elements_are_ints (void) cons
+ Matrix
+ Range::matrix_value (void) const
+ {
+   if (rng_nelem > 0 && cache.nelem () == 0)
+     {
+       cache.resize (1, rng_nelem);
+       double b = rng_base;
+       double increment = rng_inc;
+-      for (octave_idx_type i = 0; i < rng_nelem; i++)
+-        cache(i) = b + i * increment;
++      if (rng_nelem > 0)
++        {
++          // The first element must always be *exactly* the base.
++          // E.g, -0 would otherwise become +0 in the loop (-0 + 0*increment).
++          cache(0) = b; 
++          for (octave_idx_type i = 1; i < rng_nelem; i++)
++            cache(i) = b + i * increment;
++        }
+ 
+       // On some machines (x86 with extended precision floating point
+       // arithmetic, for example) it is possible that we can overshoot
+       // the limit by approximately the machine precision even though
+       // we were very careful in our calculation of the number of
+-      // elements.
++      // elements.  The tests need equality (>= rng_limit or <= rng_limit)
++      // to have expressions like -5:1:-0 result in a -0 endpoint.
+ 
+-      if ((rng_inc > 0 && cache(rng_nelem-1) > rng_limit)
+-          || (rng_inc < 0 && cache(rng_nelem-1) < rng_limit))
++      if ((rng_inc > 0 && cache(rng_nelem-1) >= rng_limit)
++          || (rng_inc < 0 && cache(rng_nelem-1) <= rng_limit))
+         cache(rng_nelem-1) = rng_limit;
+     }
+ 
+   return cache;
+ }
+ 
+ double
+ Range::checkelem (octave_idx_type i) const
+ {
+   if (i < 0 || i >= rng_nelem)
+     gripe_index_out_of_range (1, 1, i+1, rng_nelem);
+ 
+-  return rng_base + rng_inc * i;
++  if (i == 0)
++    return rng_base;
++  else if (i < rng_nelem - 1) 
++    return rng_base + i * rng_inc;
++  else
++    {
++      double end = rng_base + i * rng_inc;
++      if ((rng_inc > 0 && end >= rng_limit)
++          || (rng_inc < 0 && end <= rng_limit))
++        return rng_limit;
++      else
++        return end;
++    }
+ }
+ 
++double
++Range::elem (octave_idx_type i) const
++{
++#if defined (BOUNDS_CHECKING)
++  return checkelem (i);
++#else
++  if (i == 0)
++    return rng_base;
++  else if (i < rng_nelem - 1) 
++    return rng_base + i * rng_inc;
++  else
++    {
++      double end = rng_base + i * rng_inc;
++      if ((rng_inc > 0 && end >= rng_limit)
++          || (rng_inc < 0 && end <= rng_limit))
++        return rng_limit;
++      else
++        return end;
++    }
++#endif
++}
++
++// Pseudo-class used for idx_vector.loop () function call
+ struct _rangeidx_helper
+ {
+-  double *array, base, inc;
+-  _rangeidx_helper (double *a, double b, double i)
+-    : array (a), base (b), inc (i) { }
++  double *array, base, inc, limit;
++  octave_idx_type nmax;
++
++  _rangeidx_helper (double *a, double b, double i, double l, octave_idx_type n)
++    : array (a), base (b), inc (i), limit (l), nmax (n-1) { }
++
+   void operator () (octave_idx_type i)
+-    { *array++ = base + i * inc; }
++    {
++      if (i == 0)
++        *array++ = base;
++      else if (i < nmax) 
++        *array++ = base + i * inc;
++      else
++        {
++          double end = base + i * inc;
++          if ((inc > 0 && end >= limit)
++              || (inc < 0 && end <= limit))
++            *array++ = limit;
++          else
++            *array++ = end;
++        }
++    }
+ };
+ 
+ Array<double>
+ Range::index (const idx_vector& i) const
+ {
+   Array<double> retval;
+ 
+   octave_idx_type n = rng_nelem;
+@@ -114,23 +165,24 @@ Range::index (const idx_vector& i) const
+     {
+       if (i.extent (n) != n)
+         gripe_index_out_of_range (1, 1, i.extent (n), n); // throws
+ 
+       dim_vector rd = i.orig_dimensions ();
+       octave_idx_type il = i.length (n);
+ 
+       // taken from Array.cc.
+-
+       if (n != 1 && rd.is_vector ())
+         rd = dim_vector (1, il);
+ 
+       retval.clear (rd);
+ 
+-      i.loop (n, _rangeidx_helper (retval.fortran_vec (), rng_base, rng_inc));
++      // idx_vector loop across all values in i, executing _rangeidx_helper (i) foreach i
++      i.loop (n, _rangeidx_helper (retval.fortran_vec (),
++                                   rng_base, rng_inc, rng_limit, rng_nelem));
+     }
+ 
+   return retval;
+ }
+ 
+ // NOTE: max and min only return useful values if nelem > 0.
+ 
+ double
+@@ -141,18 +193,17 @@ Range::min (void) const
+     {
+       if (rng_inc > 0)
+         retval = rng_base;
+       else
+         {
+           retval = rng_base + (rng_nelem - 1) * rng_inc;
+ 
+           // See the note in the matrix_value method above.
+-
+-          if (retval < rng_limit)
++          if (retval <= rng_limit)
+             retval = rng_limit;
+         }
+ 
+     }
+   return retval;
+ }
+ 
+ double
+@@ -161,18 +212,17 @@ Range::max (void) const
+   double retval = 0.0;
+   if (rng_nelem > 0)
+     {
+       if (rng_inc > 0)
+         {
+           retval = rng_base + (rng_nelem - 1) * rng_inc;
+ 
+           // See the note in the matrix_value method above.
+-
+-          if (retval > rng_limit)
++          if (retval >= rng_limit)
+             retval = rng_limit;
+         }
+       else
+         retval = rng_base;
+     }
+   return retval;
+ }
+ 
+@@ -263,52 +313,55 @@ Range
+ Range::sort (Array<octave_idx_type>& sidx, octave_idx_type dim,
+              sortmode mode) const
+ {
+   Range retval = *this;
+ 
+   if (dim == 1)
+     {
+       if (mode == ASCENDING)
+-          retval.sort_internal (sidx, true);
++        retval.sort_internal (sidx, true);
+       else if (mode == DESCENDING)
+         retval.sort_internal (sidx, false);
+     }
+   else if (dim != 0)
+     (*current_liboctave_error_handler) ("Range::sort: invalid dimension");
+ 
+   return retval;
+ }
+ 
+ sortmode
+ Range::is_sorted (sortmode mode) const
+ {
+-  if (rng_nelem > 1 && rng_inc < 0)
++  if (rng_nelem > 1 && rng_inc > 0)
++    mode = (mode == DESCENDING) ? UNSORTED : ASCENDING;
++  else if (rng_nelem > 1 && rng_inc < 0)
+     mode = (mode == ASCENDING) ? UNSORTED : DESCENDING;
+-  else if (rng_nelem > 1 && rng_inc > 0)
+-    mode = (mode == DESCENDING) ? UNSORTED : ASCENDING;
+   else
+     mode = mode ? mode : ASCENDING;
+ 
+   return mode;
+ }
+ 
+ std::ostream&
+ operator << (std::ostream& os, const Range& a)
+ {
+   double b = a.base ();
+   double increment = a.inc ();
+   octave_idx_type num_elem = a.nelem ();
+ 
+-  for (octave_idx_type i = 0; i < num_elem-1; i++)
+-    os << b + i * increment << " ";
++  if (num_elem > 1)
++    {
++      // First element must be the base *exactly* (-0).
++      os << b << " ";
++      for (octave_idx_type i = 1; i < num_elem-1; i++)
++        os << b + i * increment << " ";
++    }
+ 
+-  // Prevent overshoot.  See comment in the matrix_value method
+-  // above.
+-
++  // Prevent overshoot.  See comment in the matrix_value method above.
+   os << (increment > 0 ? a.max () : a.min ()) << "\n";
+ 
+   return os;
+ }
+ 
+ std::istream&
+ operator >> (std::istream& is, Range& a)
+ {
+@@ -497,13 +550,13 @@ Range::nelem_internal (void) const
+       if (! teq (rng_base + (n_elt - 1) * rng_inc, rng_limit))
+         {
+           if (teq (rng_base + (n_elt - 2) * rng_inc, rng_limit))
+             n_elt--;
+           else if (teq (rng_base + n_elt * rng_inc, rng_limit))
+             n_elt++;
+         }
+ 
+-      retval = (n_elt >= std::numeric_limits<octave_idx_type>::max () - 1) ? -1 : n_elt;
++      retval = (n_elt < std::numeric_limits<octave_idx_type>::max () - 1) ? n_elt : -1;
+     }
+ 
+   return retval;
+ }
+diff --git a/liboctave/array/Range.h b/liboctave/array/Range.h
+--- a/liboctave/array/Range.h
++++ b/liboctave/array/Range.h
+@@ -45,17 +45,23 @@ Range
+     : rng_base (b), rng_limit (l), rng_inc (1),
+       rng_nelem (nelem_internal ()), cache () { }
+ 
+   Range (double b, double l, double i)
+     : rng_base (b), rng_limit (l), rng_inc (i),
+       rng_nelem (nelem_internal ()), cache () { }
+ 
+   // For operators' usage (to preserve element count).
+-  Range (double b, double i, octave_idx_type n);
++  Range (double b, double i, octave_idx_type n)
++    : rng_base (b), rng_limit (b + (n-1) * i), rng_inc (i),
++      rng_nelem (n), cache ()
++    {
++      if (! xfinite (b) || ! xfinite (i))
++        rng_nelem = -2;
++    }
+ 
+   double base (void) const { return rng_base; }
+   double limit (void) const { return rng_limit; }
+   double inc (void) const { return rng_inc; }
+   octave_idx_type nelem (void) const { return rng_nelem; }
+ 
+   bool all_elements_are_ints (void) const;
+ 
+@@ -75,24 +81,17 @@ Range
+               sortmode mode = ASCENDING) const;
+ 
+   sortmode is_sorted (sortmode mode = ASCENDING) const;
+ 
+   // Support for single-index subscripting, without generating matrix cache.
+ 
+   double checkelem (octave_idx_type i) const;
+ 
+-  double elem (octave_idx_type i) const
+-    {
+-#if defined (BOUNDS_CHECKING)
+-      return checkelem (i);
+-#else
+-      return rng_base + rng_inc * i;
+-#endif
+-    }
++  double elem (octave_idx_type i) const;
+ 
+   Array<double> index (const idx_vector& i) const;
+ 
+   void set_base (double b)
+   {
+     if (rng_base != b)
+       {
+         rng_base = b;
+diff --git a/test/range.tst b/test/range.tst
+--- a/test/range.tst
++++ b/test/range.tst
+@@ -67,8 +67,43 @@
+ %!assert ([ r ; int16(z)           ], int16(expect))
+ %!assert ([ r ; int32(z)           ], int32(expect))
+ %!assert ([ r ; int64(z)           ], int64(expect))
+ %!assert ([ r ; uint8(z)           ], uint8(expect))
+ %!assert ([ r ; uint16(z)          ], uint16(expect))
+ %!assert ([ r ; uint32(z)          ], uint32(expect))
+ %!assert ([ r ; uint64(z)          ], uint64(expect))
+ 
++## Test corner cases of ranges (base and limit)
++
++%!shared r, rrev, rneg
++%! r = -0:3;
++%! rrev = 3:-1:-0;
++%! rneg = -3:-0;
++
++%!assert (full (r), [-0 1 2 3])
++%!assert (signbit (full (r)), logical ([1 0 0 0]))
++%!assert (r(1), -0)
++%!assert (signbit (r(1)), true)
++%!assert (signbit (r(1:2)), logical ([1 0]))
++%!assert (signbit (r(2:-1:1)), logical ([0 1]))
++%!assert (signbit (r([2 1 1 3])), logical ([0 1 1 0]))
++
++%!assert (full (rrev), [3 2 1 -0])
++%!assert (signbit (full (rrev)), logical ([0 0 0 1]))
++%!assert (rrev(4), -0)
++%!assert (signbit (rrev(4)), true)
++%!assert (signbit (rrev(3:4)), logical ([0 1]))
++%!assert (signbit (rrev(4:-1:3)), logical ([1 0]))
++%!assert (signbit (rrev([1 4 4 2])), logical ([0 1 1 0]))
++
++%!assert (min (r), -0)
++%!assert (signbit (min (r)), true)
++%!assert (min (rrev), -0)
++%!assert (signbit (min (rrev)), true)
++
++%!assert (max (rneg), -0)
++%!assert (signbit (min (rneg)), true)
++
++%!assert (sort (r, "descend"), [3 2 1 -0])
++%!assert (signbit (sort (r, "descend")), logical ([0 0 0 1]))
++%!assert (signbit (sort (rrev, "ascend")), logical ([1 0 0 0]))
++

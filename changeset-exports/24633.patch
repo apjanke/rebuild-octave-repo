@@ -1,0 +1,496 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1516549159 18000
+#      Sun Jan 21 10:39:19 2018 -0500
+# Node ID 428780eec08a5df4d291c576c660d786d5d9a6b9
+# Parent  e9f7cfd40f85baa9e8aa943eb1ed14493a912570
+improve behavior of variable editor
+
+* main-window.cc (main_window::refresh_variable_editor): Call
+variable_editor_window::refresh, not
+variable_editor_window::clear_data_cache.
+
+* variable-editor-model.cc (cell::cell): Use default argument to merge
+two constructors.
+(variable_editor_model::impl): Use C++11 syntax to disable copying and
+default constructor.
+(variable_editor_model::data): Set pending state before posting event.
+(variable_editor_model::setData): Avoid flicker issue by temporarily
+setting data to string user entered.
+(variable_editor_model::set_data_oct): Use try-catch block to handle
+parsing and evaluation errors.  Don't emit signals.
+(variable_editor_model::set_data_oct,
+variable_editor_model::set_data_oct,
+variable_editor_model::init_from_oct,
+variable_editor_model::eval_oct,
+variable_editor_model::retrieve_variable):
+Tag as a function that must be evaluated in the interpreter thread.
+
+* variable-editor.cc (variable_editor::refresh): New function.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1746,17 +1746,17 @@ main_window::edit_variable (const QStrin
+       m_variable_editor_window->raise ();
+     }
+ 
+ }
+ 
+ void
+ main_window::refresh_variable_editor (void)
+ {
+-  m_variable_editor_window->clear_data_cache ();
++  m_variable_editor_window->refresh ();
+ }
+ 
+ void
+ main_window::handle_variable_editor_update (void)
+ {
+   // Called when the variable editor emits the updated signal.  The size
+   // of a variable may have changed, so we refresh the workspace in the
+   // interpreter.  That will eventually cause the workspace view in the
+diff --git a/libgui/src/variable-editor-model.cc b/libgui/src/variable-editor-model.cc
+--- a/libgui/src/variable-editor-model.cc
++++ b/libgui/src/variable-editor-model.cc
+@@ -34,39 +34,34 @@ along with Octave; see the file COPYING.
+ #include <QString>
+ #include <QVector>
+ 
+ #include "octave-qt-link.h"
+ #include "variable-editor-model.h"
+ 
+ #include "ov.h"
+ #include "parse.h"
++#include "utils.h"
+ #include "variables.h"
+ 
+ // Pimpl/Dpointer for variable_editor_model.
+ 
+ struct variable_editor_model::impl
+ {
+   struct cell
+   {
+     enum state_t
+       {
+         avail,
+         notavail,
+         pending,
+         unset
+       };
+ 
+-    cell (void)
+-      : m_state (unset)
+-    { }
+-
+-    cell (state_t s)
+-      : m_state (s)
+-    { }
++    explicit cell (state_t s = unset) : m_state (s) { }
+ 
+     cell (const QString& d, const QString& s, const QString& t,
+           bool rse, sub_editor_types edtype)
+       : m_state (avail), m_data (d), m_status_tip (s), m_tool_tip (t),
+         m_requires_sub_editor (rse), m_editor_type (edtype)
+     { }
+ 
+     state_t m_state;
+@@ -182,22 +177,28 @@ struct variable_editor_model::impl
+ 
+   octave_idx_type columns (void) const { return m_cols; }
+ 
+   int model_to_index (const QModelIndex& idx) const
+   {
+     return idx.column () * m_rows + idx.row ();
+   }
+ 
++  impl (void) = delete;
++
+   impl (const QString& n, QLabel *l)
+     : m_name (n.toStdString ()), m_type (),
+       m_rows (0), m_cols (0), m_table (), m_label (l),
+       m_validity (true), m_validtext ()
+   { }
+ 
++  impl (const impl&) = delete;
++
++  impl& operator = (const impl&) = delete;
++
+   const std::string m_name;
+ 
+   std::string m_type;
+ 
+   octave_idx_type m_rows;
+ 
+   octave_idx_type m_cols;
+ 
+@@ -277,23 +278,23 @@ variable_editor_model::data (const QMode
+   if (idx.isValid ())
+     {
+       if (m_d->is_set (idx))
+         return m_d->data (idx, role);
+       else
+         {
+           if (! m_d->is_pending (idx))
+             {
++              m_d->pending (idx);
++
+               octave_link::post_event<variable_editor_model,
+                                       int, int, std::string>
+                 (const_cast<variable_editor_model *> (this),
+                  &variable_editor_model::get_data_oct,
+                  idx.row (), idx.column (), m_d->m_name);
+-
+-              m_d->pending (idx);
+             }
+ 
+           if (role == Qt::DisplayRole)
+             return QVariant (QString (m_d->is_notavail (idx) ? "⌛" : "✗"));
+           else
+             return QVariant ();
+         }
+     }
+@@ -301,60 +302,71 @@ variable_editor_model::data (const QMode
+   // Invalid.
+   return QVariant ();
+ }
+ 
+ bool
+ variable_editor_model::setData (const QModelIndex& idx, const QVariant& v,
+                                 int role)
+ {
+-  if (idx.isValid () && role == Qt::EditRole)
+-    {
+-      if (v.type () != QVariant::String)
+-        {
+-          qDebug () << v.typeName () << " Expected String!";
+-          return false;
+-        }
++  if (role != Qt::EditRole || v.type () != QVariant::String
++      || ! idx.isValid ())
++    return false;
++
++  // Initially, set value to whatever the user entered.
++
++  int r = idx.row ();
++  int c = idx.column ();
++
++  QString vstr = v.toString ();
++
++  m_d->set (r, c, impl::cell (vstr, "", "", false, sub_none));
+ 
+-      octave_link::post_event<variable_editor_model,
+-                              std::string, int, int, std::string>
+-        (this, &variable_editor_model::set_data_oct,
+-         m_d->m_name, idx.row (), idx.column (),
+-         v.toString ().toStdString ());
++  emit dataChanged (idx, idx);
++
++  // Evaluate the string that the user entered.  If that fails, we
++  // will restore previous value.
+ 
+-      return true;
+-    }
+-  else
+-    return false;
++  octave_link::post_event<variable_editor_model,
++                          std::string, int, int, std::string>
++    (this, &variable_editor_model::set_data_oct,
++     m_d->m_name, r, c, v.toString ().toStdString ());
++
++  // This is success so far...
++
++  return true;
+ }
+ 
+ Qt::ItemFlags
+ variable_editor_model::flags (const QModelIndex& idx) const
+ {
+   if (m_d->m_validity)
+     {
+       if (requires_sub_editor (idx))
+         {
+           if (editor_type (idx) != sub_string)
+             return QAbstractTableModel::flags (idx);
+         }
+ 
+       return QAbstractTableModel::flags (idx) | Qt::ItemIsEditable;
+ 
+-      // FIXME: ???
+-      // return requires_sub_editor(idx) ?  QAbstractTableModel::flags (idx) : QAbstractTableModel::flags (idx) | Qt::ItemIsEditable;
++      // FIXME: What was the intent here?
++      // return (requires_sub_editor (idx)
++      //         ? QAbstractTableModel::flags (idx)
++      //         : QAbstractTableModel::flags (idx) | Qt::ItemIsEditable);
+     }
+ 
+   return Qt::NoItemFlags;
+ }
+ 
+ bool
+ variable_editor_model::insertRows (int row, int count, const QModelIndex&)
+ {
+   // FIXME: cells?
++
+   octave_link::post_event <variable_editor_model, std::string, std::string>
+     (this, &variable_editor_model::eval_oct, m_d->m_name,
+      QString ("%1 = [ %1(1:%2,:) ; zeros(%3, columns(%1)) ; %1(%2+%3:end,:) ]")
+      .arg (QString::fromStdString (m_d->m_name))
+      .arg (row)
+      .arg (count)
+      .toStdString ());
+ 
+@@ -565,28 +577,33 @@ variable_editor_model::received_initiali
+ }
+ 
+ // Private.
+ 
+ void
+ variable_editor_model::get_data_oct (const int& row, const int& col,
+                                      const std::string& x)
+ {
++  // INTERPRETER THREAD
++
+   int parse_status = 0;
+ 
+   octave_value v = retrieve_variable (x, parse_status);
+ 
+   // FIXME: What was the intent here?
+   // eval_string (x, true, parse_status);
+   // retrieve_variable (x, parse_status);
+   // (symbol_exist (x, "var") > 0
+   //  ? eval_string (x, true, parse_status) : octave_value ());
+ 
+   if (parse_status != 0 || ! v.is_defined ())
+     {
++      // FIXME: This function executes in the interpreter thread, so no
++      // signals should be emitted.
++
+       emit no_data (row, col);
+       m_d->m_validity = false;
+       return;
+     }
+   octave_value_list ovlidx = ovl (row + 1, col + 1);
+   /*const*/ octave_value elem = v.single_subsref (m_d->m_type, ovlidx);
+ 
+   if (elem.is_defined ())
+@@ -598,79 +615,81 @@ variable_editor_model::get_data_oct (con
+ 
+       // FIXME: This should not be necessary.
+ 
+       if (dat == QString ("inf"))
+         dat = "Inf";
+       if (dat == QString ("nan"))
+         dat = "NaN";
+ 
++      // FIXME: This function executes in the interpreter thread, so no
++      // signals should be emitted.
++
+       emit data_ready (row, col, dat, cname, elem.rows (), elem.columns ());
+     }
+   else
+-    emit no_data (row, col);
++    {
++      // FIXME: This function executes in the interpreter thread, so no
++      // signals should be emitted.
++
++      emit no_data (row, col);
++    }
+ }
+ 
+ // val has to be copied!
+ 
+ void
+ variable_editor_model::set_data_oct (const std::string& x,
+                                      const int& row, const int& col,
+                                      const std::string& val)
+ {
+-  m_d->m_validity = true;
++  // INTERPRETER THREAD
++
++  try
++    {
++      m_d->m_validity = true;
+ 
+-  // Accessing directly since
+-  // 1) retrieve_variable does not support writeback, and
+-  // 2) we can be reasonably sure that this variable exists.
++      int parse_status = 0;
++
++      octave_value ret = octave::eval_string (val, true, parse_status);
+ 
+-  int parse_status = 0;
+-
+-  octave_value ret = octave::eval_string (val, true, parse_status);
++      if (parse_status == 0 && ret.is_defined ())
++        {
++          octave_value v = retrieve_variable (x, parse_status);
+ 
+-  // FIXME: ???
+-  // retrieve_variable(x, parse_status);//eval_string (val, true, parse_status);
+-
+-  if (parse_status != 0 || ret.is_undefined ())
++          if (parse_status == 0 && v.is_defined ())
++            {
++              octave_value_list ovlidx = ovl (row + 1, col + 1);
++              std::list<octave_value_list> idxl;
++              idxl.push_back (ovlidx);
++              v.subsasgn (m_d->m_type, idxl, ret);
++            }
++        }
++    }
++  catch (octave::execution_exception&)
+     {
+-      emit user_error ("Invalid expression",
+-                       QString ("Expression `%1' invalid")
+-                       .arg (QString::fromStdString (val)));
+-      return;
++      // Send error info back to GUI thread here?
++
++      // Allow execution to continue below so we can restore the
++      // previous value in the variable editor display.
+     }
+ 
+-  parse_status = 0;
+-
+-  octave_value v = retrieve_variable (x, parse_status);
+-
+-  // FIXME: ???
+-  // eval_string (x, true, parse_status);
++  // Set new or restore old value in the variable editor display.
+ 
+-  if (parse_status != 0 || ! v.is_defined ())
+-    {
+-      m_d->m_validity = false;
+-      emit user_error ("Table invalid",
+-                       QString ("Table expression `%1' invalid")
+-                       .arg (QString::fromStdString (x)));
+-      return;
+-    }
+-
+-  octave_value_list ovlidx = ovl (row + 1, col + 1);
+-  std::list<octave_value_list> idxl;
+-  idxl.push_back (ovlidx);
+-  v.subsasgn (m_d->m_type, idxl, ret);
+-  emit unset_data (row, col);
+-  QModelIndex idx = QAbstractTableModel::index (row, col);
+-
+-  emit dataChanged (idx, idx);
++  octave_link::post_event<variable_editor_model, int, int, std::string>
++    (const_cast<variable_editor_model *> (this),
++     &variable_editor_model::get_data_oct,
++     row, col, m_d->m_name);
+ }
+ 
+ void
+ variable_editor_model::init_from_oct (const std::string& x)
+ {
++  // INTERPRETER THREAD
++
+   int parse_status = 0;
+ 
+   const octave_value ov = retrieve_variable (x, parse_status);
+ 
+   // FIXME: What was the intent here?
+   // eval_string (x, true, parse_status);
+ 
+   m_d->m_validity = true;
+@@ -686,22 +705,27 @@ variable_editor_model::init_from_oct (co
+ 
+   const QString class_name = QString::fromStdString (ov.class_name ());
+   const QString paren = ov.iscell () ? "{" : "(";
+   const octave_idx_type rows = ov.rows ();
+   const octave_idx_type cols = ov.columns ();
+ 
+   display_valid ();
+ 
++  // FIXME: This function executes in the interpreter thread, so no
++  // signals should be emitted.
++
+   emit initialize_data (class_name, paren, rows, cols);
+ }
+ 
+ void
+ variable_editor_model::eval_oct (const std::string& name, const std::string& x)
+ {
++  // INTERPRETER THREAD
++
+   int parse_status = 0;
+ 
+   octave::eval_string (x, true, parse_status);
+ 
+   if (parse_status != 0)
+     emit user_error ("Evaluation failed",
+                      QString ("Evaluation of `%s' failed")
+                      .arg (QString::fromStdString (x)));
+@@ -711,16 +735,18 @@ variable_editor_model::eval_oct (const s
+ 
+ // If the variable exists, load it into the data model.  If it doesn't
+ // exist, flag the data model as referring to a nonexistent variable.
+ // This allows the variable to be opened before it is created.
+ octave_value
+ variable_editor_model::retrieve_variable (const std::string& x,
+                                           int& parse_status)
+ {
++  // INTERPRETER THREAD
++
+   std::string name = x;
+ 
+   if (x.back () == ')' || x.back () == '}')
+     name = x.substr (0, x.find (x.back () == ')' ? "(" : "{"));
+ 
+   if (symbol_exist (name, "var") > 0)
+     return octave::eval_string (x, true, parse_status);
+ 
+diff --git a/libgui/src/variable-editor.cc b/libgui/src/variable-editor.cc
+--- a/libgui/src/variable-editor.cc
++++ b/libgui/src/variable-editor.cc
+@@ -241,16 +241,26 @@ variable_editor::clear_data_cache (void)
+   for (int i = 0; i < m_tab_widget->count (); ++i)
+     {
+       QTableView *const table = get_table_data (m_tab_widget, i).m_table;
+       QAbstractItemModel *const model = table->model ();
+       qobject_cast<variable_editor_model *> (model)->clear_data_cache ();
+     }
+ }
+ 
++void
++variable_editor::refresh (void)
++{
++  // FIXME: this preserves existing behavior, but what we really want to
++  // do is refresh the variable tabs that are displayed only if
++  // something has actually changed.
++
++  clear_data_cache ();
++}
++
+ bool
+ variable_editor::has_focus (void)
+ {
+   // FIXME: This only generates exceptions in certain circumstances.
+   // Get a definitive list and eliminate the need to handle exceptions?
+ 
+   if (m_tab_widget->currentIndex () == -1)
+     return false;  // No tabs.
+diff --git a/libgui/src/variable-editor.h b/libgui/src/variable-editor.h
+--- a/libgui/src/variable-editor.h
++++ b/libgui/src/variable-editor.h
+@@ -52,16 +52,18 @@ public:
+ 
+   variable_editor& operator = (const variable_editor&) = delete;
+ 
+   void edit_variable (const QString& name);
+ 
+   // Clear all the models' data cache.
+   void clear_data_cache (void);
+ 
++  void refresh (void);
++
+   bool has_focus (void);
+ 
+   static QList<QColor> default_colors (void);
+ 
+   static QStringList color_names (void);
+ 
+ public slots:
+ 

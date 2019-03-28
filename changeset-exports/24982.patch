@@ -1,0 +1,302 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1521775461 14400
+#      Thu Mar 22 23:24:21 2018 -0400
+# Branch stable
+# Node ID c16ad80274c9abc702963f821047036cfb43cd48
+# Parent  8033e53e6cb4f3129e5a85e7118f3916eccc4b72
+improve previous fix for clear in nested scopes (bug #53027)
+
+* symrec.h (symbol_record::unbind_fwd_rep): New arg, recurse.
+(symbol_record::symbol_record_rep::unbind_fwd_rep): New arg, recurse.
+If TRUE, recurse to find ultimate rep.
+
+* symscope.cc (symbol_scope_rep::unbind_script_symbols): Don't recurse
+when unbinding script symbols.
+
+* symscope.h (symbol_record_rep::clear_varaible,
+symbol_record_rep::clear_variable_pattern,
+symbol_record_rep::clear_variable_regexp):
+If scope is nested, check parent for symbols.
+
+* test/bug-53027/globals53027.m, test/bug-53027/gtest53027.m:
+New test scripts.
+* test/bug-53027/ntest53027c.m: New test function.
+* test/bug-53027/ntest53027b.m: Fix typo.
+* test/bug-53027/bug-53027.tst: Update.
+* test/bug-53027/module.mk: Update.
+
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+--- a/libinterp/corefcn/symrec.h
++++ b/libinterp/corefcn/symrec.h
+@@ -485,28 +485,48 @@ namespace octave
+             t_fwd_rep->bind_fwd_rep (fwd_scope, fwd_rep);
+             return;
+           }
+ 
+         m_fwd_scope = fwd_scope;
+         m_fwd_rep = fwd_rep;
+       }
+ 
+-      void unbind_fwd_rep (void)
++      void unbind_fwd_rep (bool recurse = true)
+       {
+-        if (auto t_fwd_rep = m_fwd_rep.lock ())
++        // When unbinding variables in a script scope, recurse will be
++        // false and we will only break the immediate link.  By doing
++        // that, we ensure that any variables that are made global in
++        // a script remain linked as globals in the enclosing scope.
++
++        // When unbinding variables in a (possibly nested) function
++        // scope, recurse will be true and we will break the link to
++        // the global scope, not just the immediate link to the parent
++        // scope of the nested function.
++
++        if (recurse)
+           {
+-            t_fwd_rep->unbind_fwd_rep ();
+-            return;
+-          }
++            if (auto t_fwd_rep = m_fwd_rep.lock ())
++              {
++                // Currently, it is only possible to have at most two
++                // levels of indirection here, either
++                //
++                //   nested function -> parent function -> global scope
++                //
++                // or
++                //
++                //   script -> top level scope -> global scope
++                //
++                // so we can break the recursion here by setting the
++                // argument to unbind_fwd_rep to false.
+ 
+-        // When unbinding an object, only break the immediate link.
+-        // By doing that, we ensure that any variables that are made
+-        // global in a script remain linked as globals in the
+-        // enclosing scope.
++                t_fwd_rep->unbind_fwd_rep (false);
++                return;
++              }
++          }
+ 
+         m_fwd_scope = std::weak_ptr<symbol_scope_rep> ();
+         m_fwd_rep.reset ();
+       }
+ 
+       std::shared_ptr<symbol_record_rep>
+       dup (const std::shared_ptr<symbol_scope_rep>& new_scope) const;
+ 
+@@ -654,17 +674,17 @@ namespace octave
+     unsigned int storage_class (void) const { return m_rep->storage_class (); }
+ 
+     void bind_fwd_rep (const std::shared_ptr<symbol_scope_rep>& fwd_scope,
+                        const symbol_record& sr)
+     {
+       m_rep->bind_fwd_rep (fwd_scope, sr.m_rep);
+     }
+ 
+-    void unbind_fwd_rep (void) { m_rep->unbind_fwd_rep (); }
++    void unbind_fwd_rep (bool recurse = true) { m_rep->unbind_fwd_rep (recurse); }
+ 
+     octave_value dump (context_id context) const
+     {
+       return m_rep->dump (context);
+     }
+ 
+   private:
+ 
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -232,11 +232,11 @@ namespace octave
+       nm_sr.second.bind_fwd_rep (curr_scope,
+                                  curr_scope->find_symbol (nm_sr.first));
+   }
+ 
+   void
+   symbol_scope_rep::unbind_script_symbols (void)
+   {
+     for (auto& nm_sr : m_symbols)
+-      nm_sr.second.unbind_fwd_rep ();
++      nm_sr.second.unbind_fwd_rep (false);
+   }
+ }
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -300,48 +300,71 @@ namespace octave
+     }
+ 
+     void clear_variable (const std::string& name)
+     {
+       table_iterator p = m_symbols.find (name);
+ 
+       if (p != m_symbols.end ())
+         p->second.clear (m_context);
++      else if (m_is_nested)
++        {
++          std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
++
++          if (psr)
++            psr->clear_variable (name);
++        }
+     }
+ 
+     void clear_variable_pattern (const std::string& pat)
+     {
+       glob_match pattern (pat);
+ 
+       for (auto& nm_sr : m_symbols)
+         {
+           symbol_record& sr = nm_sr.second;
+ 
+           if (sr.is_defined (m_context) || sr.is_global ())
+             {
+               if (pattern.match (sr.name ()))
+                 sr.clear (m_context);
+             }
+         }
++
++      if (m_is_nested)
++        {
++          std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
++
++          if (psr)
++            psr->clear_variable_pattern (pat);
++        }
+     }
+ 
+     void clear_variable_regexp (const std::string& pat)
+     {
+       octave::regexp pattern (pat);
+ 
+       for (auto& nm_sr : m_symbols)
+         {
+           symbol_record& sr = nm_sr.second;
+ 
+           if (sr.is_defined (m_context) || sr.is_global ())
+             {
+               if (pattern.is_match (sr.name ()))
+                 sr.clear (m_context);
+             }
+         }
++
++      if (m_is_nested)
++        {
++          std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
++
++          if (psr)
++            psr->clear_variable_regexp (pat);
++        }
+     }
+ 
+     void mark_automatic (const std::string& name)
+     {
+       insert (name).mark_automatic ();
+     }
+ 
+     void mark_hidden (const std::string& name)
+diff --git a/test/bug-53027/bug-53027.tst b/test/bug-53027/bug-53027.tst
+--- a/test/bug-53027/bug-53027.tst
++++ b/test/bug-53027/bug-53027.tst
+@@ -23,12 +23,28 @@
+ %! assert (X, 1);
+ %! clear X
+ %! assert (exist ("X"), 0);
+ 
+ %!test <*53027>
+ %! [a, b] = ntest53027a ();
+ %! assert ([a, b], [0, 0])
+ 
+-## Not fixed yet.
+-%!test <53027>
++%!test <*53027>
+ %! [a, b] = ntest53027b ();
+ %! assert ([a, b], [0, 0])
++
++%!test <*53027>
++%! [a, b] = ntest53027c ();
++%! assert ([a, b], [0, 0])
++
++## Previous bugs have caused segfaults when executing script twice.
++%!test <*53027>
++%! gtest53027
++%! assert (isempty (a) && isempty (c))
++%! assert (isglobal ("a") && isglobal ("c"))
++%! assert (! exist ("b"))
++%! assert (isempty (xx) && ! isglobal ("xx"))
++%! gtest53027
++%! assert (isempty (a) && isempty (c))
++%! assert (isglobal ("a") && isglobal ("c"))
++%! assert (! exist ("b"))
++%! assert (isempty (xx) && ! isglobal ("xx"))
+diff --git a/test/bug-53027/globals53027.m b/test/bug-53027/globals53027.m
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/globals53027.m
+@@ -0,0 +1,1 @@
++global a b c
+diff --git a/test/bug-53027/gtest53027.m b/test/bug-53027/gtest53027.m
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/gtest53027.m
+@@ -0,0 +1,4 @@
++globals53027
++
++xx = a;
++clear b
+diff --git a/test/bug-53027/module.mk b/test/bug-53027/module.mk
+--- a/test/bug-53027/module.mk
++++ b/test/bug-53027/module.mk
+@@ -1,6 +1,9 @@
+ bug_53027_TEST_FILES = \
+   %reldir%/bug-53027.tst \
++  %reldir%/globals53027.m \
++  %reldir%/gtest53027.m \
+   %reldir%/ntest53027a.m \
+-  %reldir%/ntest53027b.m
++  %reldir%/ntest53027b.m \
++  %reldir%/ntest53027c.m
+ 
+ TEST_FILES += $(bug_53027_TEST_FILES)
+diff --git a/test/bug-53027/ntest53027b.m b/test/bug-53027/ntest53027b.m
+--- a/test/bug-53027/ntest53027b.m
++++ b/test/bug-53027/ntest53027b.m
+@@ -1,15 +1,15 @@
+ function [m_exist, n_exist] = ntest53027b ()
+   global x
+   x = 3;
+   n_exist = nest ();
+   m_exist = exist ("x", 'var');
+   function n_exist = nest ()
+     ## The clear statement should operate on the variable in the
+     ## parent scope even though there is no explicit varabiable
+-    ## reference in teh code (the clear function just sees a string
++    ## reference in the code (the clear function just sees a string
+     ## containing the name of the variable and the parser (correctly)
+     ## does not treat this as a special case.
+     clear x
+     n_exist = exist ("x", "var");
+   endfunction
+ endfunction
+diff --git a/test/bug-53027/ntest53027c.m b/test/bug-53027/ntest53027c.m
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/ntest53027c.m
+@@ -0,0 +1,15 @@
++function [m_exist, n_exist] = ntest53027c ()
++  ## In this test, x is not global.
++  x = 3;
++  n_exist = nest ();
++  m_exist = exist ("x", 'var');
++  function n_exist = nest ()
++    ## The clear statement should operate on the variable in the
++    ## parent scope even though there is no explicit varabiable
++    ## reference in the code (the clear function just sees a string
++    ## containing the name of the variable and the parser (correctly)
++    ## does not treat this as a special case.
++    clear x
++    n_exist = exist ("x", "var");
++  endfunction
++endfunction

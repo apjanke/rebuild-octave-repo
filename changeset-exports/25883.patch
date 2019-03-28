@@ -1,0 +1,419 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1536943643 -7200
+#      Fri Sep 14 18:47:23 2018 +0200
+# Node ID cfdc768b661c0e7ad02b7e146c7558032554531a
+# Parent  22ee68edcf3a23cd3cfd43c87d063206248f482e
+allow native dialogs for remaining file open/save dialogs (bug #5
+
+* files-dock-widget.cc (popdownmenu_search_dir): allow native dialogs for
+  selecting a new file browser directory
+
+* file-editor-tab.cc (load_file): read file in binary form and test for errors
+  when decoding text using the currently set default encoding, allows user
+  to continue editing or close the file in case of invalid characters;
+  (handle_decode_warning_answer): analyze users choice in case of
+  detection of invalid chars during decoding
+  (save_file_as): allow native dialogs for file selection dialog and remove
+  the extra items for encoding and line ending from the dialog;
+  (handle_combo_eol_current_index, handle_combo_enc_current_index):
+  removed obsolete slots for removed dialog items
+
+* file-editor-tab.h: update includes, new slot handle_decode_warning_answer,
+  removed slots handle_combo_eol_current_index, handle_combo_enc_current_index
+
+* main-window.cc (request_open_file): allow native file dialogs and remove
+  extra items for selecting encoding and line ending from the dialog
+
+* shortcut-manager.cc (do_import_export): allow native file dialogs
+
+* variable-editor.cc (variable_editor_stack::save): allow native file dialogs
+
+diff --git a/libgui/src/files-dock-widget.cc b/libgui/src/files-dock-widget.cc
+--- a/libgui/src/files-dock-widget.cc
++++ b/libgui/src/files-dock-widget.cc
+@@ -848,18 +848,17 @@ namespace octave
+     set_current_directory (dir);
+   }
+ 
+   void files_dock_widget::popdownmenu_search_dir (bool)
+   {
+     QString dir = QFileDialog::getExistingDirectory (this,
+                      tr ("Set directory of file browser"),
+                      m_file_system_model->rootPath (),
+-                     QFileDialog::ShowDirsOnly
+-                     | QFileDialog::DontUseNativeDialog);
++                     QFileDialog::ShowDirsOnly);
+     set_current_directory (dir);
+   }
+ 
+   void files_dock_widget::popdownmenu_findfiles (bool)
+   {
+     process_find_files (m_file_system_model->rootPath ());
+   }
+ 
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -1729,28 +1729,59 @@ namespace octave
+     // get the absolute path
+     QFileInfo file_info = QFileInfo (fileName);
+     QString file_to_load;
+     if (file_info.exists ())
+       file_to_load = file_info.canonicalFilePath ();
+     else
+       file_to_load = fileName;
+     QFile file (file_to_load);
+-    if (! file.open (QFile::ReadOnly))
++    if (!file.open(QIODevice::ReadOnly))
+       return file.errorString ();
+ 
+-    // read the file
+-    QTextStream in (&file);
+-    // set the desired codec
+-    QTextCodec *codec = QTextCodec::codecForName (_encoding.toLatin1 ());
+-    in.setCodec (codec);
+-
+     QApplication::setOverrideCursor (Qt::WaitCursor);
+-    _edit_area->setText (in.readAll ());
++
++    // read the file binary, decoding later
++    const QByteArray text_data = file.readAll ();
++
++    // decode
++    QTextCodec::ConverterState st;
++    QTextCodec *codec = QTextCodec::codecForName (_encoding.toLatin1 ());
++    const QString text = codec->toUnicode(text_data.constData(),
++                                          text_data.size(), &st);
++
++    // Decoding with invalid characters?
++    if (st.invalidChars > 0)
++      {
++        // Message box for user decision
++        QString msg = tr ("There were problems reading the file\n"
++                          "%1\n"
++                          "with the selected encoding %2.\n\n"
++                          "Modifying and saving the file might "
++                          "cause data loss!")
++                          .arg (file_to_load).arg (_encoding);
++        QMessageBox *msg_box = new QMessageBox ();
++        msg_box->setIcon (QMessageBox::Warning);
++        msg_box->setText (msg);
++        msg_box->setWindowTitle (tr ("Octave Editor"));
++        msg_box->addButton (tr ("&Edit anyway"), QMessageBox::YesRole);
++        //msg_box->addButton (tr ("&Change encoding"), QMessageBox::AcceptRole);
++        msg_box->addButton (tr ("&Close"), QMessageBox::RejectRole);
++
++        connect (msg_box, SIGNAL (buttonClicked (QAbstractButton *)),
++                 this, SLOT (handle_decode_warning_answer (QAbstractButton *)));
++
++        msg_box->setWindowModality (Qt::WindowModal);
++        msg_box->setAttribute (Qt::WA_DeleteOnClose);
++        msg_box->show ();
++      }
++
++    _edit_area->setText (text);
+     _edit_area->setEolMode (detect_eol_mode ());
++
+     QApplication::restoreOverrideCursor ();
+ 
+     _copy_available = false;     // no selection yet available
+     set_file_name (file_to_load);
+     update_window_title (false); // window title (no modification)
+     _edit_area->setModified (false); // loaded file is not modified yet
+ 
+     update_eol_indicator ();
+@@ -1771,16 +1802,24 @@ namespace octave
+       octave_link, SLOT (queue_octave_command (const QString&)));
+ 
+       emit evaluate_octave_command ("dbstatus");
+     */
+ 
+     return QString ();
+   }
+ 
++  void file_editor_tab::handle_decode_warning_answer (QAbstractButton *btn)
++  {
++    QString txt = btn->text ();
++
++    if (txt == tr ("&Close"))
++      close ();
++  }
++
+   QsciScintilla::EolMode file_editor_tab::detect_eol_mode (void)
+   {
+     QByteArray text = _edit_area->text ().toLatin1 ();
+ 
+     QByteArray eol_lf = QByteArray (1,0x0a);
+     QByteArray eol_cr = QByteArray (1,0x0d);
+     QByteArray eol_crlf = eol_cr;
+     eol_crlf.append (eol_lf);
+@@ -2086,63 +2125,16 @@ namespace octave
+         // If tab is closed, "this" cannot be parent in which case modality
+         // has no effect.  Disable editing instead.
+         _edit_area->setReadOnly (true);
+         fileDialog = new QFileDialog ();
+       }
+     else
+       fileDialog = new QFileDialog (this);
+ 
+-    // Giving trouble under KDE (problem is related to Qt signal handling on unix,
+-    // see https://bugs.kde.org/show_bug.cgi?id=260719 ,
+-    // it had/has no effect on Windows, though)
+-    fileDialog->setOption (QFileDialog::DontUseNativeDialog, true);
+-
+-    // define a new grid layout with the extra elements
+-    QGridLayout *extra = new QGridLayout (fileDialog);
+-    QFrame *separator = new QFrame (fileDialog);
+-    separator->setFrameShape (QFrame::HLine);   // horizontal line as separator
+-    separator->setFrameStyle (QFrame::Sunken);
+-
+-    // combo box for choosing new line ending chars
+-    QLabel *label_eol = new QLabel (tr ("Line Endings:"));
+-    QComboBox *combo_eol = new QComboBox ();
+-    combo_eol->addItem ("Windows (CRLF)");  // ensure the same order as in
+-    combo_eol->addItem ("Mac (CR)");        // the settings dialog
+-    combo_eol->addItem ("Unix (LF)");
+-    _save_as_desired_eol = _edit_area->eolMode ();      // init with current eol
+-    combo_eol->setCurrentIndex (_save_as_desired_eol);
+-
+-    // combo box for encoding
+-    QLabel *label_enc = new QLabel (tr ("File Encoding:"));
+-    QComboBox *combo_enc = new QComboBox ();
+-    resource_manager::combo_encoding (combo_enc, _encoding);
+-
+-    // track changes in the combo boxes
+-    connect (combo_eol, SIGNAL (currentIndexChanged (int)),
+-             this, SLOT (handle_combo_eol_current_index (int)));
+-    connect (combo_enc, SIGNAL (currentIndexChanged (QString)),
+-             this, SLOT (handle_combo_enc_current_index (QString)));
+-
+-    // build the extra grid layout
+-    extra->addWidget (separator,0,0,1,6);
+-    extra->addWidget (label_eol,1,0);
+-    extra->addWidget (combo_eol,1,1);
+-    extra->addItem   (new QSpacerItem (1,20,QSizePolicy::Fixed,
+-                                       QSizePolicy::Fixed), 1,2);
+-    extra->addWidget (label_enc,1,3);
+-    extra->addWidget (combo_enc,1,4);
+-    extra->addItem   (new QSpacerItem (1,20,QSizePolicy::Expanding,
+-                                       QSizePolicy::Fixed), 1,5);
+-
+-    // and add the extra grid layout to the dialog's layout
+-    QGridLayout *dialog_layout = dynamic_cast<QGridLayout *> (fileDialog->layout ());
+-    dialog_layout->addLayout (extra,dialog_layout->rowCount (),0,
+-                              1,dialog_layout->columnCount ());
+-
+     // add the possible filters and the default suffix
+     QStringList filters;
+     filters << tr ("Octave Files (*.m)")
+             << tr ("All Files (*)");
+     fileDialog->setNameFilters (filters);
+     fileDialog->setDefaultSuffix ("m");
+ 
+     if (valid_file_name ())
+@@ -2185,26 +2177,16 @@ namespace octave
+       {
+         connect (fileDialog, SIGNAL (fileSelected (const QString&)),
+                  this, SLOT (handle_save_file_as_answer (const QString&)));
+       }
+ 
+     show_dialog (fileDialog, ! valid_file_name ());
+   }
+ 
+-  void file_editor_tab::handle_combo_eol_current_index (int index)
+-  {
+-    _save_as_desired_eol = static_cast<QsciScintilla::EolMode> (index);
+-  }
+-
+-  void file_editor_tab::handle_combo_enc_current_index (QString text)
+-  {
+-    _new_encoding = text;
+-  }
+-
+   void file_editor_tab::handle_save_as_filter_selected (const QString& filter)
+   {
+     QFileDialog *file_dialog = qobject_cast<QFileDialog *> (sender ());
+ 
+     QRegExp rx ("\\*\\.([^ ^\\)]*)[ \\)]");   // regexp for suffix in filter
+     int index = rx.indexIn (filter,0);        // get first suffix in filter
+ 
+     if (index > -1)
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -18,26 +18,26 @@ You should have received a copy of the G
+ along with Octave; see the file COPYING.  If not, see
+ <https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if ! defined (octave_file_editor_tab_h)
+ #define octave_file_editor_tab_h 1
+ 
++#include <QAbstractButton>
+ #include <QWidget>
+ #include <QCloseEvent>
+ #include <QDateTime>
+ #include <QFileSystemWatcher>
+ #include <QSettings>
+ #include <QFileInfo>
+ #include <Qsci/qsciapis.h>
+ #include <QStatusBar>
+ #include <QLabel>
+-#include <QComboBox>
+ 
+ #include "find-dialog.h"
+ #include "octave-qscintilla.h"
+ #include "builtin-defun-decls.h"
+ 
+ #include "marker.h" /* Only needed for typedef of "QIntList", which may be
+                        typedefed elsewhere.  Could use common location. */
+ 
+@@ -189,16 +189,19 @@ namespace octave
+ 
+   protected:
+ 
+     void closeEvent (QCloseEvent *event);
+     void set_file_name (const QString& fileName);
+ 
+   private slots:
+ 
++    // When user closes message box for decoding problems
++    void handle_decode_warning_answer (QAbstractButton *btn);
++
+     // When user closes message box for reload question.
+     void handle_file_reload_answer (int decision);
+ 
+     // When user closes message box for resave question.
+     void handle_file_resave_answer (int decision);
+ 
+     // When user closes message box for modified question.
+     void handle_file_modified_answer (int decision);
+@@ -206,18 +209,16 @@ namespace octave
+     // When user closes find_dialog box.
+     void handle_find_dialog_finished (int decision);
+ 
+     // When user closes QFileDialog box.
+     void handle_save_file_as_answer (const QString& fileName);
+     void handle_save_file_as_answer_close (const QString& fileName);
+     void handle_save_file_as_answer_cancel (void);
+     void handle_save_as_filter_selected (const QString& filter);
+-    void handle_combo_eol_current_index (int index);
+-    void handle_combo_enc_current_index (QString text);
+ 
+     // When apis preparation has finished and is ready to save
+     void save_apis_info (void);
+ 
+     // When the numer of lines changes -> adapt width of margin
+     void auto_margin_width (void);
+ 
+     void handle_cursor_moved (int line, int col);
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1053,53 +1053,16 @@ namespace octave
+ 
+     // Create a NonModal message.
+     QWidget *p = this;
+     if (is_internal)
+       p = m_editor_window;
+     QFileDialog *fileDialog = new QFileDialog (p);
+     fileDialog->setNameFilter (tr ("Octave Files (*.m);;All Files (*)"));
+ 
+-    // Giving trouble under KDE (problem is related to Qt signal handling on unix,
+-    // see https://bugs.kde.org/show_bug.cgi?id=260719 ,
+-    // it had/has no effect on Windows, though)
+-    fileDialog->setOption (QFileDialog::DontUseNativeDialog, true);
+-
+-    // define a new grid layout with the extra elements
+-    QGridLayout *extra = new QGridLayout (fileDialog);
+-    QFrame *separator = new QFrame (fileDialog);
+-    separator->setFrameShape (QFrame::HLine);   // horizontal line as separator
+-    separator->setFrameStyle (QFrame::Sunken);
+-
+-    if (is_internal)
+-      {
+-        // combo box for encoding, only when using the internal editor
+-        QLabel *label_enc = new QLabel (tr ("File Encoding:"));
+-        QComboBox *combo_enc = new QComboBox ();
+-        resource_manager::combo_encoding (combo_enc);
+-        m_file_encoding = QString ();  // default
+-
+-        // track changes in the combo boxes
+-        connect (combo_enc, SIGNAL (currentIndexChanged (QString)),
+-                 this, SLOT (set_file_encoding (QString)));
+-
+-        // build the extra grid layout
+-        extra->addWidget (separator,0,0,1,3);
+-        extra->addWidget (label_enc,1,0);
+-        extra->addWidget (combo_enc,1,1);
+-        extra->addItem   (new QSpacerItem (1,20,QSizePolicy::Expanding,
+-                                           QSizePolicy::Fixed), 1,2);
+-
+-        // and add the extra grid layout to the dialog's layout
+-        QGridLayout *dialog_layout = dynamic_cast<QGridLayout *> (
+-                                                                  fileDialog->layout ());
+-        dialog_layout->addLayout (extra,dialog_layout->rowCount (),0,
+-                                  1,dialog_layout->columnCount ());
+-      }
+-
+     fileDialog->setAcceptMode (QFileDialog::AcceptOpen);
+     fileDialog->setViewMode (QFileDialog::Detail);
+     fileDialog->setFileMode (QFileDialog::ExistingFiles);
+     fileDialog->setDirectory (m_current_directory_combo_box->itemText (0));
+ 
+     connect (fileDialog, SIGNAL (filesSelected (const QStringList&)),
+              this, SLOT (request_open_files (const QStringList&)));
+ 
+diff --git a/libgui/src/shortcut-manager.cc b/libgui/src/shortcut-manager.cc
+--- a/libgui/src/shortcut-manager.cc
++++ b/libgui/src/shortcut-manager.cc
+@@ -646,22 +646,22 @@ namespace octave
+     if (action != OSC_DEFAULT)
+       {
+         QString file;
+ 
+         if (action == OSC_IMPORT)
+           file = QFileDialog::getOpenFileName (this,
+                                                tr ("Import shortcuts from file..."), QString (),
+                                                tr ("Octave Shortcut Files (*.osc);;All Files (*)"),
+-                                               nullptr, QFileDialog::DontUseNativeDialog);
++                                               nullptr);
+         else if (action == OSC_EXPORT)
+           file = QFileDialog::getSaveFileName (this,
+                                                tr ("Export shortcuts to file..."), QString (),
+                                                tr ("Octave Shortcut Files (*.osc);;All Files (*)"),
+-                                               nullptr, QFileDialog::DontUseNativeDialog);
++                                               nullptr);
+ 
+         if (file.isEmpty ())
+           return false;
+ 
+         QSettings *osc_settings = new QSettings (file, QSettings::IniFormat);
+ 
+         if (! osc_settings)
+           {
+diff --git a/libgui/src/variable-editor.cc b/libgui/src/variable-editor.cc
+--- a/libgui/src/variable-editor.cc
++++ b/libgui/src/variable-editor.cc
+@@ -444,18 +444,17 @@ namespace octave
+       return;
+ 
+     QString name = objectName ();
+     QString file
+       = QFileDialog::getSaveFileName (this,
+                                       tr ("Save Variable %1 As").arg (name),
+     // FIXME: Should determine extension from save_default_options
+                                       QString ("./%1.txt").arg (name),
+-                                      0, 0,
+-                                      QFileDialog::DontUseNativeDialog);
++                                      0, 0);
+ 
+     // FIXME: Type? binary, float-binary, ascii, text, hdf5, matlab format?
+     // FIXME: Call octave_value::save_* directly?
+ 
+     if (! file.isEmpty ())
+       emit command_signal (QString ("save (\"%1\", \"%2\");")
+                            .arg (file)
+                            .arg (name));

@@ -1,0 +1,315 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1367346736 14400
+#      Tue Apr 30 14:32:16 2013 -0400
+# Node ID 645672f1c8736d882cc7f031960391346750f9c8
+# Parent  3ce0c312a40b696622408b4fd668c742841d72fe
+handle setting breakpoints in subfunctions in GUI editor
+
+* symtab.h (symbol_table::subfunctions_defined_in_scope): Now public.
+* debug.h, debug.cc (bp_table::do_add_breakpoint_1): New function.
+(bp_table::do_add_breakpoint): Handle subfunctions.
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_code::subfunctions,
+octave_user_function::subfunctions): New functions.
+* pt-bp.h (tree_breakpoint::get_line): Return 0 if line wasn't found.
+
+diff --git a/libinterp/interpfcn/debug.cc b/libinterp/interpfcn/debug.cc
+--- a/libinterp/interpfcn/debug.cc
++++ b/libinterp/interpfcn/debug.cc
+@@ -269,41 +269,71 @@ bp_table::instance_ok (void)
+     {
+       ::error ("unable to create breakpoint table!");
+       retval = false;
+     }
+ 
+   return retval;
+ }
+ 
++bool
++bp_table::do_add_breakpoint_1 (octave_user_code *fcn,
++                               const std::string& fname,
++                               const bp_table::intmap& line,
++                               bp_table::intmap& retval)
++{
++  bool found = false;
++
++  tree_statement_list *cmds = fcn->body ();
++
++  std::string file = fcn->fcn_file_name ();
++
++  if (cmds)
++    {
++      retval = cmds->add_breakpoint (file, line);
++
++      for (intmap_iterator p = retval.begin (); p != retval.end (); p++)
++        {
++          if (p->second != 0)
++            {
++              bp_set.insert (fname);
++              found = true;
++              break;
++            }
++        }
++    }
++
++  return found;
++}
++
+ bp_table::intmap
+ bp_table::do_add_breakpoint (const std::string& fname,
+                              const bp_table::intmap& line)
+ {
+   intmap retval;
+ 
+   octave_user_code *dbg_fcn = get_user_code (fname);
+ 
+   if (dbg_fcn)
+     {
+-      tree_statement_list *cmds = dbg_fcn->body ();
+-
+-      std::string file = dbg_fcn->fcn_file_name ();
++      if (! do_add_breakpoint_1 (dbg_fcn, fname, line, retval))
++        {
++          typedef std::map<std::string, octave_value>::const_iterator
++            subfunction_map_const_iterator;
+ 
+-      if (cmds)
+-        {
+-          retval = cmds->add_breakpoint (file, line);
++          std::map<std::string, octave_value> subfcns
++            = dbg_fcn->subfunctions ();
+ 
+-          for (intmap_iterator p = retval.begin (); p != retval.end (); p++)
++          for (subfunction_map_const_iterator p = subfcns.begin ();
++               p != subfcns.end (); p++)
+             {
+-              if (p->second != 0)
+-                {
+-                  bp_set.insert (fname);
+-                  break;
+-                }
++              octave_user_code *dbg_subfcn = p->second.user_code_value ();
++
++              if (do_add_breakpoint_1 (dbg_subfcn, fname, line, retval))
++                break;
+             }
+         }
+     }
+   else
+     error ("add_breakpoint: unable to find the requested function\n");
+ 
+   tree_evaluator::debug_mode = bp_table::have_breakpoints () || Vdebugging;
+ 
+diff --git a/libinterp/interpfcn/debug.h b/libinterp/interpfcn/debug.h
+--- a/libinterp/interpfcn/debug.h
++++ b/libinterp/interpfcn/debug.h
+@@ -110,16 +110,19 @@ private:
+ 
+   // Set of function names containing at least one breakpoint.
+   std::set<std::string> bp_set;
+ 
+   static bp_table *instance;
+ 
+   static void cleanup_instance (void) { delete instance; instance = 0; }
+ 
++  bool do_add_breakpoint_1 (octave_user_code *fcn, const std::string& fname,
++                            const intmap& line, intmap& retval);
++
+   intmap do_add_breakpoint (const std::string& fname, const intmap& lines);
+ 
+   int do_remove_breakpoint (const std::string&, const intmap& lines);
+ 
+   intmap do_remove_all_breakpoints_in_file (const std::string& fname,
+                                             bool silent);
+ 
+   void do_remove_all_breakpoints (void);
+diff --git a/libinterp/interpfcn/symtab.h b/libinterp/interpfcn/symtab.h
+--- a/libinterp/interpfcn/symtab.h
++++ b/libinterp/interpfcn/symtab.h
+@@ -2170,16 +2170,36 @@ public:
+ 
+   static void unlock_subfunctions (scope_id scope = xcurrent_scope)
+   {
+     for (fcn_table_iterator p = fcn_table.begin ();
+          p != fcn_table.end (); p++)
+       p->second.unlock_subfunction (scope);
+   }
+ 
++  static std::map<std::string, octave_value>
++  subfunctions_defined_in_scope (scope_id scope = xcurrent_scope)
++  {
++    std::map<std::string, octave_value> retval;
++
++    for (fcn_table_const_iterator p = fcn_table.begin ();
++         p != fcn_table.end (); p++)
++      {
++        std::pair<std::string, octave_value> tmp
++          = p->second.subfunction_defined_in_scope (scope);
++
++        std::string nm = tmp.first;
++
++        if (! nm.empty ())
++          retval[nm] = tmp.second;
++      }
++
++    return retval;
++  }
++
+   static void free_scope (scope_id scope)
+   {
+     if (scope == xglobal_scope || scope == xtop_scope)
+       error ("can't free global or top-level scopes!");
+     else
+       symbol_table::scope_id_cache::free (scope);
+   }
+ 
+@@ -2791,36 +2811,16 @@ private:
+           retval.push_back (p->first);
+       }
+ 
+     retval.sort ();
+ 
+     return retval;
+   }
+ 
+-  static std::map<std::string, octave_value>
+-  subfunctions_defined_in_scope (scope_id scope = xcurrent_scope)
+-  {
+-    std::map<std::string, octave_value> retval;
+-
+-    for (fcn_table_const_iterator p = fcn_table.begin ();
+-         p != fcn_table.end (); p++)
+-      {
+-        std::pair<std::string, octave_value> tmp
+-          = p->second.subfunction_defined_in_scope (scope);
+-
+-        std::string nm = tmp.first;
+-
+-        if (! nm.empty ())
+-          retval[nm] = tmp.second;
+-      }
+-
+-    return retval;
+-  }
+-
+   bool do_is_local_variable (const std::string& name) const
+   {
+     table_const_iterator p = table.find (name);
+ 
+     return (p != table.end ()
+             && ! p->second.is_global ()
+             && p->second.is_defined ());
+   }
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -53,16 +53,23 @@ along with Octave; see the file COPYING.
+ #include "parse.h"
+ #include "profiler.h"
+ #include "variables.h"
+ #include "ov-fcn-handle.h"
+ 
+ // Whether to optimize subsasgn method calls.
+ static bool Voptimize_subsasgn_calls = true;
+ 
++
++std::map<std::string, octave_value>
++octave_user_code::subfunctions (void) const
++{
++  return std::map<std::string, octave_value> ();
++}
++
+ // User defined scripts.
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_user_script);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_user_script,
+                                      "user-defined script",
+                                      "user-defined script");
+ 
+@@ -301,16 +308,22 @@ octave_user_function::lock_subfunctions 
+ }
+ 
+ void
+ octave_user_function::unlock_subfunctions (void)
+ {
+   symbol_table::unlock_subfunctions (local_scope);
+ }
+ 
++std::map<std::string, octave_value>
++octave_user_function::subfunctions (void) const
++{
++  return symbol_table::subfunctions_defined_in_scope (local_scope);
++}
++
+ octave_value_list
+ octave_user_function::all_va_args (const octave_value_list& args)
+ {
+   octave_value_list retval;
+ 
+   octave_idx_type n = args.length () - num_named_args;
+ 
+   if (n > 0)
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -54,16 +54,18 @@ octave_user_code : public octave_functio
+ public:
+   octave_user_code (void)
+     : octave_function () { }
+ 
+   ~octave_user_code (void) { }
+ 
+   bool is_user_code (void) const { return true; }
+ 
++  virtual std::map<std::string, octave_value> subfunctions (void) const;
++
+   virtual tree_statement_list *body (void) = 0;
+ 
+ protected:
+ 
+   octave_user_code (const std::string& nm,
+                     const std::string& ds = std::string ())
+     : octave_function (nm, ds) { }
+ 
+@@ -257,16 +259,18 @@ public:
+ 
+       octave_function::mark_as_private_function (cname);
+     }
+ 
+   void lock_subfunctions (void);
+ 
+   void unlock_subfunctions (void);
+ 
++  std::map<std::string, octave_value> subfunctions (void) const;
++
+   octave_value_list all_va_args (const octave_value_list& args);
+ 
+   void stash_function_name (const std::string& s) { my_name = s; }
+ 
+   void mark_as_subfunction (void) { subfunction = true; }
+ 
+   bool is_subfunction (void) const { return subfunction; }
+ 
+diff --git a/libinterp/parse-tree/pt-bp.h b/libinterp/parse-tree/pt-bp.h
+--- a/libinterp/parse-tree/pt-bp.h
++++ b/libinterp/parse-tree/pt-bp.h
+@@ -129,17 +129,17 @@ tree_breakpoint : public tree_walker
+   void visit_switch_command (tree_switch_command&);
+ 
+   void visit_try_catch_command (tree_try_catch_command&);
+ 
+   void visit_unwind_protect_command (tree_unwind_protect_command&);
+ 
+   octave_value_list get_list (void) { return bp_list; }
+ 
+-  int get_line (void) { return line; }
++  int get_line (void) { return found ? line : 0; }
+ 
+  private:
+ 
+   void do_decl_command (tree_decl_command&);
+ 
+   void take_action (tree& tr);
+ 
+   void take_action (tree_statement& stmt);

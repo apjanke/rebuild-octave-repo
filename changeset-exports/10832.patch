@@ -1,0 +1,760 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1280400323 -7200
+#      Thu Jul 29 12:45:23 2010 +0200
+# Node ID 1b2fcd122c6aa9143e6448065632cf05eca86863
+# Parent  1646bd8e37359029ff20f62e9b26170b2dbec703
+allow user detect ignored outputs in m-functions
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,36 @@
++2010-07-29  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov.cc (octave_value::subsref (..., const std::list<octave_lvalue> *)
++	octave_value::do_multi_index_op (..., const std::list<octave_lvalue> *)): 
++	New methods.
++	* ov.h: Declare them.
++	* ov-base.cc (octave_base_value::subsref (..., const std::list<octave_lvalue> *)
++	octave_base_value::do_multi_index_op (..., const std::list<octave_lvalue> *)): 
++	New methods.
++	* ov-base.h: Declare them.
++	* ov-usr-fcn.cc (octave_user_function::subsref (..., const std::list<octave_lvalue> *)
++	octave_user_function::do_multi_index_op (..., const std::list<octave_lvalue> *)): 
++	New virtual method overrides. Move code here.
++	(octave_user_function::bind_automatic_vars): Add lvalue_list
++	parameter. Bind automatic variable ".ignored.".
++	(Fis_ignored_output): New defun.
++	* ov-usr-fcn.h: Update decls.
++	* pt-misc.cc (tree_parameter_list::initialize_undefined_elements):
++	Skip warning if outputs are ignored.
++	* pt-exp.cc (tree_expression::rvalue (..., const
++	std::list<octave_lvalue> *)): New method overload.
++	* pt-exp.h: Declare it.
++	* pt-idx.cc (tree_index_expression::rvalue (..., const
++	std::list<octave_lvalue> *)): New method override. Move code here.
++	* pt-idx.h: Declare it.
++	* pt-assign.cc (tree_multi_assignment::rvalue): Pass in the pointer to
++	lvalue_list.
++
+ 2010-07-28  John W. Eaton  <jwe@octave.org>
+ 
+ 	* DLD-FUNCTIONS/find.cc (Ffind): Reorder cases to check for
+ 	character strings before numeric arrays.
+ 	Delete explicit instantiations of find_nonzero_elem_idx templates.
+ 	New test for char array argument.
+ 
+ 2010-07-27  Rik <octave@nomad.inbox5.com>
+diff --git a/src/ov-base.cc b/src/ov-base.cc
+--- a/src/ov-base.cc
++++ b/src/ov-base.cc
+@@ -174,32 +174,50 @@ octave_value
+ octave_base_value::subsref (const std::string& type,
+                             const std::list<octave_value_list>& idx,
+                             bool /* auto_add */)
+ {
+   // This way we may get a more meaningful error message.
+   return subsref (type, idx);
+ }
+ 
++octave_value_list
++octave_base_value::subsref (const std::string& type,
++                            const std::list<octave_value_list>& idx,
++                            int nargout,
++                            const std::list<octave_lvalue> *)
++{
++  // Fall back to call without passing lvalue list.
++  return subsref (type, idx, nargout);
++}
++
+ octave_value
+ octave_base_value::do_index_op (const octave_value_list&, bool)
+ {
+   std::string nm = type_name ();
+   error ("can't perform indexing operations for %s type", nm.c_str ());
+   return octave_value ();
+ }
+ 
+ octave_value_list
+ octave_base_value::do_multi_index_op (int, const octave_value_list&)
+ {
+   std::string nm = type_name ();
+   error ("can't perform indexing operations for %s type", nm.c_str ());
+   return octave_value ();
+ }
+ 
++octave_value_list
++octave_base_value::do_multi_index_op (int nargout, const octave_value_list& idx,
++                                      const std::list<octave_lvalue> *)
++{
++  // Fall back.
++  return do_multi_index_op (nargout, idx);
++}
++
+ idx_vector
+ octave_base_value::index_vector (void) const
+ {
+   std::string nm = type_name ();
+   error ("%s type invalid as index value", nm.c_str ());
+   return idx_vector ();
+ }
+ 
+diff --git a/src/ov-base.h b/src/ov-base.h
+--- a/src/ov-base.h
++++ b/src/ov-base.h
+@@ -255,22 +255,32 @@ public:
+            const std::list<octave_value_list>& idx,
+            int nargout);
+ 
+   virtual octave_value
+   subsref (const std::string& type,
+            const std::list<octave_value_list>& idx,
+            bool auto_add);
+ 
++  virtual octave_value_list
++  subsref (const std::string& type,
++           const std::list<octave_value_list>& idx,
++           int nargout,
++           const std::list<octave_lvalue> *lvalue_list);
++
+   virtual octave_value
+   do_index_op (const octave_value_list& idx, bool resize_ok = false);
+ 
+   virtual octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& idx);
+ 
++  virtual octave_value_list
++  do_multi_index_op (int nargout, const octave_value_list& idx,
++                     const std::list<octave_lvalue> *lvalue_list);
++
+   virtual void assign (const std::string&, const octave_value&) { }
+ 
+   virtual octave_value
+   subsasgn (const std::string& type,
+             const std::list<octave_value_list>& idx,
+             const octave_value& rhs);
+ 
+   virtual idx_vector index_vector (void) const;
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include "str-vec.h"
+ 
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
++#include "gripes.h"
+ #include "input.h"
+ #include "oct-obj.h"
+ #include "ov-usr-fcn.h"
+ #include "ov.h"
+ #include "pager.h"
+ #include "pt-eval.h"
+ #include "pt-jump.h"
+ #include "pt-misc.h"
+@@ -277,25 +278,34 @@ octave_user_function::all_va_args (const
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_user_function::subsref (const std::string& type,
+                                const std::list<octave_value_list>& idx,
+                                int nargout)
+ {
++  return octave_user_function::subsref (type, idx, nargout, 0);
++}
++
++octave_value_list
++octave_user_function::subsref (const std::string& type,
++                               const std::list<octave_value_list>& idx,
++                               int nargout, const std::list<octave_lvalue>* lvalue_list)
++{
+   octave_value_list retval;
+ 
+   switch (type[0])
+     {
+     case '(':
+       {
+         int tmp_nargout = (type.length () > 1 && nargout == 0) ? 1 : nargout;
+ 
+-        retval = do_multi_index_op (tmp_nargout, idx.front ());
++        retval = do_multi_index_op (tmp_nargout, idx.front (),
++                                    idx.size () == 1 ? lvalue_list : 0);
+       }
+       break;
+ 
+     case '{':
+     case '.':
+       {
+         std::string nm = type_name ();
+         error ("%s cannot be indexed with %c", nm.c_str (), type[0]);
+@@ -315,16 +325,24 @@ octave_user_function::subsref (const std
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_user_function::do_multi_index_op (int nargout,
+                                          const octave_value_list& args)
+ {
++  return do_multi_index_op (nargout, args, 0);
++}
++
++octave_value_list
++octave_user_function::do_multi_index_op (int nargout,
++                                         const octave_value_list& args,
++                                         const std::list<octave_lvalue>* lvalue_list)
++{
+   octave_value_list retval;
+ 
+   if (error_state)
+     return retval;
+ 
+   if (! cmd_list)
+     return retval;
+ 
+@@ -387,17 +405,18 @@ octave_user_function::do_multi_index_op 
+       // variables will be cleared before the parameter lists are
+       // cleared.  That way, any function parameters that have been
+       // declared global will be unmarked as global before they are
+       // undefined by the clear_param_list cleanup function.
+ 
+       frame.add_fcn (symbol_table::clear_variables);
+     }
+ 
+-  bind_automatic_vars (arg_names, nargin, nargout, all_va_args (args));
++  bind_automatic_vars (arg_names, nargin, nargout, all_va_args (args),
++                       lvalue_list);
+ 
+   bool echo_commands = (Vecho_executing_commands & ECHO_FUNCTIONS);
+ 
+   if (echo_commands)
+     print_code_function_header ();
+ 
+   // Set pointer to the current unwind_protect frame to allow
+   // certain builtins register simple cleanup in a very optimized manner.
+@@ -517,29 +536,54 @@ octave_user_function::print_code_functio
+   tree_print_code tpc (octave_stdout, VPS4);
+ 
+   tpc.visit_octave_user_function_trailer (*this);
+ }
+ 
+ void
+ octave_user_function::bind_automatic_vars
+   (const string_vector& arg_names, int nargin, int nargout,
+-   const octave_value_list& va_args)
++   const octave_value_list& va_args, const std::list<octave_lvalue> *lvalue_list)
+ {
+   if (! arg_names.empty ())
+     symbol_table::varref ("argn") = arg_names;
+ 
+   symbol_table::varref (".nargin.") = nargin;
+   symbol_table::varref (".nargout.") = nargout;
+ 
+   symbol_table::mark_hidden (".nargin.");
+   symbol_table::mark_hidden (".nargout.");
+ 
+   if (takes_varargs ())
+     symbol_table::varref ("varargin") = va_args.cell_value ();
++  
++  if (lvalue_list)
++    {
++      octave_idx_type nbh = 0;
++      for (std::list<octave_lvalue>::const_iterator p = lvalue_list->begin ();
++           p != lvalue_list->end (); p++)
++        nbh += p->is_black_hole ();
++
++      if (nbh > 0)
++        {
++          // Only assign the hidden variable if black holes actually present.
++          Matrix bh (1, nbh);
++          octave_idx_type k = 0, l = 0;
++          for (std::list<octave_lvalue>::const_iterator p = lvalue_list->begin ();
++               p != lvalue_list->end (); p++)
++            {
++              if (p->is_black_hole ())
++                bh(l++) = k+1;
++              k += p->numel ();
++            }
++
++          symbol_table::varref (".ignored.") = bh;
++          symbol_table::mark_hidden (".ignored.");
++        }
++    }
+ }
+ 
+ DEFUN (nargin, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} nargin ()\n\
+ @deftypefnx {Built-in Function} {} nargin (@var{fcn_name})\n\
+ Within a function, return the number of arguments passed to the function.\n\
+ At the top level, return the number of command line arguments passed to\n\
+@@ -678,8 +722,74 @@ DEFUN (optimize_subsasgn_calls, args, na
+ @deftypefnx {Built-in Function} {@var{old_val} =} optimize_subsasgn_calls  (@var{new_val})\n\
+ Query or set the internal flag for subsasgn method call optimizations.\n\
+ If true, Octave will attempt to eliminate the redundant copying when calling\n\
+ subsasgn method of a user-defined class.\n\
+ @end deftypefn")
+ {
+   return SET_INTERNAL_VARIABLE (optimize_subsasgn_calls);
+ }
++
++static bool val_in_table (const Matrix& table, double val)
++{
++  if (table.is_empty ())
++    return false;
++
++  octave_idx_type i = table.lookup (val, ASCENDING);
++  return (i > 0 && table(i-1) == val);
++}
++
++DEFUN (is_ignored_output, args, ,
++  "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} is_ignored_output (@var{k})\n\
++Within a function, given an index @var{k} within the range @code{1:nargout},\n\
++return a logical value indicating whether the argument will be ignored on output\n\
++using the tilde (~) special output argument. If @var{k} is outside the range,\n\
++the function yields false. @var{k} can also be an array, in which case the function\n\
++works element-wise and a logical array is returned.\n\
++\n\
++At the top level, @code{is_ignored_output} returns an error.\n\
++@seealso{nargout, nargin, varargin, varargout}\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  int nargin = args.length ();
++
++  if (nargin == 1)
++    {
++      if (! symbol_table::at_top_level ())
++        {
++          Matrix ignored;
++          octave_value tmp = symbol_table::varval (".ignored.");
++          if (tmp.is_defined ())
++            ignored = tmp.matrix_value ();
++
++          if (args(0).is_scalar_type ())
++            {
++              double k = args(0).double_value ();
++              if (! error_state)
++                retval = val_in_table (ignored, k);
++            }
++          else if (args(0).is_numeric_type ())
++            {
++              const NDArray ka = args(0).array_value ();
++              if (! error_state)
++                {
++                  boolNDArray r (ka.dims ());
++                  for (octave_idx_type i = 0; i < ka.numel (); i++)
++                    r(i) = val_in_table (ignored, ka(i));
++
++                  retval = r;
++                }
++            }
++          else
++            gripe_wrong_type_arg ("is_ignored_output", args(0));
++        }
++      else
++        error ("is_ignored_output: invalid call at top level");
++    }
++  else
++    print_usage ();
++
++  return retval;
++}
++
+diff --git a/src/ov-usr-fcn.h b/src/ov-usr-fcn.h
+--- a/src/ov-usr-fcn.h
++++ b/src/ov-usr-fcn.h
+@@ -263,19 +263,27 @@ public:
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+     }
+ 
+   octave_value_list subsref (const std::string& type,
+                              const std::list<octave_value_list>& idx,
+                              int nargout);
+ 
++  octave_value_list subsref (const std::string& type,
++                             const std::list<octave_value_list>& idx,
++                             int nargout, const std::list<octave_lvalue>* lvalue_list);
++
+   octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& args);
+ 
++  octave_value_list
++  do_multi_index_op (int nargout, const octave_value_list& args, 
++                     const std::list<octave_lvalue>* lvalue_list);
++
+   tree_parameter_list *parameter_list (void) { return param_list; }
+ 
+   tree_parameter_list *return_list (void) { return ret_list; }
+ 
+   tree_statement_list *body (void) { return cmd_list; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+@@ -377,17 +385,18 @@ private:
+   octave_value& varargin_varref;
+ #endif
+ 
+   void print_code_function_header (void);
+ 
+   void print_code_function_trailer (void);
+ 
+   void bind_automatic_vars (const string_vector& arg_names, int nargin,
+-                            int nargout, const octave_value_list& va_args);
++                            int nargout, const octave_value_list& va_args,
++                            const std::list<octave_lvalue> *lvalue_list);
+ 
+   // No copying!
+ 
+   octave_user_function (const octave_user_function& fn);
+ 
+   octave_user_function& operator = (const octave_user_function& fn);
+ 
+   DECLARE_OCTAVE_ALLOCATOR
+diff --git a/src/ov.cc b/src/ov.cc
+--- a/src/ov.cc
++++ b/src/ov.cc
+@@ -1197,16 +1197,27 @@ octave_value::subsref (const std::string
+                        const std::list<octave_value_list>& idx, int nargout)
+ {
+   if (nargout == 1)
+     return rep->subsref (type, idx);
+   else
+     return rep->subsref (type, idx, nargout);
+ }
+ 
++octave_value_list
++octave_value::subsref (const std::string& type,
++                       const std::list<octave_value_list>& idx, int nargout,
++                       const std::list<octave_lvalue> *lvalue_list)
++{
++  if (lvalue_list)
++    return rep->subsref (type, idx, nargout, lvalue_list);
++  else
++    return subsref (type, idx, nargout);
++}
++
+ octave_value
+ octave_value::next_subsref (const std::string& type,
+                             const std::list<octave_value_list>& idx,
+                             size_t skip) 
+ {
+   if (! error_state && idx.size () > skip)
+     {
+       std::list<octave_value_list> new_idx (idx);
+@@ -1251,16 +1262,23 @@ octave_value::next_subsref (bool auto_ad
+ }
+ 
+ octave_value_list
+ octave_value::do_multi_index_op (int nargout, const octave_value_list& idx)
+ {
+   return rep->do_multi_index_op (nargout, idx);
+ }
+ 
++octave_value_list
++octave_value::do_multi_index_op (int nargout, const octave_value_list& idx,
++                                 const std::list<octave_lvalue> *lvalue_list)
++{
++  return rep->do_multi_index_op (nargout, idx, lvalue_list);
++}
++
+ #if 0
+ static void
+ gripe_assign_failed (const std::string& on, const std::string& tn1,
+                      const std::string& tn2)
+ {
+   error ("assignment failed for `%s %s %s'",
+          tn1.c_str (), on.c_str (), tn2.c_str ());
+ }
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -386,16 +386,21 @@ public:
+                         const std::list<octave_value_list>& idx,
+                         bool auto_add)
+     { return rep->subsref (type, idx, auto_add); }
+ 
+   octave_value_list subsref (const std::string& type,
+                              const std::list<octave_value_list>& idx,
+                              int nargout);
+ 
++  octave_value_list subsref (const std::string& type,
++                             const std::list<octave_value_list>& idx,
++                             int nargout,
++                             const std::list<octave_lvalue> *lvalue_list);
++
+   octave_value next_subsref (const std::string& type, const
+                              std::list<octave_value_list>& idx,
+                              size_t skip = 1);
+ 
+   octave_value_list next_subsref (int nargout,
+                                   const std::string& type, const
+                                   std::list<octave_value_list>& idx,
+                                   size_t skip = 1);
+@@ -406,16 +411,20 @@ public:
+ 
+   octave_value do_index_op (const octave_value_list& idx,
+                             bool resize_ok = false)
+     { return rep->do_index_op (idx, resize_ok); }
+ 
+   octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& idx);
+ 
++  octave_value_list
++  do_multi_index_op (int nargout, const octave_value_list& idx,
++                     const std::list<octave_lvalue> *lvalue_list);
++
+   octave_value subsasgn (const std::string& type,
+                                  const std::list<octave_value_list>& idx,
+                                  const octave_value& rhs);
+ 
+   octave_value& assign (assign_op op, const std::string& type,
+                        const std::list<octave_value_list>& idx,
+                        const octave_value& rhs);
+ 
+diff --git a/src/pt-assign.cc b/src/pt-assign.cc
+--- a/src/pt-assign.cc
++++ b/src/pt-assign.cc
+@@ -349,25 +349,25 @@ tree_multi_assignment::rvalue (int)
+ 
+   if (rhs)
+     {
+       std::list<octave_lvalue> lvalue_list = lhs->lvalue_list ();
+ 
+       if (error_state)
+         return retval;
+ 
+-      int n_out = 0;
++      octave_idx_type n_out = 0;
+ 
+       for (std::list<octave_lvalue>::const_iterator p = lvalue_list.begin ();
+            p != lvalue_list.end ();
+            p++)
+         n_out += p->numel ();
+ 
+       // The following trick is used to keep rhs_val constant.
+-      const octave_value_list rhs_val1 = rhs->rvalue (n_out);
++      const octave_value_list rhs_val1 = rhs->rvalue (n_out, &lvalue_list);
+       const octave_value_list rhs_val = (rhs_val1.length () == 1 && rhs_val1(0).is_cs_list ()
+                                          ? rhs_val1(0).list_value () : rhs_val1);
+ 
+       if (error_state)
+         return retval;
+ 
+       octave_idx_type k = 0;
+ 
+diff --git a/src/pt-exp.cc b/src/pt-exp.cc
+--- a/src/pt-exp.cc
++++ b/src/pt-exp.cc
+@@ -64,16 +64,22 @@ tree_expression::rvalue1 (int)
+ 
+ octave_value_list
+ tree_expression::rvalue (int)
+ {
+   ::error ("invalid rvalue function called in expression");
+   return octave_value_list ();
+ }
+ 
++octave_value_list
++tree_expression::rvalue (int nargout, const std::list<octave_lvalue> *)
++{
++  return rvalue (nargout);
++}
++
+ octave_lvalue
+ tree_expression::lvalue (void)
+ {
+   ::error ("invalid lvalue function called in expression");
+   return octave_lvalue ();
+ }
+ 
+ std::string
+diff --git a/src/pt-exp.h b/src/pt-exp.h
+--- a/src/pt-exp.h
++++ b/src/pt-exp.h
+@@ -20,16 +20,17 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_tree_expr_h)
+ #define octave_tree_expr_h 1
+ 
+ #include <string>
++#include <list>
+ 
+ class octave_value;
+ class octave_lvalue;
+ 
+ #include "pt.h"
+ #include "symtab.h"
+ 
+ // A base class for expressions.
+@@ -73,16 +74,19 @@ public:
+   virtual bool lvalue_ok (void) const { return false; }
+ 
+   virtual bool rvalue_ok (void) const { return false; }
+ 
+   virtual octave_value rvalue1 (int nargout = 1);
+ 
+   virtual octave_value_list rvalue (int nargout);
+ 
++  virtual octave_value_list rvalue (int nargout,
++                                    const std::list<octave_lvalue> *lvalue_list);
++
+   virtual octave_lvalue lvalue (void);
+ 
+   int paren_count (void) const { return num_parens; }
+ 
+   bool is_postfix_indexed (void) const { return postfix_indexed; }
+ 
+   bool print_result (void) const { return print_flag; }
+ 
+diff --git a/src/pt-idx.cc b/src/pt-idx.cc
+--- a/src/pt-idx.cc
++++ b/src/pt-idx.cc
+@@ -270,16 +270,22 @@ tree_index_expression::make_arg_struct (
+   m.assign ("subs", subs_field);
+ 
+   return m;
+ }
+ 
+ octave_value_list
+ tree_index_expression::rvalue (int nargout)
+ {
++  return tree_index_expression::rvalue (nargout, 0);
++}
++
++octave_value_list
++tree_index_expression::rvalue (int nargout, const std::list<octave_lvalue> *lvalue_list)
++{
+   octave_value_list retval;
+ 
+   if (error_state)
+     return retval;
+ 
+   octave_value first_expr_val;
+ 
+   octave_value_list first_args;
+@@ -393,17 +399,18 @@ tree_index_expression::rvalue (int nargo
+             break;
+ 
+           p_args++;
+           p_arg_nm++;
+           p_dyn_field++;
+         }
+ 
+       if (! error_state)
+-        retval = tmp.subsref (type.substr (tmpi, n - tmpi), idx, nargout);
++        retval = tmp.subsref (type.substr (tmpi, n - tmpi), idx, nargout,
++                              lvalue_list);
+     }
+ 
+   return retval;
+ }
+ 
+ octave_value
+ tree_index_expression::rvalue1 (int nargout)
+ {
+diff --git a/src/pt-idx.h b/src/pt-idx.h
+--- a/src/pt-idx.h
++++ b/src/pt-idx.h
+@@ -81,16 +81,18 @@ public:
+   bool lvalue_ok (void) const { return expr->lvalue_ok (); }
+ 
+   bool rvalue_ok (void) const { return true; }
+ 
+   octave_value rvalue1 (int nargout = 1);
+ 
+   octave_value_list rvalue (int nargout);
+ 
++  octave_value_list rvalue (int nargout, const std::list<octave_lvalue> *lvalue_list);
++
+   octave_lvalue lvalue (void);
+ 
+   tree_index_expression *dup (symbol_table::scope_id scope,
+                               symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+diff --git a/src/pt-misc.cc b/src/pt-misc.cc
+--- a/src/pt-misc.cc
++++ b/src/pt-misc.cc
+@@ -120,40 +120,61 @@ tree_parameter_list::validate (in_or_out
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ tree_parameter_list::initialize_undefined_elements (const std::string& warnfor,
+-                                                    int nargout,
+-                                                    const octave_value& val)
++                                                    int nargout, const octave_value& val)
+ {
+   bool warned = false;
+ 
+   int count = 0;
+ 
++  octave_value tmp = symbol_table::varval (".ignored.");
++  const Matrix ignored = tmp.is_defined () ? tmp.matrix_value () : Matrix ();
++
++  octave_idx_type k = 0;
++
+   for (iterator p = begin (); p != end (); p++)
+     {
+       if (++count > nargout)
+         break;
+ 
+       tree_decl_elt *elt = *p;
+ 
+       if (! elt->is_variable ())
+         {
+           if (! warned)
+             {
+               warned = true;
+ 
+-              warning_with_id
+-                ("Octave:undefined-return-values",
+-                 "%s: some elements in list of return values are undefined",
+-                 warnfor.c_str ());
++              while (k < ignored.numel ())
++                {
++                  octave_idx_type l = ignored (k);
++                  if (l == count)
++                    {
++                      warned = false;
++                      break;
++                    }
++                  else if (l > count)
++                    break;
++                  else
++                    k++;
++                }
++
++              if (warned)
++                {
++                  warning_with_id
++                    ("Octave:undefined-return-values",
++                     "%s: some elements in list of return values are undefined",
++                     warnfor.c_str ());
++                }
+             }
+ 
+           octave_lvalue tmp = elt->lvalue ();
+ 
+           tmp.assign (octave_value::op_asn_eq, val);
+         }
+     }
+ }

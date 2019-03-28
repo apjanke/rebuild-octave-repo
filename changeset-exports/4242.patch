@@ -1,0 +1,583 @@
+# HG changeset patch
+# User jwe
+# Date 1040940390 0
+#      Thu Dec 26 22:06:30 2002 +0000
+# Node ID 4d3994172bd57b2e3de586fa440bbd1d15516c44
+# Parent  71209cc7ad4a375e193a67643ea79674a899c13d
+[project @ 2002-12-26 22:06:10 by jwe]
+
+diff --git a/kpathsea/ChangeLog b/kpathsea/ChangeLog
+--- a/kpathsea/ChangeLog
++++ b/kpathsea/ChangeLog
+@@ -1,8 +1,16 @@
++2002-12-26  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* pathsearch.c (path_find_first_of, find_first_of,
++	kpse_path_find_first_of, kpse_all_path_find_first_of):
++	New functions. 
++	* pathsearch.h (kpse_path_find_first_of, kpse_all_path_find_first_of):
++	Provide declarations.
++
+ 2002-11-23  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* Makefile.in (objects): Include basename.lo in the list.
+ 
+ 2002-11-08  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* Makefile.in (default all): Build the libarary only.
+ 
+diff --git a/kpathsea/pathsearch.c b/kpathsea/pathsearch.c
+--- a/kpathsea/pathsearch.c
++++ b/kpathsea/pathsearch.c
+@@ -362,16 +362,255 @@ kpse_path_search P3C(const_string, path,
+ 
+ string *
+ kpse_all_path_search P2C(const_string, path,  const_string, name)
+ {
+   string *ret = search (path, name, true, true);
+   return ret;
+ }
+ 
++/* This is the hard case -- look in each element of PATH for each
++   element of NAMES.  If ALL is false, return the first file found.
++   Otherwise, search all elements of PATH.  */
++
++static str_list_type
++path_find_first_of P4C(const_string, path, const_string *, names,
++		       boolean, must_exist, boolean, all)
++{
++  const_string *p;
++  string elt;
++  const_string name;
++  str_list_type ret_list;
++  boolean done = false;
++  ret_list = str_list_init (); /* some compilers lack struct initialization */
++
++  for (elt = kpse_path_element (path); !done && elt;
++       elt = kpse_path_element (NULL))
++    {
++      str_llist_type *dirs;
++      str_llist_elt_type *dirs_elt;
++      str_list_type *found;
++      boolean allow_disk_search = true;
++
++      if (*elt == '!' && *(elt + 1) == '!')
++	{
++	  /* Those magic leading chars in a path element means don't
++	     search the disk for this elt.  And move past the magic to
++	     get to the name.  */
++
++	  allow_disk_search = false;
++	  elt += 2;
++	}
++
++      /* Do not touch the device if present */
++
++      if (NAME_BEGINS_WITH_DEVICE (elt))
++	{
++	  while (IS_DIR_SEP (*(elt + 2)) && IS_DIR_SEP (*(elt + 3)))
++	    {
++	      *(elt + 2) = *(elt + 1);
++	      *(elt + 1) = *elt;
++	      elt++;
++	    }
++	}
++      else
++	{
++	  /* We never want to search the whole disk.  */
++	  while (IS_DIR_SEP (*elt) && IS_DIR_SEP (*(elt + 1)))
++	    elt++;
++	}
++
++      /* We have to search one directory at a time.  */
++      dirs = kpse_element_dirs (elt);
++      for (dirs_elt = *dirs; dirs_elt; dirs_elt = STR_LLIST_NEXT (*dirs_elt))
++	{
++	  string dir = STR_LLIST (*dirs_elt);
++
++	  for (p = names; !done && *p; p++)
++	    {
++	      name = *p;
++
++	      /* Try ls-R, unless we're searching for texmf.cnf.  Our caller
++		 (find_first_of), also tests first_search, and does the
++		 resetting.  */
++	      found = first_search ? NULL : kpse_db_search (name, dir, all);
++
++	      /* Search the filesystem if (1) the path spec allows it,
++		 and either
++
++		   (2a) we are searching for texmf.cnf ; or
++		   (2b) no db exists; or 
++		   (2c) no db's are relevant to this elt; or
++		   (3) MUST_EXIST && NAME was not in the db.
++
++		 In (2*), `found' will be NULL.
++		 In (3),  `found' will be an empty list. */
++
++	      if (allow_disk_search
++		  && (!found || (must_exist && !STR_LIST (*found))))
++		{
++		  static str_llist_type *tmp = 0;
++
++		  if (! tmp)
++		    {
++		      tmp = XTALLOC1 (str_llist_type);
++		      *tmp = NULL;
++		      str_llist_add (tmp, "");
++		    }
++
++		  STR_LLIST (*(*tmp)) = dir;
++
++		  if (!found)
++		    found = XTALLOC1 (str_list_type);
++
++		  *found = dir_list_search (tmp, name, all);
++		}
++
++	      /* Did we find anything anywhere?  */
++	      if (found && STR_LIST (*found))
++		{
++		  if (all)
++		    str_list_concat (&ret_list, *found);
++		  else
++		    {
++		      str_list_add (&ret_list, STR_LIST_ELT (*found, 0));
++		      done = true;
++		    }
++		}
++
++	      /* Free the list space, if any (but not the elements).  */
++	      if (found)
++		{
++		  str_list_free (found);
++		  free (found);
++		}
++	    }
++	}
++    }
++
++  return ret_list;
++}      
++
++static string *
++find_first_of P4C(const_string, path, const_string *, names,
++		  boolean, must_exist, boolean, all)
++{
++  str_list_type ret_list;
++  boolean absolute_p;
++
++#ifdef __DJGPP__
++  /* We will use `stat' heavily, so let's request for
++     the fastest possible version of `stat', by telling
++     it what members of struct stat do we really need.
++
++     We need to set this on each call because this is a
++     library function; the caller might need other options
++     from `stat'.  Thus save the flags and restore them
++     before exit.
++
++     This call tells `stat' that we do NOT need to recognize
++     executable files (neither by an extension nor by a magic
++     signature); that we do NOT need time stamp of root directories;
++     and that we do NOT need the write access bit in st_mode.
++
++     Note that `kpse_set_progname' needs the EXEC bits,
++     but it was already called by the time we get here.  */
++  unsigned short save_djgpp_flags  = _djstat_flags;
++
++  _djstat_flags = _STAT_EXEC_MAGIC | _STAT_EXEC_EXT
++		  | _STAT_ROOT_TIME | _STAT_WRITEBIT;
++#endif
++
++  if (KPSE_DEBUG_P (KPSE_DEBUG_SEARCH))
++    {
++      const_string *p;
++      fputs ("start find_first_of((", stderr);
++      for (p = names; *p; p++)
++	{
++	  if (p == names)
++	    fputs (*p, stderr);
++	  else
++	    fprintf (stderr, ", %s", *p);
++	}
++      fprintf (stderr, "), path=%s, must_exist=%d).\n", path, must_exist);
++    }
++
++  /* Find the file. */
++  ret_list = path_find_first_of (path, names, must_exist, all);
++
++  /* Append NULL terminator if we didn't find anything at all, or we're
++     supposed to find ALL and the list doesn't end in NULL now.  */
++  if (STR_LIST_LENGTH (ret_list) == 0
++      || (all && STR_LIST_LAST_ELT (ret_list) != NULL))
++    str_list_add (&ret_list, NULL);
++
++  /* The very first search is for texmf.cnf.  We can't log that, since
++     we want to allow setting TEXMFLOG in texmf.cnf.  */
++  if (first_search) {
++    first_search = false;
++  } else {
++    /* Record the filenames we found, if desired.  And wrap them in a
++       debugging line if we're doing that.  */
++    if (KPSE_DEBUG_P (KPSE_DEBUG_SEARCH))
++      {
++	const_string *p;
++	fputs ("find_first_of(", stderr);
++	for (p = names; *p; p++)
++	  {
++	    if (p == names)
++	      fputs (*p, stderr);
++	    else
++	      fprintf (stderr, ", %s", *p);
++	  }
++	fputs (") =>", stderr);
++      }
++    log_search (ret_list);
++    if (KPSE_DEBUG_P (KPSE_DEBUG_SEARCH))
++      putc ('\n', stderr);
++  }  
++
++#ifdef __DJGPP__
++  /* Undo any side effects.  */
++  _djstat_flags = save_djgpp_flags;
++#endif
++
++  return STR_LIST (ret_list);
++}
++
++/* Search each element of PATH for each element of NAMES.  Return the
++   first one found.  */
++
++string
++kpse_path_find_first_of P3C(const_string, path, const_string *, names,
++			    boolean, must_exist)
++{
++  static string *ret_list = 0;
++
++  if (ret_list)
++    {
++      free (ret_list);
++      ret_list = 0;  /* Don't let an interrupt in search() cause trouble */
++    }
++
++  ret_list = find_first_of (path, names, must_exist, false);
++
++  return *ret_list;  /* Freeing this is caller's responsibility */
++}
++
++/* Search each element of PATH for each element of NAMES and return a
++   list containing everything found, in the order found.  */
++
++string *
++kpse_all_path_find_first_of P2C(const_string, path,  const_string *, names)
++{
++  string *ret = find_first_of (path, names, true, true);
++  return ret;
++}
++
++
+ #ifdef TEST
+ 
+ void
+ test_path_search (const_string path, const_string file)
+ {
+   string answer;
+   string *answer_list;
+   
+diff --git a/kpathsea/pathsearch.h b/kpathsea/pathsearch.h
+--- a/kpathsea/pathsearch.h
++++ b/kpathsea/pathsearch.h
+@@ -67,15 +67,27 @@ extern str_llist_type *kpse_element_dirs
+ extern string kpse_path_search P3H(const_string path, const_string name,
+                                    boolean must_exist);
+ 
+ 
+ /* Like `kpse_path_search' with MUST_EXIST true, but return a list of
+    all the filenames (or NULL if none), instead of taking the first.  */
+ extern string *kpse_all_path_search P2H(const_string path, const_string name);
+ 
++/* Search each element of PATH for each element in the list of NAMES.
++   Return the first one found.  */
++extern string kpse_path_find_first_of P3H(const_string path,
++					  const_string *names,
++					  boolean must_exist);
++
++/* Like `kpse_path_find_first_of' with MUST_EXIST true, but return a
++   list of all the filenames (or NULL if none), instead of taking the
++   first.  */
++extern string *kpse_all_path_find_first_of P2H(const_string path,
++					       const_string *names);
++
+ #if 0
+ /* Clear the directory cache.  */
+ extern void kpse_clear_dir_cache P1H(void);
+ #endif
+ 
+ #endif /* not KPATHSEA_PATHSEARCH_H */
+ 
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,20 @@
++2002-12-26  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* pathsearch.cc (make_retval, free_c_array, make_c_names,
++	delete_c_names): New helper functions.
++	(dir_path::find_first_of): New function.
++	(dir_path::find_all_first_of): Likewise.
++	* pathsearch.h: Provide decls.
++
++	* oct-kpse.c (octave_kpse_path_find_first_of): New function.
++	(octave_kpse_all_path_find_first_of): Likewise.
++	* oct-kpse.h: Provide decls.
++
+ 2002-12-19  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* ODESSA.cc (ODESSA::integrate): Handle maxord.
+ 	* ODESSA-opts.in: Likewise.
+ 
+ 	* LSODE.cc (ODESSA::integrate): Handle maxord.
+ 	* LSODE-opts.in: Likewise.
+ 
+diff --git a/liboctave/oct-kpse.c b/liboctave/oct-kpse.c
+--- a/liboctave/oct-kpse.c
++++ b/liboctave/oct-kpse.c
+@@ -46,16 +46,29 @@ octave_kpse_path_search (const char *pat
+ }
+ 
+ char **
+ octave_kpse_all_path_search (const char *path, const char *name)
+ {
+   return kpse_all_path_search (path, name);
+ }
+ 
++char *
++octave_kpse_path_find_first_of (const char *path, const char **names,
++				int must_exist)
++{
++  return kpse_path_find_first_of (path, names, must_exist);
++}
++
++char **
++octave_kpse_all_path_find_first_of (const char *path, const char **names)
++{
++  return kpse_all_path_find_first_of (path, names);
++}
++
+ void
+ octave_kpse_set_progname (const char *name)
+ {
+   kpse_set_progname (name);
+ }
+ 
+ char *
+ octave_kpse_expand_default (const char *path, const char *dflt)
+diff --git a/liboctave/oct-kpse.h b/liboctave/oct-kpse.h
+--- a/liboctave/oct-kpse.h
++++ b/liboctave/oct-kpse.h
+@@ -46,16 +46,20 @@ extern "C"
+ extern unsigned int kpathsea_debug;
+ 
+ extern str_llist_type *octave_kpse_element_dirs (const char *);
+ 
+ extern char *octave_kpse_path_search (const char *, const char *, int);
+ 
+ extern char **octave_kpse_all_path_search (const char *, const char *);
+ 
++extern char *octave_kpse_path_find_first_of (const char *, const char **, int);
++
++extern char **octave_kpse_all_path_find_first_of (const char *, const char **);
++
+ extern void octave_kpse_set_progname (const char *);
+ 
+ extern char *octave_kpse_expand_default (const char *, const char *);
+ 
+ extern char *octave_kpse_path_expand (const char *);
+ 
+ extern char *octave_kpse_path_element (const char *);
+ 
+diff --git a/liboctave/pathsearch.cc b/liboctave/pathsearch.cc
+--- a/liboctave/pathsearch.cc
++++ b/liboctave/pathsearch.cc
+@@ -92,47 +92,145 @@ dir_path::all_directories (void)
+ std::string
+ dir_path::find_first (const std::string& nm)
+ {
+   std::string retval;
+ 
+   if (initialized)
+     {
+       char *tmp = ::octave_kpse_path_search (p.c_str (), nm.c_str (), true);
++
++      if (tmp)
++	{
++	  retval = tmp;
++	  free (tmp);
++	}
++    }
++
++  return retval;
++}
++
++static string_vector
++make_retval (char **tmp)
++{
++  string_vector retval;
++
++  if (tmp)
++    {
++      int count = 0;
++      char **ptr = tmp;
++      while (*ptr++)
++	count++;
++
++      retval.resize (count);
++
++      for (int i = 0; i < count; i++)
++	retval[i] = tmp[i];
++    }
++
++  return retval;
++}
++
++static void
++free_c_array (char **tmp)
++{
++  if (tmp)
++    {
++      char **ptr = tmp;
++
++      while (char *elt = *ptr++)
++	if (elt)
++	  free (elt);
++
++      free (tmp);
++    }
++}
++
++string_vector
++dir_path::find_all (const std::string& nm)
++{
++  string_vector retval;
++
++  if (initialized)
++    {
++      char **tmp = ::octave_kpse_all_path_search (p.c_str (), nm.c_str ());
++
++      retval = make_retval (tmp);
++
++      free_c_array (tmp);
++    }
++
++  return retval;
++}
++
++static const char **
++make_c_names (const string_vector& names)
++{
++  int len = names.length ();
++
++  const char **c_names = new const char *[len+1];
++
++  for (int i = 0; i < len; i++)
++    c_names[i] = strsave (names[i].c_str ());
++
++  c_names[len] = 0;
++
++  return c_names;
++}
++
++static void
++delete_c_names (const char **c_names)
++{
++  const char **p = c_names;
++
++  while (const char *elt = *p++)
++    delete [] elt;
++
++  delete [] c_names;
++}
++
++std::string
++dir_path::find_first_of (const string_vector& names)
++{
++  std::string retval;
++
++  if (initialized)
++    {
++      const char **c_names = make_c_names (names);
++
++      char *tmp = ::octave_kpse_path_find_first_of (p.c_str (), c_names, true);
++
++      delete_c_names (c_names);
++
+       if (tmp)
+ 	{
+ 	  retval = tmp;
+ 	  free (tmp);
+ 	}
+     }
+ 
+   return retval;
+ }
+ 
+ string_vector
+-dir_path::find_all (const std::string& nm)
++dir_path::find_all_first_of (const string_vector& names)
+ {
+   string_vector retval;
+ 
+   if (initialized)
+     {
+-      char **tmp = ::octave_kpse_all_path_search (p.c_str (), nm.c_str ());
++      const char **c_names = make_c_names (names);
++
++      char **tmp = ::octave_kpse_all_path_find_first_of (p.c_str (), c_names);
+ 
+-      if (tmp)
+-	{
+-	  int count = 0;
+-	  char **ptr = tmp;
+-	  while (*ptr++)
+-	    count++;
++      delete_c_names (c_names);
+ 
+-	  retval.resize (count);
++      retval = make_retval (tmp);
+ 
+-	  for (int i = 0; i < count; i++)
+-	    retval[i] = tmp[i];
+-	}
++      free_c_array (tmp);
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ dir_path::set_program_name (const std::string& nm)
+ {
+diff --git a/liboctave/pathsearch.h b/liboctave/pathsearch.h
+--- a/liboctave/pathsearch.h
++++ b/liboctave/pathsearch.h
+@@ -67,16 +67,19 @@ public:
+   string_vector elements (void);
+   string_vector all_directories (void);
+ 
+   std::string find_first (const std::string&);
+   std::string find (const std::string& nm) { return find_first (nm); }
+ 
+   string_vector find_all (const std::string&);
+ 
++  std::string find_first_of (const string_vector& names);
++  string_vector find_all_first_of (const string_vector& names);
++
+   static void set_program_name (const std::string&);
+ 
+   void rehash (void)
+     {
+       initialized = false;
+       init ();
+     }
+ 

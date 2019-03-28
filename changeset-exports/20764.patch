@@ -1,0 +1,186 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1448559411 28800
+#      Thu Nov 26 09:36:51 2015 -0800
+# Node ID 0ad449bc8848f2540958ccd516f42b324c318862
+# Parent  47cec845dd5afd138838c48813a03e07fbaa9db8
+Stop 'fclose ("all")' from closing down gnuplot pipes (bug #39504).
+
+* file-io.cc (Ffclose): Explain new behavior for fclose ("all") in docstring.
+
+* oct-stream.cc (do_clear): Switch from using list.clear () to iterating over
+list of open streams and using list.erase ().  Check that the name of the
+open file handle does not include "gnuplot" before closing stream.
+
+* syscalls.cc (Fpopen2): Name two created octave streams "exec_file" + "-in"
+and "exec_file" + "-out", rather than "".
+
+* syscalls.cc (Fpipe): Name two created octave streams "pipe-in" and
+"pipe-out", rather than "".
+
+diff --git a/libinterp/corefcn/file-io.cc b/libinterp/corefcn/file-io.cc
+--- a/libinterp/corefcn/file-io.cc
++++ b/libinterp/corefcn/file-io.cc
+@@ -234,21 +234,18 @@ DEFUN (fclose, args, ,
+        "-*- texinfo -*-\n\
+ @deftypefn  {Built-in Function} {} fclose (@var{fid})\n\
+ @deftypefnx {Built-in Function} {} fclose (\"all\")\n\
+ @deftypefnx {Built-in Function} {@var{status} =} fclose (\"all\")\n\
+ Close the file specified by the file descriptor @var{fid}.\n\
+ \n\
+ If successful, @code{fclose} returns 0, otherwise, it returns -1.  The\n\
+ second form of the @code{fclose} call closes all open files except\n\
+-@code{stdout}, @code{stderr}, and @code{stdin}.\n\
+-\n\
+-Programming Note: When using @qcode{\"all\"} the file descriptors associated\n\
+-with gnuplot will also be closed.  This will prevent further plotting with\n\
+-gnuplot until Octave is closed and restarted.\n\
++@code{stdin}, @code{stdout}, @code{stderr}, and any FIDs associated\n\
++with gnuplot.\n\
+ @seealso{fopen, fflush, freport}\n\
+ @end deftypefn")
+ {
+   octave_value retval = -1;
+ 
+   int nargin = args.length ();
+ 
+   if (nargin == 1)
+diff --git a/libinterp/corefcn/oct-stream.cc b/libinterp/corefcn/oct-stream.cc
+--- a/libinterp/corefcn/oct-stream.cc
++++ b/libinterp/corefcn/oct-stream.cc
+@@ -4290,19 +4290,17 @@ octave_stream_list::do_lookup (const oct
+   return retval;
+ }
+ 
+ int
+ octave_stream_list::do_remove (int fid, const std::string& who)
+ {
+   int retval = -1;
+ 
+-  // Can't remove stdin (std::cin), stdout (std::cout), or stderr
+-  // (std::cerr).
+-
++  // Can't remove stdin (std::cin), stdout (std::cout), or stderr (std::cerr).
+   if (fid > 2)
+     {
+       ostrl_map::iterator iter = list.find (fid);
+ 
+       if (iter != list.end ())
+         {
+           octave_stream os = iter->second;
+           list.erase (iter);
+@@ -4347,35 +4345,50 @@ octave_stream_list::do_remove (const oct
+   return retval;
+ }
+ 
+ void
+ octave_stream_list::do_clear (bool flush)
+ {
+   if (flush)
+     {
+-      // Do flush stdout and stderr.
+-
+-      list[0].flush ();
++      // Flush stdout and stderr.
+       list[1].flush ();
++      list[2].flush ();
+     }
+ 
+-  octave_stream saved_os[3];
+-  // But don't delete them or stdin.
+-  for (ostrl_map::iterator iter = list.begin (); iter != list.end (); iter++)
++  for (ostrl_map::iterator iter = list.begin (); iter != list.end (); )
+     {
+       int fid = iter->first;
++      if (fid < 3)  // Don't delete stdin, stdout, stderr
++        {
++          iter++;
++          continue;
++        }
++
+       octave_stream os = iter->second;
+-      if (fid < 3)
+-        saved_os[fid] = os;
+-      else if (os.is_valid ())
++     
++      std::string name = os.name (); 
++      std::transform (name.begin (), name.end (), name.begin (), tolower);
++
++      // FIXME: This test for gnuplot is hardly foolproof.
++      if (name.find ("gnuplot") != std::string::npos)
++        {
++          // Don't close down pipes to gnuplot
++          iter++;
++          continue;
++        }
++
++      // Normal file handle.  Close and delete from list.
++      if (os.is_valid ())
+         os.close ();
++
++      list.erase (iter++);
+     }
+-  list.clear ();
+-  for (int fid = 0; fid < 3; fid++) list[fid] = saved_os[fid];
++
+   lookup_cache = list.end ();
+ }
+ 
+ string_vector
+ octave_stream_list::do_get_info (int fid) const
+ {
+   string_vector retval;
+ 
+diff --git a/libinterp/corefcn/syscalls.cc b/libinterp/corefcn/syscalls.cc
+--- a/libinterp/corefcn/syscalls.cc
++++ b/libinterp/corefcn/syscalls.cc
+@@ -317,20 +317,22 @@ exit status, it will linger until Octave
+                                      fildes, msg, interactive);
+       if (pid >= 0)
+         {
+           FILE *ifile = fdopen (fildes[1], "r");
+           FILE *ofile = fdopen (fildes[0], "w");
+ 
+           std::string nm;
+ 
+-          octave_stream is = octave_stdiostream::create (nm, ifile,
++          octave_stream is = octave_stdiostream::create (exec_file + "-in",
++                                                         ifile,
+                                                          std::ios::in);
+ 
+-          octave_stream os = octave_stdiostream::create (nm, ofile,
++          octave_stream os = octave_stdiostream::create (exec_file + "-out",
++                                                         ofile,
+                                                          std::ios::out);
+ 
+           Cell file_ids (1, 2);
+ 
+           retval(2) = pid;
+           retval(1) = octave_stream_list::insert (is);
+           retval(0) = octave_stream_list::insert (os);
+         }
+@@ -888,22 +890,20 @@ error message.\n\
+ 
+       if (status < 0)
+         retval(3) = msg;
+       else
+         {
+           FILE *ifile = fdopen (fid[0], "r");
+           FILE *ofile = fdopen (fid[1], "w");
+ 
+-          std::string nm;
+-
+-          octave_stream is = octave_stdiostream::create (nm, ifile,
++          octave_stream is = octave_stdiostream::create ("pipe-in", ifile,
+                                                          std::ios::in);
+ 
+-          octave_stream os = octave_stdiostream::create (nm, ofile,
++          octave_stream os = octave_stdiostream::create ("pipe-out", ofile,
+                                                          std::ios::out);
+ 
+           retval(2) = status;
+           retval(1) = octave_stream_list::insert (os);
+           retval(0) = octave_stream_list::insert (is);
+         }
+     }
+   else

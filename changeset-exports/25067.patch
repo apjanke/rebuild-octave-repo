@@ -1,0 +1,992 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1522446432 14400
+#      Fri Mar 30 17:47:12 2018 -0400
+# Node ID e909207e9ff151d4201cc1ff3dfb472b6383da5b
+# Parent  4c2ca91a790f4590baefeab4ea327a71412f9faa
+# Parent  b940e457e11fb9d50294bd16c5f4228a0dec6c62
+maint: Merge stable to default.
+
+diff --git a/.hgsub b/.hgsub
+--- a/.hgsub
++++ b/.hgsub
+@@ -1,1 +1,1 @@
+-gnulib = http://hg.octave.org/gnulib
++gnulib = http://hg-new.octave.org/gnulib
+diff --git a/.hgsubstate b/.hgsubstate
+--- a/.hgsubstate
++++ b/.hgsubstate
+@@ -1,1 +1,1 @@
+-733fbf6b39bc505d2717f25e8b7d114aeaa94098 gnulib
++791f51373ba1b80c8ae3b7a9d2509d8a827a3e25 gnulib
+diff --git a/libgui/graphics/ObjectProxy.cc b/libgui/graphics/ObjectProxy.cc
+--- a/libgui/graphics/ObjectProxy.cc
++++ b/libgui/graphics/ObjectProxy.cc
+@@ -124,12 +124,28 @@ namespace QtHandles
+     Qt::ConnectionType t = Qt::BlockingQueuedConnection;
+ 
+     if (QThread::currentThread () == QCoreApplication::instance ()->thread ())
+       t = Qt::DirectConnection;
+ 
+     QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
+                                Q_RETURN_ARG (uint8NDArray, retval));
+ 
+-    return retval;
+-  }
++    // FIXME: The following may fail for obscure reasons, see bug #53328.
++    //        In absence of a solution, we retry twice before calling error().
++    if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
++                                     Q_RETURN_ARG (uint8NDArray, retval)))
++      {
++        QThread::msleep (100);
++        if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
++                                         Q_RETURN_ARG (uint8NDArray, retval)))
++          {
++            QThread::msleep (200);
++            if (! QMetaObject::invokeMethod (m_object, "slotGetPixels", t,
++                                             Q_RETURN_ARG (uint8NDArray, retval)))
++              error ("getframe: unable to retrieve figure pixels");
++          }
++      }
++    
++     return retval;
++   }
+ 
+ };
+diff --git a/libgui/src/documentation-dock-widget.cc b/libgui/src/documentation-dock-widget.cc
+--- a/libgui/src/documentation-dock-widget.cc
++++ b/libgui/src/documentation-dock-widget.cc
+@@ -40,16 +40,22 @@ namespace octave
+     setStatusTip (tr ("See the documentation for help."));
+ 
+     m_docs = new octave::documentation (this);
+     setWidget (m_docs);
+     setFocusProxy (m_docs);
+ 
+     connect (p, SIGNAL (show_doc_signal (const QString&)),
+              this, SLOT (showDoc (const QString&)));
++
++    connect (p, SIGNAL (register_doc_signal (const QString&)),
++             this, SLOT (registerDoc (const QString&)));
++
++    connect (p, SIGNAL (unregister_doc_signal (const QString&)),
++             this, SLOT (unregisterDoc (const QString&)));
+   }
+ 
+   documentation_dock_widget::~documentation_dock_widget (void)
+   {
+     if (m_docs)
+       delete m_docs;
+   }
+ 
+@@ -78,9 +84,19 @@ namespace octave
+     // show the doc pane without focus for carrying on typing in the console
+     if (! isVisible ())
+       setVisible (true);
+ 
+     raise ();
+ 
+     m_docs->load_ref (name);
+   }
++
++  void documentation_dock_widget::registerDoc (const QString& name)
++  {
++    m_docs->registerDoc (name);
++  }
++
++  void documentation_dock_widget::unregisterDoc (const QString& name)
++  {
++    m_docs->unregisterDoc (name);
++  }
+ }
+diff --git a/libgui/src/documentation-dock-widget.h b/libgui/src/documentation-dock-widget.h
+--- a/libgui/src/documentation-dock-widget.h
++++ b/libgui/src/documentation-dock-widget.h
+@@ -43,16 +43,18 @@ namespace octave
+ 
+   protected slots:
+ 
+     void copyClipboard (void);
+     void pasteClipboard (void);
+     void selectAll (void);
+ 
+     void showDoc (const QString & name);
++    void registerDoc (const QString & name);
++    void unregisterDoc (const QString & name);
+ 
+   private:
+ 
+     octave::documentation *m_docs;
+   };
+ }
+ 
+ #endif
+diff --git a/libgui/src/documentation.cc b/libgui/src/documentation.cc
+--- a/libgui/src/documentation.cc
++++ b/libgui/src/documentation.cc
+@@ -19,42 +19,67 @@ along with Octave; see the file COPYING.
+ <https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
++#include "defaults.h"
++#include "file-ops.h"
++#include "oct-env.h"
++
+ #include <QApplication>
+ #include <QCompleter>
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
+ #include <QHelpContentWidget>
+ #include <QHelpIndexWidget>
+ #include <QHelpSearchEngine>
+ #include <QHelpSearchQueryWidget>
+ #include <QHelpSearchResultWidget>
+ #include <QLabel>
+ #include <QLineEdit>
++#include <QMessageBox>
+ #include <QTabWidget>
+-#include <QMessageBox>
+ #include <QVBoxLayout>
+ 
+ #include "documentation.h"
+ 
+ namespace octave
+ {
+   // The documentation splitter, which is the main widget
+   // of the doc dock widget
+   documentation::documentation (QWidget *p)
+     : QSplitter (Qt::Horizontal, p)
+   {
++    // Get original collection
+     QString collection = getenv ("OCTAVE_QTHELP_COLLECTION");
++    if (collection.isEmpty ())
++      collection = QString::fromStdString (octave::config::oct_doc_dir ()
++                                         + octave::sys::file_ops::dir_sep_str ()
++                                         + "octave_interpreter.qhc");
++
++    // Setup the help engine with the original collection, use a writable copy
++    // of the original collection and load the help data
++    m_help_engine = new QHelpEngine (collection, this);
+ 
+-    // Setup the help engine and load the help data
+-    m_help_engine = new QHelpEngine (collection, this);
++    std::string tmpdir (octave::sys::env::getenv ("TMPDIR"));
++    m_collection
++      = QString::fromStdString (octave::sys::tempnam (tmpdir, "oct-qhelp-"));
++
++    if (m_help_engine->copyCollectionFile (m_collection))
++      m_help_engine->setCollectionFile (m_collection);
++    else
++      QMessageBox::warning (this, tr ("Octave Documentation"),
++                            tr ("Could not copy help collection to temporary\n"
++                                "file. Search capabilities may be affected.\n"
++                                "%1").arg (m_help_engine->error ()));
+ 
+     connect(m_help_engine, SIGNAL(setupFinished()),
+             m_help_engine->searchEngine(), SLOT(indexDocumentation()));
+ 
+     if (! m_help_engine->setupData())
+       {
+         QMessageBox::warning (this, tr ("Octave Documentation"),
+                               tr ("Could not setup the data required for the\n"
+@@ -157,23 +182,47 @@ namespace octave
+     // Initial view: Contents
+     m_doc_browser->setSource (QUrl (
+         "qthelp://org.octave.interpreter-1.0/doc/octave.html/index.html"));
+   }
+ 
+   documentation::~documentation (void)
+   {
+     if (m_help_engine)
+-      delete m_help_engine;
++      {
++        delete m_help_engine;
++
++        // Cleanup temporary file and directory
++        QFile file (m_collection);
++        QFileInfo finfo (file);
++        QString bname = finfo.fileName ();
++        QDir dir = finfo.absoluteDir ();
++        dir.setFilter (QDir::Dirs | QDir::NoDotAndDotDot | QDir::Hidden);
++        QStringList namefilter;
++        namefilter.append ("*" + bname + "*");
++        foreach (QFileInfo fi, dir.entryInfoList (namefilter))
++          {
++            QDir tmpdir (fi.absoluteFilePath ());
++            tmpdir.removeRecursively ();
++          }
++
++        file.remove();
++      }
+   }
+ 
+   void documentation::global_search (void)
+   {
++#if defined (HAVE_QHELPSEARCHQUERYWIDGET_SEARCHINPUT)
++    QString queries
++      = m_help_engine->searchEngine ()->queryWidget ()->searchInput ();
++#else
+     QList<QHelpSearchQuery> queries
+       = m_help_engine->searchEngine ()->queryWidget ()->query ();
++#endif
++
+     m_help_engine->searchEngine ()->search (queries);
+   }
+ 
+   void documentation::global_search_started (void)
+   {
+     qApp->setOverrideCursor(QCursor(Qt::WaitCursor));
+   }
+ 
+@@ -220,16 +269,57 @@ namespace octave
+ 
+     if (index > -1)
+       m_filter->removeItem (index);            // remove if already existing
+ 
+     m_filter->insertItem (0, text);            // (re)insert at beginning
+     m_filter->setCurrentIndex (0);
+   }
+ 
++  void documentation::registerDoc (const QString& qch)
++  {
++    if (m_help_engine)
++      {
++        QString ns = m_help_engine->namespaceName (qch);
++        bool do_setup = true;
++        if (m_help_engine->registeredDocumentations ().contains (ns))
++          {
++            if (m_help_engine->documentationFileName (ns) == qch)
++              do_setup = false;
++            else
++              {
++                m_help_engine->unregisterDocumentation (ns);
++                m_help_engine->registerDocumentation (qch);
++              }
++          }
++        else if (! m_help_engine->registerDocumentation (qch))
++          {
++            QMessageBox::warning (this, tr ("Octave Documentation"),
++                                  tr ("Unable to register help file %1.").
++                                  arg (qch));
++            do_setup = false;
++            return;
++          }
++
++        if (do_setup)
++          m_help_engine->setupData();
++      }
++  }
++
++  void documentation::unregisterDoc (const QString& qch)
++  {
++    QString ns = m_help_engine->namespaceName (qch);
++    if (m_help_engine
++        && m_help_engine->registeredDocumentations ().contains (ns)
++        && m_help_engine->documentationFileName (ns) == qch)
++      {
++        m_help_engine->unregisterDocumentation (ns);
++        m_help_engine->setupData ();
++      }
++  }
+ 
+ 
+   // The documentation browser
+   documentation_browser::documentation_browser (QHelpEngine *he, QWidget *p)
+     : QTextBrowser (p), m_help_engine (he)
+   { }
+ 
+   documentation_browser::~documentation_browser (void)
+diff --git a/libgui/src/documentation.h b/libgui/src/documentation.h
+--- a/libgui/src/documentation.h
++++ b/libgui/src/documentation.h
+@@ -71,28 +71,31 @@ namespace octave
+ 
+     void notice_settings (const QSettings *settings);
+ 
+     void copyClipboard (void);
+     void pasteClipboard (void);
+     void selectAll (void);
+ 
+     void load_ref (const QString & name);
++    void registerDoc (const QString & name);
++    void unregisterDoc (const QString & name);
+ 
+   private slots:
+ 
+     void global_search (void);
+     void global_search_started (void);
+     void global_search_finished (int hits);
+     void filter_update (const QString& expression);
+     void filter_update_history (void);
+ 
+   private:
+ 
+     QHelpEngine *m_help_engine;
+     documentation_browser *m_doc_browser;
+     QComboBox *m_filter;
++    QString m_collection;
+ 
+   };
+ 
+ }
+ 
+ #endif
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -2237,31 +2237,31 @@ namespace octave
+   }
+ 
+   bool file_editor_tab::check_valid_codec (QTextCodec *codec)
+   {
+     if (! codec)
+       {
+         QMessageBox::critical (nullptr,
+                                tr ("Octave Editor"),
+-                               tr ("The current codec %1\n"
++                               tr ("The current encoding %1\n"
+                                    "can not be applied.\n\n"
+                                    "Please select another one or cancel saving!").arg (_encoding));
+ 
+         return true;
+       }
+ 
+     if (! codec->canEncode (_edit_area->text ()))
+       {
+         int ans = QMessageBox::warning (nullptr,
+                                         tr ("Octave Editor"),
+                                         tr ("The current editor contents can not be encoded\n"
+-                                            "with the selected codec %1.\n"
++                                            "with the selected encoding %1.\n"
+                                             "Using it will result in data loss!\n\n"
+-                                            "Do you want to chose another codec?").arg (_encoding),
++                                            "Do you want to chose another encoding?").arg (_encoding),
+                                         QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+ 
+         if (ans == QMessageBox::Yes)
+           return true;
+       }
+ 
+     return false;
+   }
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -1735,17 +1735,17 @@ namespace octave
+       = add_action (m_edit_fmt_menu,
+                     tr ("Indent Code"),
+                     SLOT (request_smart_indent_line_or_selected_text (void)));
+ 
+     m_edit_fmt_menu->addSeparator ();
+ 
+     m_conv_eol_windows_action
+       = add_action (m_edit_fmt_menu,
+-                    tr ("convert line endings to &windows (crlf)"),
++                    tr ("Convert Line Endings to &Windows (CRLF)"),
+                     SLOT (request_conv_eol_windows (bool)));
+ 
+     m_conv_eol_unix_action
+       = add_action (m_edit_fmt_menu,
+                     tr ("Convert Line Endings to &Unix (LF)"),
+                     SLOT (request_conv_eol_unix (bool)));
+ 
+     m_conv_eol_mac_action
+@@ -2233,17 +2233,17 @@ namespace octave
+ 
+   void file_editor::mru_menu_update (void)
+   {
+     int num_files = qMin (m_mru_files.size (), int (MaxMRUFiles));
+ 
+     // configure and show active actions of mru-menu
+     for (int i = 0; i < num_files; ++i)
+       {
+-        QString text = tr ("&%1 %2").
++        QString text = QString ("&%1 %2").
+           arg ((i+1) % int (MaxMRUFiles)).arg (m_mru_files.at (i));
+         m_mru_file_actions[i]->setText (text);
+ 
+         QStringList action_data;
+         action_data << m_mru_files.at (i) << m_mru_files_encodings.at (i);
+         m_mru_file_actions[i]->setData (action_data);
+ 
+         m_mru_file_actions[i]->setVisible (true);
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1471,16 +1471,26 @@ namespace octave
+   }
+ 
+   void main_window::handle_show_doc (const QString& file)
+   {
+     m_doc_browser_window->setVisible (true);
+     emit show_doc_signal (file);
+   }
+ 
++  void main_window::handle_register_doc (const QString& file)
++  {
++    emit register_doc_signal (file);
++  }
++
++  void main_window::handle_unregister_doc (const QString& file)
++  {
++    emit unregister_doc_signal (file);
++  }
++
+   void main_window::handle_octave_ready (void)
+   {
+     // actions after the startup files are executed
+     QSettings *settings = resource_manager::get_settings ();
+ 
+     QDir startup_dir = QDir ();    // current octave dir after startup
+ 
+     if (settings)
+@@ -1979,16 +1989,24 @@ namespace octave
+                                                           int, const QString&)),
+                  this,
+                  SLOT (handle_update_breakpoint_marker_request (bool, const QString&,
+                                                                 int, const QString&)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (show_doc_signal (const QString &)),
+                  this, SLOT (handle_show_doc (const QString &)));
++
++        connect (m_octave_qt_link,
++                 SIGNAL (register_doc_signal (const QString &)),
++                 this, SLOT (handle_register_doc (const QString &)));
++
++        connect (m_octave_qt_link,
++                 SIGNAL (unregister_doc_signal (const QString &)),
++                 this, SLOT (handle_unregister_doc (const QString &)));
+       }
+ 
+     // Defer initializing and executing the interpreter until after the main
+     // window and QApplication are running to prevent race conditions
+     QTimer::singleShot (0, m_interpreter, SLOT (execute (void)));
+   }
+ 
+   QAction* main_window::add_action (QMenu *menu, const QIcon& icon,
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -122,16 +122,18 @@ namespace octave
+ 
+     void settings_changed (const QSettings *);
+     void init_terminal_size_signal (void);
+     void new_file_signal (const QString&);
+     void open_file_signal (const QString&);
+     void open_file_signal (const QString& file, const QString& enc, int line);
+ 
+     void show_doc_signal (const QString&);
++    void register_doc_signal (const QString&);
++    void unregister_doc_signal (const QString&);
+ 
+     void insert_debugger_pointer_signal (const QString& file, int line);
+     void delete_debugger_pointer_signal (const QString& file, int line);
+     void update_breakpoint_marker_signal (bool insert, const QString& file,
+                                           int line, const QString& cond);
+ 
+     void copyClipboard_signal (void);
+     void pasteClipboard_signal (void);
+@@ -238,16 +240,18 @@ namespace octave
+ 
+     void handle_create_filedialog (const QStringList& filters,
+                                    const QString& title,
+                                    const QString& filename,
+                                    const QString& dirname,
+                                    const QString& multimode);
+ 
+     void handle_show_doc (const QString& file);
++    void handle_register_doc (const QString& file);
++    void handle_unregister_doc (const QString& file);
+ 
+     void handle_octave_ready ();
+     void handle_octave_finished (int);
+ 
+     //! Find files dialog.
+     //!@{
+     void find_files (const QString& startdir = QDir::currentPath ());
+     void find_files_finished (int) { }
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -582,16 +582,26 @@ namespace octave
+     emit show_preferences_signal ();
+   }
+ 
+   void octave_qt_link::do_show_doc (const std::string& file)
+   {
+     emit show_doc_signal (QString::fromStdString (file));
+   }
+ 
++  void octave_qt_link::do_register_doc (const std::string& file)
++  {
++    emit register_doc_signal (QString::fromStdString (file));
++  }
++
++  void octave_qt_link::do_unregister_doc (const std::string& file)
++  {
++    emit unregister_doc_signal (QString::fromStdString (file));
++  }
++
+   void octave_qt_link::do_edit_variable (const std::string& expr,
+                                          const octave_value& val)
+   {
+     emit edit_variable_signal (QString::fromStdString (expr), val);
+   }
+ 
+   void octave_qt_link::do_insert_debugger_pointer (const std::string& file,
+                                                    int line)
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -137,16 +137,18 @@ namespace octave
+     void do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                  std::string& ps4);
+ 
+     static bool file_in_path (const std::string& file, const std::string& dir);
+ 
+     void do_show_preferences (void);
+ 
+     void do_show_doc (const std::string& file);
++    void do_register_doc (const std::string& file);
++    void do_unregister_doc (const std::string& file);
+ 
+     void do_edit_variable (const std::string& name, const octave_value& val);
+ 
+     void shutdown_confirmation (bool sd) { m_shutdown_confirm_result = sd; }
+ 
+     void lock (void) { m_mutex.lock (); }
+     void wait (void) { m_waitcondition.wait (&m_mutex); }
+     void unlock (void) { m_mutex.unlock (); }
+@@ -191,16 +193,20 @@ namespace octave
+ 
+     void insert_debugger_pointer_signal (const QString&, int);
+     void delete_debugger_pointer_signal (const QString&, int);
+ 
+     void show_preferences_signal (void);
+ 
+     void show_doc_signal (const QString& file);
+ 
++    void register_doc_signal (const QString& file);
++
++    void unregister_doc_signal (const QString& file);
++
+     void edit_variable_signal (const QString& name, const octave_value& val);
+ 
+     void refresh_variable_editor_signal (void);
+ 
+     void confirm_shutdown_signal (void);
+   };
+ }
+ 
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -1163,17 +1163,17 @@
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="toolTip">
+                    <string>This works well for monospaced fonts. The line is drawn at a position based on the width of a space character in the default font. It may not work very well if styles use proportional fonts or if varied font sizes or bold, italic and normal texts are used.</string>
+                   </property>
+                   <property name="text">
+-                   <string>Wrap long lines at curent window border</string>
++                   <string>Wrap long lines at current window border</string>
+                   </property>
+                   <property name="checked">
+                    <bool>false</bool>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
+diff --git a/libgui/src/variable-editor.cc b/libgui/src/variable-editor.cc
+--- a/libgui/src/variable-editor.cc
++++ b/libgui/src/variable-editor.cc
+@@ -354,18 +354,18 @@ namespace octave
+   {
+     if (! hasFocus ())
+       return;
+ 
+     QString name = objectName ();
+     QString file
+       = QFileDialog::getSaveFileName (this,
+                                       tr ("Save Variable %1 As").arg (name),
+-                                      /* Should determine extension from save_default_options */
+-                                      tr ("./%1.txt").arg (name),
++    // FIXME: Should determine extension from save_default_options
++                                      QString ("./%1.txt").arg (name),
+                                       0, 0,
+                                       QFileDialog::DontUseNativeDialog);
+ 
+     // FIXME: Type? binary, float-binary, ascii, text, hdf5, matlab format?
+     // FIXME: Call octave_value::save_* directly?
+ 
+     if (! file.isEmpty ())
+       emit command_signal (QString ("save (\"%1\", \"%2\");")
+diff --git a/libinterp/corefcn/__betainc__.cc b/libinterp/corefcn/__betainc__.cc
+--- a/libinterp/corefcn/__betainc__.cc
++++ b/libinterp/corefcn/__betainc__.cc
+@@ -1,28 +1,28 @@
+ /*
+ 
+ Copyright (C) 2018 Michele Ginesi
+ Copyright (C) 2018 Stefan Schlögl
+ 
+ This file is part of Octave.
+ 
+-Octave is free software; you can redistribute it and/or modify it
++Octave is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
++the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ 
+ Octave is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
++<https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "defun.h"
+diff --git a/libinterp/corefcn/__expint__.cc b/libinterp/corefcn/__expint__.cc
+--- a/libinterp/corefcn/__expint__.cc
++++ b/libinterp/corefcn/__expint__.cc
+@@ -1,27 +1,27 @@
+ /*
+ 
+ Copyright (C) 2018 Michele Ginesi
+ 
+ This file is part of Octave.
+ 
+-Octave is free software; you can redistribute it and/or modify it
++Octave is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
++the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ 
+ Octave is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
++<https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "CNDArray.h"
+diff --git a/libinterp/corefcn/__gammainc__.cc b/libinterp/corefcn/__gammainc__.cc
+--- a/libinterp/corefcn/__gammainc__.cc
++++ b/libinterp/corefcn/__gammainc__.cc
+@@ -1,29 +1,29 @@
+ /*
+ 
+ Copyright (C) 2017-2018 Nir Krakauer
+ Copyright (C) 2018 Michele Ginesi
+ Copyright (C) 2018 Stefan Schlögl
+ 
+ This file is part of Octave.
+ 
+-Octave is free software; you can redistribute it and/or modify it
++Octave is free software: you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
++the Free Software Foundation, either version 3 of the License, or
+ (at your option) any later version.
+ 
+ Octave is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of
+ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
++<https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "defun.h"
+diff --git a/libinterp/corefcn/gl-render.cc b/libinterp/corefcn/gl-render.cc
+--- a/libinterp/corefcn/gl-render.cc
++++ b/libinterp/corefcn/gl-render.cc
+@@ -2013,16 +2013,17 @@ namespace octave
+     // is actually initialized.  See bug #48669.
+     // Check actual maximum number of lights possible
+     max_lights = get_maxlights ();
+ 
+     // Start with the last element of the array of child objects to
+     // display them in the order they were added to the array.
+ 
+     num_lights = 0;
++    current_light = GL_LIGHT0;
+     draw_all_lights (props, obj_list);
+ 
+     // disable other OpenGL lights
+     for (int i = num_lights; i < max_lights; i++)
+       glDisable (GL_LIGHT0 + i);
+ 
+     // save camera position and set ambient light color before drawing
+     // other objects
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -473,17 +473,18 @@ namespace octave
+ 
+         traditional = options.traditional ();
+ 
+         // FIXME: if possible, perform the following actions directly
+         // instead of using the interpreter-level functions.
+ 
+         if (options.echo_commands ())
+           m_evaluator.echo
+-            (tree_evaluator::ECHO_SCRIPTS | tree_evaluator::ECHO_FUNCTIONS);
++            (tree_evaluator::ECHO_SCRIPTS | tree_evaluator::ECHO_FUNCTIONS
++             | tree_evaluator::ECHO_ALL);
+ 
+         std::string docstrings_file = options.docstrings_file ();
+         if (! docstrings_file.empty ())
+           Fbuilt_in_docstrings_file (*this, octave_value (docstrings_file));
+ 
+         std::string doc_cache_file = options.doc_cache_file ();
+         if (! doc_cache_file.empty ())
+           Fdoc_cache_file (*this, octave_value (doc_cache_file));
+diff --git a/libinterp/corefcn/octave-link.cc b/libinterp/corefcn/octave-link.cc
+--- a/libinterp/corefcn/octave-link.cc
++++ b/libinterp/corefcn/octave-link.cc
+@@ -427,8 +427,36 @@ Undocumented internal function.
+ {
+   std::string file;
+ 
+   if (args.length () >= 1)
+     file = args(0).string_value();
+ 
+   return ovl (octave_link::show_doc (file));
+ }
++
++DEFUN (__octave_link_register_doc__, args, ,
++       doc: /* -*- texinfo -*-
++@deftypefn {} {} __octave_link_register_doc__ (@var{filename})
++Undocumented internal function.
++@end deftypefn */)
++{
++  std::string file;
++
++  if (args.length () >= 1)
++    file = args(0).string_value();
++
++  return ovl (octave_link::register_doc (file));
++}
++
++DEFUN (__octave_link_unregister_doc__, args, ,
++       doc: /* -*- texinfo -*-
++@deftypefn {} {} __octave_link_unregister_doc__ (@var{filename})
++Undocumented internal function.
++@end deftypefn */)
++{
++  std::string file;
++
++  if (args.length () >= 1)
++    file = args(0).string_value();
++
++  return ovl (octave_link::unregister_doc (file));
++}
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -421,16 +421,40 @@ public:
+   {
+     if (enabled ())
+       {
+         instance->do_show_doc (file);
+         return true;
+       }
+     else
+       return false;
++  }
++
++  static bool
++  register_doc (const std::string & file)
++  {
++    if (enabled ())
++      {
++        instance->do_register_doc (file);
++        return true;
++      }
++    else
++      return false;
++  }
++
++  static bool
++  unregister_doc (const std::string & file)
++  {
++    if (enabled ())
++      {
++        instance->do_unregister_doc (file);
++        return true;
++      }
++    else
++      return false;
+ 
+   }
+ 
+   static bool
+   edit_variable (const std::string &name, const octave_value& val)
+   {
+     if (enabled ())
+       {
+@@ -597,13 +621,17 @@ protected:
+ 
+   virtual void do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                        std::string& ps4) = 0;
+ 
+   virtual void do_show_preferences (void) = 0;
+ 
+   virtual void do_show_doc (const std::string& file) = 0;
+ 
++  virtual void do_register_doc (const std::string& file) = 0;
++
++  virtual void do_unregister_doc (const std::string& file) = 0;
++
+   virtual void
+   do_edit_variable (const std::string& name, const octave_value& val) = 0;
+ };
+ 
+ #endif
+diff --git a/m4/acinclude.m4 b/m4/acinclude.m4
+--- a/m4/acinclude.m4
++++ b/m4/acinclude.m4
+@@ -462,16 +462,48 @@ AC_DEFUN([OCTAVE_CHECK_FUNC_QHEADERVIEW_
+     AC_LANG_POP(C++)
+   ])
+   if test $octave_cv_func_qheaderview_setsectionsmovable = yes; then
+     AC_DEFINE(HAVE_QHEADERVIEW_SETSECTIONSMOVABLE, 1,
+       [Define to 1 if you have the `QHeaderView::setSectionsMovable' member function.])
+   fi
+ ])
+ dnl
++dnl Check whether the Qt QHelpSearchQueryWidget class has the searchInput
++dnl member function.  This function was introduced in Qt 5.9.
++dnl
++dnl FIXME: Delete this entirely when we drop support for Qt 5.8 or older.
++dnl
++AC_DEFUN([OCTAVE_CHECK_FUNC_QHELPSEARCHQUERYWIDGET_SEARCHINPUT], [
++  AC_CACHE_CHECK([for QHelpSearchQueryWidget::searchInput],
++    [octave_cv_func_qhelpsearchquerywidget_searchinput],
++    [AC_LANG_PUSH(C++)
++    ac_octave_save_CPPFLAGS="$CPPFLAGS"
++    ac_octave_save_CXXFLAGS="$CXXFLAGS"
++    CPPFLAGS="$QT_CPPFLAGS $CXXPICFLAG $CPPFLAGS"
++    CXXFLAGS="$CXXPICFLAG $CPPFLAGS"
++    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++        #include <QHelpSearchQueryWidget>
++        #include <QString>
++        ]], [[
++        QHelpSearchQueryWidget *query_widget = new QHelpSearchQueryWidget ();
++        QString search_input = query_widget->searchInput ();
++        ]])],
++      octave_cv_func_qhelpsearchquerywidget_searchinput=yes,
++      octave_cv_func_qhelpsearchquerywidget_searchinput=no)
++    CPPFLAGS="$ac_octave_save_CPPFLAGS"
++    CXXFLAGS="$ac_octave_save_CXXFLAGS"
++    AC_LANG_POP(C++)
++  ])
++  if test $octave_cv_func_qhelpsearchquerywidget_searchinput = yes; then
++    AC_DEFINE(HAVE_QHELPSEARCHQUERYWIDGET_SEARCHINPUT, 1,
++      [Define to 1 if you have the `QHelpSearchQueryWidget::searchInput' member function.])
++  fi
++])
++dnl
+ dnl Check whether the Qt function qInstallMessageHandler is available.
+ dnl This function was introduced in Qt 5.
+ dnl
+ dnl FIXME: Delete this entirely when we drop support for Qt 4.
+ dnl
+ AC_DEFUN([OCTAVE_CHECK_FUNC_QINSTALLMESSAGEHANDLER], [
+   AC_CACHE_CHECK([for qInstallMessageHandler],
+     [octave_cv_func_qinstallmessagehandler],
+@@ -1756,17 +1788,17 @@ AC_DEFUN([OCTAVE_CHECK_QT_OPENGL_OFFSCRE
+          #endif
+          #if defined (HAVE_QOPENGLWIDGET)
+          #  include <QOpenGLWidget>
+          #  include <QOpenGLContext>
+          #endif
+          #if defined (HAVE_QOFFSCREENSURFACE)
+          #  include <QOffscreenSurface>
+          #endif
+-         QOpenGLContext ctx;    
++         QOpenGLContext ctx;
+          QOffscreenSurface surf;
+        ]])],
+        octave_cv_qt_opengl_os_ok=yes,
+        octave_cv_qt_opengl_os_ok=no)
+   ])
+   CPPFLAGS="$ac_octave_save_CPPFLAGS"
+   CXXFLAGS="$ac_octave_save_CXXFLAGS"
+   AC_LANG_POP(C++)
+@@ -1950,17 +1982,17 @@ AC_DEFUN([OCTAVE_CHECK_QT_VERSION], [AC_
+     if test -z "$LRELEASE_QTVER"; then
+       AC_CHECK_TOOLS(LRELEASE, [lrelease])
+       if test -n "$LRELEASE" && test -n "$QTCHOOSER"; then
+         LRELEASEFLAGS="-qt$qt_version"
+       fi
+     else
+       LRELEASE="$LRELEASE_QTVER"
+     fi
+-    
++
+     AC_CHECK_TOOLS(QCOLLECTIONGENERATOR_QTVER, [qcollectiongenerator-qt$qt_version])
+     if test -z "$QCOLLECTIONGENERATOR_QTVER"; then
+       AC_CHECK_TOOLS(QCOLLECTIONGENERATOR, [qcollectiongenerator])
+       if test -n "$QCOLLECTIONGENERATOR" && test -n "$QTCHOOSER"; then
+         QCOLLECTIONGENERATORFLAGS="-qt$qt_version"
+       fi
+     else
+       QCOLLECTIONGENERATOR="$QCOLLECTIONGENERATOR_QTVER"
+@@ -2059,16 +2091,17 @@ AC_DEFUN([OCTAVE_CHECK_QT_VERSION], [AC_
+     ## We don't need to unset cache variables for any of the remaining
+     ## tests if they fail because we have already decided that the Qt
+     ## version that we are testing now will be the one used.
+ 
+     OCTAVE_CHECK_FUNC_QGUIAPPLICATION_SETDESKTOPFILENAME
+     OCTAVE_CHECK_FUNC_QHEADERVIEW_SETSECTIONRESIZEMODE
+     OCTAVE_CHECK_FUNC_QHEADERVIEW_SETSECTIONSCLICKABLE
+     OCTAVE_CHECK_FUNC_QHEADERVIEW_SETSECTIONSMOVABLE
++    OCTAVE_CHECK_FUNC_QHELPSEARCHQUERYWIDGET_SEARCHINPUT
+     OCTAVE_CHECK_FUNC_QINSTALLMESSAGEHANDLER
+     OCTAVE_CHECK_FUNC_QLINEEDIT_SETPLACEHOLDERTEXT
+     OCTAVE_CHECK_FUNC_QMOUSEEVENT_LOCALPOS
+     OCTAVE_CHECK_FUNC_QOBJECT_FINDCHILDREN_ACCEPTS_FINDCHILDOPTIONS
+     OCTAVE_CHECK_FUNC_QTABWIDGET_SETMOVABLE
+     OCTAVE_CHECK_FUNC_QTMESSAGEHANDLER_ACCEPTS_QMESSAGELOGCONTEXT
+     OCTAVE_CHECK_MEMBER_QFONT_FORCE_INTEGER_METRICS
+     OCTAVE_CHECK_MEMBER_QFONT_MONOSPACE

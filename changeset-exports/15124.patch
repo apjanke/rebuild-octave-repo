@@ -1,0 +1,196 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1344369598 18000
+#      Tue Aug 07 14:59:58 2012 -0500
+# Node ID 0464e3ceb85b4f1117ffd81c327088d3e1807c1e
+# Parent  4e0ab3b2841899bcda5379763bf3ffd579cd5746
+Skip functions when resolving end context in JIT
+
+* src/interp-core/jit-ir.cc (jit_magic_end::resolve_context): Skip functions.
+
+* src/interp-core/jit-typeinfo.cc (jit_type::jit_type): Add askip_paren
+parameter.
+(jit_typeinfo::addbuiltin): Skip end resolution for builtin functions.
+* src/interp-core/jit-typeinfo.h (jit_type::skip_paren): New function.
+(jit_typeinfo::new_type): Add skip_paren argument.
+
+diff --git a/src/interp-core/jit-ir.cc b/src/interp-core/jit-ir.cc
+--- a/src/interp-core/jit-ir.cc
++++ b/src/interp-core/jit-ir.cc
+@@ -614,19 +614,29 @@ jit_magic_end::jit_magic_end (const std:
+   std::vector<context>::const_iterator iter;
+   for (iter = contexts.begin (), i = 0; iter != contexts.end (); ++iter, ++i)
+     stash_argument (i, iter->value);
+ }
+ 
+ jit_magic_end::context
+ jit_magic_end::resolve_context (void) const
+ {
+-  // FIXME: We need to have a way of marking functions so we can skip them here
+-  context ret = contexts[0];
+-  ret.value = argument (0);
++  size_t idx;
++  for (idx = 0; idx < contexts.size (); ++idx)
++    {
++      jit_type *ctx_type = contexts[idx].value->type ();
++      if (! ctx_type || ctx_type->skip_paren ())
++        break;
++    }
++
++  if (idx >= contexts.size ())
++    idx = 0;
++
++  context ret = contexts[idx];
++  ret.value = argument (idx);
+   return ret;
+ }
+ 
+ bool
+ jit_magic_end::infer (void)
+ {
+   jit_type *new_type = overload ().result ();
+   if (new_type != type ())
+diff --git a/src/interp-core/jit-typeinfo.cc b/src/interp-core/jit-typeinfo.cc
+--- a/src/interp-core/jit-typeinfo.cc
++++ b/src/interp-core/jit-typeinfo.cc
+@@ -495,19 +495,19 @@ operator<< (std::ostream& os, const jit_
+ {
+   return os << "Matrix[" << mat.ref_count << ", " << mat.slice_data << ", "
+             << mat.slice_len << ", " << mat.dimensions << ", "
+             << mat.array << "]";
+ }
+ 
+ // -------------------- jit_type --------------------
+ jit_type::jit_type (const std::string& aname, jit_type *aparent,
+-                    llvm::Type *allvm_type, int aid) :
++                    llvm::Type *allvm_type, bool askip_paren, int aid) :
+   mname (aname), mparent (aparent), llvm_type (allvm_type), mid (aid),
+-  mdepth (aparent ? aparent->mdepth + 1 : 0)
++  mdepth (aparent ? aparent->mdepth + 1 : 0), mskip_paren (askip_paren)
+ {
+   std::memset (msret, 0, sizeof (msret));
+   std::memset (mpointer_arg, 0, sizeof (mpointer_arg));
+   std::memset (mpack, 0, sizeof (mpack));
+   std::memset (munpack, 0, sizeof (munpack));
+ 
+   for (size_t i = 0; i < jit_convention::length; ++i)
+     mpacked_type[i] = llvm_type;
+@@ -1795,19 +1795,19 @@ jit_typeinfo::do_end (jit_value *value, 
+   if (ccount && ccount->value () == 1)
+     return end1_fn.overload (value->type (), idx->type (), count->type ());
+ 
+   return end_fn.overload (value->type (), idx->type (), count->type ());
+ }
+ 
+ jit_type*
+ jit_typeinfo::new_type (const std::string& name, jit_type *parent,
+-                        llvm::Type *llvm_type)
++                        llvm::Type *llvm_type, bool skip_paren)
+ {
+-  jit_type *ret = new jit_type (name, parent, llvm_type, next_id++);
++  jit_type *ret = new jit_type (name, parent, llvm_type, skip_paren, next_id++);
+   id_to_type.push_back (ret);
+   return ret;
+ }
+ 
+ void
+ jit_typeinfo::add_print (jit_type *ty, void *fptr)
+ {
+   std::stringstream name;
+@@ -1913,17 +1913,17 @@ llvm::Value *
+ jit_typeinfo::do_insert_error_check (llvm::IRBuilderD& abuilder)
+ {
+   return abuilder.CreateLoad (lerror_state);
+ }
+ 
+ void
+ jit_typeinfo::add_builtin (const std::string& name)
+ {
+-  jit_type *btype = new_type (name, any, any->to_llvm ());
++  jit_type *btype = new_type (name, any, any->to_llvm (), true);
+   builtins[name] = btype;
+ 
+   octave_builtin *ov_builtin = find_builtin (name);
+   if (ov_builtin)
+     ov_builtin->stash_jit (*btype);
+ }
+ 
+ void
+diff --git a/src/interp-core/jit-typeinfo.h b/src/interp-core/jit-typeinfo.h
+--- a/src/interp-core/jit-typeinfo.h
++++ b/src/interp-core/jit-typeinfo.h
+@@ -127,17 +127,17 @@ jit_convention
+ // eventually we may allow for multiple predecessors.
+ class
+ jit_type
+ {
+ public:
+   typedef llvm::Value *(*convert_fn) (llvm::IRBuilderD&, llvm::Value *);
+ 
+   jit_type (const std::string& aname, jit_type *aparent, llvm::Type *allvm_type,
+-            int aid);
++            bool askip_paren, int aid);
+ 
+   // a user readable type name
+   const std::string& name (void) const { return mname; }
+ 
+   // a unique id for the type
+   int type_id (void) const { return mid; }
+ 
+   // An abstract base type, may be null
+@@ -146,16 +146,18 @@ public:
+   // convert to an llvm type
+   llvm::Type *to_llvm (void) const { return llvm_type; }
+ 
+   // how this type gets passed as a function argument
+   llvm::Type *to_llvm_arg (void) const;
+ 
+   size_t depth (void) const { return mdepth; }
+ 
++  bool skip_paren (void) const { return mskip_paren; }
++
+   // -------------------- Calling Convention information --------------------
+ 
+   // A function declared like: mytype foo (int arg0, int arg1);
+   // Will be converted to: void foo (mytype *retval, int arg0, int arg1)
+   // if mytype is sret. The caller is responsible for allocating space for
+   // retval. (on the stack)
+   bool sret (jit_convention::type cc) const { return msret[cc]; }
+ 
+@@ -190,16 +192,17 @@ public:
+   void set_packed_type (jit_convention::type cc, llvm::Type *ty)
+   { mpacked_type[cc] = ty; }
+ private:
+   std::string mname;
+   jit_type *mparent;
+   llvm::Type *llvm_type;
+   int mid;
+   size_t mdepth;
++  bool mskip_paren;
+ 
+   bool msret[jit_convention::length];
+   bool mpointer_arg[jit_convention::length];
+ 
+   convert_fn mpack[jit_convention::length];
+   convert_fn munpack[jit_convention::length];
+ 
+   llvm::Type *mpacked_type[jit_convention::length];
+@@ -620,17 +623,17 @@ private:
+   {
+     return do_cast (to).overload (from);
+   }
+ 
+   const jit_function& do_end (jit_value *value, jit_value *index,
+                               jit_value *count);
+ 
+   jit_type *new_type (const std::string& name, jit_type *parent,
+-                      llvm::Type *llvm_type);
++                      llvm::Type *llvm_type, bool skip_paren = false);
+ 
+ 
+   void add_print (jit_type *ty, void *fptr);
+ 
+   void add_binary_op (jit_type *ty, int op, int llvm_op);
+ 
+   void add_binary_icmp (jit_type *ty, int op, int llvm_op);
+ 

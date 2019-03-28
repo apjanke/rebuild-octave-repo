@@ -1,0 +1,169 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1339180540 18000
+#      Fri Jun 08 13:35:40 2012 -0500
+# Node ID 8efcaf5aa233d7adf574fec15520226e4c0248ea
+# Parent  e8487d98561c1062af61fce040de7a73039e4bbc
+Prevent crash when using scalars as conditionals
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -162,16 +162,29 @@ octave_jit_cast_scalar_any (octave_base_
+ }
+ 
+ extern "C" octave_base_value *
+ octave_jit_cast_any_scalar (double value)
+ {
+   return new octave_scalar (value);
+ }
+ 
++extern "C" void
++octave_jit_gripe_nan_to_logical_conversion (void)
++{
++  try
++    {
++      gripe_nan_to_logical_conversion ();
++    }
++  catch (const octave_execution_exception&)
++    {
++      gripe_library_execution_error ();
++    }
++}
++
+ // -------------------- jit_range --------------------
+ std::ostream&
+ operator<< (std::ostream& os, const jit_range& rng)
+ {
+   return os << "Range[" << rng.base << ", " << rng.limit << ", " << rng.inc
+             << ", " << rng.nelem << "]";
+ }
+ 
+@@ -490,35 +503,50 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+     llvm::Value *ret = builder.CreateFMul (didx, inc);
+     ret = builder.CreateFAdd (base, ret);
+     builder.CreateRet (ret);
+   }
+   llvm::verifyFunction (*fn);
+   for_index_fn.add_overload (fn, false, false, scalar, range, index);
+ 
+   // logically true
+-  // FIXME: Check for NaN
+-  fn = create_function ("octave_logically_true_scalar", boolean, scalar);
++  logically_true_fn.stash_name ("logically_true");
++
++  llvm::Function *gripe_nantl = create_function ("octave_jit_gripe_nan_to_logical_conversion", void_t);
++  engine->addGlobalMapping (gripe_nantl, reinterpret_cast<void *> (&octave_jit_gripe_nan_to_logical_conversion));
++                            
++
++  fn = create_function ("octave_jit_logically_true_scalar", boolean, scalar);
+   body = llvm::BasicBlock::Create (context, "body", fn);
+   builder.SetInsertPoint (body);
+   {
+-    llvm::Value *zero = llvm::ConstantFP::get (scalar->to_llvm (), 0);
+-    llvm::Value *ret = builder.CreateFCmpUNE (fn->arg_begin (), zero);
++    llvm::BasicBlock *error_block = llvm::BasicBlock::Create (context, "error", fn);
++    llvm::BasicBlock *normal_block = llvm::BasicBlock::Create (context, "normal", fn);
++
++    llvm::Value *check = builder.CreateFCmpUNE (fn->arg_begin (), fn->arg_begin ());
++    builder.CreateCondBr (check, error_block, normal_block);
++
++    builder.SetInsertPoint (error_block);
++    builder.CreateCall (gripe_nantl);
++    builder.CreateBr (normal_block);
++    builder.SetInsertPoint (normal_block);
++
++    llvm::Value *zero = llvm::ConstantFP::get (dbl, 0);
++    llvm::Value *ret = builder.CreateFCmpONE (fn->arg_begin (), zero);
+     builder.CreateRet (ret);
+   }
+   llvm::verifyFunction (*fn);
+-  logically_true.add_overload (fn, true, false, boolean, scalar);
++  logically_true_fn.add_overload (fn, true, false, boolean, scalar);
+ 
+   fn = create_function ("octave_logically_true_bool", boolean, boolean);
+   body = llvm::BasicBlock::Create (context, "body", fn);
+   builder.SetInsertPoint (body);
+   builder.CreateRet (fn->arg_begin ());
+   llvm::verifyFunction (*fn);
+-  logically_true.add_overload (fn, false, false, boolean, boolean);
+-  logically_true.stash_name ("logically_true");
++  logically_true_fn.add_overload (fn, false, false, boolean, boolean);
+ 
+   // make_range
+   // FIXME: May be benificial to implement all in LLVM
+   make_range_fn.stash_name ("make_range");
+   llvm::Function *compute_nelem
+     = create_function ("octave_jit_compute_nelem", index, scalar, scalar, scalar);
+   engine->addGlobalMapping (compute_nelem,
+                             reinterpret_cast<void*> (&octave_jit_compute_nelem));
+@@ -1495,17 +1523,24 @@ jit_convert::visit_if_command_list (tree
+       assert (block);
+ 
+       if (i) // the first block is prev_block, so it has already been added
+         blocks.push_back (entry_blocks[i]);
+ 
+       if (! tic->is_else_clause ())
+         {
+           tree_expression *expr = tic->condition ();
+-          jit_value *cond = visit (expr);
++          jit_instruction *cond = visit (expr);
++          cond = create<jit_call> (&jit_typeinfo::logically_true, cond);
++          block->append (cond);
++
++          jit_block *next = create<jit_block> (block->name () + "a");
++          blocks.push_back (next);
++          block->append (create<jit_check_error> (next, final_block));
++          block = next;
+ 
+           jit_block *body = create<jit_block> (i == 0 ? "if_body" : "ifelse_body");
+           blocks.push_back (body);
+ 
+           jit_instruction *br = create<jit_cond_break> (cond, body,
+                                                         entry_blocks[i + 1]);
+           block->append (br);
+           block = body;
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -343,16 +343,21 @@ public:
+     return instance->for_index_fn;
+   }
+ 
+   static const jit_function& make_range (void)
+   {
+     return instance->make_range_fn;
+   }
+ 
++  static const jit_function& logically_true (void)
++  {
++    return instance->logically_true_fn;
++  }
++
+   static const jit_function& cast (jit_type *result)
+   {
+     return instance->do_cast (result);
+   }
+ 
+   static const jit_function::overload& cast (jit_type *to, jit_type *from)
+   {
+     return instance->do_cast (to, from);
+@@ -520,17 +525,17 @@ private:
+ 
+   std::vector<jit_function> binary_ops;
+   jit_function grab_fn;
+   jit_function release_fn;
+   jit_function print_fn;
+   jit_function for_init_fn;
+   jit_function for_check_fn;
+   jit_function for_index_fn;
+-  jit_function logically_true;
++  jit_function logically_true_fn;
+   jit_function make_range_fn;
+ 
+   // type id -> cast function TO that type
+   std::vector<jit_function> casts;
+ 
+   // type id -> identity function
+   std::vector<llvm::Function *> identities;
+ };

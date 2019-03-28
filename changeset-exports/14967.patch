@@ -1,0 +1,285 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1340397986 18000
+#      Fri Jun 22 15:46:26 2012 -0500
+# Node ID 0cfe0cf55a02ca990291bf35744997c27fb8b1da
+# Parent  b7b647bc4b9070fdf9024c517ffcdbeca9db0368
+Simplify matrix handling in JIT
+
+* src/pt-jit.cc (octave_jit_release_matrix, octave_jit_grab_matrix):
+    New function.
+  (octave_jit_delete_matrix): Removed function.
+  (octave_jit_cast_any_matrix, octave_jit_print_matrix): Use new jit_matrix
+    layout.
+  (jit_typeinfo::jit_typeing): Removed identity overload for grab/release and
+    do not release matrix on subsref.
+
+* src/pt-jit.h (jit_matrix::jit_matrix): Initialize NDArray field.
+  (jit_matrix::operator T): Return NDArray directly.
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -142,37 +142,41 @@ octave_jit_compute_nelem (double base, d
+ 
+ extern "C" void
+ octave_jit_release_any (octave_base_value *obv)
+ {
+   obv->release ();
+ }
+ 
+ extern "C" void
+-octave_jit_delete_matrix (jit_matrix *m)
++octave_jit_release_matrix (jit_matrix *m)
+ {
+-  NDArray array (*m);
++  delete m->array;
+ }
+ 
+ extern "C" octave_base_value *
+ octave_jit_grab_any (octave_base_value *obv)
+ {
+   obv->grab ();
+   return obv;
+ }
+ 
+-extern "C" octave_base_value *
+-octave_jit_cast_any_matrix (jit_matrix *jmatrix)
++extern "C" void
++octave_jit_grab_matrix (jit_matrix *result, jit_matrix *m)
+ {
+-  ++(*jmatrix->ref_count);
+-  NDArray matrix = *jmatrix;
+-  octave_value ret (matrix);
+-
++  *result = *m->array;
++}
++
++extern "C" octave_base_value *
++octave_jit_cast_any_matrix (jit_matrix *m)
++{
++  octave_value ret (*m->array);
+   octave_base_value *rep = ret.internal_rep ();
+   rep->grab ();
++
+   return rep;
+ }
+ 
+ extern "C" void
+ octave_jit_cast_matrix_any (jit_matrix *ret, octave_base_value *obv)
+ {
+   NDArray m = obv->array_value ();
+   *ret = m;
+@@ -248,17 +252,17 @@ operator<< (std::ostream& os, const jit_
+ 
+ // -------------------- jit_matrix --------------------
+ 
+ std::ostream&
+ operator<< (std::ostream& os, const jit_matrix& mat)
+ {
+   return os << "Matrix[" << mat.ref_count << ", " << mat.slice_data << ", "
+             << mat.slice_len << ", " << mat.dimensions << ", "
+-            << mat.array_rep << "]";
++            << mat.array << "]";
+ }
+ 
+ // -------------------- jit_type --------------------
+ llvm::Type *
+ jit_type::to_llvm_arg (void) const
+ {
+   return llvm_type ? llvm_type->getPointerTo () : 0;
+ }
+@@ -440,79 +444,34 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   grab_fn.stash_name ("grab");
+ 
+   // grab matrix
+   llvm::Function *print_matrix = create_function ("octave_jit_print_matrix",
+                                                   void_t,
+                                                   matrix_t->getPointerTo ());
+   engine->addGlobalMapping (print_matrix,
+                             reinterpret_cast<void*>(&octave_jit_print_matrix));
+-
+-  fn = create_function ("octave_jit_grab_matrix", matrix, matrix);
+-  llvm::BasicBlock *body = llvm::BasicBlock::Create (context, "body", fn);
+-  builder.SetInsertPoint (body);
+-  {
+-    llvm::Value *one = llvm::ConstantInt::get (refcount_t, 1);
+-
+-    llvm::Value *mat = fn->arg_begin ();
+-    llvm::Value *rcount= builder.CreateExtractValue (mat, 0);
+-    llvm::Value *count = builder.CreateLoad (rcount);
+-    count = builder.CreateAdd (count, one);
+-    builder.CreateStore (count, rcount);
+-    builder.CreateRet (mat);
+-  }
++  fn = create_function ("octave_jit_grab_matrix", void_t,
++                        matrix_t->getPointerTo (), matrix_t->getPointerTo ());
++  engine->addGlobalMapping (fn,
++                            reinterpret_cast<void *> (&octave_jit_grab_matrix));
+   grab_fn.add_overload (fn, false, matrix, matrix);
+ 
+-  // grab scalar
+-  fn = create_identity (scalar);
+-  grab_fn.add_overload (fn, false, scalar, scalar);
+-
+-  // grab index
+-  fn = create_identity (index);
+-  grab_fn.add_overload (fn, false, index, index);
+-
+   // release any
+   fn = create_function ("octave_jit_release_any", void_t, any_t);
+   engine->addGlobalMapping (fn,
+                             reinterpret_cast<void*>(&octave_jit_release_any));
+   release_fn.add_overload (fn, false, 0, any);
+   release_fn.stash_name ("release");
+ 
+   // release matrix
+-  llvm::Function *delete_mat = create_function ("octave_jit_delete_matrix",
+-                                                void_t, matrix_t);
+-  engine->addGlobalMapping (delete_mat,
+-                            reinterpret_cast<void*> (&octave_jit_delete_matrix));
+-
+-  fn = create_function ("octave_jit_release_matrix", void_t, matrix_t);
+-  llvm::Function *release_mat = fn;
+-  body = llvm::BasicBlock::Create (context, "body", fn);
+-  builder.SetInsertPoint (body);
+-  {
+-    llvm::Value *one = llvm::ConstantInt::get (refcount_t, 1);
+-    llvm::Value *zero = llvm::ConstantInt::get (refcount_t, 0);
+-
+-    llvm::Value *mat = fn->arg_begin ();
+-    llvm::Value *rcount= builder.CreateExtractValue (mat, 0);
+-    llvm::Value *count = builder.CreateLoad (rcount);
+-    count = builder.CreateSub (count, one);
+-
+-    llvm::BasicBlock *dead = llvm::BasicBlock::Create (context, "dead", fn);
+-    llvm::BasicBlock *live = llvm::BasicBlock::Create (context, "live", fn);
+-    llvm::Value *isdead = builder.CreateICmpEQ (count, zero);
+-    builder.CreateCondBr (isdead, dead, live);
+-
+-    builder.SetInsertPoint (dead);
+-    builder.CreateCall (delete_mat, mat);
+-    builder.CreateRetVoid ();
+-
+-    builder.SetInsertPoint (live);
+-    builder.CreateStore (count, rcount);
+-    builder.CreateRetVoid ();
+-  }
++  fn = create_function ("octave_jit_release_matrix", void_t,
++                        matrix_t->getPointerTo ());
++  engine->addGlobalMapping (fn,
++                            reinterpret_cast<void *> (&octave_jit_release_matrix));
+   release_fn.add_overload (fn, false, 0, matrix);
+ 
+   // release scalar
+   fn = create_identity (scalar);
+   release_fn.add_overload (fn, false, 0, scalar);
+ 
+   // release index
+   fn = create_identity (index);
+@@ -533,17 +492,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   add_binary_fcmp (scalar, octave_value::op_ne, llvm::CmpInst::FCMP_UNE);
+ 
+   llvm::Function *gripe_div0 = create_function ("gripe_divide_by_zero", void_t);
+   engine->addGlobalMapping (gripe_div0,
+                             reinterpret_cast<void *> (&gripe_divide_by_zero));
+ 
+   // divide is annoying because it might error
+   fn = create_function ("octave_jit_div_scalar_scalar", scalar, scalar, scalar);
+-  body = llvm::BasicBlock::Create (context, "body", fn);
++  llvm::BasicBlock *body = llvm::BasicBlock::Create (context, "body", fn);
+   builder.SetInsertPoint (body);
+   {
+     llvm::BasicBlock *warn_block = llvm::BasicBlock::Create (context, "warn",
+                                                              fn);
+     llvm::BasicBlock *normal_block = llvm::BasicBlock::Create (context,
+                                                                "normal", fn);
+ 
+     llvm::Value *zero = llvm::ConstantFP::get (scalar_t, 0);
+@@ -728,17 +687,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   {
+     llvm::Value *one = llvm::ConstantInt::get (index_t, 1);
+     llvm::Value *ione;
+     if (index_t == int_t)
+       ione = one;
+     else
+       ione = llvm::ConstantInt::get (int_t, 1);
+ 
+-    llvm::Value *szero = llvm::ConstantFP::get (scalar_t, 0);
++    llvm::Value *undef = llvm::UndefValue::get (scalar_t);
+ 
+     llvm::Function::arg_iterator args = fn->arg_begin ();
+     llvm::Value *mat = args++;
+     llvm::Value *idx = args;
+ 
+     // convert index to scalar to integer, and check index >= 1
+     llvm::Value *int_idx = builder.CreateFPToSI (idx, index_t);
+     llvm::Value *check_idx = builder.CreateSIToFP (int_idx, scalar_t);
+@@ -783,20 +742,19 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+     llvm::Value *gep = builder.CreateInBoundsGEP (data, int_idx);
+     llvm::Value *ret = builder.CreateLoad (gep);
+     builder.CreateBr (done);
+ 
+     builder.SetInsertPoint (done);
+ 
+     llvm::PHINode *merge = llvm::PHINode::Create (scalar_t, 3);
+     builder.Insert (merge);
+-    merge->addIncoming (szero, conv_error);
+-    merge->addIncoming (szero, bounds_error);
++    merge->addIncoming (undef, conv_error);
++    merge->addIncoming (undef, bounds_error);
+     merge->addIncoming (ret, success);
+-    builder.CreateCall (release_mat, mat);
+     builder.CreateRet (merge);
+   }
+   llvm::verifyFunction (*fn);
+   paren_subsref_fn.add_overload (fn, true, scalar, matrix, scalar);
+ 
+   casts[any->type_id ()].stash_name ("(any)");
+   casts[scalar->type_id ()].stash_name ("(scalar)");
+ 
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -225,38 +225,38 @@ std::ostream& operator<< (std::ostream& 
+ template <typename T, typename U>
+ struct
+ jit_array
+ {
+   jit_array (T& from) : ref_count (from.jit_ref_count ()),
+                         slice_data (from.jit_slice_data () - 1),
+                         slice_len (from.capacity ()),
+                         dimensions (from.jit_dimensions ()),
+-                        array_rep (from.jit_array_rep ())
++                        array (new T (from))
+   {
+     grab_dimensions ();
+   }
+ 
+   void grab_dimensions (void)
+   {
+     ++(dimensions[-2]);
+   }
+ 
+   operator T () const
+   {
+-    return T (slice_data + 1, slice_len, dimensions, array_rep);
++    return *array;
+   }
+ 
+   int *ref_count;
+ 
+   U *slice_data;
+   octave_idx_type slice_len;
+   octave_idx_type *dimensions;
+ 
+-  void *array_rep;
++  T *array;
+ };
+ 
+ typedef jit_array<NDArray, double> jit_matrix;
+ 
+ std::ostream& operator<< (std::ostream& os, const jit_matrix& mat);
+ 
+ // Used to keep track of estimated (infered) types during JIT. This is a
+ // hierarchical type system which includes both concrete and abstract types.

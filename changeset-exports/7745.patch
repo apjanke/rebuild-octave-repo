@@ -1,0 +1,422 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1209592262 14400
+#      Wed Apr 30 17:51:02 2008 -0400
+# Node ID 0ff0fc033f2834d1b44af74fe99c8c34810bf401
+# Parent  14b841c47a5f35d752b5d29dd94f5fbd112bc797
+better handling of functions found by relative lookup
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,20 @@
+ 2008-04-30  John W. Eaton  <jwe@octave.org>
+ 
++	* dynamic-ld.cc (octave_dynamic_loader::do_load_oct):
++	If function already exists, reload it anyway.  Clear existing
++	oct_file only if reloading a function from the same file.
++	(octave_shlib_list::display): New static function.
++	(octave_shlib_list::do_display): New function.
++
++	* symtab.cc (out_of_date_check_internal): Better handling for
++	functions found in files by relative file names.
++	(load_out_of_date_fcn): New function.
++
+ 	* ls-oct-ascii.cc (extract_keyword): Return early if first char is
+ 	not a comment character.
+ 	(read_ascii_data): Accept .nargin. and .nargout. as valid identifiers.
+ 
+ 	* ov-fcn-handle.cc: Combine tests.  Test saving and loading
+ 	handles for built-in, .oct, and .m functions.
+ 	(octave_fcn_handle::save_ascii, octave_fcn_handle::save_binary,
+ 	octave_fcn_handle::save_hdf5, octave_fcn_handle::print):
+diff --git a/src/dynamic-ld.cc b/src/dynamic-ld.cc
+--- a/src/dynamic-ld.cc
++++ b/src/dynamic-ld.cc
+@@ -53,29 +53,33 @@ public:
+ 
+   static void append (const octave_shlib& shl);
+ 
+   static void remove (octave_shlib& shl, octave_shlib::close_hook cl_hook = 0);
+ 
+   static void *search (const std::string& fcn_name, octave_shlib& shl,
+ 		       octave_shlib::name_mangler mangler = 0);
+ 
++  static void display (void);
++
+ private:
+ 
+   octave_shlib_list (void) { }
+ 
+   ~octave_shlib_list (void) { }
+ 
+   void do_append (const octave_shlib& shl);
+ 
+   void do_remove (octave_shlib& shl, octave_shlib::close_hook cl_hook = 0);
+ 
+   void *do_search (const std::string& fcn_name, octave_shlib& shl,
+ 		   octave_shlib::name_mangler mangler = 0);
+ 
++  void do_display (void) const;
++
+   static octave_shlib_list *instance;
+ 
+   static bool instance_ok (void);
+ 
+   // List of libraries we have loaded.
+   std::list<octave_shlib> lib_list;
+ 
+   // No copying!
+@@ -132,16 +136,25 @@ octave_shlib_list::do_search (const std:
+ 
+ 	  break;
+ 	}
+     }
+ 
+   return function;
+ }
+ 
++void
++octave_shlib_list::do_display (void) const
++{
++  std::cerr << "current shared libraries:" << std::endl;
++  for (std::list<octave_shlib>::const_iterator p = lib_list.begin ();
++       p != lib_list.end (); p++)
++    std::cerr << "  " << p->file_name () << std::endl;
++}
++
+ bool
+ octave_shlib_list::instance_ok (void)
+ {
+   bool retval = true;
+ 
+   if (! instance)
+     instance = new octave_shlib_list ();
+ 
+@@ -172,16 +185,23 @@ octave_shlib_list::remove (octave_shlib&
+ 
+ void *
+ octave_shlib_list::search (const std::string& fcn_name, octave_shlib& shl,
+ 			   octave_shlib::name_mangler mangler)
+ {
+   return (instance_ok ()) ? instance->do_search (fcn_name, shl, mangler) : 0;
+ }
+ 
++void
++octave_shlib_list::display (void)
++{
++  if (instance_ok ())
++    instance->do_display ();
++}
++
+ class
+ octave_mex_file_list
+ {
+ public:
+ 
+   static void append (const octave_shlib& shl);
+ 
+   static void remove (octave_shlib& shl, octave_shlib::close_hook cl_hook = 0);
+@@ -327,65 +347,76 @@ octave_dynamic_loader::do_load_oct (cons
+ 
+   doing_load = true;
+ 
+   void *function
+     = octave_shlib_list::search (fcn_name, oct_file, xmangle_name);
+ 
+   if (! error_state)
+     {
+-      if (function
+-	  && (! same_file (file_name, oct_file.file_name ())
+-	      || oct_file.is_out_of_date ()))
++      bool reloading = false;
++
++      if (function)
+ 	{
+-	  clear (oct_file);
++	  // If there is already a function by this name installed
++	  // from the same file, clear the file so we can reload it.
++
++	  // If there is already a function by this name installed
++	  // from a different file, leave the other file alone and
++	  // load the function from the new file.
++
++	  reloading = same_file (file_name, oct_file.file_name ());
++
++	  if (reloading)
++	    clear (oct_file);
++
+ 	  function = 0;
+ 	}
+ 
+-      if (! function)
+-	{
+-	  std::string oct_file_name = file_name;
++      if (! reloading)
++	oct_file = octave_shlib ();
++
++      std::string oct_file_name = file_name;
+ 
+-	  if (oct_file_name.empty ())
+-	    {
+-	      oct_file_name = oct_file_in_path (fcn_name);
++      if (oct_file_name.empty ())
++	{
++	  oct_file_name = oct_file_in_path (fcn_name);
++
++	  if (! oct_file_name.empty ())
++	    relative = ! octave_env::absolute_pathname (oct_file_name);
++	}
+ 
+-	      if (! oct_file_name.empty ())
+-		relative = ! octave_env::absolute_pathname (oct_file_name);
+-	    }
+-
+-	  if (oct_file_name.empty ())
++      if (oct_file_name.empty ())
++	{
++	  if (oct_file.is_relative ())
+ 	    {
+-	      if (oct_file.is_relative ())
++	      // Can't see this function from current
++	      // directory, so we should clear it.
++	      clear (oct_file);
++	      function = 0;
++	    }
++	}
++      else
++	{
++	  oct_file.open (oct_file_name);
++
++	  if (! error_state)
++	    {
++	      if (oct_file)
+ 		{
+-		  // Can't see this function from current
+-		  // directory, so we should clear it.
+-		  clear (oct_file);
+-		  function = 0;
++		  if (relative)
++		    oct_file.mark_relative ();
++
++		  octave_shlib_list::append (oct_file);
++
++		  function = oct_file.search (fcn_name, xmangle_name);
+ 		}
+-	    }
+-	  else
+-	    {
+-	      oct_file.open (oct_file_name);
+-
+-	      if (! error_state)
+-		{
+-		  if (oct_file)
+-		    {
+-		      if (relative)
+-			oct_file.mark_relative ();
+-
+-		      octave_shlib_list::append (oct_file);
+-
+-		      function = oct_file.search (fcn_name, xmangle_name);
+-		    }
+-		  else
+-		    ::error ("%s is not a valid shared library",
+-			     oct_file_name.c_str ());
+-		}
++	      else
++		::error ("%s is not a valid shared library",
++			 oct_file_name.c_str ());
+ 	    }
+ 	}
+     }
+ 
+   if (function)
+     {
+       octave_dld_fcn_getter f
+ 	= FCN_PTR_CAST (octave_dld_fcn_getter, function);
+diff --git a/src/ov-fcn-handle.cc b/src/ov-fcn-handle.cc
+--- a/src/ov-fcn-handle.cc
++++ b/src/ov-fcn-handle.cc
+@@ -111,20 +111,20 @@ octave_fcn_handle::subsref (const std::s
+ }
+ 
+ bool
+ octave_fcn_handle::set_fcn (const std::string &octaveroot, 
+ 			    const std::string& fpath)
+ {
+   bool success = true;
+ 
+-  if (octaveroot.length () != 0 && 
+-      fpath.length () >= octaveroot.length () &&
+-      fpath.substr (0, octaveroot.length ()) == octaveroot &&
+-      OCTAVE_EXEC_PREFIX != octaveroot)
++  if (octaveroot.length () != 0
++      && fpath.length () >= octaveroot.length ()
++      && fpath.substr (0, octaveroot.length ()) == octaveroot
++      && OCTAVE_EXEC_PREFIX != octaveroot)
+     {
+       // First check if just replacing matlabroot is enough
+       std::string str = OCTAVE_EXEC_PREFIX + 
+ 	fpath.substr (octaveroot.length ());		    
+       file_stat fs (str);
+ 
+       if (fs.exists ())
+ 	{
+@@ -1072,17 +1072,17 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+ 
+ /* 
+ 
+ %!test
+ %! a = 2;
+ %! f = @(x) a + x;
+ %! g = @(x) 2 * x;
+ %! hm = @flops;
+-%! hdld = @time;
++%! hdld = @svd;
+ %! hbi = @log2;
+ %! f2 = f;
+ %! g2 = g;
+ %! hm2 = hm;
+ %! hdld2 = hdld;
+ %! hbi2 = hbi;
+ %! modes = {"-text", "-binary"};
+ %! if (!isempty(findstr(octave_config_info ("DEFS"),"HAVE_HDF5")))
+diff --git a/src/symtab.cc b/src/symtab.cc
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -98,16 +98,36 @@ symbol_table::symbol_record::find (tree_
+ // elements, we also check if the working directory has changed
+ // since the last time the function was loaded/parsed).
+ //
+ // FIXME -- perhaps this should be done for all loaded functions when
+ // the prompt is printed or the directory has changed, and then we
+ // would not check for it when finding symbol definitions.
+ 
+ static inline bool
++load_out_of_date_fcn (const std::string& ff, const std::string& dir_name,
++		      octave_value& function)
++{
++  bool retval = false;
++
++  octave_function *fcn = load_fcn_from_file (ff, dir_name);
++
++  if (fcn)
++    {
++      retval = true;
++
++      function = octave_value (fcn);
++    }
++  else
++    function = octave_value ();
++
++  return retval;
++}
++
++static inline bool
+ out_of_date_check_internal (octave_value& function)
+ {
+   bool retval = false;
+ 
+   octave_function *fcn = function.function_value (true);
+ 
+   if (fcn)
+     {
+@@ -121,74 +141,79 @@ out_of_date_check_internal (octave_value
+ 	    {
+ 	      octave_time tc = fcn->time_checked ();
+ 
+ 	      bool relative = fcn->is_relative ();
+ 
+ 	      if (tc < Vlast_prompt_time
+ 		  || (relative && tc < Vlast_chdir_time))
+ 		{
+-		  octave_time ottp = fcn->time_parsed ();
+-		  time_t tp = ottp.unix_time ();
+-
+ 		  std::string nm = fcn->name ();
+ 
+ 		  int nm_len = nm.length ();
+ 
+ 		  std::string file;
+ 		  std::string dir_name;
+ 
+ 		  if (octave_env::absolute_pathname (nm)
+ 		      && ((nm_len > 4 && (nm.substr (nm_len-4) == ".oct"
+ 					  || nm.substr (nm_len-4) == ".mex"))
+ 			  || (nm_len > 2 && nm.substr (nm_len-4) == ".m")))
+ 		    file = nm;
+ 		  else
+-		    // FIXME -- this lookup is not right since it doesn't
+-		    // account for dispatch type.
+-		    file = octave_env::make_absolute (load_path::find_fcn (nm, dir_name),
+-						      octave_env::getcwd ());
++		    {
++		      // FIXME -- this lookup is not right since it doesn't
++		      // account for dispatch type.
++
++		      // We don't want to make this an absolute name,
++		      // because load_fcn_file looks at the name to
++		      // decide whether it came from a relative lookup.
++
++		      file = load_path::find_fcn (nm, dir_name);
++		    }
+ 
+ 		  if (file.empty ())
+ 		    {
+ 		      // Can't see this function from current
+ 		      // directory, so we should clear it.
+ 
+ 		      function = octave_value ();
+ 		    }
+ 		  else if (same_file (file, ff))
+ 		    {
++		      // Same file.  If it is out of date, then reload it.
++
++		      octave_time ottp = fcn->time_parsed ();
++		      time_t tp = ottp.unix_time ();
++
+ 		      fcn->mark_fcn_file_up_to_date (octave_time ());
+ 
+ 		      if (! (Vignore_function_time_stamp == 2
+ 			     || (Vignore_function_time_stamp
+ 				 && fcn->is_system_fcn_file ())))
+ 			{
+ 			  file_stat fs (ff);
+ 
+ 			  if (fs)
+ 			    {
+ 			      if (fs.is_newer (tp))
+-				{
+-				  fcn = load_fcn_from_file (ff, dir_name);
+-
+-				  if (fcn)
+-				    {
+-				      retval = true;
+-
+-				      function = octave_value (fcn);
+-				    }
+-				  else
+-				    function = octave_value ();
+-				}				
++				retval = load_out_of_date_fcn (ff, dir_name,
++							       function);
+ 			    }
+ 			  else
+ 			    function = octave_value ();
+ 			}
+ 		    }
++		  else
++		    {
++		      // Not the same file, so load the new file in
++		      // place of the old.
++
++		      retval = load_out_of_date_fcn (file, dir_name, function);
++		    }
+ 		}
+ 	    }
+ 	}
+     }
+ 
+   return retval;
+ }
+ 

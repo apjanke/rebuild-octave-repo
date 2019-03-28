@@ -1,0 +1,186 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1369683717 -7200
+#      Mon May 27 21:41:57 2013 +0200
+# Node ID e38a0fa08368d4dd6f3a0dfd20cbe28cf8555f73
+# Parent  5cf19370011dcd7327cdea780548ac711bb45fbc
+fix restoring editor files from previous session and speedup lexer preparation
+
+* file-editor-tab.h: new slot save_apis_info, class variable for lexer's apis
+* file-editor-tab.cc(update_lexer): cancel any existing apis preparation,
+  try to load prepared apis information or prepare and save it
+  (save_apis_info): new slot for saving apis info when preparation is finished
+  (constructor): initialize class variable for apis to zero
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -21,17 +21,16 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #ifdef HAVE_QSCINTILLA
+ 
+-#include <Qsci/qsciapis.h>
+ #if defined (HAVE_QSCI_QSCILEXEROCTAVE_H)
+ #define HAVE_LEXER_OCTAVE
+ #include <Qsci/qscilexeroctave.h>
+ #elif defined (HAVE_QSCI_QSCILEXERMATLAB_H)
+ #define HAVE_LEXER_MATLAB
+ #include <Qsci/qscilexermatlab.h>
+ #endif
+ #include <Qsci/qscilexercpp.h>
+@@ -55,17 +54,17 @@ along with Octave; see the file COPYING.
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ 
+ // Make parent null for the file editor tab so that warning
+ // WindowModal messages don't affect grandparents.
+ file_editor_tab::file_editor_tab (const QString& directory_arg)
+ {
+   QString directory = directory_arg;
+-
++  _lexer_apis = 0;
+   _app_closing = false;
+ 
+   // Make sure there is a slash at the end of the directory name
+   // for identification when saved later.
+   if (directory.count () && directory.at (directory.count () - 1) != '/')
+     directory.append ("/");
+ 
+   _file_name = directory;
+@@ -204,16 +203,19 @@ file_editor_tab::handle_margin_clicked (
+             request_add_breakpoint (line);
+         }
+     }
+ }
+ 
+ void
+ file_editor_tab::update_lexer ()
+ {
++  if (_lexer_apis)
++    _lexer_apis->cancelPreparation ();  // stop preparing if apis exists
++
+   QsciLexer *lexer = _edit_area->lexer ();
+   delete lexer;
+   lexer = 0;
+ 
+   if (_file_name.endsWith (".m")
+       || _file_name.endsWith ("octaverc"))
+     {
+ #if defined (HAVE_LEXER_OCTAVE)
+@@ -253,41 +255,52 @@ file_editor_tab::update_lexer ()
+         {
+           // FIXME -- why should the bash lexer be the default?
+           lexer = new QsciLexerBash ();
+         }
+     }
+ 
+   if (lexer)
+     {
+-      QsciAPIs *apis = new QsciAPIs(lexer);
+-      if (apis)
++      _lexer_apis = new QsciAPIs(lexer);
++      if (_lexer_apis)
+         {
+           QString keyword;
+           QStringList keyword_list;
+           int i;
+           for (i=1; i<=3; i++) // load the first 3 keyword sets
+             {
+               keyword = QString(lexer->keywords (i));           // get list
+               keyword_list = keyword.split (QRegExp ("\\s+"));  // split
+               for (i = 0; i < keyword_list.size (); i++)        // add to API
+-                apis->add (keyword_list.at (i));
++                _lexer_apis->add (keyword_list.at (i));
+             }
+-          apis->prepare ();
++          if (!_lexer_apis->loadPrepared ())
++            {
++              connect (_lexer_apis, SIGNAL (apiPreparationFinished ()),
++                       this, SLOT (save_apis_info ()));
++              _lexer_apis->prepare ();
++            }
+         }
+     }
+ 
+   QSettings *settings = resource_manager::get_settings ();
+   if (settings)
+     lexer->readSettings (*settings);
+ 
+   _edit_area->setLexer (lexer);
+ 
+ }
+ 
++void
++file_editor_tab::save_apis_info ()
++{
++  _lexer_apis->savePrepared ();
++}
++
+ // slot for fetab_set_focus: sets the focus to the current edit area
+ void
+ file_editor_tab::set_focus (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+   _edit_area->setFocus ();
+ }
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -24,16 +24,17 @@ along with Octave; see the file COPYING.
+ #define file_editor_tab_h 1
+ 
+ #include <QWidget>
+ #include <QCloseEvent>
+ #include <QFileSystemWatcher>
+ #include <QSettings>
+ #include <QFileInfo>
+ #include <Qsci/qsciscintilla.h>
++#include <Qsci/qsciapis.h>
+ 
+ #include "find-dialog.h"
+ 
+ class file_editor;
+ 
+ class file_editor_tab : public QWidget
+ {
+   Q_OBJECT
+@@ -132,16 +133,19 @@ private slots:
+   // When user closes find_dialog box.
+   void handle_find_dialog_finished (int decision);
+ 
+   // When user closes QFileDialog box.
+   void handle_save_file_as_answer (const QString& fileName);
+   void handle_save_file_as_answer_close (const QString& fileName);
+   void handle_save_file_as_answer_cancel ();
+ 
++  // When apis preparation has finished and is ready to save
++  void save_apis_info ();
++
+ private:
+ 
+   enum editor_markers
+     {
+       bookmark,
+       breakpoint,
+       debugger_position
+     };
+@@ -184,11 +188,13 @@ private:
+   bool _copy_available;
+   bool _app_closing;
+ 
+   QFileSystemWatcher _file_system_watcher;
+ 
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+   QRect _find_dialog_geometry;
++
++  QsciAPIs *_lexer_apis;
+ };
+ 
+ #endif

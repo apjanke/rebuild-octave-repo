@@ -1,0 +1,408 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1533498308 -7200
+#      Sun Aug 05 21:45:08 2018 +0200
+# Node ID c2a703df02152f5a3660a5cf2aa7bec4b881518a
+# Parent  d3c6de326bae4b2b2f2fe898f19759224fb270ba
+preserve tab position and line when reloading renamed editor file (bug #49322)
+
+* file-editor-interface.h: tab index as new argument for request_open_file
+
+* file-editor.cc (restore_session): session_data now with line number
+  and new file name after rename;
+  (handle_file_remove): store data of file to remove in the struct
+  session_data and append it to the list of all removed/renamed files;
+  (handle_file_renamed): reload all files at desired tab indexes and line
+  numbers that were previously renamed based on data stored in the list
+  of structures;
+  (request_open_file): new argument: desired tab index, also passed to
+  add_file_editor_tab;
+  (add_file_editor_tab): new argument: desired tab index
+  (handle_dir_remove): use list of session_data structures to store data
+  of removed/renamed files in a directory;
+
+* file-editor.h: extended session data by new_file_name and line,
+  request_open_file and add_file_editor_tab with tab index as additional
+  argument, list of session_data structures instead of list of strings
+  for the file data
+
+diff --git a/libgui/src/m-editor/file-editor-interface.h b/libgui/src/m-editor/file-editor-interface.h
+--- a/libgui/src/m-editor/file-editor-interface.h
++++ b/libgui/src/m-editor/file-editor-interface.h
+@@ -78,13 +78,14 @@ namespace octave
+     virtual void request_new_file (const QString& command = QString ()) = 0;
+ 
+     virtual void request_open_file (const QString& openFileName,
+                                     const QString& encoding = QString (),
+                                     int line = -1,
+                                     bool debug_pointer = false,
+                                     bool breakpoint_marker = false,
+                                     bool insert = true,
+-                                    const QString& cond = "") = 0;
++                                    const QString& cond = "",
++                                    int index = -1) = 0;
+   };
+ }
+ 
+ #endif
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -275,17 +275,18 @@ namespace octave
+     bool do_index = (session_index.count () == sessionFileNames.count ());
+ 
+     for (int n = 0; n < sessionFileNames.count (); ++n)
+       {
+         QFileInfo file = QFileInfo (sessionFileNames.at (n));
+         if (! file.exists ())
+           continue;
+ 
+-        session_data item = { 0, sessionFileNames.at (n), QString ()};
++        session_data item = { 0, 0, sessionFileNames.at (n),
++                              QString (), QString ()};
+         if (do_index)
+           item.index = session_index.at (n).toInt ();
+         if (do_encoding)
+           item.encoding = session_encodings.at (n);
+ 
+         s_data << item;
+       }
+ 
+@@ -920,71 +921,101 @@ namespace octave
+     request_open_file (file);
+   }
+ 
+   // Slot used for signals indicating that a file was changed/rename or
+   // is going to be deleted/renamed
+   void file_editor::handle_file_remove (const QString& old_name,
+                                         const QString& new_name)
+   {
+-    // Clear old lsit of files to reload
++    // Clear old list of file data and declare a structure for file data
+     m_tmp_closed_files.clear ();
++    session_data f_data;
+ 
+     // Check if old name is a file or directory
+     QFileInfo old (old_name);
+     if (old.isDir ())
+       {
+         // Call the function which handles directories and return
+         handle_dir_remove (old_name, new_name);
+       }
+     else
+       {
+-        // It is a single file. IT is open?
++        // It is a single file. Is it open?
+         file_editor_tab *editor_tab
+           = static_cast<file_editor_tab *> (find_tab_widget (old_name));
+ 
+         if (editor_tab)
+           {
+-            // Yes, close it silently
+-            m_no_focus = true;  // Remember for not focussing editor
+-            editor_tab->file_has_changed (QString (), true);  // Close the tab
+-            m_no_focus = false;  // Back to normal
+-
+-            m_tmp_closed_files << old_name;  // for reloading if error removing
+-
+-            if (! new_name.isEmpty ())
+-              m_tmp_closed_files << new_name;  // store new name
+-            else
+-              m_tmp_closed_files << ""; // no new name, just removing this file
+-
+-            // Get and store the related encoding
++            // YES: Get and store the related encoding
+             for (editor_tab_map_const_iterator p = m_editor_tab_map.begin ();
+                   p != m_editor_tab_map.end (); p++)
+               {
+                 if (editor_tab == p->second.fet_ID)
+                   {
+-                    m_tmp_closed_files << p->second.encoding;
++                    // Get index and line
++                    f_data.encoding = p->second.encoding;
++                    f_data.index = m_tab_widget->indexOf (editor_tab);
++                    int l, c;
++                    editor_tab->qsci_edit_area ()->getCursorPosition (&l, &c);
++                    f_data.line = l + 1;
+                     break;
+                   }
+               }
++
++            // Close it silently
++            m_no_focus = true;  // Remember for not focussing editor
++            editor_tab->file_has_changed (QString (), true);  // Close the tab
++            m_no_focus = false;  // Back to normal
++
++            // For reloading old file if error while removing
++            f_data.file_name = old_name;
++            // For reloading new file (if new_fiel is not empty)
++            f_data.new_file_name = new_name;
++
++            // Add file data to list
++            m_tmp_closed_files << f_data;
+           }
+       }
+   }
+ 
+   // Slot for signal indicating that a file was renamed
+   void file_editor::handle_file_renamed (bool load_new)
+   {
+     m_no_focus = true;  // Remember for not focussing editor
+-    for (int i = 0; i < m_tmp_closed_files.count (); i = i + 3)
++
++    // Loop over all file that have to be reloaded. Start at the end of the
++    // list, otherwise the stored indexes are not correct
++    for (int i = m_tmp_closed_files.count () - 1; i >= 0; i--)
+       {
+-        if (! m_tmp_closed_files.at (i + load_new).isEmpty ())
+-          request_open_file (m_tmp_closed_files.at (i + load_new),
+-                             m_tmp_closed_files.at (i+2));
++        // Load old or new file
++        if (load_new)
++          {
++            if (! m_tmp_closed_files.at (i).new_file_name.isEmpty ())
++              request_open_file (m_tmp_closed_files.at (i).new_file_name,
++                                 m_tmp_closed_files.at (i).encoding,
++                                 m_tmp_closed_files.at (i).line,
++                                 false, false, true, "",
++                                 m_tmp_closed_files.at (i).index);
++          }
++        else
++          {
++            request_open_file (m_tmp_closed_files.at (i).file_name,
++                                 m_tmp_closed_files.at (i).encoding,
++                                 m_tmp_closed_files.at (i).line,
++                                 false, false, true, "",
++                                 m_tmp_closed_files.at (i).index);
++          }
++
+       }
++
+     m_no_focus = false;  // Back to normal focus
++
++    // Clear the list of file data
++    m_tmp_closed_files.clear ();
+   }
+ 
+   void file_editor::notice_settings (const QSettings *settings)
+   {
+     int icon_size_settings = settings->value ("toolbar_icon_size",0).toInt ();
+     QStyle *st = style ();
+     int icon_size = st->pixelMetric (QStyle::PM_ToolBarIconSize);
+ 
+@@ -1182,17 +1213,17 @@ namespace octave
+   }
+ 
+   // Open a file, if not already open, and mark the current execution location
+   // and/or a breakpoint with condition cond.
+   void file_editor::request_open_file (const QString& openFileName,
+                                        const QString& encoding,
+                                        int line, bool debug_pointer,
+                                        bool breakpoint_marker, bool insert,
+-                                       const QString& cond)
++                                       const QString& cond, int index)
+   {
+     if (call_custom_editor (openFileName, line))
+       return;   // custom editor called
+ 
+     QSettings *settings = resource_manager::get_settings ();
+     bool show_dbg_file
+       = settings->value (ed_show_dbg_file.key, ed_show_dbg_file.def).toBool ();
+ 
+@@ -1258,17 +1289,17 @@ namespace octave
+               {
+                 fileEditorTab->set_encoding (encoding);
+                 QString result = fileEditorTab->load_file (openFileName);
+                 if (result == "")
+                   {
+                     // Supply empty title then have the file_editor_tab update
+                     // with full or short name.
+                     if (! reusing)
+-                      add_file_editor_tab (fileEditorTab, "");
++                      add_file_editor_tab (fileEditorTab, "", index);
+                     fileEditorTab->update_window_title (false);
+                     // file already loaded, add file to mru list here
+                     QFileInfo file_info = QFileInfo (openFileName);
+                     handle_mru_add_file (file_info.canonicalFilePath (),
+                                          encoding);
+ 
+                     if (line > 0)
+                       {
+@@ -2062,19 +2093,23 @@ namespace octave
+ 
+     resize (500, 400);
+     setWindowIcon (QIcon (":/actions/icons/logo.png"));
+     set_title (tr ("Editor"));
+ 
+     check_actions ();
+   }
+ 
+-  void file_editor::add_file_editor_tab (file_editor_tab *f, const QString& fn)
++  void file_editor::add_file_editor_tab (file_editor_tab *f, const QString& fn,
++                                         int index)
+   {
+-    m_tab_widget->addTab (f, fn);
++    if (index == -1)
++      m_tab_widget->addTab (f, fn);
++    else
++      m_tab_widget->insertTab (index, f, fn);
+ 
+     // signals from the qscintilla edit area
+     connect (f->qsci_edit_area (), SIGNAL (status_update (bool, bool)),
+              this, SLOT (edit_status_update (bool, bool)));
+ 
+     connect (f->qsci_edit_area (), SIGNAL (show_doc_signal (const QString&)),
+              main_win (), SLOT (handle_show_doc (const QString&)));
+ 
+@@ -2327,16 +2362,17 @@ namespace octave
+     notice_settings (settings);
+   }
+ 
+   // Function for closing the files in a removed directory
+   void file_editor::handle_dir_remove (const QString& old_name,
+                                        const QString& new_name)
+   {
+     QDir old_dir (old_name);
++    session_data f_data;
+ 
+     // Have all file editor tabs signal what their filenames are.
+     m_editor_tab_map.clear ();
+     emit fetab_file_name_query (nullptr);
+ 
+     // Loop over all open files and pick those within old_dir
+     for (auto p = m_editor_tab_map.cbegin ();
+          p != m_editor_tab_map.cend (); p++)
+@@ -2345,33 +2381,45 @@ namespace octave
+         if (rel_path_to_file.left (3) != QString ("../"))
+           {
+             // We directly go down from old_dir to reach our file: Our
+             // file is included in the removed/renamed diectory.
+             // Thus delete it.
+             m_no_focus = true;  // Remember for not focussing editor
+             file_editor_tab *editor_tab
+               = static_cast<file_editor_tab *> (p->second.fet_ID);
+-            editor_tab->file_has_changed (QString (), true);  // Close
++            if (editor_tab)
++              {
++                // Get index and line
++                int l, c;
++                editor_tab->qsci_edit_area ()->getCursorPosition (&l, &c);
++                f_data.line = l + 1;
++                f_data.index = m_tab_widget->indexOf (p->second.fet_ID);
++                // Close
++                editor_tab->file_has_changed (QString (), true);
++              }
+             m_no_focus = false;  // Back to normal
+ 
+             // Store file for possible later reload
+-            m_tmp_closed_files << p->first;
++            f_data.file_name = p->first;
+ 
+             // Add the new file path and the encoding for later reloading
+             // if new_name is given
+             if (! new_name.isEmpty ())
+               {
+                 QDir new_dir (new_name);
+-                m_tmp_closed_files << new_dir.absoluteFilePath (rel_path_to_file);
++                f_data.new_file_name = new_dir.absoluteFilePath (rel_path_to_file);
+               }
+             else
+-              m_tmp_closed_files << ""; // no new name, just removing this file
+-
+-            m_tmp_closed_files << p->second.encoding; // store the encoding
++              f_data.new_file_name = ""; // no new name, just removing this file
++
++            f_data.encoding = p->second.encoding; // store the encoding
++
++            // Store data in list for later reloading
++            m_tmp_closed_files << f_data;
+           }
+       }
+   }
+ 
+   bool file_editor::editor_tab_has_focus (void)
+   {
+     QWidget *foc_w = focusWidget ();
+     if (foc_w && foc_w->inherits ("octave::octave_qscintilla"))
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -73,17 +73,19 @@ namespace octave
+ 
+     typedef std::map<QString, tab_info>::iterator editor_tab_map_iterator;
+     typedef std::map<QString, tab_info>::const_iterator editor_tab_map_const_iterator;
+ 
+     // struct that allows to sort with respect to the tab index
+     struct session_data
+     {
+       int index;
++      int line;
+       QString file_name;
++      QString new_file_name;
+       QString encoding;
+ 
+       bool operator < (const session_data& other) const
+       {
+         return index < other.index;
+       }
+     };
+ 
+@@ -279,17 +281,17 @@ namespace octave
+     void do_undo (void);
+ 
+   private slots:
+ 
+     void request_open_file (const QString& fileName,
+                             const QString& encoding = QString (),
+                             int line = -1, bool debug_pointer = false,
+                             bool breakpoint_marker = false, bool insert = true,
+-                            const QString& cond = "");
++                            const QString& cond = "", int index = -1);
+     void request_preferences (bool);
+     void request_styles_preferences (bool);
+ 
+     void show_line_numbers (bool);
+     void show_white_space (bool);
+     void show_eol_chars (bool);
+     void show_indent_guides (bool);
+     void show_long_line (bool);
+@@ -308,17 +310,18 @@ namespace octave
+     void closeEvent (QCloseEvent *event);
+     void dragEnterEvent (QDragEnterEvent *event);
+     void dropEvent (QDropEvent *event);
+ 
+   private:
+ 
+     bool is_editor_console_tabbed (void);
+     void construct (void);
+-    void add_file_editor_tab (file_editor_tab *f, const QString& fn);
++    void add_file_editor_tab (file_editor_tab *f, const QString& fn,
++                              int index = -1);
+     void mru_menu_update (void);
+     bool call_custom_editor (const QString& file_name = QString (), int line = -1);
+ 
+     void toggle_preference (const QString& preference, bool def);
+ 
+     void handle_dir_remove (const QString& old_name, const QString& new_name);
+ 
+     bool editor_tab_has_focus (void);
+@@ -444,17 +447,14 @@ namespace octave
+     bool m_no_focus;
+ 
+     enum { MaxMRUFiles = 10 };
+     QMenu *m_mru_file_menu;
+     QAction *m_mru_file_actions[MaxMRUFiles];
+     QStringList m_mru_files;
+     QStringList m_mru_files_encodings;
+ 
+-    // List of temporarily closed files for later reloading.
+-    // Order: first closed old file
+-    //        first new location of closed file
+-    //        encoding to use for reload
+-    QStringList m_tmp_closed_files;
++    // List of data on temporarily closed files for later reloading.
++    QList<session_data> m_tmp_closed_files;
+   };
+ }
+ 
+ #endif

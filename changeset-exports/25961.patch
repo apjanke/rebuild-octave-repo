@@ -1,0 +1,270 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1540218846 -7200
+#      Mon Oct 22 16:34:06 2018 +0200
+# Node ID f7b205562f1dcb0089b3fb034464822564ced575
+# Parent  ae9d6a491c0614125c1c880d795a1729fde1aa24
+Allow graphics events to be processed while pause is active (bug #53729)
+
+* util.h/cc (octave::sleep): Add second argument "do_graphics_events" that
+  defaults to false. Depending on do_graphics_events, unlock the graphics mutex
+  and call gh_manager::process_events after each time laps. When the requested
+  time is infinite, call octave::kbhit after each time laps and interrupt if
+  a character was typed.
+
+* sysdep.cc (Fpause): Without argument, set time value to inf. Call
+  octave::sleep with the second argument true. Document that graphics events
+  are handled even though the program is paused.
+
+diff --git a/libinterp/corefcn/sysdep.cc b/libinterp/corefcn/sysdep.cc
+--- a/libinterp/corefcn/sysdep.cc
++++ b/libinterp/corefcn/sysdep.cc
+@@ -1079,50 +1079,43 @@ clearing the screen.
+ @example
+ @group
+ disp ("wait please...");
+ pause (5);
+ clc;
+ @end group
+ @end example
+ 
++While the program is supended, Octave still handles figures painting and 
++graphics callbacks execution.
++
+ @seealso{kbhit}
+ @end deftypefn */)
+ {
+   int nargin = args.length ();
+ 
+   if (nargin > 1)
+     print_usage ();
+ 
+-  if (nargin == 1)
+-    {
+-      double dval = args(0).double_value ();
+-
+-      if (octave::math::isnan (dval))
+-        warning ("pause: NaN is an invalid delay");
+-      else
+-        {
+-          Fdrawnow ();
++  double dval;
++  
++  if (nargin == 0)
++    dval = octave_Inf;
++  else
++    dval = args(0).xdouble_value ("pause: N must be a scalar double value");
+ 
+-          if (octave::math::isinf (dval))
+-            {
+-              octave::flush_stdout ();
+-              octave::kbhit ();
+-            }
+-          else
+-            octave::sleep (dval);
+-        }
+-    }
++  if (octave::math::isnan (dval))
++    warning ("pause: NaN is an invalid delay");
+   else
+     {
+       Fdrawnow ();
+-      octave::flush_stdout ();
+-      octave::kbhit ();
++      
++      octave::sleep (dval, true);
+     }
+-
++      
+   return ovl ();
+ }
+ 
+ /*
+ %!test
+ %! pause (1);
+ 
+ %!error (pause (1, 2))
+diff --git a/libinterp/corefcn/utils.cc b/libinterp/corefcn/utils.cc
+--- a/libinterp/corefcn/utils.cc
++++ b/libinterp/corefcn/utils.cc
+@@ -47,16 +47,17 @@ along with Octave; see the file COPYING.
+ #include "str-vec.h"
+ #include "vasprintf-wrapper.h"
+ 
+ #include "Cell.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "errwarn.h"
++#include "graphics.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "lex.h"
+ #include "load-path.h"
+ #include "oct-errno.h"
+ #include "oct-hist.h"
+ #include "ovl.h"
+ #include "ov-range.h"
+@@ -1265,65 +1266,99 @@ namespace octave
+     return retval;
+   }
+ 
+   // FIXME: sleep is complicated because we want it to be interruptible.
+   // With the way this program handles signals, the sleep system call
+   // won't respond to SIGINT.  Maybe there is a better way than
+   // breaking this up into multiple shorter intervals?
+ 
+-  void sleep (double seconds)
++  void sleep (double seconds, bool do_graphics_events)
+   {
+     if (seconds <= 0)
+       return;
+ 
+-    // Split delay into whole seconds and the remainder as a decimal
+-    // fraction.
+-
+-    double fraction = std::modf (seconds, &seconds);
+-
+-    // Further split the fractional seconds into whole tenths and the
+-    // nearest number of nanoseconds remaining.
+-
+-    double tenths = 0;
+-    fraction = std::modf (fraction * 10, &tenths) / 10;
+-    fraction = std::round (fraction * 1000000000);
+-
+-    // Sleep for the hundredths portion.
+-
+-    struct timespec hundredths_delay = { 0, static_cast<long> (fraction) };
+-
+-    octave_nanosleep_wrapper (&hundredths_delay, nullptr);
+-
+-    // Sleep for the whole tenths portion, allowing interrupts every
+-    // tenth.
+-
+-    struct timespec one_tenth = { 0, 100000000 };
+-
+-    for (int i = 0; i < static_cast<int> (tenths); i++)
++    // Allow free access to graphics resources while the interpreter thread
++    // is asleep
++    if (do_graphics_events)
++      gh_manager::unlock ();
++    
++    if (octave::math::isinf (seconds))
+       {
+-        octave_nanosleep_wrapper (&one_tenth, nullptr);
+-
+-        octave_quit ();
+-      }
+-
+-    // Sleep for the whole seconds portion, allowing interrupts every
+-    // tenth.
+-
+-    time_t sec = ((seconds > std::numeric_limits<time_t>::max ())
+-                  ? std::numeric_limits<time_t>::max ()
+-                  : static_cast<time_t> (seconds));
+-
+-    for (time_t s = 0; s < sec; s++)
+-      {
+-        for (int i = 0; i < 10; i++)
++        // Wait for kbhit
++        int c = -1;
++        octave::flush_stdout ();
++        
++        struct timespec one_tenth = { 0, 100000000 };
++        
++        while (c < 0)
+           {
+             octave_nanosleep_wrapper (&one_tenth, nullptr);
+ 
+             octave_quit ();
++
++            if (do_graphics_events)
++              gh_manager::process_events ();
++
++            c = octave::kbhit (false);
++          }
++      }
++    else
++      {
++        // Split delay into whole seconds and the remainder as a decimal
++        // fraction.
++
++        double fraction = std::modf (seconds, &seconds);
++
++        // Further split the fractional seconds into whole tenths and the
++        // nearest number of nanoseconds remaining.
++
++        double tenths = 0;
++        fraction = std::modf (fraction * 10, &tenths) / 10;
++        fraction = std::round (fraction * 1000000000);
++
++        // Sleep for the hundredths portion.
++
++        struct timespec hundredths_delay = { 0, static_cast<long> (fraction) };
++
++        octave_nanosleep_wrapper (&hundredths_delay, nullptr);
++
++        // Sleep for the whole tenths portion, allowing interrupts every
++        // tenth.
++
++        struct timespec one_tenth = { 0, 100000000 };
++
++        for (int i = 0; i < static_cast<int> (tenths); i++)
++          {
++            octave_nanosleep_wrapper (&one_tenth, nullptr);
++
++            octave_quit ();
++
++            if (do_graphics_events)
++              gh_manager::process_events ();
++          }
++
++        // Sleep for the whole seconds portion, allowing interrupts every
++        // tenth.
++
++        time_t sec = ((seconds > std::numeric_limits<time_t>::max ())
++                      ? std::numeric_limits<time_t>::max ()
++                      : static_cast<time_t> (seconds));
++
++        for (time_t s = 0; s < sec; s++)
++          {
++            for (int i = 0; i < 10; i++)
++              {
++                octave_nanosleep_wrapper (&one_tenth, nullptr);
++
++                octave_quit ();
++
++                if (do_graphics_events)
++                  gh_manager::process_events ();
++              }
+           }
+       }
+   }
+ }
+ 
+ DEFUN (isindex, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {} isindex (@var{ind})
+diff --git a/libinterp/corefcn/utils.h b/libinterp/corefcn/utils.h
+--- a/libinterp/corefcn/utils.h
++++ b/libinterp/corefcn/utils.h
+@@ -111,17 +111,18 @@ namespace octave
+   extern OCTINTERP_API size_t
+   vformat (std::ostream& os, const char *fmt, va_list args);
+ 
+   extern OCTINTERP_API std::string
+   vasprintf (const char *fmt, va_list args);
+ 
+   extern OCTINTERP_API std::string asprintf (const char *fmt, ...);
+ 
+-  extern OCTINTERP_API void sleep (double seconds);
++  extern OCTINTERP_API void sleep (double seconds,
++                                   bool do_graphics_events = false);
+ 
+   extern OCTINTERP_API
+   octave_value_list
+   do_simple_cellfun (octave_value_list (*fun) (const octave_value_list&, int),
+                      const char *fun_name, const octave_value_list& args,
+                      int nargout);
+ 
+   extern OCTINTERP_API

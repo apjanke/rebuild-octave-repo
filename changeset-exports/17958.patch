@@ -1,0 +1,395 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1384888898 18000
+#      Tue Nov 19 14:21:38 2013 -0500
+# Node ID 1adf3710bb68b7bd88b58197ebb35686b40f42dc
+# Parent  e5566719e0a16532a8179bab6b0e4e7964faa9f2
+Working CTRL-C handling implementation for Win32.
+
+* libgui/src/thread-manager.cc (sighandlers.h): New include.
+(windows_thread_manager::interrupt): Call w32_raise_sigint instead of
+::raise.
+
+* libinterp/corefcn/sighandlers.h (w32_raise_sigint): New declatation.
+
+* libinterp/cirefcn/sighandlers.cc (user_abort): Forward declare.
+(class w32_interrupt_manager): New singleton helper class.
+(w32_raise_sigint): New function.
+(user_abort): Call
+w32_interrupt_manager::octave_jump_to_enclosing_context instead of
+octave_jump_to_enclosing_context on Win32 platform.
+(sigint_handler): Call w32_interrupt_manager::user_abort instead of
+user_abort on Win32 platform.
+(octave_catch_interrupts, octave_ignore_interrupts,
+octave_set_interrupt_handler): Call w32_interrupt_manager::init on
+Win32 platform.
+
+* liboctave/util/oct-rl-edit.c (octave_rl_initialize): Set
+rl_catch_signals to 0 on Win32 platform.
+
+diff --git a/libgui/src/thread-manager.cc b/libgui/src/thread-manager.cc
+--- a/libgui/src/thread-manager.cc
++++ b/libgui/src/thread-manager.cc
+@@ -28,39 +28,32 @@ along with Octave; see the file COPYING.
+ #include <windows.h>
+ #else
+ #include <pthread.h>
+ #endif
+ 
+ #include <sys/types.h>
+ #include <signal.h>
+ 
++#include "sighandlers.h"
+ #include "thread-manager.h"
+ 
+ #if defined (__WIN32__) && ! defined (__CYGWIN__)
+ 
+ class windows_thread_manager : public octave_base_thread_manager
+ {
+ public:
+ 
+   windows_thread_manager (void) : octave_base_thread_manager () { }
+ 
+   void register_current_thread (void) { }
+ 
+   void interrupt (void)
+   {
+-    // FIXME: This doesn't work when octave_interrupt_immediately is
+-    // true.  Octave crashes, presumably in the call to
+-    // octave_jump_to_enclosing_context.  Does this happen because the
+-    // jump occurs while Octave is running in the wrong thread?  That
+-    // was happening on Unixy systems until we started using
+-    // pthread_kill and blocking interrupts from all threads except the
+-    // one running the Octave interpreter.
+-
+-    ::raise (SIGINT);
++    w32_raise_sigint ();
+   }
+ };
+ 
+ #else
+ 
+ class pthread_thread_manager : public octave_base_thread_manager
+ {
+ public:
+diff --git a/libinterp/corefcn/sighandlers.cc b/libinterp/corefcn/sighandlers.cc
+--- a/libinterp/corefcn/sighandlers.cc
++++ b/libinterp/corefcn/sighandlers.cc
+@@ -69,16 +69,163 @@ bool Vdebug_on_interrupt = false;
+ static bool Vsighup_dumps_octave_core = true;
+ 
+ // Similar to Vsighup_dumps_octave_core, but for SIGTERM signal.
+ static bool Vsigterm_dumps_octave_core = true;
+ 
+ // List of signals we have caught since last call to octave_signal_handler.
+ static bool octave_signals_caught[NSIG];
+ 
++// Forward declaration.
++static void user_abort (const char *sig_name, int sig_number);
++
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++
++class
++w32_interrupt_manager
++{
++public:
++  ~w32_interrupt_manager (void)
++  {
++    if (thread)
++      CloseHandle (thread);
++  }
++
++  static bool init (void) { return instance_ok (); }
++
++  static void octave_jump_to_enclosing_context (void)
++  {
++    if (instance_ok ())
++      instance->do_octave_jump_to_enclosing_context ();
++  }
++
++  static void user_abort (const char *sig_name, int sig_number)
++  {
++    if (instance_ok ())
++      instance->do_user_abort (sig_name, sig_number);
++  }
++
++  static void raise_sigint (void)
++  {
++    if (instance_ok ())
++      instance->do_raise_sigint ();
++  }
++
++private:
++  w32_interrupt_manager (void)
++    : thread (0), thread_id (0)
++  {
++    thread_id = GetCurrentThreadId ();
++
++    DuplicateHandle (GetCurrentProcess (), GetCurrentThread (),
++                     GetCurrentProcess (), &thread, 0, FALSE,
++                     DUPLICATE_SAME_ACCESS);
++  }
++
++  static void octave_jump_to_enclosing_context_sync (void)
++  {
++#ifdef _MSC_VER
++    _fpreset ();
++#endif
++    ::octave_jump_to_enclosing_context ();
++  }
++
++  void do_octave_jump_to_enclosing_context (void)
++  {
++    bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
++
++    if (is_interrupt_thread)
++      octave_jump_to_enclosing_context_sync ();
++    else
++      {
++        CONTEXT threadContext;
++
++        SuspendThread (thread);
++        threadContext.ContextFlags = CONTEXT_CONTROL;
++        GetThreadContext (thread, &threadContext);
++        threadContext.Eip = (DWORD) octave_jump_to_enclosing_context_sync;
++        SetThreadContext (thread, &threadContext);
++        ResumeThread (thread);
++      }
++  }
++
++  void do_user_abort (const char *sig_name, int sig_number)
++  {
++    bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
++
++    if (is_interrupt_thread)
++      ::user_abort (sig_name, sig_number);
++    else
++      {
++        SuspendThread (thread);
++        ::user_abort (sig_name, sig_number);
++        ResumeThread (thread);
++      }
++  }
++
++  void do_raise_sigint (void)
++  {
++    bool is_interrupt_thread = (GetCurrentThreadId () == thread_id);
++
++    if (is_interrupt_thread)
++      ::raise (SIGINT);
++    else
++      {
++        SuspendThread (thread);
++        ::raise (SIGINT);
++        ResumeThread (thread);
++      }
++  }
++
++  static bool instance_ok (void)
++  {
++    bool retval = true;
++
++    if (! instance)
++      {
++        instance = new w32_interrupt_manager ();
++
++        if (instance)
++          singleton_cleanup_list::add (cleanup_instance);
++      }
++
++    if (! instance)
++      {
++        ::error ("unable to create w32_interrupt_manager");
++
++        retval = false;
++      }
++
++    return retval;
++  }
++
++  static void cleanup_instance (void) { delete instance; instance = 0; }
++
++private:
++  // A handle to the thread that is running the octave interpreter.
++  HANDLE thread;
++
++  // The ID of the thread that is running the octave interpreter.
++  DWORD thread_id;
++
++  static w32_interrupt_manager* instance;
++};
++
++w32_interrupt_manager* w32_interrupt_manager::instance = 0;
++
++void w32_raise_sigint (void)
++{
++  w32_interrupt_manager::raise_sigint ();
++}
++
++#endif
++
+ // Signal handler return type.
+ #ifndef BADSIG
+ #define BADSIG (void (*)(int))-1
+ #endif
+ 
+ // The following is a workaround for an apparent bug in GCC 4.1.2 and
+ // possibly earlier versions.  See Octave bug report #30685 for details.
+ #if defined (__GNUC__)
+@@ -346,17 +493,21 @@ user_abort (const char *sig_name, int si
+             }
+         }
+ 
+       if (octave_interrupt_immediately)
+         {
+           if (octave_interrupt_state == 0)
+             octave_interrupt_state = 1;
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++          w32_interrupt_manager::octave_jump_to_enclosing_context ();
++#else
+           octave_jump_to_enclosing_context ();
++#endif
+         }
+       else
+         {
+           // If we are already cleaning up from a previous interrupt,
+           // take note of the fact that another interrupt signal has
+           // arrived.
+ 
+           if (octave_interrupt_state < 0)
+@@ -373,17 +524,21 @@ user_abort (const char *sig_name, int si
+         }
+     }
+ 
+ }
+ 
+ static void
+ sigint_handler (int sig)
+ {
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  w32_interrupt_manager::user_abort (strsignal (sig), sig);
++#else
+   user_abort (strsignal (sig), sig);
++#endif
+ }
+ 
+ #ifdef SIGPIPE
+ static void
+ sigpipe_handler (int /* sig */)
+ {
+   octave_signal_caught = 1;
+ 
+@@ -396,32 +551,40 @@ sigpipe_handler (int /* sig */)
+ }
+ #endif /* defined (SIGPIPE) */
+ 
+ octave_interrupt_handler
+ octave_catch_interrupts (void)
+ {
+   octave_interrupt_handler retval;
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  w32_interrupt_manager::init ();
++#endif
++
+ #ifdef SIGINT
+   retval.int_handler = octave_set_signal_handler (SIGINT, sigint_handler);
+ #endif
+ 
+ #ifdef SIGBREAK
+   retval.brk_handler = octave_set_signal_handler (SIGBREAK, sigint_handler);
+ #endif
+ 
+   return retval;
+ }
+ 
+ octave_interrupt_handler
+ octave_ignore_interrupts (void)
+ {
+   octave_interrupt_handler retval;
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  w32_interrupt_manager::init ();
++#endif
++
+ #ifdef SIGINT
+   retval.int_handler = octave_set_signal_handler (SIGINT, SIG_IGN);
+ #endif
+ 
+ #ifdef SIGBREAK
+   retval.brk_handler = octave_set_signal_handler (SIGBREAK, SIG_IGN);
+ #endif
+ 
+@@ -429,16 +592,20 @@ octave_ignore_interrupts (void)
+ }
+ 
+ octave_interrupt_handler
+ octave_set_interrupt_handler (const volatile octave_interrupt_handler& h,
+                               bool restart_syscalls)
+ {
+   octave_interrupt_handler retval;
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  w32_interrupt_manager::init ();
++#endif
++
+ #ifdef SIGINT
+   retval.int_handler = octave_set_signal_handler (SIGINT, h.int_handler,
+                                                   restart_syscalls);
+ #endif
+ 
+ #ifdef SIGBREAK
+   retval.brk_handler = octave_set_signal_handler (SIGBREAK, h.brk_handler,
+                                                   restart_syscalls);
+diff --git a/libinterp/corefcn/sighandlers.h b/libinterp/corefcn/sighandlers.h
+--- a/libinterp/corefcn/sighandlers.h
++++ b/libinterp/corefcn/sighandlers.h
+@@ -77,16 +77,20 @@ extern OCTINTERP_API void octave_signal_
+ extern OCTINTERP_API octave_interrupt_handler octave_catch_interrupts (void);
+ 
+ extern OCTINTERP_API octave_interrupt_handler octave_ignore_interrupts (void);
+ 
+ extern OCTINTERP_API octave_interrupt_handler
+ octave_set_interrupt_handler (const volatile octave_interrupt_handler&,
+                               bool restart_syscalls = true);
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++extern OCTINTERP_API void w32_raise_sigint (void);
++#endif
++
+ // extern void ignore_sigchld (void);
+ 
+ // Maybe this should be in a separate file?
+ 
+ class
+ OCTINTERP_API
+ octave_child
+ {
+diff --git a/liboctave/util/oct-rl-edit.c b/liboctave/util/oct-rl-edit.c
+--- a/liboctave/util/oct-rl-edit.c
++++ b/liboctave/util/oct-rl-edit.c
+@@ -390,16 +390,20 @@ octave_rl_set_terminal_name (const char 
+   OCTAVE_RL_SAVE_STRING (saved_term, term);
+ 
+   rl_terminal_name = saved_term;
+ }
+ 
+ void
+ octave_rl_initialize (void)
+ {
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  rl_catch_signals = 0;
++#endif
++
+   rl_initialize ();
+ }
+ 
+ int
+ octave_rl_history_search_forward (int count, int ignore)
+ {
+   return rl_history_search_forward (count, ignore);
+ }

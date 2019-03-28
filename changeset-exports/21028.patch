@@ -1,0 +1,410 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1451818159 -3600
+#      Sun Jan 03 11:49:19 2016 +0100
+# Node ID 4a7d9c335402d0cf818c80b642cd02fd8a5853c0
+# Parent  8000dacaea986441151f0f022ca4911d757a3192
+GUI: move the command queue into a separate class
+
+* main-window.cc (main_window): remove initializations of queue synchronization;
+  (execute_command_in_terminal,run_file_callback,debug_continue,debug_step_into,
+  debug_step_over,debug_step_out,debug_quit,closeEvent):
+  adapt queuing commands;
+  (queue_command): remove function for queuing a command;
+  (execute_command_callback): move function from here into octave-cmd;
+
+* main-window.h: remove class variables related to the command queue_command
+
+* module.mk: add octave-cmd to the moc-list
+
+* octave-cmd.cc: new class octave_command_queue;
+  (add_cmd): method for adding a command to the queue;
+  (execute_command_callback): method for executing commands from the queue
+
+* octave-cmd.h: new class octave_command_queue
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -84,19 +84,16 @@ main_window::main_window (QWidget *p, bo
+     editor_window (start_gui ? create_default_editor (this) : 0),
+     workspace_window (start_gui ? new workspace_view (this) : 0),
+     _settings_dlg (0),
+     find_files_dlg (0),
+     release_notes_window (0),
+     community_news_window (0),
+     _octave_qt_link (0),
+     _clipboard (QApplication::clipboard ()),
+-    _cmd_queue (QList<octave_cmd *> ()),  // no command pending
+-    _cmd_processing (1),
+-    _cmd_queue_mutex (),
+     _prevent_readline_conflicts (true),
+     _suppress_dbg_location (true),
+     _start_gui (start_gui)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   bool connect_to_web = true;
+   QDateTime last_checked;
+@@ -320,45 +317,34 @@ main_window::focus_console_after_command
+   QSettings *settings = resource_manager::get_settings ();
+   return settings->value ("terminal/focus_after_command",false).toBool ();
+ }
+ 
+ void
+ main_window::execute_command_in_terminal (const QString& command)
+ {
+   octave_cmd_exec *cmd = new octave_cmd_exec (command);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+   if (focus_console_after_command ())
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::run_file_in_terminal (const QFileInfo& info)
+ {
+   octave_link::post_event (this, &main_window::run_file_callback, info);
+   if (focus_console_after_command ())
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::run_file_callback (const QFileInfo& info)
+ {
+   octave_cmd_eval *cmd = new octave_cmd_eval (info);
+-  queue_command (cmd);
+-}
+-
+-void
+-main_window::queue_command (octave_cmd* cmd)
+-{
+-  _cmd_queue_mutex.lock ();
+-  _cmd_queue.append (cmd);     // queue command and type
+-  _cmd_queue_mutex.unlock ();
+-
+-  if (_cmd_processing.tryAcquire ())  // if callback not processing, post event
+-    octave_link::post_event (this, &main_window::execute_command_callback);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::handle_new_figure_request (void)
+ {
+   octave_link::post_event (this, &main_window::new_figure_callback);
+ }
+ 
+@@ -951,45 +937,45 @@ main_window::handle_exit_debugger (void)
+   editor_window->handle_exit_debug_mode ();
+ #endif
+ }
+ 
+ void
+ main_window::debug_continue (void)
+ {
+   octave_cmd_debug *cmd = new octave_cmd_debug ("cont", _suppress_dbg_location);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::debug_step_into (void)
+ {
+   octave_cmd_debug *cmd = new octave_cmd_debug ("in", _suppress_dbg_location);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::debug_step_over (void)
+ {
+   octave_cmd_debug *cmd = new octave_cmd_debug ("step", _suppress_dbg_location);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::debug_step_out (void)
+ {
+   octave_cmd_debug *cmd = new octave_cmd_debug ("out", _suppress_dbg_location);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::debug_quit (void)
+ {
+   octave_cmd_debug *cmd = new octave_cmd_debug ("quit", _suppress_dbg_location);
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::handle_insert_debugger_pointer_request (const QString& file,
+                                                      int line)
+ {
+   bool cmd_focus = command_window_has_focus ();
+ 
+@@ -1034,17 +1020,17 @@ main_window::show_about_octave (void)
+                       QString::fromStdString (message));
+ }
+ 
+ void
+ main_window::closeEvent (QCloseEvent *e)
+ {
+   e->ignore ();
+   octave_cmd_exec *cmd = new octave_cmd_exec ("exit");
+-  queue_command (cmd);
++  _cmd_queue.add_cmd (cmd);
+ }
+ 
+ void
+ main_window::read_settings (void)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   if (! settings)
+@@ -2123,43 +2109,16 @@ main_window::set_screen_size_callback (c
+ 
+ void
+ main_window::clear_history_callback (void)
+ {
+   Fhistory (ovl ("-c"));
+ }
+ 
+ void
+-main_window::execute_command_callback ()
+-{
+-  bool repost = false;          // flag for reposting event for this callback
+-
+-  if (! _cmd_queue.isEmpty ())  // list can not be empty here, just to make sure
+-    {
+-      _cmd_queue_mutex.lock (); // critical path
+-
+-      octave_cmd *cmd = _cmd_queue.takeFirst ();
+-
+-      if (_cmd_queue.isEmpty ())
+-        _cmd_processing.release ();  // cmd queue empty, processing will stop
+-      else
+-        repost = true;          // not empty, repost at end
+-      _cmd_queue_mutex.unlock ();
+-
+-      cmd->execute ();
+-
+-      delete cmd;
+-    }
+-
+-  if (repost)  // queue not empty, so repost event for further processing
+-    octave_link::post_event (this, &main_window::execute_command_callback);
+-
+-}
+-
+-void
+ main_window::new_figure_callback (void)
+ {
+   Fbuiltin (ovl ("figure"));
+   Fdrawnow ();
+ }
+ 
+ void
+ main_window::change_directory_callback (const std::string& directory)
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -31,17 +31,16 @@ along with Octave; see the file COPYING.
+ #include <QMdiArea>
+ #include <QStatusBar>
+ #include <QToolBar>
+ #include <QQueue>
+ #include <QMdiSubWindow>
+ #include <QCloseEvent>
+ #include <QToolButton>
+ #include <QComboBox>
+-#include <QSemaphore>
+ #include <QPointer>
+ 
+ // Editor includes
+ #include "file-editor-interface.h"
+ 
+ // QTerminal includes
+ #include "QTerminal.h"
+ 
+@@ -390,21 +389,19 @@ private:
+ 
+   // Flag for closing whole application.
+   bool _closing;
+ 
+   // command queue and semaphore to synchronize execution signals
+   // and related callback
+ 
+   // the queue for the command structures
+-  QList<octave_cmd *> _cmd_queue;
+-  // semaphores used for handling the queue
+-  QSemaphore   _cmd_processing;
+-  QMutex       _cmd_queue_mutex;
++  octave_command_queue _cmd_queue;
+ 
++  // some class global flags
+   bool _prevent_readline_conflicts;
+   bool _suppress_dbg_location;
+   bool _start_gui;
+ };
+ 
+ class news_reader : public QObject
+ {
+   Q_OBJECT
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -82,16 +82,17 @@ DIRSTAMP_FILES += \
+ endif
+ 
+ OCTAVE_GUI_SRC_MOC = \
+   libgui/src/moc-dialog.cc \
+   libgui/src/moc-documentation-dock-widget.cc \
+   libgui/src/moc-files-dock-widget.cc \
+   libgui/src/moc-history-dock-widget.cc \
+   libgui/src/moc-main-window.cc \
++  libgui/src/moc-octave-cmd.cc \
+   libgui/src/moc-octave-interpreter.cc \
+   libgui/src/moc-octave-qt-link.cc \
+   libgui/src/moc-settings-dialog.cc \
+   libgui/src/moc-terminal-dock-widget.cc \
+   libgui/src/moc-color-picker.cc \
+   libgui/src/moc-resource-manager.cc \
+   libgui/src/moc-shortcut-manager.cc \
+   libgui/src/moc-welcome-wizard.cc \
+diff --git a/libgui/src/octave-cmd.cc b/libgui/src/octave-cmd.cc
+--- a/libgui/src/octave-cmd.cc
++++ b/libgui/src/octave-cmd.cc
+@@ -103,8 +103,54 @@ octave_cmd_debug::execute ()
+   else
+     {
+       F__db_next_breakpoint_quiet__ (ovl (_suppress_dbg_location));
+       Fdbstep (ovl (_cmd.toStdString ()));
+     }
+ 
+   command_editor::interrupt (true);
+ }
++
++
++// ---------------------------------------------------------------------
++//  class octave_command_queue: queue of octave commands
++
++// add_cmd: add a command to the queue
++void
++octave_command_queue::add_cmd (octave_cmd* cmd)
++{
++  _queue_mutex.lock ();
++  _queue.append (cmd);
++  _queue_mutex.unlock ();
++
++  if (_processing.tryAcquire ())  // if callback not processing, post event
++    octave_link::post_event (this,
++                             &octave_command_queue::execute_command_callback);
++}
++
++// callback for executing the command by the worker thread
++void
++octave_command_queue::execute_command_callback ()
++{
++  bool repost = false;          // flag for reposting event for this callback
++
++  if (! _queue.isEmpty ())  // list can not be empty here, just to make sure
++    {
++      _queue_mutex.lock ();     // critical path
++
++      octave_cmd *cmd = _queue.takeFirst ();
++
++      if (_queue.isEmpty ())
++        _processing.release (); // cmd queue empty, processing will stop
++      else
++        repost = true;          // not empty, repost at end
++      _queue_mutex.unlock ();
++
++      cmd->execute ();
++
++      delete cmd;
++    }
++
++  if (repost)  // queue not empty, so repost event for further processing
++    octave_link::post_event (this,
++                             &octave_command_queue::execute_command_callback);
++
++}
+diff --git a/libgui/src/octave-cmd.h b/libgui/src/octave-cmd.h
+--- a/libgui/src/octave-cmd.h
++++ b/libgui/src/octave-cmd.h
+@@ -20,19 +20,23 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ // Author: Torsten <ttl@justmail.de>
+ 
+ #if ! defined (octave_cmd_h)
+ #define octave_cmd_h 1
+ 
++#include <QSemaphore>
++#include <QMutex>
+ #include <QString>
+ #include <QFileInfo>
+ 
++#include "octave-qt-link.h"
++
+ class octave_cmd
+ {
+ public:
+ 
+   octave_cmd () { };
+   virtual ~octave_cmd () { };
+ 
+   virtual void execute () { };
+@@ -85,9 +89,48 @@ public:
+   };
+ 
+   void execute ();
+ 
+ protected:
+ 
+   bool _suppress_dbg_location;
+ };
++
++
++/**
++ * @class octave_command_queue
++ *
++ * Queuing commands from the GUI for the worker thread
++ */
++// ---------------------------------------------------------------------
++//  class octave_command_queue: queue of octave commands
++
++class octave_command_queue : QObject
++{
++  Q_OBJECT;
++
++public:
++
++  octave_command_queue (void) : QObject (),
++      _queue (QList<octave_cmd *> ()),
++      _processing (1),
++      _queue_mutex () { };
++  ~octave_command_queue (void) { };
++
++  /**
++   * Adds a new octave command to the command queue.
++   * @param cmd The octave command to be queued
++   */
++  void add_cmd (octave_cmd *cmd);
++  /**
++   * Callback routine for executing the command by the worker thread
++   */
++  void execute_command_callback (void);
++
++private:
++
++  QList<octave_cmd *>  _queue;
++  QSemaphore   _processing;
++  QMutex       _queue_mutex;
++};
++
+ #endif

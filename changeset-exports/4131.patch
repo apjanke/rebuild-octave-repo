@@ -1,0 +1,499 @@
+# HG changeset patch
+# User jwe
+# Date 1035911574 0
+#      Tue Oct 29 17:12:54 2002 +0000
+# Node ID 597fbc55ea404a63bd092932618374f1f3566aea
+# Parent  7d9bda865012b640f28be1e0096753aca9061020
+[project @ 2002-10-29 17:12:53 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,30 @@
++2002-10-29  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* pt-idx.h (tree_index_expression::dyn_field): New data member.
++	* pt-idx.cc (tree_index_expression::tree_index_expression
++	(tree_expression*, tree_expression*, int, int)): New constructor.
++	(tree_index_expression::append (tree_expression*)): New function.
++	(tree_index_expression::get_struct_index): New function.
++	(tree_index_expression::make_arg_struct): Handle dynamic fields.
++	(tree_index_expression::rvalue): Likewise.
++	(tree_index_expression::lvalue): Likewise.
++
++	* parse.y (make_indirect_ref (tree_expression*, tree_expression*)):
++	New function.
++	(indirect_ref_op): New non-terminal.
++	(postfix_expr): Use it.
++	Recognize dynamic struct field references.
++	(parsing_indir): Delete unused non-terminal.
++
++	* lex.l ("("): Set lexer_flags.looking_at_indirect_ref to false here.
++
++	* pt-idx.cc (tree_index_expression::name): Simplify.
++
+ 2002-10-28  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* oct-conf.h.in (OCTAVE_CONF_HAVE_DLOPEN_API,
+ 	OCTAVE_CONF_HAVE_LOADLIBRARY_API, OCTAVE_CONF_HAVE_SHL_LOAD_API):
+ 	Delete.
+ 	* toplev.cc (octave_config_info): Delete them from the struct
+ 
+ 	* load-save.cc (read_ascii_data): Use octave_read_double and
+diff --git a/src/lex.l b/src/lex.l
+--- a/src/lex.l
++++ b/src/lex.l
+@@ -686,16 +686,17 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ 
+ "-" { 
+     if (lexer_flags.plotting && ! lexer_flags.in_plot_range)
+       lexer_flags.past_plot_range = true;
+     BIN_OP_RETURN ('-', false);
+   }
+ 
+ "(" {
++    lexer_flags.looking_at_indirect_ref = false;
+     if (lexer_flags.plotting && ! lexer_flags.in_plot_range)
+       lexer_flags.past_plot_range = true;
+     nesting_level.paren ();
+     promptflag--;
+     TOK_RETURN ('(');
+   }
+ 
+ ")" {
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -286,16 +286,20 @@ recover_from_parsing_function (void);
+ static tree_index_expression *
+ make_index_expression (tree_expression *expr,
+ 		       tree_argument_list *args, char type);
+ 
+ // Make an indirect reference expression.
+ static tree_index_expression *
+ make_indirect_ref (tree_expression *expr, const std::string&);
+ 
++// Make an indirect reference expression with dynamic field name.
++static tree_index_expression *
++make_indirect_ref (tree_expression *expr, tree_expression *field);
++
+ // Make a declaration command.
+ static tree_decl_command *
+ make_decl_command (int tok, token *tok_val, tree_decl_init_list *lst);
+ 
+ // Finish building a matrix list.
+ static tree_expression *
+ finish_matrix (tree_matrix *m);
+ 
+@@ -691,17 +695,17 @@ arg_list	: expression
+ 		  {
+ 		    octave_value tmp (octave_value::all_va_args_t);
+ 		    tree_constant *all_va_args = new tree_constant (tmp);
+ 		    $1->append (all_va_args);
+ 		    $$ = $1;
+ 		  }
+ 		;
+ 
+-parsing_indir	: // empty
++indirect_ref_op	: '.'
+ 		  { lexer_flags.looking_at_indirect_ref = true; }
+ 		;
+ 
+ postfix_expr	: primary_expr
+ 		  { $$ = $1; }
+ 		| postfix_expr '(' ')'
+ 		  { $$ = make_index_expression ($1, 0, '('); }
+ 		| postfix_expr '(' arg_list ')'
+@@ -713,18 +717,20 @@ postfix_expr	: primary_expr
+ 		| postfix_expr PLUS_PLUS
+ 		  { $$ = make_postfix_op (PLUS_PLUS, $1, $2); }
+ 		| postfix_expr MINUS_MINUS
+ 		  { $$ = make_postfix_op (MINUS_MINUS, $1, $2); }
+ 		| postfix_expr QUOTE
+ 		  { $$ = make_postfix_op (QUOTE, $1, $2); }
+ 		| postfix_expr TRANSPOSE
+ 		  { $$ = make_postfix_op (TRANSPOSE, $1, $2); }
+-		| postfix_expr '.' parsing_indir STRUCT_ELT
+-		  { $$ = make_indirect_ref ($1, $4->text ()); }
++		| postfix_expr indirect_ref_op STRUCT_ELT
++		  { $$ = make_indirect_ref ($1, $3->text ()); }
++		| postfix_expr indirect_ref_op '(' expression ')'
++		  { $$ = make_indirect_ref ($1, $4); }
+ 		;
+ 
+ prefix_expr	: postfix_expr
+ 		  { $$ = $1; }
+ 		| binary_expr
+ 		  { $$ = $1; }
+ 		| PLUS_PLUS prefix_expr %prec UNARY
+ 		  { $$ = make_prefix_op (PLUS_PLUS, $2, $1); }
+@@ -2651,16 +2657,42 @@ make_indirect_ref (tree_expression *expr
+   else
+     retval = new tree_index_expression (expr, elt, l, c);
+ 
+   lexer_flags.looking_at_indirect_ref = false;
+ 
+   return retval;
+ }
+ 
++// Make an indirect reference expression with dynamic field name.
++
++static tree_index_expression *
++make_indirect_ref (tree_expression *expr, tree_expression *elt)
++{
++  tree_index_expression *retval = 0;
++
++  int l = expr->line ();
++  int c = expr->column ();
++
++  if (expr->is_index_expression ())
++    {
++      tree_index_expression *tmp = static_cast<tree_index_expression *> (expr);
++
++      tmp->append (elt);
++
++      retval = tmp;
++    }
++  else
++    retval = new tree_index_expression (expr, elt, l, c);
++
++  lexer_flags.looking_at_indirect_ref = false;
++
++  return retval;
++}
++
+ // Make a declaration command.
+ 
+ static tree_decl_command *
+ make_decl_command (int tok, token *tok_val, tree_decl_init_list *lst)
+ {
+   tree_decl_command *retval = 0;
+ 
+   int l = tok_val->line ();
+diff --git a/src/pt-idx.cc b/src/pt-idx.cc
+--- a/src/pt-idx.cc
++++ b/src/pt-idx.cc
+@@ -47,43 +47,65 @@ Software Foundation, 59 Temple Place - S
+ template class SLNode<string_vector>;
+ template class SLList<string_vector>;
+ 
+ // Index expressions.
+ 
+ tree_index_expression::tree_index_expression (tree_expression *e,
+ 					      tree_argument_list *lst,
+ 					      int l, int c, char t)
+-  : tree_expression (l, c), expr (e), args (), type (), arg_nm ()
++  : tree_expression (l, c), expr (e), args (), type (),
++    arg_nm (), dyn_field ()
+ {
+   append (lst, t);
+ }
+ 
+ tree_index_expression::tree_index_expression (tree_expression *e,
+ 					      const std::string& n,
+ 					      int l, int c)
+-  : tree_expression (l, c), expr (e), args (), type (), arg_nm ()
++  : tree_expression (l, c), expr (e), args (), type (),
++    arg_nm (), dyn_field ()
+ {
+   append (n);
+ }
+ 
++tree_index_expression::tree_index_expression (tree_expression *e,
++					      tree_expression *df,
++					      int l, int c)
++  : tree_expression (l, c), expr (e), args (), type (),
++    arg_nm (), dyn_field ()
++{
++  append (df);
++}
++
+ void
+ tree_index_expression::append (tree_argument_list *lst, char t)
+ {
+   args.append (lst);
+   type.append (1, t);
+   arg_nm.append (lst ? lst->get_arg_names () : string_vector ());
++  dyn_field.append (static_cast<tree_expression *> (0));
+ }
+ 
+ void
+ tree_index_expression::append (const std::string& n)
+ {
+   args.append (static_cast<tree_argument_list *> (0));
+   type.append (".");
+   arg_nm.append (n);
++  dyn_field.append (static_cast<tree_expression *> (0));
++}
++
++void
++tree_index_expression::append (tree_expression *df)
++{
++  args.append (static_cast<tree_argument_list *> (0));
++  type.append (".");
++  arg_nm.append ("");
++  dyn_field.append (df);
+ }
+ 
+ tree_index_expression::~tree_index_expression (void)
+ {
+   delete expr;
+ 
+   while (! args.empty ())
+     {
+@@ -93,21 +115,17 @@ tree_index_expression::~tree_index_expre
+ }
+ 
+ // This is useful for printing the name of the variable in an indexed
+ // assignment.
+ 
+ std::string
+ tree_index_expression::name (void) const
+ {
+-  // ??? FIXME ???
+-  std::string xname = expr->name ();
+-
+-  return (type[0] != '.' || xname == "<unknown>")
+-    ? xname : xname + "." + arg_nm.front ()(0);
++  return expr->name ();
+ }
+ 
+ static Cell
+ make_subs_cell (tree_argument_list *args, const string_vector& arg_nm)
+ {
+   Cell retval;
+ 
+   octave_value_list arg_values;
+@@ -147,54 +165,79 @@ make_value_list (tree_argument_list *arg
+ 
+       if (n > 0)
+ 	retval.stash_name_tags (arg_nm);
+     }
+ 
+   return retval;
+ }
+ 
++std::string
++tree_index_expression::get_struct_index (Pix p_arg_nm, Pix p_dyn_field) const
++{
++  std::string fn = arg_nm(p_arg_nm)(0);
++
++  if (fn.empty ())
++    {
++      tree_expression *df = dyn_field (p_dyn_field);
++
++      if (df)
++	{
++	  octave_value t = df->rvalue ();
++
++	  if (! error_state)
++	    fn = t.string_value ();
++	}
++      else
++	panic_impossible ();
++    }
++
++  return fn;
++}
++
+ Octave_map
+ tree_index_expression::make_arg_struct (void) const
+ {
+   int n = args.length ();
+ 
+   octave_value_list subs_list (n, octave_value ());
+   octave_value_list type_list (n, octave_value ());
+ 
+   Pix p_args = args.first ();
+   Pix p_arg_nm = arg_nm.first ();
++  Pix p_dyn_field = dyn_field.first ();
+ 
+   Octave_map m;
+ 
+   for (int i = 0; i < n; i++)
+     {
+       switch (type[i])
+ 	{
+ 	case '(':
+ 	  subs_list(i) = make_subs_cell (args(p_args), arg_nm(p_arg_nm));
+ 	  break;
+ 
+ 	case '{':
+ 	  subs_list(i) = make_subs_cell (args(p_args), arg_nm(p_arg_nm));
+ 	  break;
+ 
+ 	case '.':
+-	  subs_list(i) = arg_nm(p_arg_nm)(0);
++	  subs_list(i) = get_struct_index (p_arg_nm, p_dyn_field);
+ 	  break;
+ 
+ 	default:
+ 	  panic_impossible ();
+ 	}
+ 
+       if (error_state)
+ 	return m;
+ 
+       args.next (p_args);
+       arg_nm.next (p_arg_nm);
++      dyn_field.next (p_dyn_field);
+     }
+ 
+   m ["subs"] = subs_list;
+   m ["type"] = type_list;
+ 
+   return m;
+ }
+ 
+@@ -211,42 +254,44 @@ tree_index_expression::rvalue (int nargo
+   if (! error_state)
+     {
+       SLList<octave_value_list> idx;
+ 
+       int n = args.length ();
+ 
+       Pix p_args = args.first ();
+       Pix p_arg_nm = arg_nm.first ();
++      Pix p_dyn_field = dyn_field.first ();
+ 
+       for (int i = 0; i < n; i++)
+ 	{
+ 	  switch (type[i])
+ 	    {
+ 	    case '(':
+ 	      idx.append (make_value_list (args(p_args), arg_nm(p_arg_nm)));
+ 	      break;
+ 
+ 	    case '{':
+ 	      idx.append (make_value_list (args(p_args), arg_nm(p_arg_nm)));
+ 	      break;
+ 
+ 	    case '.':
+-	      idx.append (arg_nm(p_arg_nm)(0));
++	      idx.append (get_struct_index (p_arg_nm, p_dyn_field));
+ 	      break;
+ 
+ 	    default:
+ 	      panic_impossible ();
+ 	    }
+ 
+ 	  if (error_state)
+ 	    break;
+ 
+ 	  args.next (p_args);
+ 	  arg_nm.next (p_arg_nm);
++	  dyn_field.next (p_dyn_field);
+ 	}
+ 
+       if (! error_state)
+ 	retval = tmp.subsref (type, idx, nargout);
+     }
+ 
+   return retval;
+ }
+@@ -270,42 +315,44 @@ tree_index_expression::lvalue (void)
+   octave_lvalue retval;
+ 
+   SLList<octave_value_list> idx;
+ 
+   int n = args.length ();
+ 
+   Pix p_args = args.first ();
+   Pix p_arg_nm = arg_nm.first ();
++  Pix p_dyn_field = dyn_field.first ();
+ 
+   for (int i = 0; i < n; i++)
+     {
+       switch (type[i])
+ 	{
+ 	case '(':
+ 	  idx.append (make_value_list (args(p_args), arg_nm(p_arg_nm)));
+ 	  break;
+ 
+ 	case '{':
+ 	  idx.append (make_value_list (args(p_args), arg_nm(p_arg_nm)));
+ 	  break;
+ 
+ 	case '.':
+-	  idx.append (arg_nm(p_arg_nm)(0));
++	  idx.append (get_struct_index (p_arg_nm, p_dyn_field));
+ 	  break;
+ 
+ 	default:
+ 	  panic_impossible ();
+ 	}
+ 
+       if (error_state)
+ 	break;
+ 
+       args.next (p_args);
+       arg_nm.next (p_arg_nm);
++      dyn_field.next (p_dyn_field);
+     }
+ 
+   if (! error_state)
+     {
+       retval = expr->lvalue ();
+ 
+       if (! error_state)
+ 	retval.set_index (type, idx);
+diff --git a/src/pt-idx.h b/src/pt-idx.h
+--- a/src/pt-idx.h
++++ b/src/pt-idx.h
+@@ -49,22 +49,27 @@ tree_index_expression : public tree_expr
+ public:
+ 
+   tree_index_expression (tree_expression *e = 0, tree_argument_list *lst = 0,
+ 			 int l = -1, int c = -1, char t = '(');
+ 
+   tree_index_expression (tree_expression *e, const std::string& n,
+ 			 int l = -1, int c = -1);
+ 
++  tree_index_expression (tree_expression *e, tree_expression* df,
++			 int l = -1, int c = -1);
++
+   ~tree_index_expression (void);
+ 
+   void append (tree_argument_list *lst = 0, char t = '(');
+ 
+   void append (const std::string& n);
+ 
++  void append (tree_expression *df);
++
+   bool is_index_expression (void) const { return true; }
+ 
+   std::string name (void) const;
+ 
+   tree_expression *expression (void) { return expr; }
+ 
+   SLList<tree_argument_list *> arg_lists (void) { return args; }
+ 
+@@ -92,20 +97,26 @@ private:
+   tree_expression *expr;
+ 
+   // The indices (only valid if type == paren || type == brace).
+   SLList<tree_argument_list *> args;
+ 
+   // The type of this index expression.
+   std::string type;
+ 
+-  // The names of the arguments.
++  // The names of the arguments.  Used for constant struct element
++  // references.
+   SLList<string_vector> arg_nm;
+ 
+-  Octave_map tree_index_expression::make_arg_struct (void) const;
++  // The list of dynamic field names, if any.
++  SLList<tree_expression *> dyn_field;
++
++  Octave_map make_arg_struct (void) const;
++
++  std::string get_struct_index (Pix p_arg_nm, Pix p_dyn_field) const;
+ 
+   // No copying!
+ 
+   tree_index_expression (const tree_index_expression&);
+ 
+   tree_index_expression& operator = (const tree_index_expression&);
+ };
+ 

@@ -1,0 +1,279 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1524117604 14400
+#      Thu Apr 19 02:00:04 2018 -0400
+# Node ID 9b059a36a1ae75c8da513f8a90cc2e2d8f8374a5
+# Parent  172d464b62eaaf0037571697b03a204c8aea985a
+# Parent  78fb24bdd8bb1a4fc55aadd92983dafdb8a98486
+maint: Merge stable to default.
+
+diff --git a/libinterp/corefcn/sighandlers.cc b/libinterp/corefcn/sighandlers.cc
+--- a/libinterp/corefcn/sighandlers.cc
++++ b/libinterp/corefcn/sighandlers.cc
+@@ -238,17 +238,17 @@ namespace octave
+                      || (have_sigxfsz && sig == sigxfsz)
+                      || (have_sigusr1 && sig == sigusr1)
+                      || (have_sigusr2 && sig == sigusr2))
+               std::cerr << "warning: ignoring signal: "
+                         << octave_strsignal_wrapper (sig)
+                         << std::endl;
+             else if ((have_sigint && sig == sigint)
+                      || (have_sigbreak && sig == sigbreak))
+-              /* handled separately; do nothing */;
++              ; // Handled separately; do nothing.
+             else
+               std::cerr << "warning: ignoring unexpected signal: "
+                         << octave_strsignal_wrapper (sig)
+                         << std::endl;
+           }
+       }
+   }
+ 
+@@ -282,17 +282,26 @@ namespace octave
+       = octave_get_sig_number ("SIGINT", &sigint);
+ 
+     static int sigbreak;
+     static const bool have_sigbreak
+       = octave_get_sig_number ("SIGBREAK", &sigbreak);
+ 
+     if ((have_sigint && sig == sigint)
+         || (have_sigbreak && sig == sigbreak))
+-      octave_interrupt_state++;
++      {
++        if (! octave_initialized)
++          exit (1);
++
++        if (can_interrupt)
++          {
++            octave_signal_caught = 1;
++            octave_interrupt_state++;
++          }
++      }
+   }
+ 
+   static void
+   deadly_sig_handler (int sig)
+   {
+     std::cerr << "fatal: caught signal "
+               << octave_strsignal_wrapper (sig)
+               << " -- stopping myself..." << std::endl;
+@@ -305,42 +314,23 @@ namespace octave
+   static void
+   fpe_sig_handler (int)
+   {
+     // FIXME: is there something better we can do?
+ 
+     std::cerr << "warning: floating point exception" << std::endl;
+   }
+ 
+-  // Handle SIGINT.
+-  //
+-  // This also has to work for SIGBREAK (on systems that have it), so we
+-  // use the value of sig, instead of just assuming that it is called
+-  // for SIGINT only.
+-
+-  static void
+-  sigint_handler (int)
+-  {
+-    if (! octave_initialized)
+-      exit (1);
+-
+-    if (can_interrupt)
+-      {
+-        octave_signal_caught = 1;
+-        octave_interrupt_state++;
+-      }
+-  }
+-
+   interrupt_handler
+   catch_interrupts (void)
+   {
+     interrupt_handler retval;
+ 
+-    retval.int_handler = set_signal_handler ("SIGINT", sigint_handler);
+-    retval.brk_handler = set_signal_handler ("SIGBREAK", sigint_handler);
++    retval.int_handler = set_signal_handler ("SIGINT", generic_sig_handler);
++    retval.brk_handler = set_signal_handler ("SIGBREAK", generic_sig_handler);
+ 
+     return retval;
+   }
+ 
+   interrupt_handler
+   ignore_interrupts (void)
+   {
+     interrupt_handler retval;
+diff --git a/libinterp/corefcn/toplev.cc b/libinterp/corefcn/toplev.cc
+--- a/libinterp/corefcn/toplev.cc
++++ b/libinterp/corefcn/toplev.cc
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include "async-system-wrapper.h"
+ #include "child-list.h"
+ #include "lo-error.h"
+ #include "oct-fftw.h"
+ #include "oct-locbuf.h"
+ #include "oct-syscalls.h"
++#include "signal-wrappers.h"
+ #include "str-vec.h"
+ #include "wait-for-input.h"
+ 
+ #include "build-env.h"
+ #include "liboctinterp-build-info.h"
+ #include "call-stack.h"
+ #include "defaults.h"
+ #include "defun.h"
+@@ -144,16 +145,38 @@ run_command_and_return_output (const std
+   else
+     cmd_status = 127;
+ 
+   retval = ovl (cmd_status, output_buf.str ());
+ 
+   return retval;
+ }
+ 
++// Combine alloc+get in one action.
++
++static void *
++get_signal_mask (void)
++{
++  void *mask = octave_alloc_signal_mask ();
++
++  octave_get_signal_mask (mask);
++
++  return mask;
++}
++
++// Combine set+free in one action.
++
++static void
++restore_signal_mask (void *mask)
++{
++  octave_set_signal_mask (mask);
++
++  octave_free_signal_mask (mask);
++}
++
+ enum system_exec_type { et_sync, et_async };
+ 
+ DEFUN (system, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {} system ("@var{string}")
+ @deftypefnx {} {} system ("@var{string}", @var{return_output})
+ @deftypefnx {} {} system ("@var{string}", @var{return_output}, @var{type})
+ @deftypefnx {} {[@var{status}, @var{output}] =} system (@dots{})
+@@ -227,19 +250,16 @@ systems.
+       else if (type_str == "async")
+         type = et_async;
+       else
+         error (R"(system: TYPE must be "sync" or "async")");
+     }
+ 
+   octave_value_list retval;
+ 
+-  // FIXME: Is this unwind_protect frame needed anymore (12/16/15)?
+-  octave::unwind_protect frame;
+-
+   bool return_output = (nargin == 1 && nargout > 1);
+ 
+   if (nargin > 1)
+     {
+       try
+         {
+           return_output = args(1).is_true ();
+         }
+@@ -255,16 +275,22 @@ systems.
+   std::string cmd_str = args(0).xstring_value ("system: first argument must be a string");
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+   // Work around weird double-quote handling on Windows systems.
+   if (type == et_sync)
+     cmd_str = '"' + cmd_str + '"';
+ #endif
+ 
++  octave::unwind_protect frame;
++
++  frame.add_fcn (restore_signal_mask, get_signal_mask ());
++
++  octave_unblock_async_signals ();
++
+   if (type == et_async)
+     retval(0) = octave_async_system_wrapper (cmd_str.c_str ());
+   else if (return_output)
+     retval = run_command_and_return_output (cmd_str);
+   else
+     {
+       int status = system (cmd_str.c_str ());
+ 
+diff --git a/liboctave/wrappers/signal-wrappers.c b/liboctave/wrappers/signal-wrappers.c
+--- a/liboctave/wrappers/signal-wrappers.c
++++ b/liboctave/wrappers/signal-wrappers.c
+@@ -541,16 +541,40 @@ octave_save_signal_mask (void)
+ }
+ 
+ void
+ octave_restore_signal_mask (void)
+ {
+   sigprocmask (SIG_SETMASK, &octave_signal_mask, 0);
+ }
+ 
++void *
++octave_alloc_signal_mask (void)
++{
++  return malloc (sizeof (sigset_t));
++}
++
++void
++octave_free_signal_mask (void *mask)
++{
++  free (mask);
++}
++
++void
++octave_get_signal_mask (void *mask)
++{
++  sigprocmask (0, 0, mask);
++}
++
++void
++octave_set_signal_mask (void *mask)
++{
++  sigprocmask (SIG_SETMASK, (sigset_t *) mask, 0);
++}
++
+ #if ! defined (__WIN32__)
+ static const sigset_t *
+ octave_async_signals (void)
+ {
+   static bool initialized = false;
+   static sigset_t sigmask;
+ 
+   if (! initialized)
+diff --git a/liboctave/wrappers/signal-wrappers.h b/liboctave/wrappers/signal-wrappers.h
+--- a/liboctave/wrappers/signal-wrappers.h
++++ b/liboctave/wrappers/signal-wrappers.h
+@@ -71,16 +71,24 @@ extern void octave_unblock_interrupt_sig
+ extern void octave_block_signal_by_name (const char *signame);
+ 
+ extern void octave_unblock_signal_by_name (const char *signame);
+ 
+ extern void octave_save_signal_mask (void);
+ 
+ extern void octave_restore_signal_mask (void);
+ 
++extern void * octave_alloc_signal_mask (void);
++
++extern void octave_free_signal_mask (void *mask);
++
++extern void octave_get_signal_mask (void *mask);
++
++extern void octave_set_signal_mask (void *mask);
++
+ extern void octave_block_async_signals (void);
+ 
+ extern void octave_unblock_async_signals (void);
+ 
+ extern int octave_raise_wrapper (int signum);
+ 
+ extern void
+ octave_create_interrupt_watcher_thread (octave_sig_handler *handler);

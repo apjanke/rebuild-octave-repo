@@ -1,0 +1,265 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1521754481 14400
+#      Thu Mar 22 17:34:41 2018 -0400
+# Branch stable
+# Node ID 2b040946dc6976a6fbe2d0a5081362ae9014b54c
+# Parent  241b80a7d8c74b1b22aae430919d2b2e5385ee15
+improve handling of clear for globals, forwarded symbols (bug #53027)
+
+* symrec.h (symbol_record::symbol_record_rep::clear): Don't return
+early after unbinding global.  Don't check for forwarded symbol here.
+
+* symrec.h (symbol_record::is_forwarded,
+symbol_record::symbol_record_rep::is_forwarded): New functions.
+* symscope.h (symbol_scope_rep::refresh): Don't delete forwarded symbols.
+
+* test/bug-53027/bug-53027.tst, test/bug-53027/module.mk,
+test/bug-53027/ntest53027a.m, test/bug-53027/ntest53027b.m:
+New test files.
+
+* test/module.mk: Include test/bug-53027/module.mk.
+
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+--- a/libinterp/corefcn/symrec.h
++++ b/libinterp/corefcn/symrec.h
+@@ -194,41 +194,29 @@ namespace octave
+             retval = m_value_stack.size ();
+           }
+ 
+         return retval;
+       }
+ 
+       void clear (context_id context)
+       {
+-        // There is no need to do anything with a fowarded
+-        // symbol_record_rep here.
+-        //
+-        // For scripts, we are never executing in the script "scope".
+-        //
+-        // For globals, we are only interested in breaking the link to
+-        // the global value and clearing the local value, not the
+-        // global one.
+-
+-        // For persistent values, we clear the value then unmark so
+-        // that we clear the first element of the value stack.
++        // For globals, break the link to the global value first, then
++        // clear the local value.
+ 
+         if (is_global ())
+-          {
+-            unbind_fwd_rep ();
+-            return;
+-          }
+-
+-        if (auto t_fwd_rep = m_fwd_rep.lock ())
+-          return;
++          unbind_fwd_rep ();
+ 
+         if (! (is_hidden () || is_inherited ()))
+           {
+             assign (octave_value (), context);
+ 
++            // For persistent values, we clear the value then unmark so
++            // that we clear the first element of the value stack.
++
+             if (is_persistent ())
+               unmark_persistent ();
+           }
+       }
+ 
+       bool is_defined (context_id context) const
+       {
+         return varval (context).is_defined ();
+@@ -277,16 +265,21 @@ namespace octave
+       bool is_inherited (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->is_inherited ();
+ 
+         return m_storage_class & inherited;
+       }
+ 
++      bool is_forwarded (void) const
++      {
++        return ! m_fwd_rep.expired ();
++      }
++
+       bool is_global (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->is_global ();
+ 
+         return m_storage_class & global;
+       }
+ 
+@@ -494,16 +487,22 @@ namespace octave
+           }
+ 
+         m_fwd_scope = fwd_scope;
+         m_fwd_rep = fwd_rep;
+       }
+ 
+       void unbind_fwd_rep (void)
+       {
++        if (auto t_fwd_rep = m_fwd_rep.lock ())
++          {
++            t_fwd_rep->unbind_fwd_rep ();
++            return;
++          }
++
+         // When unbinding an object, only break the immediate link.
+         // By doing that, we ensure that any variables that are made
+         // global in a script remain linked as globals in the
+         // enclosing scope.
+ 
+         m_fwd_scope = std::weak_ptr<symbol_scope_rep> ();
+         m_fwd_rep.reset ();
+       }
+@@ -624,16 +623,17 @@ namespace octave
+     }
+ 
+     bool is_local (void) const { return m_rep->is_local (); }
+     bool is_automatic (void) const { return m_rep->is_automatic (); }
+     bool is_formal (void) const { return m_rep->is_formal (); }
+     bool is_global (void) const { return m_rep->is_global (); }
+     bool is_hidden (void) const { return m_rep->is_hidden (); }
+     bool is_inherited (void) const { return m_rep->is_inherited (); }
++    bool is_forwarded (void) const { return m_rep->is_forwarded (); }
+     bool is_persistent (void) const { return m_rep->is_persistent (); }
+     bool is_added_static (void) const { return m_rep->is_added_static (); }
+ 
+     void mark_local (void) { m_rep->mark_local (); }
+     void mark_automatic (void) { m_rep->mark_automatic (); }
+     void mark_formal (void) { m_rep->mark_formal (); }
+     void mark_hidden (void) { m_rep->mark_hidden (); }
+     void mark_inherited (void) { m_rep->mark_inherited (); }
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -272,17 +272,17 @@ namespace octave
+     }
+ 
+     void refresh (void)
+     {
+       for (auto& nm_sr : m_symbols)
+         {
+           symbol_record& sr = nm_sr.second;
+ 
+-          if (! sr.is_persistent ())
++          if (! (sr.is_persistent () || sr.is_forwarded ()))
+             sr.clear (m_context);
+         }
+     }
+ 
+     void clear_variables (void)
+     {
+       for (auto& nm_sr : m_symbols)
+         nm_sr.second.clear (m_context);
+diff --git a/test/bug-53027/bug-53027.tst b/test/bug-53027/bug-53027.tst
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/bug-53027.tst
+@@ -0,0 +1,34 @@
++%!function load53027 (fname)
++%!  global X
++%!  X = 2;
++%!  load (fname);
++%!  assert (X, 1);
++%!endfunction
++
++%!function save53027 (fname)
++%!  global X
++%!  X = 1;
++%!  save (fname, "X");
++%!endfunction
++
++%!test <*53027>
++%! global X
++%! X = 0;
++%! fname = tmpnam ();
++%! save53027 (fname);
++%! assert (X, 1);
++%! load53027 (fname);
++%! assert (X, 1);
++%! load53027 (fname);
++%! assert (X, 1);
++%! clear X
++%! assert (exist ("X"), 0);
++
++%!test <*53027>
++%! [a, b] = ntest53027a ();
++%! assert ([a, b], [0, 0])
++
++## Not fixed yet.
++%!test <53027>
++%! [a, b] = ntest53027b ();
++%! assert ([a, b], [0, 0])
+diff --git a/test/bug-53027/module.mk b/test/bug-53027/module.mk
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/module.mk
+@@ -0,0 +1,6 @@
++bug_53027_TEST_FILES = \
++  %reldir%/bug-53027.tst \
++  %reldir%/ntest53027a.m \
++  %reldir%/ntest53027b.m
++
++TEST_FILES += $(bug_53027_TEST_FILES)
+diff --git a/test/bug-53027/ntest53027a.m b/test/bug-53027/ntest53027a.m
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/ntest53027a.m
+@@ -0,0 +1,11 @@
++function [m_exist, n_exist] = ntest53027a ()
++  global x
++  x = 3;
++  n_exist = nest ();
++  m_exist = exist ("x", 'var');
++  function n_exist = nest ()
++    x = 1;
++    clear x
++    n_exist = exist ("x", "var");
++  endfunction
++endfunction
+diff --git a/test/bug-53027/ntest53027b.m b/test/bug-53027/ntest53027b.m
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53027/ntest53027b.m
+@@ -0,0 +1,15 @@
++function [m_exist, n_exist] = ntest53027b ()
++  global x
++  x = 3;
++  n_exist = nest ();
++  m_exist = exist ("x", 'var');
++  function n_exist = nest ()
++    ## The clear statement should operate on the variable in the
++    ## parent scope even though there is no explicit varabiable
++    ## reference in teh code (the clear function just sees a string
++    ## containing the name of the variable and the parser (correctly)
++    ## does not treat this as a special case.
++    clear x
++    n_exist = exist ("x", "var");
++  endfunction
++endfunction
+diff --git a/test/module.mk b/test/module.mk
+--- a/test/module.mk
++++ b/test/module.mk
+@@ -60,16 +60,17 @@ include %reldir%/bug-50014/module.mk
+ include %reldir%/bug-50035/module.mk
+ include %reldir%/bug-50716/module.mk
+ include %reldir%/bug-51192/module.mk
+ include %reldir%/bug-51532/module.mk
+ include %reldir%/bug-51534/module.mk
+ include %reldir%/bug-51599/module.mk
+ include %reldir%/bug-52075/module.mk
+ include %reldir%/bug-52722/module.mk
++include %reldir%/bug-53027/module.mk
+ include %reldir%/class-concat/module.mk
+ include %reldir%/classdef/module.mk
+ include %reldir%/classdef-multiple-inheritance/module.mk
+ include %reldir%/classes/module.mk
+ include %reldir%/ctor-vs-method/module.mk
+ include %reldir%/fcn-handle-derived-resolution/module.mk
+ include %reldir%/local-functions/module.mk
+ include %reldir%/nest/module.mk

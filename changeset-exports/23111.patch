@@ -1,0 +1,1005 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1485634782 18000
+#      Sat Jan 28 15:19:42 2017 -0500
+# Node ID 252975fdc444670800f8706844caa4ea583e013e
+# Parent  af48d8be62b3c6da01d3daf802b35609d46e76a3
+more refactoring of interpreter and application classes
+
+An embedded interperter is now just an interpreter that is running
+without an application context.
+
+* octave.h, octave.cc (embedded_application): Delete class.
+(application::program_invocation_name, application::program_name,
+application::argv, application::is_gui_running,
+application::the_interpreter): Handle possibility that there is no
+application instance.
+
+* interpreter.h, interpreter.cc (interpreter::initialize_load_path):
+Now a member function instead of a static file-scope function.
+(interpreter::m_embedded): Delete data member.
+(interpreter::m_read_site_files, interpreter::m_read_init_files,
+interpreter::m_verbose, interpreter::m_inhibit_startup_message,
+interpreter::m_load_path_initialized): New data members.
+(interpreter::read_site_files, interpreter::read_init_files,
+interpreter::verbose, interpreter::inhibit_startup_message):
+New member functions.
+(interpreter::interpreter): Eliminate embedded argument.  Initialize
+new data members.  Refactor initialization sequence.
+(interpreter::initialize_history): New function.
+(interpreter::execute_internal, interpreter::display_startup_message,
+interpreter::execute_startup_files): Refactor startup sequence.
+(interpreter::main_loop): Handle EOF from parser.
+(interpreter::cleanup): Don't print extra newline here.
+(interpreter::recover_from_exception): Define as member function.
+(interpreter::atexit_functions): Define as static member variable.
+
+* embedded.cc: Update.
+
+diff --git a/examples/code/embedded.cc b/examples/code/embedded.cc
+--- a/examples/code/embedded.cc
++++ b/examples/code/embedded.cc
+@@ -2,23 +2,19 @@
+ #include <octave/oct.h>
+ #include <octave/octave.h>
+ #include <octave/parse.h>
+ #include <octave/interpreter.h>
+ 
+ int
+ main (void)
+ {
+-  string_vector argv (2);
+-  argv(0) = "embedded";
+-  argv(1) = "-q";
++  octave::interpreter interpreter;
+ 
+-  octave::embedded_application app (2, argv.c_str_vec ());
+-
+-  int status = app.execute ();
++  int status = interpreter.execute ();
+ 
+   if (status != 0)
+     {
+       std::cerr << "creating embedded Octave interpreter failed!" << std::endl;
+       return status;
+     }
+ 
+   try
+diff --git a/libinterp/corefcn/input.cc b/libinterp/corefcn/input.cc
+--- a/libinterp/corefcn/input.cc
++++ b/libinterp/corefcn/input.cc
+@@ -666,16 +666,18 @@ get_debug_input (const std::string& prom
+   std::string msg = buf.str ();
+ 
+   if (! msg.empty ())
+     std::cerr << msg << std::endl;
+ 
+   frame.protect_var (VPS1);
+   VPS1 = prompt;
+ 
++  // FIXME: should debugging be possible in an embedded interpreter?
++
+   octave::application *app = octave::application::app ();
+ 
+   if (! app->interactive ())
+     {
+ 
+       frame.add_method (app, &octave::application::interactive,
+                         app->interactive ());
+ 
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <string>
+ #include <iostream>
+ 
+ #include "cmd-edit.h"
++#include "cmd-hist.h"
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "fpucw-wrappers.h"
+ #include "lo-blas-proto.h"
+ #include "lo-error.h"
+ #include "oct-env.h"
+ #include "str-vec.h"
+ #include "signal-wrappers.h"
+@@ -349,163 +350,159 @@ execute_pkg_add (const std::string& dir)
+       octave::interpreter::recover_from_exception ();
+     }
+   catch (const octave::execution_exception&)
+     {
+       octave::interpreter::recover_from_exception ();
+     }
+ }
+ 
+-static void
+-initialize_load_path (bool set_initial_path)
+-{
+-  // Temporarily set the execute_pkg_add function to one that catches
+-  // exceptions.  This is better than wrapping load_path::initialize in
+-  // a try-catch block because it will not stop executing PKG_ADD files
+-  // at the first exception.  It's also better than changing the default
+-  // execute_pkg_add function to use safe_source file because that will
+-  // normally be evaluated from the normal intepreter loop where
+-  // exceptions are already handled.
+-
+-  octave::unwind_protect frame;
+-
+-  frame.add_fcn (load_path::set_add_hook, load_path::get_add_hook ());
+-
+-  load_path::set_add_hook (execute_pkg_add);
+-
+-  load_path::initialize (set_initial_path);
+-}
+-
+ namespace octave
+ {
+   tree_evaluator *current_evaluator = 0;
+ 
+-  interpreter::interpreter (application *app_context, bool embedded)
++  interpreter::interpreter (application *app_context)
+     : m_app_context (app_context), m_evaluator (new tree_evaluator (this)),
+-      m_embedded (embedded), m_interactive (false)
++      m_interactive (false), m_read_site_files (true),
++      m_read_init_files (m_app_context != 0), m_verbose (false),
++      m_inhibit_startup_message (false), m_load_path_initialized (false)
+   {
+     current_evaluator = m_evaluator;
+ 
+-    const cmdline_options& options = m_app_context->options ();
++    // This should probably happen early.
++    sysdep_init ();
++
++    // Need to have global Vfoo variables defined early.
++    install_defaults ();
+ 
+     // Matlab uses "C" locale for LC_NUMERIC class regardless of local setting
+     setlocale (LC_NUMERIC, "C");
+     setlocale (LC_TIME, "C");
+     octave::sys::env::putenv ("LC_NUMERIC", "C");
+     octave::sys::env::putenv ("LC_TIME", "C");
+ 
+     // Initialize the default floating point unit control state.
+     octave_set_default_fpucw ();
+ 
+-    string_vector all_args = options.all_args ();
+-
+     octave::thread::init ();
+ 
+     set_default_prompts ();
+ 
+     // Initialize default warning state before --traditional option
+     // that may reset them.
+ 
+     initialize_default_warning_state ();
+ 
+-    if (options.traditional ())
+-      maximum_braindamage ();
++    octave_ieee_init ();
+ 
+-    octave_ieee_init ();
++    octave_prepare_hdf5 ();
+ 
+     // The idea here is to force xerbla to be referenced so that we will link to
+     // our own version instead of the one provided by the BLAS library.  But
+     // octave::numeric_limits<double>::NaN () should never be -1, so we
+     // should never actually call xerbla.  FIXME (again!):  If this
+     // becomes a constant expression the test might be optimized away and
+     // then the reference to the function might also disappear.
+ 
+     if (octave::numeric_limits<double>::NaN () == -1)
+       F77_FUNC (xerbla, XERBLA) ("octave", 13 F77_CHAR_ARG_LEN (6));
+ 
+     initialize_error_handlers ();
+ 
+-    if (! m_embedded)
++    if (app_context)
+       octave::install_signal_handlers ();
+     else
+       quit_allowed = false;
+ 
+     initialize_file_io ();
+ 
+     install_types ();
+ 
+     install_ops ();
+ 
+     install_builtins ();
+ 
+     install_classdef ();
+ 
+-    std::list<std::string> command_line_path = options.command_line_path ();
++    bool line_editing = false;
++    bool traditional = false;
+ 
+-    for (const auto& pth : command_line_path)
+-      load_path::set_command_line_path (pth);
++    if (app_context)
++      {
++        // Embedded interpeters don't execute command line options or
++        const cmdline_options& options = m_app_context->options ();
+ 
+-    std::string exec_path = options.exec_path ();
+-    if (! exec_path.empty ())
+-      set_exec_path (exec_path);
++        // Make all command-line arguments available to startup files,
++        // including PKG_ADD files.
+ 
+-    std::string image_path = options.image_path ();
+-    if (! image_path.empty ())
+-      set_image_path (image_path);
++        app_context->intern_argv (options.all_args ());
++
++        bool is_octave_program = m_app_context->is_octave_program ();
++
++        std::list<std::string> command_line_path = options.command_line_path ();
+ 
+-    if (options.no_window_system ())
+-      display_info::no_window_system ();
++        for (const auto& pth : command_line_path)
++          load_path::set_command_line_path (pth);
+ 
+-    // Is input coming from a terminal?  If so, we are probably interactive.
++        std::string exec_path = options.exec_path ();
++        if (! exec_path.empty ())
++          set_exec_path (exec_path);
+ 
+-    // If stdin is not a tty, then we are reading commands from a pipe or
+-    // a redirected file.
+-    bool stdin_is_tty = octave_isatty_wrapper (fileno (stdin));
++        std::string image_path = options.image_path ();
++        if (! image_path.empty ())
++          set_image_path (image_path);
++
++        if (options.no_window_system ())
++          display_info::no_window_system ();
+ 
+-    m_interactive = (! m_embedded
+-                     && ! m_app_context->is_octave_program ()
+-                     && stdin_is_tty
+-                     && octave_isatty_wrapper (fileno (stdout)));
++        // Is input coming from a terminal?  If so, we are probably
++        // interactive.
++
++        // If stdin is not a tty, then we are reading commands from a
++        // pipe or a redirected file.
++        bool stdin_is_tty = octave_isatty_wrapper (fileno (stdin));
+ 
+-    // Check if the user forced an interactive session.
+-    if (options.forced_interactive ())
+-      m_interactive = true;
++        m_interactive = (! is_octave_program && stdin_is_tty
++                         && octave_isatty_wrapper (fileno (stdout)));
++
++        // Check if the user forced an interactive session.
++        if (options.forced_interactive ())
++          m_interactive = true;
+ 
+-    bool line_editing = options.line_editing ();
+-    if ((! m_interactive || options.forced_interactive ())
+-        && ! options.forced_line_editing ())
+-      line_editing = false;
++        line_editing = options.line_editing ();
++        if ((! m_interactive || options.forced_interactive ())
++            && ! options.forced_line_editing ())
++          line_editing = false;
++
++        traditional = options.traditional ();
++      }
+ 
+     // Force default line editor if we don't want readline editing.
+-    if (! line_editing)
++    if (line_editing)
++      initialize_command_input ();
++    else
+       octave::command_editor::force_default_editor ();
+ 
+     // These can come after command line args since none of them set any
+     // defaults that might be changed by command line options.
+ 
+-    if (line_editing)
+-      initialize_command_input ();
+-
+-    octave_interpreter_ready = true;
+-
+     initialize_version_info ();
+ 
+-    // Make all command-line arguments available to startup files,
+-    // including PKG_ADD files.
++    // This should be done before initializing the load path because
++    // some PKG_ADD files might need --traditional behavior.
+ 
+-    app_context->intern_argv (options.all_args ());
++    if (traditional)
++      maximum_braindamage ();
+ 
+-    initialize_load_path (options.set_initial_path ());
+-
+-    initialize_history (options.read_history_file ());
++    octave_interpreter_ready = true;
+   }
+ 
+   interpreter::~interpreter (void)
+   {
+-    if (m_embedded)
++    if (! m_app_context)
+       cleanup ();
+ 
+     current_evaluator = 0;
+ 
+     delete m_evaluator;
+   }
+ 
+   int interpreter::execute (void)
+@@ -516,105 +513,189 @@ namespace octave
+       {
+         exit_status = execute_internal ();
+       }
+     catch (const octave::exit_exception& ex)
+       {
+         exit_status = ex.exit_status ();
+       }
+ 
+-    if (! m_embedded)
++    if (m_app_context)
+       cleanup ();
+ 
+     return exit_status;
+   }
+ 
++  // Set the initial path to the system default unless command-line
++  // option says to leave it empty.
++
++  void interpreter::initialize_load_path (bool set_initial_path)
++  {
++    if (! m_load_path_initialized)
++      {
++        // Allow command-line option to override.
++
++        if (m_app_context)
++          {
++            const cmdline_options& options = m_app_context->options ();
++
++            set_initial_path = options.set_initial_path ();
++          }
++
++        // Temporarily set the execute_pkg_add function to one that
++        // catches exceptions.  This is better than wrapping
++        // load_path::initialize in a try-catch block because it will
++        // not stop executing PKG_ADD files at the first exception.
++        // It's also better than changing the default execute_pkg_add
++        // function to use safe_source file because that will normally
++        // be evaluated from the normal intepreter loop where exceptions
++        // are already handled.
++
++        octave::unwind_protect frame;
++
++        frame.add_fcn (load_path::set_add_hook, load_path::get_add_hook ());
++
++        load_path::set_add_hook (execute_pkg_add);
++
++        load_path::initialize (set_initial_path);
++
++        m_load_path_initialized = true;
++      }
++  }
++
++  void interpreter::initialize_history (bool read_history_file)
++  {
++    if (! m_history_initialized)
++      {
++        // Allow command-line option to override.
++
++        if (m_app_context)
++          {
++            const cmdline_options& options = m_app_context->options ();
++
++            read_history_file = options.read_history_file ();
++          }
++
++        ::initialize_history (read_history_file);
++
++        if (! m_app_context)
++          octave::command_history::ignore_entries ();
++
++        m_history_initialized = true;
++      }
++  }
++
+   int interpreter::execute_internal (void)
+   {
+     display_startup_message ();
+ 
+-    octave_prepare_hdf5 ();
++    // Initializing the load path may execute PKG_ADD files.  It also
++    // allows the path to be initialized between the calls to create and
++    // executeexecute the interpreter.
++
++    initialize_load_path ();
++
++    initialize_history ();
+ 
+     // Don't fail, but return non-zero if there is an error in a startup
+     // file.
+ 
+     int exit_status = 0;
+ 
+     int status = execute_startup_files ();
+ 
+     if (status)
+       exit_status = status;
+ 
+-    const cmdline_options& options = m_app_context->options ();
++    if (m_app_context)
++      {
++        const cmdline_options& options = m_app_context->options ();
+ 
+-    if (m_app_context->have_eval_option_code ())
+-      {
+-        status = execute_eval_option_code ();
++        if (m_app_context->have_eval_option_code ())
++          {
++            status = execute_eval_option_code ();
+ 
+-        if (status )
+-          exit_status = status;
++            if (status )
++              exit_status = status;
+ 
+-        if (! options.persist ())
+-          return exit_status;
+-      }
++            if (! options.persist ())
++              return exit_status;
++          }
++
++        // If there is an extra argument, see if it names a file to
++        // read.  Additional arguments are taken as command line options
++        // for the script.
+ 
+-    // If there is an extra argument, see if it names a file to read.
+-    // Additional arguments are taken as command line options for the script.
++        if (m_app_context->have_script_file ())
++          {
++            status = execute_command_line_file ();
++
++            if (status)
++              exit_status = status;
++
++            if (! options.persist ())
++              return exit_status;
++          }
+ 
+-    if (m_app_context->have_script_file ())
+-      {
+-        status = execute_command_line_file ();
++        // Force input to be echoed if not really interactive,
++        // but the user has forced interactive behavior.
+ 
+-        if (status)
+-          exit_status = status;
++        if (options.forced_interactive ())
++          {
++            octave::command_editor::blink_matching_paren (false);
+ 
+-        if (! options.persist ())
+-          return exit_status;
++            // FIXME: is this the right thing to do?
++            Fecho_executing_commands (octave_value (ECHO_CMD_LINE));
++          }
+       }
+ 
+     // Avoid counting commands executed from startup or script files.
+ 
+     octave::command_editor::reset_current_command_number (1);
+ 
+-    // Force input to be echoed if not really interactive,
+-    // but the user has forced interactive behavior.
+-
+-    if (options.forced_interactive ())
+-      {
+-        octave::command_editor::blink_matching_paren (false);
+-
+-        // FIXME: is this the right thing to do?
+-        Fecho_executing_commands (octave_value (ECHO_CMD_LINE));
+-      }
+-
+     return main_loop ();
+   }
+ 
+   void interpreter::display_startup_message (void) const
+   {
+-    const cmdline_options& options = m_app_context->options ();
++    bool inhibit_startup_message = false;
+ 
+-    if (m_interactive && ! options.inhibit_startup_message ())
++    if (m_app_context)
++      {
++        const cmdline_options& options = m_app_context->options ();
++
++        inhibit_startup_message = options.inhibit_startup_message ();
++      }
++    
++    if (m_interactive && ! inhibit_startup_message)
+       std::cout << octave_startup_message () << "\n" << std::endl;
+   }
+ 
+   // Initialize by reading startup files.  Return non-zero if an exception
+   // occurs when reading any of them, but don't exit early because of an
+   // exception.
+ 
+   int interpreter::execute_startup_files (void) const
+   {
+-    const cmdline_options& options = m_app_context->options ();
++    bool read_site_files = m_read_site_files;
++    bool read_init_files = m_read_init_files;
++    bool verbose = m_verbose;
++    bool inhibit_startup_message = m_inhibit_startup_message;
+ 
+-    bool read_site_files = options.read_site_files ();
+-    bool read_init_files = options.read_init_files ();
+-    bool verbose_flag = options.verbose_flag ();
+-    bool inhibit_startup_message = options.inhibit_startup_message ();
++    if (m_app_context)
++      {
++        const cmdline_options& options = m_app_context->options ();
+ 
+-    bool verbose = (verbose_flag && ! inhibit_startup_message);
++        read_site_files = options.read_site_files ();
++        read_init_files = options.read_init_files ();
++        verbose = options.verbose_flag ();
++        inhibit_startup_message = options.inhibit_startup_message ();
++      }
++
++    verbose = (verbose && ! inhibit_startup_message);
+ 
+     bool require_file = false;
+ 
+     std::string context;
+ 
+     int exit_status = 0;
+ 
+     if (read_site_files)
+@@ -687,18 +768,17 @@ namespace octave
+             int status = safe_source_file (local_rc, context, verbose,
+                                            require_file);
+ 
+             if (status)
+               exit_status = status;
+           }
+       }
+ 
+-    if (m_interactive && ! options.inhibit_startup_message ()
+-        && options.verbose_flag ())
++    if (m_interactive && verbose)
+       std::cout << std::endl;
+ 
+     return exit_status;
+   }
+ 
+   // Execute any code specified with --eval 'CODE'
+ 
+   int interpreter::execute_eval_option_code (void)
+@@ -796,17 +876,17 @@ namespace octave
+     bool verbose = false;
+     bool require_file = true;
+ 
+     return safe_source_file (fname, context, verbose, require_file, "octave");
+   }
+ 
+   int interpreter::main_loop (void)
+   {
+-    if (m_embedded)
++    if (! m_app_context)
+       return 0;
+ 
+     octave_save_signal_mask ();
+ 
+     octave::can_interrupt = true;
+ 
+     octave_signal_hook = octave::signal_handler;
+     octave_interrupt_hook = 0;
+@@ -862,17 +942,20 @@ namespace octave
+                       }
+ 
+                     if (octave_completion_matches_called)
+                       octave_completion_matches_called = false;
+                     else
+                       octave::command_editor::increment_current_command_number ();
+                   }
+                 else if (parser.lexer.end_of_input)
+-                  break;
++                  {
++                    retval = EOF;
++                    break;
++                  }
+               }
+           }
+         catch (const octave::interrupt_exception&)
+           {
+             recover_from_exception ();
+ 
+             // Required newline when the user does Ctrl+C at the prompt.
+             if (octave::application::interactive ())
+@@ -916,17 +999,22 @@ namespace octave
+             if (setjump (naninf_jump) != 0)
+               debug_or_throw_exception (true);  // true = stack trace
+           }
+ #endif
+       }
+     while (retval == 0);
+ 
+     if (retval == EOF)
+-      retval = 0;
++      {
++        if (octave::application::interactive ())
++          octave_stdout << "\n";
++
++        retval = 0;
++      }
+ 
+     return retval;
+   }
+ 
+   // Call a function with exceptions handled to avoid problems with
+   // errors while shutting down.
+ 
+ #define OCTAVE_IGNORE_EXCEPTION(E)                                      \
+@@ -1012,56 +1100,46 @@ namespace octave
+         OCTAVE_SAFE_CALL (symbol_table::cleanup, ());
+ 
+         OCTAVE_SAFE_CALL (sysdep_cleanup, ());
+ 
+         OCTAVE_SAFE_CALL (octave_finalize_hdf5, ());
+ 
+         OCTAVE_SAFE_CALL (octave::flush_stdout, ());
+ 
+-        if (octave::application::interactive ())
+-          {
+-            octave_stdout << "\n";
+-
+-            // Yes, we want this to be separate from the call to
+-            // octave::flush_stdout above.
+-
+-            OCTAVE_SAFE_CALL (octave::flush_stdout, ());
+-          }
+-
+         // Don't call singleton_cleanup_list::cleanup until we have the
+         // problems with registering/unregistering types worked out.  For
+         // example, uncomment the following line, then use the make_int
+         // function from the examples directory to create an integer
+         // object and then exit Octave.  Octave should crash with a
+         // segfault when cleaning up the typinfo singleton.  We need some
+         // way to force new octave_value_X types that are created in
+         // .oct files to be unregistered when the .oct file shared library
+         // is unloaded.
+         //
+         // OCTAVE_SAFE_CALL (singleton_cleanup_list::cleanup, ());
+ 
+         OCTAVE_SAFE_CALL (octave::chunk_buffer::clear, ());
+       }
+   }
+ 
+-  void recover_from_exception (void)
++  void interpreter::recover_from_exception (void)
+   {
+     octave::can_interrupt = true;
+     octave_interrupt_immediately = 0;
+     octave_interrupt_state = 0;
+     octave_signal_caught = 0;
+     octave_exception_state = octave_no_exception;
+     octave_restore_signal_mask ();
+     octave::catch_interrupts ();
+   }
+ 
+   // Functions to call when the interpreter exits.
+ 
+-  std::list<std::string> atexit_functions;
++  std::list<std::string> interpreter::atexit_functions;
+ 
+   void interpreter::add_atexit_function (const std::string& fname)
+   {
+     atexit_functions.push_front (fname);
+   }
+ 
+   bool interpreter::remove_atexit_function (const std::string& fname)
+   {
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -51,30 +51,61 @@ namespace octave
+   // both) of them...
+ 
+   class application;
+ 
+   class OCTINTERP_API interpreter
+   {
+   public:
+ 
+-    interpreter (application *app_context = 0, bool embedded = false);
++    interpreter (application *app_context = 0);
+ 
+     // No copying, at least not yet...
+ 
+     interpreter (const interpreter&) = delete;
+ 
+     interpreter& operator = (const interpreter&) = delete;
+ 
+     ~interpreter (void);
+ 
+     int execute (void);
+ 
+-    bool interactive (void) const { return m_interactive; }
+-    void interactive (bool arg) { m_interactive = arg; }
++    bool interactive (void) const
++    {
++      return m_interactive;
++    }
++
++    void interactive (bool arg)
++    {
++      m_interactive = arg;
++    }
++
++    void read_site_files (bool flag)
++    {
++      m_read_site_files = flag;
++    }
++
++    void read_init_files (bool flag)
++    {
++      m_read_init_files = flag;
++    }
++
++    void verbose (bool flag)
++    {
++      m_verbose = flag;
++    }
++
++    void inhibit_startup_message (bool flag)
++    {
++      m_inhibit_startup_message = flag;
++    }
++
++    void initialize_load_path (bool set_initial_path = true);
++
++    void initialize_history (bool read_history_file = false);
+ 
+     static void recover_from_exception (void);
+ 
+     static void add_atexit_function (const std::string& fname);
+ 
+     static bool remove_atexit_function (const std::string& fname);
+ 
+   private:
+@@ -94,20 +125,30 @@ namespace octave
+     int main_loop (void);
+ 
+     void cleanup (void);
+ 
+     application *m_app_context;
+ 
+     tree_evaluator *m_evaluator;
+ 
+-    bool m_embedded;
+-
+     // TRUE means this is an interactive interpreter (forced or not).
+     bool m_interactive;
++
++    bool m_read_site_files;
++
++    bool m_read_init_files;
++
++    bool m_verbose;
++
++    bool m_inhibit_startup_message;
++
++    bool m_load_path_initialized;
++
++    bool m_history_initialized;
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+ OCTAVE_DEPRECATED ("use 'octave::interpreter::recover_from_exception' instead")
+ static inline void
+ recover_from_exception (void)
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -341,30 +341,30 @@ namespace octave
+       }
+ 
+     symbol_table::assign (".nargin.", nargs);
+     symbol_table::mark_hidden (".nargin.");
+   }
+ 
+   void application::interactive (bool arg)
+   {
+-    interpreter *interp = instance->m_interpreter;
++    interpreter *interp = instance ? instance->m_interpreter : 0;
+ 
+     if (interp)
+       interp->interactive (arg);
+   }
+ 
+   bool application::forced_interactive (void)
+   {
+-    return instance->m_options.forced_interactive ();
++    return instance ? instance->m_options.forced_interactive () : false;
+   }
+ 
+   bool application::interactive (void)
+   {
+-    interpreter *interp = instance->m_interpreter;
++    interpreter *interp = instance ? instance->m_interpreter : 0;
+ 
+     return interp ? interp->interactive () : false;
+   }
+ 
+   application::~application (void)
+   {
+     delete m_interpreter;
+ 
+@@ -406,56 +406,38 @@ namespace octave
+         warning ("--eval \"CODE\" and script file are mutually exclusive options");
+ 
+         octave_print_terse_usage_and_exit ();
+       }
+ 
+     m_is_octave_program = ((m_have_script_file || m_have_eval_option_code)
+                            && ! m_options.persist ()
+                            && ! m_options.traditional ());
+-
+-    // This should probably happen early.
+-    sysdep_init ();
+-
+-    // Need to have global Vfoo variables defined early.
+-    install_defaults ();
+   }
+ 
+   int cli_application::execute (void)
+   {
+     create_interpreter ();
+ 
+     return execute_interpreter ();
+   }
+-
+-  void embedded_application::create_interpreter (void)
+-  {
+-    if (! m_interpreter)
+-      m_interpreter = new interpreter (this, true);
+-  }
+-
+-  int embedded_application::execute (void)
+-  {
+-    create_interpreter ();
+-
+-    return execute_interpreter ();
+-  }
+ }
+ 
+ // embedded is int here because octave_main is extern "C".
+ 
+ int
+ octave_main (int argc, char **argv, int embedded)
+ {
+-  octave::sys::env::set_program_name (argv[0]);
+-
+   if (embedded)
+     {
+-      static octave::embedded_application app (argc, argv);
+-      return app.execute ();
++      if (argc > 0)
++        warning ("ignoring command line options for embedded octave");
++
++      static octave::interpreter embedded_interpreter;
++      return embedded_interpreter.execute ();
+     }
+   else
+     {
+       warning ("octave_main should only be used to create an embedded interpreter");
+       static octave::cli_application app (argc, argv);
+       return app.execute ();
+     }
+ }
+diff --git a/libinterp/octave.h b/libinterp/octave.h
+--- a/libinterp/octave.h
++++ b/libinterp/octave.h
+@@ -220,28 +220,42 @@ namespace octave
+     void program_invocation_name (const std::string& nm) { m_program_invocation_name = nm; }
+ 
+     void program_name (const std::string& nm) { m_program_name = nm; }
+ 
+     void forced_interactive (bool arg) { m_options.forced_interactive (arg); }
+ 
+     void interactive (bool arg);
+ 
+-    // Should be an error if instance is 0.
+     static application *app (void) { return instance; }
+ 
+-    static std::string program_invocation_name (void) { return instance->m_program_invocation_name; }
++    static std::string program_invocation_name (void)
++    {
++      return instance ? instance->m_program_invocation_name : "";
++    }
+ 
+-    static std::string program_name (void) { return instance->m_program_name; }
++    static std::string program_name (void)
++    {
++      return instance ? instance->m_program_name : "";
++    }
+ 
+-    static string_vector argv (void) { return instance->m_argv; }
++    static string_vector argv (void)
++    {
++      return instance ? instance->m_argv : string_vector ();
++    }
+ 
+-    static bool is_gui_running (void) { return instance->gui_running (); }
++    static bool is_gui_running (void)
++    {
++      return instance ? instance->gui_running () : false;
++    }
+ 
+-    static interpreter *the_interpreter (void) { return instance->m_interpreter; }
++    static interpreter *the_interpreter (void)
++    {
++      return instance ? instance->m_interpreter : 0;
++    }
+ 
+     // Convenience functions.
+ 
+     static bool forced_interactive (void);
+     static bool interactive (void);
+ 
+   private:
+ 
+@@ -301,41 +315,16 @@ namespace octave
+     cli_application (const cli_application&) = delete;
+ 
+     cli_application& operator = (const cli_application&) = delete;
+ 
+     ~cli_application (void) = default;
+ 
+     int execute (void);
+   };
+-
+-  class OCTINTERP_API embedded_application : public application
+-  {
+-  public:
+-
+-    embedded_application (const cmdline_options& opts = cmdline_options ())
+-      : application (opts)
+-    { }
+-
+-    embedded_application (int argc, char **argv)
+-      : application (argc, argv)
+-    { }
+-
+-    // No copying, at least not yet...
+-
+-    embedded_application (const embedded_application&) = delete;
+-
+-    embedded_application& operator = (const embedded_application&) = delete;
+-
+-    ~embedded_application (void) = default;
+-
+-    void create_interpreter (void);
+-
+-    int execute (void);
+-  };
+ }
+ 
+ #endif
+ 
+ #if defined  (__cplusplus)
+ extern "C" {
+ #endif
+ 

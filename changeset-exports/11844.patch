@@ -1,0 +1,436 @@
+# HG changeset patch
+# User David Bateman <dbateman@free.fr>
+# Date 1221859275 -7200
+#      Fri Sep 19 23:21:15 2008 +0200
+# Branch release-3-0-x
+# Node ID 28b0618cf67c64eb8195755c25ed28fdc269f65c
+# Parent  d1b8260dbc76564eec0da131330c7cfc1f2a0b89
+Special case single type conacation in Fcat. Rework cell2mat to take advantage. Cut trailing singletons in cat
+
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,8 +1,12 @@
++2008-09-19  David Bateman  <dbateman@free.fr>
++
++	* general/cell2mat.m: Specialize 2D case for speed.
++
+ 2008-09-08  Tatsuro MATSUOKA  <tmacchant@yahoo.co.jp>
+ 
+ 	* plot/plot.m: Doc fix.
+ 
+ 2008-09-08  Mark van Rossum  <mvanross@inf.ed.ac.uk>
+ 
+ 	* statistics/distributions/binornd.m: Handle zero values of n
+ 	correctly.
+diff --git a/scripts/general/cell2mat.m b/scripts/general/cell2mat.m
+--- a/scripts/general/cell2mat.m
++++ b/scripts/general/cell2mat.m
+@@ -43,16 +43,32 @@ function m = cell2mat (c)
+     elt = c{1};
+     if (isnumeric (elt) || ischar (elt) || islogical (elt))
+       m = elt;
+     elseif (iscell (elt))
+       m = cell2mat (elt);
+     else
+       error ("cell2mat: all elements of cell array must be numeric, logical or char");
+     endif
++  elseif (ndims (c) == 2)
++    nr = rows (c);
++    nc = columns (c);
++    if (nc > nr)
++      c1 = cell (nr, 1);
++      for i = 1 : nr
++	c1{i} = [c{i : nr : end}];
++      endfor
++      m = cat (1, c1 {:});
++    else
++      c1 = cell (nc, 1);
++      for i = 1 : nc
++	c1{i} = cat (1, c{(i - 1) * nr  + [1 : nr]});
++      endfor
++      m = [c1{:}];
++    endif
+   else
+     ## n dimensions case
+     for k = ndims (c):-1:2,
+       sz = size (c);
+       sz(end) = 1;
+       c1 = cell (sz);
+       for i = 1:(prod (sz))
+         c1{i} = cat (k, c{i:(prod (sz)):end});
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,19 @@
++2008-09-19  David Bateman  <dbateman@free.fr>
++
++	* data.cc (SINGLE_TYPE_CONCAT, DO_SINGLE_TYPE_CONCAT): New macros
++	(do_cat): Special case single type concatenations for speed.
++	* pt.mat.cc (std::string get_concat_class (const std::string&,
++	const std::string&), void maybe_warn_string_concat (bool, bool)):
++	Remove static declaration.
++	* pt-mat.h (std::string get_concat_class (const std::string&,
++	const std::string&), void maybe_warn_string_concat (bool, bool)):
++	Define extern here.
++	
+ 2008-09-19  Jaroslav Hajek <highegg@gmail.com>
+ 
+ 	* load-path.cc: Fix errors from earlier transplant changeset.
+ 	* utils.cc: Likewise.
+ 
+ 2008-09-10  John W. Eaton  <jwe@octave.org>
+ 
+ 	* octave.cc (octave_main): Make all command-line arguments
+diff --git a/src/data.cc b/src/data.cc
+--- a/src/data.cc
++++ b/src/data.cc
+@@ -780,16 +780,62 @@ omitted, it defaults to 1 (column-wise p
+ \n\
+ As a special case, if @var{x} is a vector and @var{dim} is omitted,\n\
+ return the product of the elements.\n\
+ @end deftypefn")
+ {
+   DATA_REDUCTION (prod);
+ }
+ 
++
++#define SINGLE_TYPE_CONCAT(TYPE, EXTRACTOR) \
++  do \
++    { \
++      int dv_len = dv.length (); \
++      Array<octave_idx_type> ra_idx (dv_len > 1 ? dv_len : 2, 0); \
++      \
++      for (int j = 1; j < n_args; j++) \
++	{ \
++	  OCTAVE_QUIT; \
++	  \
++	  TYPE ra = args(j).EXTRACTOR ();	\
++	  \
++	  if (! error_state) \
++	    { \
++	      result.insert (ra, ra_idx); \
++	      \
++	      if (error_state) \
++	        return retval; \
++	      \
++	      dim_vector dv_tmp = args (j).dims (); \
++	      \
++	      if (dim >= dv_len) \
++	        { \
++		  if (j > 1) \
++		    error ("%s: indexing error", fname.c_str ()); \
++		  break; \
++		} \
++	      else \
++		ra_idx (dim) += (dim < dv_tmp.length () ? dv_tmp (dim) : 1); \
++	    } \
++	} \
++    } \
++ while (0)
++
++#define DO_SINGLE_TYPE_CONCAT(TYPE, EXTRACTOR) \
++  do \
++    { \
++      TYPE result (dv); \
++      \
++      SINGLE_TYPE_CONCAT(TYPE, EXTRACTOR); \
++      \
++      retval = result; \
++    } \
++ while (0)
++
+ static octave_value
+ do_cat (const octave_value_list& args, std::string fname)
+ {
+   octave_value retval;
+ 
+   int n_args = args.length (); 
+ 
+   if (n_args == 1)
+@@ -805,91 +851,172 @@ do_cat (const octave_value_list& args, s
+ 	  error ("cat: expecting first argument to be a integer");
+ 	  return retval;
+ 	}
+   
+       if (dim >= 0)
+ 	{
+  	  
+  	  dim_vector  dv = args(1).dims ();
++	  std::string result_type = args(1).class_name ();
++	  
++	  bool all_sq_strings_p = args(1).is_sq_string ();
++	  bool all_dq_strings_p = args(1).is_dq_string ();
++	  bool all_real_p = args(1).is_real_type ();
++	  bool any_sparse_p = args(1).is_sparse_type();
++
+ 	  
+  	  for (int i = 2; i < args.length (); i++)
+   	    {
+  	      // add_dims constructs a dimension vector which holds the
+ 	      // dimensions of the final array after concatenation.
+ 
+ 	      if (! dv.concat (args(i).dims (), dim))
+ 		{
+ 		  // Dimensions do not match. 
+ 		  error ("cat: dimension mismatch");
+ 		  return retval;
+ 		}
++
++	      result_type = 
++		get_concat_class (result_type, args(i).class_name ());
++
++	      if (all_sq_strings_p && ! args(i).is_sq_string ())
++		all_sq_strings_p = false;
++	      if (all_dq_strings_p && ! args(i).is_dq_string ())
++		all_dq_strings_p = false;
++	      if (all_real_p && ! args(i).is_real_type ())
++		all_real_p = false;
++	      if (!any_sparse_p && args(i).is_sparse_type ())
++		any_sparse_p = true;
+ 	    }
+ 
+-	  // The lines below might seem crazy, since we take a copy
+-	  // of the first argument, resize it to be empty and then resize
+-	  // it to be full. This is done since it means that there is no
+-	  // recopying of data, as would happen if we used a single resize.
+-	  // It should be noted that resize operation is also significantly 
+-	  // slower than the do_cat_op function, so it makes sense to have an
+-	  // empty matrix and copy all data.
+-	  //
+-	  // We might also start with a empty octave_value using
+-	  //   tmp = octave_value_typeinfo::lookup_type (args(1).type_name());
+-	  // and then directly resize. However, for some types there might be
+-	  // some additional setup needed, and so this should be avoided.
+-
+-	  octave_value tmp;
+-
+-	  int i;
+-          for (i = 1; i < n_args; i++)
++	  if (result_type == "double")
+ 	    {
+-	      if (! args (i).all_zero_dims ())
++	      if (any_sparse_p)
++		{	    
++		  if (all_real_p)
++		    DO_SINGLE_TYPE_CONCAT (SparseMatrix, sparse_matrix_value);
++		  else
++		    DO_SINGLE_TYPE_CONCAT (SparseComplexMatrix, sparse_complex_matrix_value);
++		}
++	      else
+ 		{
+-		  tmp = args (i);
+-		  break;
++		  if (all_real_p)
++		    DO_SINGLE_TYPE_CONCAT (NDArray, array_value);
++		  else
++		    DO_SINGLE_TYPE_CONCAT (ComplexNDArray, complex_array_value);
+ 		}
+ 	    }
+-
+-	  if (i == n_args)
+-	    retval = Matrix ();
++	  else if (result_type == "char")
++	    {
++	      char type = all_dq_strings_p ? '"' : '\'';
++
++	      maybe_warn_string_concat (all_dq_strings_p, all_sq_strings_p);
++
++	      charNDArray result (dv, Vstring_fill_char);
++
++	      SINGLE_TYPE_CONCAT (charNDArray, char_array_value);
++
++	      retval = octave_value (result, true, type);
++	    }
++	  else if (result_type == "logical")
++	    {
++	      if (any_sparse_p)
++		DO_SINGLE_TYPE_CONCAT (SparseBoolMatrix, sparse_bool_matrix_value);
++	      else
++		DO_SINGLE_TYPE_CONCAT (boolNDArray, bool_array_value);
++	    }
++	  else if (result_type == "int8")
++	    DO_SINGLE_TYPE_CONCAT (int8NDArray, int8_array_value);
++	  else if (result_type == "int16")
++	    DO_SINGLE_TYPE_CONCAT (int16NDArray, int16_array_value);
++	  else if (result_type == "int32")
++	    DO_SINGLE_TYPE_CONCAT (int32NDArray, int32_array_value);
++	  else if (result_type == "int64")
++	    DO_SINGLE_TYPE_CONCAT (int64NDArray, int64_array_value);
++	  else if (result_type == "uint8")
++	    DO_SINGLE_TYPE_CONCAT (uint8NDArray, uint8_array_value);
++	  else if (result_type == "uint16")
++	    DO_SINGLE_TYPE_CONCAT (uint16NDArray, uint16_array_value);
++	  else if (result_type == "uint32")
++	    DO_SINGLE_TYPE_CONCAT (uint32NDArray, uint32_array_value);
++	  else if (result_type == "uint64")
++	    DO_SINGLE_TYPE_CONCAT (uint64NDArray, uint64_array_value);
+ 	  else
+ 	    {
+-	      tmp = tmp.resize (dim_vector (0,0)).resize (dv);
+-
+-	      if (error_state)
+-		return retval;
+-
+-	      int dv_len = dv.length ();
+-	      Array<octave_idx_type> ra_idx (dv_len, 0);
+-
+-	      for (int j = i; j < n_args; j++)
++	      // The lines below might seem crazy, since we take a copy
++	      // of the first argument, resize it to be empty and then resize
++	      // it to be full. This is done since it means that there is no
++	      // recopying of data, as would happen if we used a single resize.
++	      // It should be noted that resize operation is also significantly 
++	      // slower than the do_cat_op function, so it makes sense to have
++	      // an empty matrix and copy all data.
++	      //
++	      // We might also start with a empty octave_value using
++	      //   tmp = octave_value_typeinfo::lookup_type 
++	      //                                (args(1).type_name());
++	      // and then directly resize. However, for some types there might
++	      // be some additional setup needed, and so this should be avoided.
++
++	      octave_value tmp;
++
++	      int i;
++	      for (i = 1; i < n_args; i++)
+ 		{
+-		  if (args (j). dims (). any_zero ())
+-		    continue;
+-
+-		  tmp = do_cat_op (tmp, args (j), ra_idx);
++		  if (! args (i).all_zero_dims ())
++		    {
++		      tmp = args (i);
++		      break;
++		    }
++		}
++
++	      if (i == n_args)
++		retval = Matrix ();
++	      else
++		{
++		  tmp = tmp.resize (dim_vector (0,0)).resize (dv);
+ 
+ 		  if (error_state)
+ 		    return retval;
+ 
+-		  dim_vector dv_tmp = args (j).dims ();
+-
+-		  if (dim >= dv_len)
++		  int dv_len = dv.length ();
++		  Array<octave_idx_type> ra_idx (dv_len, 0);
++
++		  for (int j = i; j < n_args; j++)
+ 		    {
+-		      if (j > i)
+-			error ("%s: indexing error", fname.c_str ());
+-		      break;
++		      if (args (j). dims (). any_zero ())
++			continue;
++
++		      tmp = do_cat_op (tmp, args (j), ra_idx);
++
++		      if (error_state)
++			return retval;
++
++		      dim_vector dv_tmp = args (j).dims ();
++
++		      if (dim >= dv_len)
++			{
++			  if (j > i)
++			    error ("%s: indexing error", fname.c_str ());
++			  break;
++			}
++		      else
++			ra_idx (dim) += (dim < dv_tmp.length () ? 
++					 dv_tmp (dim) : 1);
+ 		    }
+-		  else
+-		    ra_idx (dim) += (dim < dv_tmp.length () ? 
+-				     dv_tmp (dim) : 1);
++
++		  retval = tmp;
+ 		}
+-
+-	      retval = tmp;
++	    }
++	  if (! error_state)
++	    {
++	      // Reshape, chopping trailing singleton dimensions
++	      dv.chop_trailing_singletons ();
++	      retval = retval.reshape (dv);
+ 	    }
+ 	}
+       else
+ 	error ("%s: invalid dimension argument", fname.c_str ());
+     }
+   else
+     print_usage ();
+  
+diff --git a/src/pt-mat.cc b/src/pt-mat.cc
+--- a/src/pt-mat.cc
++++ b/src/pt-mat.cc
+@@ -179,17 +179,17 @@ public:
+   iterator end (void) { return rep->end (); }
+   const_iterator end (void) const { return rep->end (); }
+ 
+ private:
+ 
+   tm_row_const_rep *rep;
+ };
+ 
+-static std::string
++std::string
+ get_concat_class (const std::string& c1, const std::string& c2)
+ {
+   std::string retval = octave_base_value::static_class_name ();
+ 
+   if (c1 == c2)
+     retval = c1;
+   else
+     {
+@@ -694,17 +694,17 @@ tree_matrix::rvalue (int nargout)
+   if (nargout > 1)
+     error ("invalid number of output arguments for matrix list");
+   else
+     retval = rvalue ();
+ 
+   return retval;
+ }
+ 
+-static void
++void
+ maybe_warn_string_concat (bool all_dq_strings_p, bool all_sq_strings_p)
+ {
+   if (! (all_dq_strings_p || all_sq_strings_p))
+     warning_with_id ("Octave:string-concat",
+ 		     "concatenation of different character string types may have unintended consequences");
+ }
+ 
+ #define SINGLE_TYPE_CONCAT(TYPE, EXTRACTOR) \
+diff --git a/src/pt-mat.h b/src/pt-mat.h
+--- a/src/pt-mat.h
++++ b/src/pt-mat.h
+@@ -74,15 +74,21 @@ private:
+   tree_matrix (const tree_matrix&);
+ 
+   tree_matrix& operator = (const tree_matrix&);
+ };
+ 
+ // The character to fill with when creating string arrays.
+ extern char Vstring_fill_char;
+ 
++extern std::string 
++get_concat_class (const std::string& c1, const std::string& c2);
++
++extern void
++maybe_warn_string_concat (bool all_dq_strings_p, bool all_sq_strings_p);
++
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */

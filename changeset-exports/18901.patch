@@ -1,0 +1,705 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1403348877 -7200
+#      Sat Jun 21 13:07:57 2014 +0200
+# Node ID df972b9d080aac5ae7b8637c1d81321b0a15f000
+# Parent  49961d67e4b950db36efaf5609de57ede59f142e
+Translate patch property listeners to C++ (bug #42159)
+
+* graphics.in.h (patch::properties::bad_data_msg): new private attribute to store the updaters warnings
+* graphics.in.h (patch::properties::has_bad_data(std::string &msg)): new public method
+* graphics.in.h (patch::properties::x/ydata): change default values to be consistent with default faces/vertices
+* graphics.in.h (patch::properties::faces/vertives/facevertexcdata): add updaters
+* graphics.in.h (patch::properties::update_fvc/update_data): declare new methods
+* graphics.in.h (patch::properties::update_x/y/z/cdata): use new update_fvc method
+* graphics.in.h (patch::properties::update_faces/vertices/facevertexcdata): use new update_data method
+* gl-render.cc (opengl_renderer::draw_patch): do not render if the patch has incorrect data
+* graphics.cc (default_patch_x/ydata (void)): new functions
+* graphics.cc (patch::properties::update_data/fvc): new methods, translated from former setvertexdata and setdata (__patch__.m) except "facecolor" is not updated  (matlab compatibility). When incoherent data are found, a warning message is stored in bad_data_msg.
+* graphics.cc: new static variable updating_patch_data to prevent recurrent calls to update_data and update_fvc
+* __patch__.m: remove listeners
+* patch.m: small correction in a demo to take into account the fact "facecolor" is no more updated
+
+diff --git a/libinterp/corefcn/gl-render.cc b/libinterp/corefcn/gl-render.cc
+--- a/libinterp/corefcn/gl-render.cc
++++ b/libinterp/corefcn/gl-render.cc
+@@ -2203,16 +2203,24 @@ opengl_renderer::draw_surface (const sur
+     }
+ }
+ 
+ // FIXME: global optimization (rendering, data structures...),
+ // there is probably a smarter/faster/less-memory-consuming way to do this.
+ void
+ opengl_renderer::draw_patch (const patch::properties &props)
+ {
++  // Do not render if the patch has incoherent data
++  std::string msg;
++  if (props.has_bad_data (msg))
++    {
++      warning ("opengl_renderer: %s. Not rendering.", msg.c_str ());
++      return;
++    }
++
+   const Matrix f = props.get_faces ().matrix_value ();
+   const Matrix v = xform.scale (props.get_vertices ().matrix_value ());
+   Matrix c;
+   const Matrix n = props.get_vertexnormals ().matrix_value ();
+   Matrix a;
+ 
+   int nv = v.rows ();
+   int nf = f.rows ();
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -322,16 +322,32 @@ default_patch_vertices (void)
+   Matrix m (3, 2, 0);
+   m(1) = 1.0;
+   m(3) = 1.0;
+   m(4) = 1.0;
+   return m;
+ }
+ 
+ static Matrix
++default_patch_xdata (void)
++{
++  Matrix m (3, 1, 0);
++  m(1) = 1.0;
++  return m;
++}
++
++static Matrix
++default_patch_ydata (void)
++{
++  Matrix m (3, 1, 1);
++  m(2) = 0;
++  return m;
++}
++
++static Matrix
+ default_axes_position (void)
+ {
+   Matrix m (1, 4, 0.0);
+   m(0) = 0.13;
+   m(1) = 0.11;
+   m(2) = 0.775;
+   m(3) = 0.815;
+   return m;
+@@ -7822,16 +7838,205 @@ patch::properties::get_color_data (void)
+ {
+   octave_value fvc = get_facevertexcdata ();
+   if (fvc.is_undefined () || fvc.is_empty ())
+     return Matrix ();
+   else
+     return convert_cdata (*this, fvc,cdatamapping_is ("scaled"), 2);
+ }
+ 
++static bool updating_patch_data = false;
++
++void
++patch::properties::update_fvc (void)
++{
++  if (updating_patch_data)
++    return;
++
++  Matrix xd = get_xdata ().matrix_value ();
++  Matrix yd = get_ydata ().matrix_value ();
++  Matrix zd = get_zdata ().matrix_value ();
++  NDArray cd = get_cdata ().array_value ();
++
++  bad_data_msg = std::string ();
++  if (xd.dims () != yd.dims () || 
++      (xd.dims () != zd.dims () && ! zd.is_empty ()))
++    {
++      bad_data_msg = "x/y/zdata should have the same dimensions";
++      return;
++    }
++
++  // Faces and Vertices
++  dim_vector dv;
++  bool is3D = false;
++  octave_idx_type nr = xd.rows ();
++  octave_idx_type nc = xd.columns ();
++  if (nr == 1 && nc > 1)
++    {
++      nr = nc;
++      nc = 1;
++      xd = xd.transpose ();
++    }
++
++  dv(0) = nr * nc;
++  if (zd.is_empty ())
++    dv(1) = 2;
++  else
++    {
++      dv(1) = 3;
++      is3D = true;
++    }
++
++  Matrix vert (dv);
++  Matrix idx (nc, nr);
++
++  octave_idx_type kk = 0;
++  for (octave_idx_type jj = 0; jj < nc; jj++)
++    {
++      for (octave_idx_type ii = 0; ii < nr; ii++)
++        {
++          vert(kk,0) = xd(ii,jj);
++          vert(kk,1) = yd(ii,jj);
++          if (is3D)
++            vert(kk,2) = zd(ii,jj);
++
++          idx(jj,ii) = static_cast<double> (kk+1);
++
++          kk++;
++        }
++    }
++
++  // facevertexcdata
++  Matrix fvc;
++  if (cd.ndims () == 3)
++    {
++      dv(0) = cd.rows () * cd.columns ();
++      dv(1) = cd.dims ()(2);
++      fvc = cd.reshape (dv);
++    }
++  else
++    fvc = cd.as_column ();
++
++  // FIXME: shouldn't we update facevertexalphadata here ?
++
++  unwind_protect frame;
++  frame.protect_var (updating_patch_data);
++  updating_patch_data = true;
++
++  faces.set (idx);
++  vertices.set (vert);
++  facevertexcdata.set (fvc);
++}
++
++
++void
++patch::properties::update_data (void)
++{
++  if (updating_patch_data)
++    return;
++
++  Matrix idx = get_faces ().matrix_value ().transpose ();
++  Matrix vert = get_vertices ().matrix_value ();
++  NDArray fvc = get_facevertexcdata ().array_value ();
++
++  octave_idx_type nfaces = idx.columns ();
++  octave_idx_type nvert = vert.rows ();
++
++  // Check all vertices in faces are defined
++  bad_data_msg = std::string ();
++  if (static_cast<double> (nvert) < idx.row_max ().max ())
++    {
++      bad_data_msg = "some vertices in \"faces\" property are undefined";
++      return;
++    }
++
++  // Replace NaNs
++  if (idx.any_element_is_inf_or_nan ())
++    {
++      for (octave_idx_type jj = 0; jj < idx.columns (); jj++)
++        {
++          double valid_vert = idx(0,jj);
++          bool turn_valid = false;
++          for (octave_idx_type ii = 0; ii < idx.rows (); ii++)
++            {
++              if (xisnan (idx(ii,jj)) || turn_valid)
++                {
++                  idx(ii,jj) = valid_vert;
++                  turn_valid = true;
++                }
++              else
++                valid_vert = idx(ii,jj);
++            }
++        }
++    }
++  
++  // Build cdata
++  dim_vector dv = dim_vector::alloc (3);
++  NDArray cd;
++  bool pervertex = false;
++
++  if (fvc.rows () == nfaces || fvc.rows () == 1)
++    {
++      dv(0) = 1;
++      dv(1) = fvc.rows ();
++      dv(2) = fvc.columns ();
++      cd = fvc.reshape (dv);
++    }
++  else 
++    {
++      if (! fvc.is_empty ())
++        {
++          dv(0) = idx.rows ();
++          dv(1) = nfaces;
++          dv(2) = fvc.columns ();
++          cd.resize (dv);
++          pervertex = true;
++        }
++    }
++
++  // Build x,y,zdata and eventually per vertex cdata 
++  Matrix xd (idx.dims ()); 
++  Matrix yd (idx.dims ());
++  Matrix zd;
++  bool has_zd = false;
++  if (vert.columns () > 2)
++    {
++      zd = Matrix (idx.dims ());
++      has_zd = true;
++    }
++
++  
++  for (octave_idx_type jj = 0; jj < nfaces; jj++)
++    {
++      for (octave_idx_type ii = 0; ii < idx.rows (); ii++)
++        {
++          octave_idx_type row = static_cast<octave_idx_type> (idx(ii,jj)-1);
++          xd(ii,jj) = vert(row,0);
++          yd(ii,jj) = vert(row,1);
++
++          if (has_zd)
++            zd(ii,jj) = vert(row,2);
++          
++          if (pervertex)
++            for (int kk = 0; kk < fvc.columns (); kk++)
++              cd(ii,jj,kk) = fvc(row,kk);
++        }
++    }
++
++
++  unwind_protect frame;
++  frame.protect_var (updating_patch_data);
++  updating_patch_data = true;
++
++  set_xdata (xd);
++  set_ydata (yd);
++  set_zdata (zd);
++  set_cdata (cd);
++}
++
+ // ---------------------------------------------------------------------
+ 
+ octave_value
+ surface::properties::get_color_data (void) const
+ {
+   return convert_cdata (*this, get_cdata (), cdatamapping_is ("scaled"), 3);
+ }
+ 
+diff --git a/libinterp/corefcn/graphics.in.h b/libinterp/corefcn/graphics.in.h
+--- a/libinterp/corefcn/graphics.in.h
++++ b/libinterp/corefcn/graphics.in.h
+@@ -4684,16 +4684,24 @@ public:
+ class OCTINTERP_API patch : public base_graphics_object
+ {
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     octave_value get_color_data (void) const;
+ 
++    // Matlab allows incoherent data to be stored into patch properties.
++    // The patch should then be ignored by the renderer. 
++    bool has_bad_data (std::string &msg) const 
++      { 
++        msg = bad_data_msg;
++        return ! msg.empty ();
++      }
++
+     bool is_aliminclude (void) const
+     { return (aliminclude.is_on () && alphadatamapping.is ("scaled")); }
+     std::string get_aliminclude (void) const
+     { return aliminclude.current_value (); }
+ 
+     bool is_climinclude (void) const
+     { return (climinclude.is_on () && cdatamapping.is ("scaled")); }
+     std::string get_climinclude (void) const
+@@ -4713,36 +4721,36 @@ public:
+       string_property displayname , ""
+       double_radio_property edgealpha , double_radio_property (1.0, radio_values ("flat|interp"))
+       color_property edgecolor , color_property (color_values (0, 0, 0), radio_values ("none|flat|interp"))
+       radio_property edgelighting , "{none}|flat|gouraud|phong"
+       radio_property erasemode , "{normal}|background|xor|none"
+       double_radio_property facealpha , double_radio_property (1.0, radio_values ("flat|interp"))
+       color_property facecolor , color_property (color_values (0, 0, 0), radio_values ("none|flat|interp"))
+       radio_property facelighting , "{none}|flat|gouraud|phong"
+-      array_property faces , default_patch_faces ()
++      array_property faces u , default_patch_faces ()
+       array_property facevertexalphadata , Matrix ()
+-      array_property facevertexcdata , Matrix ()
++      array_property facevertexcdata u , Matrix ()
+       // FIXME: interpreter is not a property of a Matlab patch.
+       //        Octave uses this for legend() with the string displayname.
+       radio_property interpreter , "{tex}|none|latex"
+       radio_property linestyle , "{-}|--|:|-.|none"
+       double_property linewidth , 0.5
+       radio_property marker , "{none}|+|o|*|.|x|s|square|d|diamond|^|v|>|<|p|pentagram|h|hexagram"
+       color_property markeredgecolor , color_property (radio_values ("none|{auto}|flat"), color_values (0, 0, 0))
+       color_property markerfacecolor , color_property (radio_values ("{none}|auto|flat"), color_values (0, 0, 0))
+       double_property markersize , 6
+       radio_property normalmode , "{auto}|manual"
+       double_property specularcolorreflectance , 1.0
+       double_property specularexponent , 10.0
+       double_property specularstrength , 0.9
+       array_property vertexnormals , Matrix ()
+-      array_property vertices , default_patch_vertices ()
+-      array_property xdata u , Matrix ()
+-      array_property ydata u , Matrix ()
++      array_property vertices u , default_patch_vertices ()
++      array_property xdata u , default_patch_xdata ()
++      array_property ydata u , default_patch_ydata ()
+       array_property zdata u , Matrix ()
+ 
+       // hidden properties for limit computation
+       row_vector_property alim hlr , Matrix ()
+       row_vector_property clim hlr , Matrix ()
+       row_vector_property xlim hlr , Matrix ()
+       row_vector_property ylim hlr , Matrix ()
+       row_vector_property zlim hlr , Matrix ()
+@@ -4766,27 +4774,77 @@ public:
+       cdata.add_constraint (dim_vector (-1, -1, 3));
+       facevertexcdata.add_constraint (dim_vector (-1, 1));
+       facevertexcdata.add_constraint (dim_vector (-1, 3));
+       facevertexalphadata.add_constraint (dim_vector (-1, 1));
+       vertexnormals.add_constraint (dim_vector (-1, -1));
+     }
+ 
+   private:
+-    void update_xdata (void) { set_xlim (xdata.get_limits ()); }
+-    void update_ydata (void) { set_ylim (ydata.get_limits ()); }
+-    void update_zdata (void) { set_zlim (zdata.get_limits ()); }
++    std::string bad_data_msg;
++
++    void update_faces (void) { update_data ();}
++
++    void update_vertices (void)  {  update_data ();}
++
++    void update_facevertexcdata (void) { update_data ();}
++
++    void update_fvc (void);
++
++    void update_xdata (void) 
++    { 
++      if (get_xdata ().is_empty ())
++        {
++          // For compatibility with matlab behavior, 
++          // if x/ydata are set empty, silently empty other *data and 
++          // faces properties while vertices remain unchanged. 
++          set_ydata (Matrix ());
++          set_zdata (Matrix ());
++          set_cdata (Matrix ());
++          set_faces (Matrix ());
++        }
++      else
++        update_fvc ();
++
++      set_xlim (xdata.get_limits ());
++    }
++
++    void update_ydata (void) 
++    { 
++      if (get_ydata ().is_empty ())
++        {
++          set_xdata (Matrix ());
++          set_zdata (Matrix ());
++          set_cdata (Matrix ());
++          set_faces (Matrix ());
++        }
++      else
++        update_fvc ();
++
++      set_ylim (ydata.get_limits ());
++    }
++
++    void update_zdata (void) 
++    { 
++      update_fvc ();
++      set_zlim (zdata.get_limits ());
++    }
+ 
+     void update_cdata (void)
+     {
++      update_fvc ();
++
+       if (cdatamapping_is ("scaled"))
+         set_clim (cdata.get_limits ());
+       else
+         clim = cdata.get_limits ();
+     }
++
++
++    void update_data (void);
+   };
+ 
+ private:
+   properties xproperties;
+ 
+ public:
+   patch (const graphics_handle& mh, const graphics_handle& p)
+     : base_graphics_object (), xproperties (mh, p)
+diff --git a/scripts/plot/draw/patch.m b/scripts/plot/draw/patch.m
+--- a/scripts/plot/draw/patch.m
++++ b/scripts/plot/draw/patch.m
+@@ -147,17 +147,18 @@ endfunction
+ %! t1 = (1/16:1/8:1)' * 2*pi;
+ %! t2 = ((1/16:1/16:1)' + 1/32) * 2*pi;
+ %! x1 = sin (t1) - 0.8;
+ %! y1 = cos (t1);
+ %! x2 = sin (t2) + 0.8;
+ %! y2 = cos (t2);
+ %! vert = [x1, y1; x2, y2];
+ %! fac = [1:8,NaN(1,8);9:24];
+-%! patch ('Faces',fac, 'Vertices',vert, 'FaceVertexCData',[0, 1, 0; 0, 0, 1]);
++%! patch ('Faces',fac, 'Vertices',vert, ...
++%!        'FaceVertexCData',[0, 1, 0; 0, 0, 1], 'FaceColor', 'flat');
+ 
+ %!demo
+ %! %% Property change on multiple patches
+ %! clf;
+ %! t1 = (1/16:1/8:1)' * 2*pi;
+ %! t2 = ((1/16:1/8:1)' + 1/32) * 2*pi;
+ %! x1 = sin (t1) - 0.8;
+ %! y1 = cos (t1);
+diff --git a/scripts/plot/draw/private/__patch__.m b/scripts/plot/draw/private/__patch__.m
+--- a/scripts/plot/draw/private/__patch__.m
++++ b/scripts/plot/draw/private/__patch__.m
+@@ -30,40 +30,37 @@
+ function [h, failed] = __patch__ (p, varargin)
+ 
+   h = NaN;
+   failed = false;
+ 
+   is_numeric_arg = cellfun (@isnumeric, varargin);
+ 
+   if (isempty (varargin))
+-    args = {"xdata", [0; 1; 0], "ydata", [1; 1; 0], "facecolor", [0, 0, 0]};
+-    args = setvertexdata (args);
++    args = varargin;
+   elseif (isstruct (varargin{1}))
+     if (isfield (varargin{1}, "vertices") && isfield (varargin{1}, "faces"))
+       args{1} = "faces";
+       args{2} = getfield (varargin{1}, "faces");
+       args{3} = "vertices";
+       args{4} = getfield (varargin{1}, "vertices");
+       args{5} = "facevertexcdata";
+       if (isfield (varargin{1}, "facevertexcdata"))
+         args{6} = getfield (varargin{1}, "facevertexcdata");
+       else
+         args{6} = [];
+       endif
+       args = [args; varargin(2:end)];
+-      args = setdata (args);
+     else
+       failed = true;
+     endif
+   elseif (is_numeric_arg(1))
+     if (nargin < 3 || ! is_numeric_arg(2))
+       failed = true;
+     else
+-
+       if (nargin > 4 && all (is_numeric_arg(1:4)))
+         x = varargin{1};
+         y = varargin{2};
+         z = varargin{3};
+         c = varargin{4};
+         iarg = 5;
+       elseif (nargin > 3 && all (is_numeric_arg(1:3)))
+         x = varargin{1};
+@@ -177,193 +174,17 @@ function [h, failed] = __patch__ (p, var
+       else
+         args{7} = "facecolor";
+         args{8} = [0, 0, 0];
+         args{9} = "cdata";
+         args{10} = [];
+       endif
+ 
+       args = [args, varargin(iarg:end)];
+-      args = setvertexdata (args);
+     endif
+   else
+     args = varargin;
+-    if (any (strcmpi (args, "faces") | strcmpi (args, "vertices")))
+-      args = setdata (args);
+-    else
+-      args = setvertexdata (args);
+-    endif
+   endif
+ 
+   if (!failed)
+     h = __go_patch__ (p, args{:});
+-
+-    ## Setup listener functions
+-    addlistener (h, "xdata", @update_data);
+-    addlistener (h, "ydata", @update_data);
+-    addlistener (h, "zdata", @update_data);
+-    addlistener (h, "cdata", @update_data);
+-
+-    addlistener (h, "faces", @update_fvc);
+-    addlistener (h, "vertices", @update_fvc);
+-    addlistener (h, "facevertexcdata", @update_fvc);
+   endif
+ endfunction
+-
+-function args = delfields (args, flds)
+-  idx = cellfun ("isclass", args, "char");
+-  idx(idx) = ismember (args(idx), flds);
+-  if (rows (idx) == 1)
+-    idx |= [false, idx(1:end-1)];
+-  else
+-    idx |= [false; idx(1:end-1)];
+-  endif
+-  args(idx) = [];
+-endfunction
+-
+-function args = setdata (args)
+-  args = delfields (args, {"xdata", "ydata", "zdata", "cdata"});
+-  ## Remove the readonly fields as well
+-  args = delfields (args, {"type", "uicontextmenu"});
+-  nargs = length (args);
+-  idx = find (strcmpi (args, "faces"), 1, "last") + 1;
+-  if (idx > nargs)
+-    faces = [];
+-  else
+-    faces = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "vertices"), 1, "last") + 1;
+-  if (idx > nargs)
+-    vert = [];
+-  else
+-    vert = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "facevertexcdata"), 1, "last") + 1;
+-  if (isempty (idx) || idx > nargs)
+-    fvc = [];
+-  else
+-    fvc = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "facecolor"), 1, "last") + 1;
+-  if (isempty (idx) || idx > nargs)
+-    if (!isempty (fvc))
+-      fc = "flat";
+-    else
+-      fc = [0, 0, 0];
+-    endif
+-    args = {"facecolor", fc, args{:}};
+-  endif
+-
+-  nc = rows (faces);
+-  idx = faces.';
+-  t1 = isnan (idx);
+-  for i = find (any (t1))
+-    first_idx_in_column = find (t1(:,i), 1);
+-    idx(first_idx_in_column:end,i) = idx(first_idx_in_column-1,i);
+-  endfor
+-  x = reshape (vert(:,1)(idx), size (idx));
+-  y = reshape (vert(:,2)(idx), size (idx));
+-  if (columns (vert) > 2)
+-    z = reshape (vert(:,3)(idx), size (idx));
+-  else
+-    z = [];
+-  endif
+-
+-  if (rows (fvc) == nc || rows (fvc) == 1)
+-    c = reshape (fvc, [1, size(fvc)]);
+-  else
+-    if (columns (fvc) == 3)
+-      c = cat (3, reshape (fvc(idx, 1), size (idx)),
+-                  reshape (fvc(idx, 2), size (idx)),
+-                  reshape (fvc(idx, 3), size (idx)));
+-    elseif (isempty (fvc))
+-      c = [];
+-    else  ## if (columnns (fvc) == 1)
+-      c = permute (fvc(faces), [2, 1]);
+-    endif
+-  endif
+-  args = {"xdata", x, "ydata", y, "zdata", z, "cdata", c, args{:}};
+-endfunction
+-
+-function args = setvertexdata (args)
+-  args = delfields (args, {"vertices", "faces", "facevertexcdata"});
+-  ## Remove the readonly fields as well
+-  args = delfields (args, {"type", "uicontextmenu"});
+-  nargs = length (args);
+-  idx = find (strcmpi (args, "xdata"), 1, "last") + 1;
+-  if (idx > nargs)
+-    x = [];
+-  else
+-    x = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "ydata"), 1, "last") + 1;
+-  if (idx > nargs)
+-    y = [];
+-  else
+-    y = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "zdata"), 1, "last") + 1;
+-  if (isempty (idx) || idx > nargs)
+-    z = [];
+-  else
+-    z = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "cdata"), 1, "last") + 1;
+-  if (isempty (idx) || idx > nargs)
+-    c = [];
+-  else
+-    c = args{idx};
+-  endif
+-  idx = find (strcmpi (args, "facecolor"), 1, "last") + 1;
+-  if (isempty (idx) || idx > nargs)
+-    if (!isempty (c))
+-      fc = "flat";
+-    else
+-      fc = [0, 0, 0];
+-    endif
+-    args = {"facecolor", fc, args{:}};
+-  endif
+-
+-  [nr, nc] = size (x);
+-  if (nr == 1 && nc > 1)
+-    nr = nc;
+-    nc = 1;
+-  endif
+-  if (isempty (z))
+-    vert = [x(:), y(:)];
+-  else
+-    vert = [x(:), y(:), z(:)];
+-  endif
+-  faces = reshape (1:numel (x), nr, nc);
+-  faces = faces.';
+-
+-  if (ndims (c) == 3)
+-    fvc = reshape (c, rows (c) * columns (c), size (c, 3));
+-  else
+-    fvc = c(:);
+-  endif
+-
+-  args = {"faces", faces, "vertices", vert, "facevertexcdata", fvc, args{:}};
+-endfunction
+-
+-function update_data (h, d)
+-  update_handle (h, false);
+-endfunction
+-
+-function update_fvc (h, d)
+-  update_handle (h, true);
+-endfunction
+-
+-function update_handle (h, isfv)
+-  persistent recursive = false;
+-
+-  if (! recursive)
+-    recursive = true;
+-    f = get (h);
+-    if (isfv)
+-      set (h, setdata ([fieldnames(f), struct2cell(f)].'(:)){:});
+-    else
+-      set (h, setvertexdata ([fieldnames(f), struct2cell(f)].'(:)){:});
+-    endif
+-    recursive = false;
+-  endif
+-endfunction
+-

@@ -1,0 +1,326 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1529954905 14400
+#      Mon Jun 25 15:28:25 2018 -0400
+# Node ID 18f5f91f734898cf1be5cfd8b41ccbd9d5db90d4
+# Parent  01eb7f87eecd0803d2fa642fccb878bb5ac7ef81
+mkoctfile: use tmp store tmp .o files in tmp directory (bug #54182)
+
+* mkoctfile.in.cc (octave_mkostemps_wrapper): New function for cross
+compiled mkoctfile.
+(do_getenv, get_temp_directory, tmp_objfile_name): New functions.
+(main): New variable, tmp_objfiles.  Use tmp_objfile_name to generate
+temporary object file names.  Track them separately and remove them
+before exiting.
+
+diff --git a/src/mkoctfile.in.cc b/src/mkoctfile.in.cc
+--- a/src/mkoctfile.in.cc
++++ b/src/mkoctfile.in.cc
+@@ -34,22 +34,24 @@ along with Octave; see the file COPYING.
+ #include <fstream>
+ #include <sstream>
+ #include <vector>
+ #include <cstdlib>
+ 
+ #if defined (CROSS)
+ #  include <sys/types.h>
+ #  include <sys/wait.h>
++#  include <stdlib.h>
+ #  include <unistd.h>
+ 
+ #  ifndef OCTAVE_UNUSED
+ #    define OCTAVE_UNUSED
+ #  endif
+ #else
++#  include "mkostemps-wrapper.h"
+ #  include "unistd-wrappers.h"
+ #  include "wait-wrappers.h"
+ #endif
+ 
+ static std::map<std::string, std::string> vars;
+ 
+ #if ! defined (OCTAVE_VERSION)
+ #  define OCTAVE_VERSION %OCTAVE_CONF_VERSION%
+@@ -63,16 +65,22 @@ static std::map<std::string, std::string
+ #  define OCTAVE_EXEC_PREFIX %OCTAVE_CONF_EXEC_PREFIX%
+ #endif
+ 
+ #include "shared-fcns.h"
+ 
+ #if defined (CROSS)
+ 
+ static int
++octave_mkostemps_wrapper (char *tmpl, int suffixlen)
++{
++  return mkostemps (tmpl, suffixlen, O_BINARY);
++}
++
++static int
+ octave_unlink_wrapper (const char *nm)
+ {
+   return unlink (nm);
+ }
+ 
+ static bool
+ octave_wifexited_wrapper (int status)
+ {
+@@ -454,16 +462,88 @@ run_command (const std::string& cmd, boo
+ }
+ 
+ bool
+ is_true (const std::string& s)
+ {
+   return (s == "yes" || s == "true");
+ }
+ 
++static std::string
++do_getenv (const std::string& name)
++{
++  char *value = ::getenv (name.c_str ());
++
++  return value ? value : "";
++}
++
++static std::string
++get_temp_directory (void)
++{
++  std::string tempd;
++
++#if defined (__MINGW32__) || defined (_MSC_VER)
++
++  tempd = do_getenv ("TEMP");
++
++  if (tempd.empty ())
++    tempd = do_getenv ("TMP");
++
++#if defined (P_tmpdir)
++  if (tempd.empty ())
++    tempd = P_tmpdir;
++#endif
++
++  // Some versions of MinGW and MSVC either don't define P_tmpdir, or
++  // define it to a single backslash.  In such cases just use C:\temp.
++  if (tempd.empty () || tempd == R"(\)")
++    tempd = R"(c:\temp)";
++
++#else
++
++  tempd = do_getenv ("TMP");
++
++#if defined (P_tmpdir)
++  if (tempd.empty ())
++    tempd = P_tmpdir;
++#else
++  if (tempd.empty ())
++    tempd = "/tmp";
++#endif
++
++#endif
++
++  return tempd;
++}
++
++static std::string
++tmp_objfile_name (void)
++{
++  std::string tmpl = get_temp_directory () + "/oct-XXXXXX.o";
++
++  char *ctmpl = new char [tmpl.length () + 1];
++
++  ctmpl = strcpy (ctmpl, tmpl.c_str ());
++
++  // mkostemps will open the file and return a file descriptor.  We
++  // won't worry about closing it because we will need the file until we
++  // are done and then the file will be closed when mkoctfile exits.
++
++  octave_mkostemps_wrapper (ctmpl, 2);
++
++  return std::string (ctmpl);
++}
++
++static void
++clean_up_tmp_files (const std::list<std::string>& tmp_files)
++{
++  for (const auto& file : tmp_files)
++    octave_unlink_wrapper (file.c_str ());
++}
++
+ int
+ main (int argc, char **argv)
+ {
+   initialize ();
+ 
+   if (argc == 1)
+     {
+       std::cout << usage_msg << std::endl;
+@@ -473,17 +553,17 @@ main (int argc, char **argv)
+   if (argc == 2 && (! strcmp (argv[1], "-v")
+                     || ! strcmp (argv[1], "-version")
+                     || ! strcmp (argv[1], "--version")))
+     {
+       std::cout << version_msg << std::endl;
+       return 0;
+     }
+ 
+-  std::list<std::string> cfiles, ccfiles, f77files;
++  std::list<std::string> cfiles, ccfiles, f77files, tmp_objfiles;
+   std::string output_ext = ".oct";
+   std::string objfiles, libfiles, octfile, outputfile;
+   std::string incflags, defs, ldflags, pass_on_options;
+   bool strip = false;
+   bool no_oct_file_strip_on_this_platform = is_true ("%NO_OCT_FILE_STRIP%");
+   bool compile_only = false;
+   bool link_stand_alone = false;
+   bool depend = false;
+@@ -779,32 +859,34 @@ main (int argc, char **argv)
+ 
+       return 0;
+     }
+ 
+   for (const auto& f : f77files)
+     {
+       if (! vars["F77"].empty ())
+         {
+-          std::string b = basename (f, true);
+           std::string o;
+           if (compile_only)
+             {
+               // There will be only one source file, so we are done
+               // after executing the command below and we don't need to
+               // keep track of the object file name.
+ 
+               if (! outputfile.empty ())
+                 o = outputfile;
+               else
+-                o = b + ".o";
++                o = basename (f, true) + ".o";
+             }
+           else
+             {
+-              o = b + ".o";
++              o = tmp_objfile_name ();
++
++              tmp_objfiles.push_back (o);
++
+               objfiles += (' ' + o);
+             }
+ 
+           std::string cmd
+             = (vars["F77"] + " -c " + vars["FPICFLAG"] + ' '
+                + vars["ALL_FFLAGS"] + ' ' + incflags + ' ' + defs + ' '
+                + pass_on_options + ' ' + f + " -o " + o);
+ 
+@@ -820,32 +902,34 @@ main (int argc, char **argv)
+           return 1;
+         }
+     }
+ 
+   for (const auto& f : cfiles)
+     {
+       if (! vars["CC"].empty ())
+         {
+-          std::string b = basename (f, true);
+           std::string o;
+           if (compile_only)
+             {
+               // There will be only one source file, so we are done
+               // after executing the command below and we don't need to
+               // keep track of the object file name.
+ 
+               if (! outputfile.empty ())
+                 o = outputfile;
+               else
+-                o = b + ".o";
++                o = basename (f, true) + ".o";
+             }
+           else
+             {
+-              o = b + ".o";
++              o = tmp_objfile_name ();
++
++              tmp_objfiles.push_back (o);
++
+               objfiles += (' ' + o);
+             }
+ 
+           std::string cmd
+             = (vars["CC"] + " -c " + vars["CPPFLAGS"] + ' '
+                + vars["CPICFLAG"] + ' ' + vars["ALL_CFLAGS"] + ' '
+                + pass_on_options + ' ' + incflags + ' ' + defs + ' '
+                + quote_path (f) + " -o " + quote_path (o));
+@@ -862,32 +946,34 @@ main (int argc, char **argv)
+           return 1;
+         }
+     }
+ 
+   for (const auto& f : ccfiles)
+     {
+       if (! vars["CXX"].empty ())
+         {
+-          std::string b = basename (f, true);
+           std::string o;
+           if (compile_only)
+             {
+               // There will be only one source file, so we are done
+               // after executing the command below and we don't need to
+               // keep track of the object file name.
+ 
+               if (! outputfile.empty ())
+                 o = outputfile;
+               else
+-                o = b + ".o";
++                o = basename (f, true) + ".o";
+             }
+           else
+             {
+-              o = b + ".o";
++              o = tmp_objfile_name ();
++
++              tmp_objfiles.push_back (o);
++
+               objfiles += (' ' + o);
+             }
+ 
+           std::string cmd
+             = (vars["CXX"] + " -c " + vars["CPPFLAGS"] + ' '
+                + vars["CXXPICFLAG"] + ' ' + vars["ALL_CXXFLAGS"] + ' '
+                + pass_on_options + ' ' + incflags + ' ' + defs + ' '
+                + quote_path (f) + " -o " + quote_path (o));
+@@ -925,16 +1011,18 @@ main (int argc, char **argv)
+                + vars["ALL_CXXFLAGS"] + ' ' + vars["RDYNAMIC_FLAG"] + ' '
+                + vars["ALL_LDFLAGS"] + ' ' + pass_on_options + ' '
+                + output_option + ' ' + objfiles + ' ' + libfiles + ' '
+                + ldflags + ' ' + vars["LFLAGS"] + ' ' + octave_libs + ' '
+                + vars["OCTAVE_LINK_OPTS"] + ' ' + vars["OCTAVE_LINK_DEPS"]);
+ 
+           int status = run_command (cmd, printonly);
+ 
++          clean_up_tmp_files (tmp_objfiles);
++
+           if (status)
+             return status;
+         }
+       else
+         {
+           std::cerr
+             << "mkoctfile: no way to link stand-alone executable file"
+             << std::endl;
+@@ -947,16 +1035,18 @@ main (int argc, char **argv)
+         = (vars["DL_LD"] + ' ' + vars["ALL_CXXFLAGS"] + ' '
+            + vars["DL_LDFLAGS"] + ' ' + pass_on_options
+            + " -o " + octfile + ' ' + objfiles + ' ' + libfiles + ' '
+            + ldflags + ' ' + vars["LFLAGS"] + ' ' + octave_libs + ' '
+            + vars["OCT_LINK_OPTS"] + ' ' + vars["OCT_LINK_DEPS"]);
+ 
+       int status = run_command (cmd, printonly);
+ 
++      clean_up_tmp_files (tmp_objfiles);
++
+       if (status)
+         return status;
+     }
+ 
+   if (strip)
+     {
+       std::string cmd = "strip " + octfile;
+ 

@@ -1,0 +1,228 @@
+# HG changeset patch
+# User Jordi Gutiérrez Hermoso <jordigh@gmail.com>
+# Date 1313115176 18000
+#      Thu Aug 11 21:12:56 2011 -0500
+# Node ID 332a97ea63baf6d664e0e5cfefb9bfc24ba73bed
+# Parent  05941540287cf8fc1c75813f51c563a0089362be
+# Parent  5a5cb2a4b71d72156f2c1770bc33fefecf789b07
+Merge in Daniel's changes
+
+diff --git a/doc/interpreter/container.txi b/doc/interpreter/container.txi
+--- a/doc/interpreter/container.txi
++++ b/doc/interpreter/container.txi
+@@ -558,26 +558,21 @@ c@{1@}
+ 
+ @noindent
+ As with numerical arrays several elements of a cell array can be
+ extracted by indexing with a vector of indexes
+ 
+ @example
+ @group
+ c@{1:2@}
++     @result{} ans = a string
+      @result{} ans =
+           
+-          (,
+-            [1] = a string
+-            [2] =
+-          
+                0.593993   0.627732
+                0.377037   0.033643
+-          
+-          ,)
+ @end group
+ @end example
+ 
+ The indexing operators can also be used to insert or overwrite elements
+ of a cell array.  The following code inserts the scalar 3 on the
+ third place of the previously created cell array
+ 
+ @example
+diff --git a/src/DLD-FUNCTIONS/cellfun.cc b/src/DLD-FUNCTIONS/cellfun.cc
+--- a/src/DLD-FUNCTIONS/cellfun.cc
++++ b/src/DLD-FUNCTIONS/cellfun.cc
+@@ -53,16 +53,18 @@ along with Octave; see the file COPYING.
+ #include "ov-int16.h"
+ #include "ov-int32.h"
+ #include "ov-int64.h"
+ #include "ov-uint8.h"
+ #include "ov-uint16.h"
+ #include "ov-uint32.h"
+ #include "ov-uint64.h"
+ 
++#include "ov-fcn-handle.h"
++
+ static octave_value_list
+ get_output_list (octave_idx_type count, octave_idx_type nargout,
+                  const octave_value_list& inputlist,
+                  octave_value& func,
+                  octave_value& error_handler)
+ {
+   octave_value_list tmp = func.do_multi_index_op (nargout, inputlist);
+ 
+@@ -217,16 +219,17 @@ cellfun (\"factorial\", @{-1,2@}, 'Error
+   if (nargin < 2)
+     {
+       error ("cellfun: function requires at least 2 arguments");
+       print_usage ();
+       return retval;
+     }
+ 
+   octave_value func = args(0);
++  bool symbol_table_lookup = false;
+ 
+   if (! args(1).is_cell ())
+     {
+       error ("cellfun: C must be a cell array");
+ 
+       return retval;
+     }
+ 
+@@ -334,26 +337,52 @@ cellfun (\"factorial\", @{-1,2@}, 'Error
+               if (ptr_func && ! error_state)
+                 func = octave_value (ptr_func, true);
+             }
+           else
+             {
+               func = symbol_table::find_function (name);
+               if (func.is_undefined ())
+                 error ("cellfun: invalid function NAME: %s", name.c_str ());
++
++              symbol_table_lookup = true;
+             }
+         }
+     }
+ 
+   if (error_state || ! retval.empty ())
+     return retval;
+ 
+   if (func.is_function_handle () || func.is_inline_function ()
+       || func.is_function ())
+     {
++
++      // The following is an optimisation because the symbol table can
++      // give a more specific function class, so this can result in
++      // fewer polymorphic function calls as the function gets called
++      // for each value of the array.
++      if (! symbol_table_lookup )
++        {
++          if (func.is_function_handle ())
++            {
++              octave_fcn_handle* f = func.fcn_handle_value ();
++
++              // Overloaded function handles need to check the type of
++              // the arguments for each element of the array, so they
++              // cannot be optimised this way.
++              if (f -> is_overloaded ())
++                goto nevermind;
++            }
++          octave_value f = symbol_table::find_function (func.function_value ()
++                                                         -> name ());
++          if (f.is_defined ())
++            func = f;
++        }
++      nevermind:
++
+       unwind_protect frame;
+       frame.protect_var (buffer_error_messages);
+ 
+       bool uniform_output = true;
+       octave_value error_handler;
+ 
+       while (nargin > 3 && args(nargin-2).is_string())
+         {
+diff --git a/src/oct-stream.cc b/src/oct-stream.cc
+--- a/src/oct-stream.cc
++++ b/src/oct-stream.cc
+@@ -2855,48 +2855,70 @@ int
+ octave_stream::seek (long offset, int origin)
+ {
+   int status = -1;
+ 
+   if (stream_ok ())
+     {
+       clearerr ();
+ 
++      // Find current position so we can return to it if needed.
++
+       long orig_pos = rep->tell ();
+ 
+-      status = rep->seek (offset, origin);
++      // Move to end of file.  If successful, find the offset of the end.
++
++      status = rep->seek (0, SEEK_END);
+ 
+       if (status == 0)
+         {
+-          long save_pos = rep->tell ();
+-
+-          rep->seek (0, SEEK_END);
+-
+-          long pos_eof = rep->tell ();
+-
+-          // I don't think save_pos can be less than zero, but we'll
+-          // check anyway...
+-
+-          if (save_pos > pos_eof || save_pos < 0)
++          long eof_pos = rep->tell ();
++
++          if (origin == SEEK_CUR)
++            {
++              // Move back to original position, otherwise we will be
++              // seeking from the end of file which is probably not the
++              // original location.
++
++              rep->seek (orig_pos, SEEK_SET);
++            }
++
++          // Attempt to move to desired position; may be outside bounds
++          // of existing file.
++
++          status = rep->seek (offset, origin);
++
++          if (status == 0)
+             {
+-              // Seek outside bounds of file.  Failure should leave
+-              // position unchanged.
++              // Where are we after moving to desired position?
++
++              long desired_pos = rep->tell ();
++
++              // I don't think save_pos can be less than zero, but we'll
++              // check anyway...
++
++              if (desired_pos > eof_pos || desired_pos < 0)
++                {
++                  // Seek outside bounds of file.  Failure should leave
++                  // position unchanged.
++
++                  rep->seek (orig_pos, SEEK_SET);
++
++                  status = -1;
++                }
++            }
++          else
++            {
++              // Seeking to the desired position failed.  Move back to
++              // original position and return failure status.
+ 
+               rep->seek (orig_pos, SEEK_SET);
+ 
+               status = -1;
+             }
+-          else
+-            {
+-              // Is it possible for this to fail?  We are just
+-              // returning to a position after the first successful
+-              // seek.
+-
+-              rep->seek (save_pos, SEEK_SET);
+-            }
+         }
+     }
+ 
+   return status;
+ }
+ 
+ int
+ octave_stream::seek (const octave_value& tc_offset,

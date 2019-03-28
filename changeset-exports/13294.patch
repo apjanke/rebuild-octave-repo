@@ -1,0 +1,792 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1318040167 14400
+#      Fri Oct 07 22:16:07 2011 -0400
+# Node ID 7dce7e110511369316c41cfbaf56142fb5f00e50
+# Parent  007ebc128ab5ffbc7f9ba155fa2fb93088a9c8d9
+make concatenation of class objects work
+
+* data.h: New file.
+* src/Makefile.am (octinclude_HEADERS): Add it to the list.
+* data.cc (attempt_type_conversion): New static function.
+(do_class_concat): New function.
+(do_cat): Use it if any elements of the list are objects.
+Check whether any elements of the list are objects or cells.
+Check whether all elements of the list are complex.
+Check whether the first element of the list is a struct.
+Maybe convert elements of the list to cells.
+New tests for horzcat and vertcat.
+* data.h (do_class_concat): Provide decl.
+* ov-class.h (octave_class::octave_class): Allow optional parent
+list.
+* ov.h, ov.h (octave_value::octave_value (const Octave_map&,
+const std::string&)): Likewise.
+* pt-mat.cc (do_class_concat): New static function.
+(tree_matrix::rvalue1): Use it to concatenate objects.
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -230,16 +230,17 @@ PT_INCLUDES = \
+ 
+ octinclude_HEADERS = \
+   Cell.h \
+   base-list.h \
+   builtins.h \
+   c-file-ptr-stream.h \
+   comment-list.h \
+   cutils.h \
++  data.h \
+   debug.h \
+   defun-dld.h \
+   defun-int.h \
+   defun.h \
+   dirfns.h \
+   display.h \
+   dynamic-ld.h \
+   error.h \
+diff --git a/src/data.cc b/src/data.cc
+--- a/src/data.cc
++++ b/src/data.cc
+@@ -48,16 +48,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "oct-map.h"
+ #include "oct-obj.h"
+ #include "ov.h"
++#include "ov-class.h"
+ #include "ov-float.h"
+ #include "ov-complex.h"
+ #include "ov-flt-complex.h"
+ #include "ov-cx-mat.h"
+ #include "ov-flt-cx-mat.h"
+ #include "ov-cx-sparse.h"
+ #include "parse.h"
+ #include "pt-mat.h"
+@@ -1522,52 +1523,207 @@ do_single_type_concat_map (const octave_
+     single_type_concat_map<octave_scalar_map> (result, args, dim);
+   else
+     single_type_concat_map<octave_map> (result, args, dim);
+ 
+   return result;
+ }
+ 
+ static octave_value
+-do_cat (const octave_value_list& args, int dim, std::string fname)
++attempt_type_conversion (const octave_value& ov, std::string dtype)
++{
++  octave_value retval;
++
++  // First try to find function in the class of OV that can convert to
++  // the dispatch type dtype.  It will have the name of the dispatch
++  // type.
++
++  std::string cname = ov.class_name ();
++
++  octave_value fcn = symbol_table::find_method (dtype, cname);
++
++  if (fcn.is_defined ())
++    {
++      octave_value_list result
++        = fcn.do_multi_index_op (1, octave_value_list (1, ov));
++
++      if (! error_state && result.length () > 0)
++        retval = result(0);
++      else
++        error ("conversion from %s to %s failed", dtype.c_str (),
++               cname.c_str ());
++    }
++  else
++    {
++      // No conversion function available.  Try the constructor for the
++      // dispatch type.
++
++      fcn = symbol_table::find_method (dtype, dtype);
++
++      if (fcn.is_defined ())
++        {
++          octave_value_list result
++            = fcn.do_multi_index_op (1, octave_value_list (1, ov));
++
++          if (! error_state && result.length () > 0)
++            retval = result(0);
++          else
++            error ("%s constructor failed for %s argument", dtype.c_str (),
++                   cname.c_str ());
++        }
++      else
++        error ("no constructor for %s!", dtype.c_str ());
++    }
++
++  return retval;
++}
++
++octave_value
++do_class_concat (const octave_value_list& ovl, std::string cattype, int dim)
+ {
+   octave_value retval;
+ 
++  // Get dominant type for list
++
++  std::string dtype = get_dispatch_type (ovl);
++
++  octave_value fcn = symbol_table::find_method (cattype, dtype);
++
++  if (fcn.is_defined ())
++    {
++      // Have method for dominant type, so call it and let it handle
++      // conversions.
++
++      octave_value_list tmp2 = fcn.do_multi_index_op (1, ovl);
++
++      if (! error_state)
++        {
++          if (tmp2.length () > 0)
++            retval = tmp2(0);
++          else
++            {
++              error ("%s/%s method did not return a value",
++                     dtype.c_str (), cattype.c_str ());
++              goto done;
++            }
++        }
++      else
++        goto done;
++    }
++  else
++    {
++      // No method for dominant type, so attempt type conversions for
++      // all elements that are not of the dominant type, then do the
++      // default operation for octave_class values.
++
++      octave_idx_type j = 0;
++      octave_idx_type len = ovl.length ();
++      octave_value_list tmp (len, octave_value ());
++      for (octave_idx_type k = 0; k < len; k++)
++        {
++          octave_value elt = ovl(k);
++
++          std::string t1_type = elt.class_name ();
++
++          if (t1_type == dtype)
++            tmp(j++) = elt;
++          else if (elt.is_object () || ! elt.is_empty ())
++            {
++              tmp(j++) = attempt_type_conversion (elt, dtype);
++
++              if (error_state)
++                goto done;
++            }
++        }
++
++      tmp.resize (j);
++
++      octave_map m = do_single_type_concat_map (tmp, dim);
++
++      std::string cname = tmp(0).class_name ();
++      std::list<std::string> parents = tmp(0).parent_class_name_list ();
++
++      retval = octave_value (new octave_class (m, cname, parents));
++    }
++
++ done:
++  return retval;
++}
++
++static octave_value
++do_cat (const octave_value_list& xargs, int dim, std::string fname)
++{
++  octave_value retval;
++
++  // We may need to convert elements of the list to cells, so make a
++  // copy.  This should be efficient, it is done mostly by incrementing
++  // reference counts.
++  octave_value_list args = xargs;
++
+   int n_args = args.length ();
+ 
+   if (n_args == 0)
+     retval = Matrix ();
+   else if (n_args == 1)
+     retval = args(0);
+   else if (n_args > 1)
+     {
+-
+-      std::string result_type = args(0).class_name ();
+-
+-      bool all_sq_strings_p = args(0).is_sq_string ();
+-      bool all_dq_strings_p = args(0).is_dq_string ();
+-      bool all_real_p = args(0).is_real_type ();
+-      bool any_sparse_p = args(0).is_sparse_type();
+-
+-      for (int i = 1; i < args.length (); i++)
++      std::string result_type;
++
++      bool all_sq_strings_p = true;
++      bool all_dq_strings_p = true;
++      bool all_real_p = true;
++      bool all_cmplx_p = true;
++      bool any_sparse_p = false;
++      bool any_cell_p = false;
++      bool any_class_p = false;
++
++      bool first_elem_is_struct = false;
++
++      for (int i = 0; i < n_args; i++)
+         {
+-          result_type =
+-            get_concat_class (result_type, args(i).class_name ());
++          if (i == 0)
++            {
++              result_type = args(i).class_name ();
++
++              first_elem_is_struct = args(i).is_map ();
++            }
++          else
++            result_type = get_concat_class (result_type, args(i).class_name ());
+ 
+           if (all_sq_strings_p && ! args(i).is_sq_string ())
+             all_sq_strings_p = false;
+           if (all_dq_strings_p && ! args(i).is_dq_string ())
+             all_dq_strings_p = false;
+           if (all_real_p && ! args(i).is_real_type ())
+             all_real_p = false;
++          if (all_cmplx_p && ! (args(i).is_complex_type () || args(i).is_real_type ()))
++            all_cmplx_p = false;
+           if (!any_sparse_p && args(i).is_sparse_type ())
+             any_sparse_p = true;
++          if (!any_cell_p && args(i).is_cell ())
++            any_cell_p = true;
++          if (!any_class_p && args(i).is_object ())
++            any_class_p = true;
+         }
+ 
+-      if (result_type == "double")
++      if (any_cell_p && ! any_class_p && ! first_elem_is_struct)
++        {
++          for (int i = 0; i < n_args; i++)
++            {
++              if (! args(i).is_cell ())
++                args(i) = Cell (args(i));
++            }
++        }
++
++      if (any_class_p)
++        {
++          retval = do_class_concat (args, fname, dim);
++        }
++      else if (result_type == "double")
+         {
+           if (any_sparse_p)
+             {
+               if (all_real_p)
+                 retval = do_single_type_concat<SparseMatrix> (args, dim);
+               else
+                 retval = do_single_type_concat<SparseComplexMatrix> (args, dim);
+             }
+@@ -1713,16 +1869,207 @@ new matrices.  For example:\n\
+ @var{hcat} = [ @var{array1}, @var{array2}, @dots{} ];\n\
+ @end example\n\
+ @seealso{cat, vertcat}\n\
+ @end deftypefn")
+ {
+   return do_cat (args, -2, "horzcat");
+ }
+ 
++/*
++%% test concatenation with all zero matrices
++%!assert(horzcat ('', 65*ones(1,10)), 'AAAAAAAAAA');
++%!assert(horzcat (65*ones(1,10), ''), 'AAAAAAAAAA');
++
++%!assert (class (horzcat (int64(1), int64(1))), 'int64')
++%!assert (class (horzcat (int64(1), int32(1))), 'int64')
++%!assert (class (horzcat (int64(1), int16(1))), 'int64')
++%!assert (class (horzcat (int64(1), int8(1))), 'int64')
++%!assert (class (horzcat (int64(1), uint64(1))), 'int64')
++%!assert (class (horzcat (int64(1), uint32(1))), 'int64')
++%!assert (class (horzcat (int64(1), uint16(1))), 'int64')
++%!assert (class (horzcat (int64(1), uint8(1))), 'int64')
++%!assert (class (horzcat (int64(1), single(1))), 'int64')
++%!assert (class (horzcat (int64(1), double(1))), 'int64')
++%!assert (class (horzcat (int64(1), cell(1))), 'cell')
++%!assert (class (horzcat (int64(1), true)), 'int64')
++%!assert (class (horzcat (int64(1), 'a')), 'char')
++
++%!assert (class (horzcat (int32(1), int64(1))), 'int32')
++%!assert (class (horzcat (int32(1), int32(1))), 'int32')
++%!assert (class (horzcat (int32(1), int16(1))), 'int32')
++%!assert (class (horzcat (int32(1), int8(1))), 'int32')
++%!assert (class (horzcat (int32(1), uint64(1))), 'int32')
++%!assert (class (horzcat (int32(1), uint32(1))), 'int32')
++%!assert (class (horzcat (int32(1), uint16(1))), 'int32')
++%!assert (class (horzcat (int32(1), uint8(1))), 'int32')
++%!assert (class (horzcat (int32(1), single(1))), 'int32')
++%!assert (class (horzcat (int32(1), double(1))), 'int32')
++%!assert (class (horzcat (int32(1), cell(1))), 'cell')
++%!assert (class (horzcat (int32(1), true)), 'int32')
++%!assert (class (horzcat (int32(1), 'a')), 'char')
++
++%!assert (class (horzcat (int16(1), int64(1))), 'int16')
++%!assert (class (horzcat (int16(1), int32(1))), 'int16')
++%!assert (class (horzcat (int16(1), int16(1))), 'int16')
++%!assert (class (horzcat (int16(1), int8(1))), 'int16')
++%!assert (class (horzcat (int16(1), uint64(1))), 'int16')
++%!assert (class (horzcat (int16(1), uint32(1))), 'int16')
++%!assert (class (horzcat (int16(1), uint16(1))), 'int16')
++%!assert (class (horzcat (int16(1), uint8(1))), 'int16')
++%!assert (class (horzcat (int16(1), single(1))), 'int16')
++%!assert (class (horzcat (int16(1), double(1))), 'int16')
++%!assert (class (horzcat (int16(1), cell(1))), 'cell')
++%!assert (class (horzcat (int16(1), true)), 'int16')
++%!assert (class (horzcat (int16(1), 'a')), 'char')
++
++%!assert (class (horzcat (int8(1), int64(1))), 'int8')
++%!assert (class (horzcat (int8(1), int32(1))), 'int8')
++%!assert (class (horzcat (int8(1), int16(1))), 'int8')
++%!assert (class (horzcat (int8(1), int8(1))), 'int8')
++%!assert (class (horzcat (int8(1), uint64(1))), 'int8')
++%!assert (class (horzcat (int8(1), uint32(1))), 'int8')
++%!assert (class (horzcat (int8(1), uint16(1))), 'int8')
++%!assert (class (horzcat (int8(1), uint8(1))), 'int8')
++%!assert (class (horzcat (int8(1), single(1))), 'int8')
++%!assert (class (horzcat (int8(1), double(1))), 'int8')
++%!assert (class (horzcat (int8(1), cell(1))), 'cell')
++%!assert (class (horzcat (int8(1), true)), 'int8')
++%!assert (class (horzcat (int8(1), 'a')), 'char')
++
++%!assert (class (horzcat (uint64(1), int64(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), int32(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), int16(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), int8(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), uint64(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), uint32(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), uint16(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), uint8(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), single(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), double(1))), 'uint64')
++%!assert (class (horzcat (uint64(1), cell(1))), 'cell')
++%!assert (class (horzcat (uint64(1), true)), 'uint64')
++%!assert (class (horzcat (uint64(1), 'a')), 'char')
++
++%!assert (class (horzcat (uint32(1), int64(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), int32(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), int16(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), int8(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), uint64(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), uint32(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), uint16(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), uint8(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), single(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), double(1))), 'uint32')
++%!assert (class (horzcat (uint32(1), cell(1))), 'cell')
++%!assert (class (horzcat (uint32(1), true)), 'uint32')
++%!assert (class (horzcat (uint32(1), 'a')), 'char')
++
++%!assert (class (horzcat (uint16(1), int64(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), int32(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), int16(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), int8(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), uint64(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), uint32(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), uint16(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), uint8(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), single(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), double(1))), 'uint16')
++%!assert (class (horzcat (uint16(1), cell(1))), 'cell')
++%!assert (class (horzcat (uint16(1), true)), 'uint16')
++%!assert (class (horzcat (uint16(1), 'a')), 'char')
++
++%!assert (class (horzcat (uint8(1), int64(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), int32(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), int16(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), int8(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), uint64(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), uint32(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), uint16(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), uint8(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), single(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), double(1))), 'uint8')
++%!assert (class (horzcat (uint8(1), cell(1))), 'cell')
++%!assert (class (horzcat (uint8(1), true)), 'uint8')
++%!assert (class (horzcat (uint8(1), 'a')), 'char')
++
++%!assert (class (horzcat (single(1), int64(1))), 'int64')
++%!assert (class (horzcat (single(1), int32(1))), 'int32')
++%!assert (class (horzcat (single(1), int16(1))), 'int16')
++%!assert (class (horzcat (single(1), int8(1))), 'int8')
++%!assert (class (horzcat (single(1), uint64(1))), 'uint64')
++%!assert (class (horzcat (single(1), uint32(1))), 'uint32')
++%!assert (class (horzcat (single(1), uint16(1))), 'uint16')
++%!assert (class (horzcat (single(1), uint8(1))), 'uint8')
++%!assert (class (horzcat (single(1), single(1))), 'single')
++%!assert (class (horzcat (single(1), double(1))), 'single')
++%!assert (class (horzcat (single(1), cell(1))), 'cell')
++%!assert (class (horzcat (single(1), true)), 'single')
++%!assert (class (horzcat (single(1), 'a')), 'char')
++
++%!assert (class (horzcat (double(1), int64(1))), 'int64')
++%!assert (class (horzcat (double(1), int32(1))), 'int32')
++%!assert (class (horzcat (double(1), int16(1))), 'int16')
++%!assert (class (horzcat (double(1), int8(1))), 'int8')
++%!assert (class (horzcat (double(1), uint64(1))), 'uint64')
++%!assert (class (horzcat (double(1), uint32(1))), 'uint32')
++%!assert (class (horzcat (double(1), uint16(1))), 'uint16')
++%!assert (class (horzcat (double(1), uint8(1))), 'uint8')
++%!assert (class (horzcat (double(1), single(1))), 'single')
++%!assert (class (horzcat (double(1), double(1))), 'double')
++%!assert (class (horzcat (double(1), cell(1))), 'cell')
++%!assert (class (horzcat (double(1), true)), 'double')
++%!assert (class (horzcat (double(1), 'a')), 'char')
++
++%!assert (class (horzcat (cell(1), int64(1))), 'cell')
++%!assert (class (horzcat (cell(1), int32(1))), 'cell')
++%!assert (class (horzcat (cell(1), int16(1))), 'cell')
++%!assert (class (horzcat (cell(1), int8(1))), 'cell')
++%!assert (class (horzcat (cell(1), uint64(1))), 'cell')
++%!assert (class (horzcat (cell(1), uint32(1))), 'cell')
++%!assert (class (horzcat (cell(1), uint16(1))), 'cell')
++%!assert (class (horzcat (cell(1), uint8(1))), 'cell')
++%!assert (class (horzcat (cell(1), single(1))), 'cell')
++%!assert (class (horzcat (cell(1), double(1))), 'cell')
++%!assert (class (horzcat (cell(1), cell(1))), 'cell')
++%!assert (class (horzcat (cell(1), true)), 'cell')
++%!assert (class (horzcat (cell(1), 'a')), 'cell')
++
++%!assert (class (horzcat (true, int64(1))), 'int64')
++%!assert (class (horzcat (true, int32(1))), 'int32')
++%!assert (class (horzcat (true, int16(1))), 'int16')
++%!assert (class (horzcat (true, int8(1))), 'int8')
++%!assert (class (horzcat (true, uint64(1))), 'uint64')
++%!assert (class (horzcat (true, uint32(1))), 'uint32')
++%!assert (class (horzcat (true, uint16(1))), 'uint16')
++%!assert (class (horzcat (true, uint8(1))), 'uint8')
++%!assert (class (horzcat (true, single(1))), 'single')
++%!assert (class (horzcat (true, double(1))), 'double')
++%!assert (class (horzcat (true, cell(1))), 'cell')
++%!assert (class (horzcat (true, true)), 'logical')
++%!assert (class (horzcat (true, 'a')), 'char')
++
++%!assert (class (horzcat ('a', int64(1))), 'char')
++%!assert (class (horzcat ('a', int32(1))), 'char')
++%!assert (class (horzcat ('a', int16(1))), 'char')
++%!assert (class (horzcat ('a', int8(1))), 'char')
++%!assert (class (horzcat ('a', int64(1))), 'char')
++%!assert (class (horzcat ('a', int32(1))), 'char')
++%!assert (class (horzcat ('a', int16(1))), 'char')
++%!assert (class (horzcat ('a', int8(1))), 'char')
++%!assert (class (horzcat ('a', single(1))), 'char')
++%!assert (class (horzcat ('a', double(1))), 'char')
++%!assert (class (horzcat ('a', cell(1))), 'cell')
++%!assert (class (horzcat ('a', true)), 'char')
++%!assert (class (horzcat ('a', 'a')), 'char')
++
++%!assert (class (horzcat (cell(1), struct('foo', 'bar'))), 'cell')
++%!error horzcat (struct('foo', 'bar'), cell(1));
++*/
++
+ DEFUN (vertcat, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} vertcat (@var{array1}, @var{array2}, @dots{}, @var{arrayN})\n\
+ Return the vertical concatenation of N-D array objects, @var{array1},\n\
+ @var{array2}, @dots{}, @var{arrayN} along dimension 1.\n\
+ \n\
+ Arrays may also be concatenated vertically using the syntax for creating\n\
+ new matrices.  For example:\n\
+@@ -1731,16 +2078,22 @@ new matrices.  For example:\n\
+ @var{vcat} = [ @var{array1}; @var{array2}; @dots{} ];\n\
+ @end example\n\
+ @seealso{cat, horzcat}\n\
+ @end deftypefn")
+ {
+   return do_cat (args, -1, "vertcat");
+ }
+ 
++/*
++%!test
++%! c = {'foo'; 'bar'; 'bazoloa'};
++%! assert (vertcat (c, 'a', 'bc', 'def'), {'foo'; 'bar'; 'bazoloa'; 'a'; 'bc'; 'def'});
++*/
++
+ DEFUN (cat, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} cat (@var{dim}, @var{array1}, @var{array2}, @dots{}, @var{arrayN})\n\
+ Return the concatenation of N-D array objects, @var{array1},\n\
+ @var{array2}, @dots{}, @var{arrayN} along dimension @var{dim}.\n\
+ \n\
+ @example\n\
+ @group\n\
+diff --git a/src/data.h b/src/data.h
+new file mode 100644
+--- /dev/null
++++ b/src/data.h
+@@ -0,0 +1,34 @@
++/*
++
++Copyright (C) 2011 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if !defined (octave_data_h)
++#define octave_data_h 1
++
++#include <string>
++
++class octave_value;
++class octave_value_list;
++
++extern OCTINTERP_API octave_value
++do_class_concat (const octave_value_list& ovl, std::string cattype, int dim);
++
++#endif
+diff --git a/src/ov-class.h b/src/ov-class.h
+--- a/src/ov-class.h
++++ b/src/ov-class.h
+@@ -49,19 +49,21 @@ octave_class : public octave_base_value
+ {
+ public:
+ 
+   octave_class (void)
+     : octave_base_value (), map (), c_name (),
+       parent_list (), obsolete_copies (0)
+     { }
+ 
+-  octave_class (const octave_map& m, const std::string& id)
++  octave_class (const octave_map& m, const std::string& id,
++                const std::list<std::string>& plist
++                  = std::list<std::string> ())
+     : octave_base_value (), map (m), c_name (id),
+-      parent_list (), obsolete_copies (0)
++      parent_list (plist), obsolete_copies (0)
+     { }
+ 
+   octave_class (const octave_class& s)
+     : octave_base_value (s), map (s.map), c_name (s.c_name),
+       parent_list (s.parent_list), obsolete_copies (0)  { }
+ 
+   octave_class (const octave_map& m, const std::string& id,
+                 const octave_value_list& parents);
+diff --git a/src/ov.cc b/src/ov.cc
+--- a/src/ov.cc
++++ b/src/ov.cc
+@@ -1127,18 +1127,19 @@ octave_value::octave_value (const octave
+ }
+ 
+ octave_value::octave_value (const Octave_map& m)
+   : rep (new octave_struct (m))
+ {
+   maybe_mutate ();
+ }
+ 
+-octave_value::octave_value (const Octave_map& m, const std::string& id)
+-  : rep (new octave_class (m, id))
++octave_value::octave_value (const Octave_map& m, const std::string& id,
++                            const std::list<std::string>& plist)
++  : rep (new octave_class (m, id, plist))
+ {
+ }
+ 
+ octave_value::octave_value (const octave_value_list& l, bool)
+   : rep (new octave_cs_list (l))
+ {
+ }
+ 
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -274,17 +274,19 @@ public:
+                 bool zero_based = false, bool cache_index = false);
+   octave_value (const Array<std::string>& cellstr);
+   octave_value (const idx_vector& idx, bool lazy = true);
+   octave_value (double base, double limit, double inc);
+   octave_value (const Range& r);
+   octave_value (const octave_map& m);
+   octave_value (const octave_scalar_map& m);
+   octave_value (const Octave_map& m);
+-  octave_value (const Octave_map& m, const std::string& id);
++  octave_value (const Octave_map& m, const std::string& id,
++                const std::list<std::string>& plist
++                  = std::list<std::string> ());
+   octave_value (const octave_value_list& m, bool = false);
+   octave_value (octave_value::magic_colon);
+ 
+   octave_value (octave_base_value *new_rep, bool borrow = false);
+   octave_value (octave_base_value *new_rep, int xcount) GCC_ATTR_DEPRECATED;
+ 
+   // Copy constructor.
+ 
+diff --git a/src/pt-mat.cc b/src/pt-mat.cc
+--- a/src/pt-mat.cc
++++ b/src/pt-mat.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <iostream>
+ 
+ #include "quit.h"
+ 
++#include "data.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "pt-arg-list.h"
+ #include "pt-bp.h"
+ #include "pt-exp.h"
+ #include "pt-mat.h"
+ #include "pt-walk.h"
+@@ -928,16 +929,55 @@ do_single_type_concat<octave_map> (const
+   if (tmp.all_1x1_p ())
+     single_type_concat<octave_scalar_map> (result, dv, tmp);
+   else
+     single_type_concat<octave_map> (result, dv, tmp);
+ 
+   return result;
+ }
+ 
++static octave_value
++do_class_concat (tm_const& tmc)
++{
++  octave_value retval;
++
++  octave_value_list rows (tmc.length (), octave_value ());
++
++  octave_idx_type j = 0;
++  for (tm_const::iterator p = tmc.begin (); p != tmc.end (); p++)
++    {
++      octave_quit ();
++
++      tm_row_const tmrc = *p;
++
++      if (tmrc.length () == 1)
++        rows(j++) = *(tmrc.begin ());
++      else
++        {
++          octave_value_list row (tmrc.length (), octave_value ());
++
++          octave_idx_type i = 0;
++          for (tm_row_const::iterator q = tmrc.begin (); q != tmrc.end (); q++)
++            row(i++) = *q;
++
++          rows(j++) = do_class_concat (row, "horzcat", 1);
++        }
++    }
++
++  if (! error_state)
++    {
++      if (rows.length () == 1)
++        retval = rows(0);
++      else
++        retval = do_class_concat (rows, "vertcat", 0);
++    }
++
++  return retval;
++}
++
+ octave_value
+ tree_matrix::rvalue1 (int)
+ {
+   octave_value retval = Matrix ();
+ 
+   bool all_sq_strings_p = false;
+   bool all_dq_strings_p = false;
+   bool all_empty_p = false;
+@@ -960,78 +1000,17 @@ tree_matrix::rvalue1 (int)
+       frc_str_conv = tmp.some_strings_p ();
+ 
+       // Try to speed up the common cases.
+ 
+       std::string result_type = tmp.class_name ();
+ 
+       if (any_class_p)
+         {
+-          octave_value_list tmp3 (tmp.length (), octave_value ());
+-
+-          int j = 0;
+-          for (tm_const::iterator p = tmp.begin (); p != tmp.end (); p++)
+-            {
+-              octave_quit ();
+-
+-              tm_row_const row = *p;
+-
+-              if (row.length () == 1)
+-                tmp3 (j++) = *(row.begin ());
+-              else
+-                {
+-                  octave_value_list tmp1 (row.length (), octave_value ());
+-
+-                  int i = 0;
+-                  for (tm_row_const::iterator q = row.begin ();
+-                       q != row.end (); q++)
+-                    tmp1 (i++) = *q;
+-
+-                  octave_value_list tmp2;
+-                  octave_value fcn =
+-                    symbol_table::find_function ("horzcat", tmp1);
+-
+-                  if (fcn.is_defined ())
+-                    {
+-                      tmp2 = fcn.do_multi_index_op (1, tmp1);
+-
+-                      if (error_state)
+-                        goto done;
+-
+-                      tmp3 (j++) = tmp2 (0);
+-                    }
+-                  else
+-                    {
+-                      ::error ("cannot find overloaded horzcat function");
+-                      goto done;
+-                    }
+-                }
+-            }
+-
+-          if (tmp.length () == 1)
+-            retval = tmp3 (0);
+-          else
+-            {
+-              octave_value_list tmp2;
+-              octave_value fcn = symbol_table::find_function ("vertcat", tmp3);
+-
+-              if (fcn.is_defined ())
+-                {
+-                  tmp2 = fcn.do_multi_index_op (1, tmp3);
+-
+-                  if (! error_state)
+-                    retval = tmp2 (0);
+-                }
+-              else
+-                ::error ("cannot find overloaded vertcat function");
+-            }
+-        }
+-      else if (result_type == "cell")
+-        {
+-          retval = do_single_type_concat<Cell> (dv, tmp);
++          retval = do_class_concat (tmp);
+         }
+       else if (result_type == "double")
+         {
+           if (any_sparse_p)
+             {
+               if (all_real_p)
+                 retval = do_single_type_concat<SparseMatrix> (dv, tmp);
+               else

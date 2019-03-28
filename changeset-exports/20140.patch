@@ -1,0 +1,265 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1430254983 25200
+#      Tue Apr 28 14:03:03 2015 -0700
+# Branch stable
+# Node ID 64a2d4c87ecbac9264bee3059a1a3a6e23d646b5
+# Parent  bcf0a288aa6c858f69ce339bc773581e7a12f07a
+Don't save "warning: " prefix in lastwarn() message.
+
+* error.cc (vwarning): Save base_msg (without "warning: ") to Vlast_warning_message.
+* error.cc (error_1): Use std::string operators rather than strsave to strip
+"\n" from fmt string.  Simpler syntax avoids having to delete [] memory created
+with new.
+* error.cc (warning_1): Strip trailing newline from fmt string as error_1 does.
+
+* fail.m: Fix input validation which allowed nonsensical second input with 3
+args.  Don't post-process warning or error messages from lastwarn or lasterr.
+Add BIST test for input validation.
+
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -153,31 +153,32 @@ vwarning (const char *name, const char *
+ {
+   if (discard_warning_messages)
+     return;
+ 
+   flush_octave_stdout ();
+ 
+   std::ostringstream output_buf;
+ 
+-  if (name)
+-    output_buf << name << ": ";
+-
+   octave_vformat (output_buf, fmt, args);
+ 
+-  output_buf << std::endl;
+-
+   // FIXME: we really want to capture the message before it has all the
+   //        formatting goop attached to it.  We probably also want just the
+   //        message, not the traceback information.
+ 
+-  std::string msg_string = output_buf.str ();
++  std::string base_msg = output_buf.str ();
++  std::string msg_string;
++
++  if (name)
++    msg_string = std::string (name) + ": ";
++  
++  msg_string += base_msg + "\n";
+ 
+   Vlast_warning_id = id;
+-  Vlast_warning_message = msg_string;
++  Vlast_warning_message = base_msg;
+ 
+   if (! Vquiet_warning)
+     {
+       octave_diary << msg_string;
+ 
+       std::cerr << msg_string;
+     }
+ }
+@@ -332,43 +333,40 @@ pr_where (const char *who)
+ // just set the error state.
+ 
+ static void
+ error_1 (std::ostream& os, const char *name, const char *id,
+          const char *fmt, va_list args, bool with_cfn = false)
+ {
+   if (error_state != -2)
+     {
+-      if (fmt)
++      if (fmt && *fmt)
+         {
+-          if (*fmt)
++          size_t len = strlen (fmt);
++
++          if (len > 0)
+             {
+-              size_t len = strlen (fmt);
+-
+-              if (len > 0)
++              if (fmt[len - 1] == '\n')
+                 {
+-                  if (fmt[len - 1] == '\n')
++                  if (len > 1)
+                     {
+-                      if (len > 1)
+-                        {
+-                          char *tmp_fmt = strsave (fmt);
+-                          tmp_fmt[len - 1] = '\0';
+-                          verror (true, os, name, id, tmp_fmt, args, with_cfn);
+-                          delete [] tmp_fmt;
+-                        }
++                      // Strip newline before issuing error
++                      std::string tmp_fmt (fmt, len - 1);
++                      verror (true, os, name, id, tmp_fmt.c_str (),
++                              args, with_cfn);
++                    }
+ 
+-                      error_state = -2;
+-                    }
+-                  else
+-                    {
+-                      verror (true, os, name, id, fmt, args, with_cfn);
++                  error_state = -2;
++                }
++              else
++                {
++                  verror (true, os, name, id, fmt, args, with_cfn);
+ 
+-                      if (! error_state)
+-                        error_state = 1;
+-                    }
++                  if (! error_state)
++                    error_state = 1;
+                 }
+             }
+         }
+       else
+         panic ("error_1: invalid format");
+     }
+ }
+ 
+@@ -629,23 +627,31 @@ warning_1 (const char *id, const char *f
+   if (warn_opt == 2)
+     {
+       // Handle this warning as an error.
+ 
+       error_2 (id, fmt, args);
+     }
+   else if (warn_opt == 1)
+     {
+-      vwarning ("warning", id, fmt, args);
++      bool fmt_suppresses_backtrace = false;
++      size_t fmt_len = fmt ? strlen (fmt) : 0;
++      fmt_suppresses_backtrace = (fmt_len > 0 && fmt[fmt_len-1] == '\n');
++
++      if (fmt_suppresses_backtrace && fmt_len > 1)
++        {
++          // Strip newline before issuing warning
++          std::string tmp_fmt (fmt, fmt_len - 1);
++          vwarning ("warning", id, tmp_fmt.c_str (), args);
++        }
++      else
++        vwarning ("warning", id, fmt, args);
+ 
+       bool in_user_code = octave_call_stack::caller_user_code () != 0;
+ 
+-      bool fmt_suppresses_backtrace = false;
+-      size_t fmt_len = fmt ? strlen (fmt) : 0;
+-      fmt_suppresses_backtrace = (fmt_len > 0 && fmt[fmt_len-1] == '\n');
+ 
+       if (! fmt_suppresses_backtrace && in_user_code
+           && Vbacktrace_on_warning && ! warning_state
+           && ! discard_warning_messages)
+         pr_where ("warning");
+ 
+       warning_state = 1;
+ 
+diff --git a/scripts/testfun/fail.m b/scripts/testfun/fail.m
+--- a/scripts/testfun/fail.m
++++ b/scripts/testfun/fail.m
+@@ -62,21 +62,30 @@
+ 
+ function retval = fail (code, pattern, warning_pattern)
+ 
+   if (nargin < 1 || nargin > 3)
+     print_usage ();
+   endif
+ 
+   ## Parse input arguments
+-  test_warning = (nargin > 1 && strcmp (pattern, "warning"));
+-  if (nargin == 3)
+-    pattern = warning_pattern;
+-  elseif (nargin == 1 || (nargin == 2 && test_warning))
++  test_warning = false;
++  if (nargin == 1)
+     pattern = "";
++  elseif (nargin == 2 && ! strcmp (pattern, "warning"))
++    ## Normal error test
++  elseif (nargin >= 2 && strcmp (pattern, "warning"))
++    test_warning = true;
++    if (nargin == 2)
++      pattern = "";
++    else
++      pattern = warning_pattern;
++    endif
++  else
++    print_usage ();
+   endif
+ 
+   ## Match any nonempty message
+   if (isempty (pattern))
+     pattern = ".";
+   endif
+ 
+   ## Allow assert (fail ())
+@@ -84,51 +93,44 @@ function retval = fail (code, pattern, w
+     retval = true;
+   endif
+ 
+   if (test_warning)
+     ## Perform the warning test.
+     ## Clear old warnings.
+     lastwarn ("");
+     ## Make sure warnings are turned on.
+-    state = warning ("query", "quiet");
++    wstate = warning ("query", "quiet");
+     warning ("on", "quiet");
+     try
+       evalin ("caller", [code ";"]);
+       ## Retrieve new warnings.
+       warn = lastwarn ();
+-      warning (state.state, "quiet");
++      warning (wstate.state, "quiet");
+       if (isempty (warn))
+         msg = sprintf ("expected warning <%s> but got none", pattern);
+       else
+-        ## Transform "warning: ...\n" to "...".
+-        warn([1:9, end]) = [];
+         if (! isempty (regexp (warn, pattern, "once")))
+           return;
+         endif
+         msg = sprintf ("expected warning <%s>\nbut got <%s>", pattern, warn);
+       endif
+     catch
+-      warning (state.state, "quiet");
+-      err = lasterr;
+-      ## Transform "error: ...\n", to "...".
+-      err([1:6, end]) = [];
++      warning (wstate.state, "quiet");
++      err = lasterr ();
+       msg = sprintf ("expected warning <%s>\nbut got error <%s>", pattern, err);
+     end_try_catch
+ 
+   else
+     ## Perform the error test.
+     try
+       evalin ("caller", [code ";"]);
+       msg = sprintf ("expected error <%s> but got none", pattern);
+     catch
+       err = lasterr ();
+-      if (strcmp (err(1:7), "error:"))
+-         err([1:6, end]) = []; # transform "error: ...\n", to "..."
+-      endif
+       if (! isempty (regexp (err, pattern, "once")))
+         return;
+       endif
+       msg = sprintf ("expected error <%s>\nbut got <%s>", pattern, err);
+     end_try_catch
+   endif
+ 
+   ## If we get here, then code didn't fail or error didn't match.
+@@ -148,9 +150,10 @@ endfunction
+ %!error <expected error> fail ("1")
+ %!error <'__a__' undefined> fail ("__a__*[2;3]", "nonconformant")
+ %!error <expected error .usage:>  fail ("__a__*[2,3]", "usage:")
+ %!error <warning failure> fail ("warning ('warning failure')", "warning", "success")
+ 
+ ## Test input validation
+ %!error fail ()
+ %!error fail (1,2,3,4)
++%!error fail (1, "nowarning", "foo")
+ 

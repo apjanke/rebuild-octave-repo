@@ -1,0 +1,327 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1448658030 18000
+#      Fri Nov 27 16:00:30 2015 -0500
+# Node ID ed708a7ce0a248d10cc4cbaee95506944b8201f9
+# Parent  826a4771718b260e13e19dc392f4bad0d408f648
+simplify memory management for mex files (bug #46559)
+
+Now that errors throw exceptions we can avoid using setjmp/longjmp and
+unwind_protect to manage memory allocations that must be deleted
+automatically in MEX functions.
+
+* mex.cc (mex::~mex): Delete memlist and arraylist objects here.
+(mex::cleanup, mex:jump): Delete.
+(mex::abort): Delete.  Remove all uses.
+(call_mex): Call octave_quit at beginning of function.
+Don't add mex::cleanup to unwind_protect stack.
+Don't use setjmp.  Don't run unwind_protect stack explicitly.
+(mexCallMATLAB): Propagate original exception unless trapping feval
+error.
+
+diff --git a/libinterp/corefcn/mex.cc b/libinterp/corefcn/mex.cc
+--- a/libinterp/corefcn/mex.cc
++++ b/libinterp/corefcn/mex.cc
+@@ -2011,17 +2011,33 @@ class mex
+ {
+ public:
+ 
+   mex (octave_mex_function *f)
+     : curr_mex_fcn (f), memlist (), arraylist (), fname (0) { }
+ 
+   ~mex (void)
+   {
+-    if (! memlist.empty ())
++    // We can't use mex::free here because it modifies memlist.
++    while (! memlist.empty ())
++      {
++        std::set<void *>::iterator p = memlist.begin ();
++        xfree (*p);
++        memlist.erase (p);
++      }
++
++    // We can't use mex::free_value here because it modifies arraylist.
++    while (! arraylist.empty ())
++      {
++        std::set<mxArray *>::iterator p = arraylist.begin ();
++        delete *p;
++        arraylist.erase (p);
++      }
++
++    if (! (memlist.empty () && arraylist.empty ()))
+       error ("mex: %s: cleanup failed", function_name ());
+ 
+     mxFree (fname);
+   }
+ 
+   const char *function_name (void) const
+   {
+     if (! fname)
+@@ -2035,49 +2051,27 @@ public:
+           }
+         else
+           fname = mxArray::strsave ("unknown");
+       }
+ 
+     return fname;
+   }
+ 
+-  // Free all unmarked pointers obtained from malloc and calloc.
+-  static void cleanup (void *ptr)
+-  {
+-    mex *context = static_cast<mex *> (ptr);
+-
+-    // We can't use mex::free here because it modifies memlist.
+-    for (std::set<void *>::iterator p = context->memlist.begin ();
+-         p != context->memlist.end (); p++)
+-      xfree (*p);
+-
+-    context->memlist.clear ();
+-
+-    // We can't use mex::free_value here because it modifies arraylist.
+-    for (std::set<mxArray *>::iterator p = context->arraylist.begin ();
+-         p != context->arraylist.end (); p++)
+-      delete *p;
+-
+-    context->arraylist.clear ();
+-  }
+-
+   // Allocate memory.
+   void *malloc_unmarked (size_t n)
+   {
+     void *ptr = gnulib::malloc (n);
+ 
+     if (! ptr)
+       {
+         // FIXME: could use "octave_new_handler();" instead
+ 
+         error ("%s: failed to allocate %d bytes of memory",
+                function_name (), n);
+-
+-        abort ();
+       }
+ 
+     global_mark (ptr);
+ 
+     return ptr;
+   }
+ 
+   // Allocate memory to be freed on exit.
+@@ -2267,22 +2261,16 @@ public:
+   octave_mex_function *current_mex_function (void) const
+   {
+     return curr_mex_fcn;
+   }
+ 
+   // 1 if error should be returned to MEX file, 0 if abort.
+   int trap_feval_error;
+ 
+-  // longjmp return point if mexErrMsgTxt or error.
+-  jmp_buf jump;
+-
+-  // Trigger a long jump back to the mex calling function.
+-  void abort (void) { longjmp (jump, 1); }
+-
+ private:
+ 
+   // Pointer to the mex function that corresponds to this mex context.
+   octave_mex_function *curr_mex_fcn;
+ 
+   // List of memory resources that need to be freed upon exit.
+   std::set<void *> memlist;
+ 
+@@ -3003,16 +2991,18 @@ mxGetElementSize (const mxArray *ptr)
+ typedef void (*cmex_fptr) (int nlhs, mxArray **plhs, int nrhs, mxArray **prhs);
+ typedef F77_RET_T (*fmex_fptr) (int& nlhs, mxArray **plhs,
+                                 int& nrhs, mxArray **prhs);
+ 
+ octave_value_list
+ call_mex (bool have_fmex, void *f, const octave_value_list& args,
+           int nargout_arg, octave_mex_function *curr_mex_fcn)
+ {
++  octave_quit ();
++
+   // Use at least 1 for nargout since even for zero specified args,
+   // still want to be able to return an ans.
+ 
+   volatile int nargout = nargout_arg;
+ 
+   int nargin = args.length ();
+   OCTAVE_LOCAL_BUFFER (mxArray *, argin, nargin);
+   for (int i = 0; i < nargin; i++)
+@@ -3025,40 +3015,35 @@ call_mex (bool have_fmex, void *f, const
+ 
+   unwind_protect_safe frame;
+ 
+   // Save old mex pointer.
+   frame.protect_var (mex_context);
+ 
+   mex context (curr_mex_fcn);
+ 
+-  frame.add_fcn (mex::cleanup, static_cast<void *> (&context));
+-
+   for (int i = 0; i < nargin; i++)
+     argin[i] = context.make_value (args(i));
+ 
+-  if (setjmp (context.jump) == 0)
++  mex_context = &context;
++
++  if (have_fmex)
+     {
+-      mex_context = &context;
+-
+-      if (have_fmex)
+-        {
+-          fmex_fptr fcn = FCN_PTR_CAST (fmex_fptr, f);
+-
+-          int tmp_nargout = nargout;
+-          int tmp_nargin = nargin;
+-
+-          fcn (tmp_nargout, argout, tmp_nargin, argin);
+-        }
+-      else
+-        {
+-          cmex_fptr fcn = FCN_PTR_CAST (cmex_fptr, f);
+-
+-          fcn (nargout, argout, nargin, argin);
+-        }
++      fmex_fptr fcn = FCN_PTR_CAST (fmex_fptr, f);
++
++      int tmp_nargout = nargout;
++      int tmp_nargin = nargin;
++
++      fcn (tmp_nargout, argout, tmp_nargin, argin);
++    }
++  else
++    {
++      cmex_fptr fcn = FCN_PTR_CAST (cmex_fptr, f);
++
++      fcn (nargout, argout, nargin, argin);
+     }
+ 
+   // Convert returned array entries back into octave values.
+ 
+   octave_value_list retval;
+ 
+   if (nargout == 0 && argout[0])
+     {
+@@ -3066,19 +3051,16 @@ call_mex (bool have_fmex, void *f, const
+       nargout = 1;
+     }
+ 
+   retval.resize (nargout);
+ 
+   for (int i = 0; i < nargout; i++)
+     retval(i) = mxArray::as_octave_value (argout[i]);
+ 
+-  // Clean up mex resources.
+-  frame.run ();
+-
+   return retval;
+ }
+ 
+ // C interface to mex functions:
+ 
+ const char *
+ mexFunctionName (void)
+ {
+@@ -3089,51 +3071,42 @@ int
+ mexCallMATLAB (int nargout, mxArray *argout[], int nargin,
+                mxArray *argin[], const char *fname)
+ {
+   octave_value_list args;
+ 
+   // FIXME: do we need unwind protect to clean up args?  Off hand, I
+   // would say that this problem is endemic to Octave and we will
+   // continue to have memory leaks after Ctrl-C until proper exception
+-  // handling is implemented.  longjmp() only clears the stack, so any
+-  // class which allocates data on the heap is going to leak.
++  // handling is implemented.
+ 
+   args.resize (nargin);
+ 
+   for (int i = 0; i < nargin; i++)
+     args(i) = mxArray::as_octave_value (argin[i]);
+ 
+   bool execution_error = false;
+ 
+   octave_value_list retval;
+ 
+   try
+     {
+       retval = feval (fname, args, nargout);
+     }
+   catch (const octave_execution_exception&)
+     {
+-      recover_from_exception ();
+-
+-      execution_error = true;
+-    }
+-
+-  if (execution_error && mex_context->trap_feval_error == 0)
+-    {
+-      // FIXME: is this the correct way to clean up?  abort() is
+-      // going to trigger a long jump, so the normal class destructors
+-      // will not be called.  Hopefully this will reduce things to a
+-      // tiny leak.  Maybe create a new octave memory tracer type
+-      // which prints a friendly message every time it is
+-      // created/copied/deleted to check this.
+-
+-      args.resize (0);
+-      retval.resize (0);
+-      mex_context->abort ();
++      if (mex_context->trap_feval_error)
++        recover_from_exception ();
++      else
++        {
++          args.resize (0);
++          retval.resize (0);
++
++          throw;
++        }
+     }
+ 
+   int num_to_copy = retval.length ();
+ 
+   if (nargout < retval.length ())
+     num_to_copy = nargout;
+ 
+   for (int i = 0; i < num_to_copy; i++)
+@@ -3192,18 +3165,16 @@ mexErrMsgTxt (const char *s)
+   if (s && strlen (s) > 0)
+     error ("%s: %s", mexFunctionName (), s);
+   else
+     {
+       // For compatibility with Matlab, print an empty message.
+       // Octave's error routine requires a non-null input so use a SPACE.
+       error (" ");
+     }
+-
+-  mex_context->abort ();
+ }
+ 
+ void
+ mexErrMsgIdAndTxt (const char *id, const char *fmt, ...)
+ {
+   if (fmt && strlen (fmt) > 0)
+     {
+       const char *fname = mexFunctionName ();
+@@ -3216,18 +3187,16 @@ mexErrMsgIdAndTxt (const char *id, const
+       va_end (args);
+     }
+   else
+     {
+       // For compatibility with Matlab, print an empty message.
+       // Octave's error routine requires a non-null input so use a SPACE.
+       error (" ");
+     }
+-
+-  mex_context->abort ();
+ }
+ 
+ void
+ mexWarnMsgTxt (const char *s)
+ {
+   warning ("%s", s);
+ }
+ 

@@ -1,0 +1,1098 @@
+# HG changeset patch
+# User jwe
+# Date 892695903 0
+#      Thu Apr 16 03:05:03 1998 +0000
+# Node ID e4bbfc196e53377d794f80a3134355ed7c125e16
+# Parent  45490c020e47401a5cee9ede0d7029bdb07ad23e
+[project @ 1998-04-16 03:01:47 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,35 @@
++Wed Apr 15 01:03:05 1998  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* input.cc (Vlast_prompt_time): New global variable.
++	(octave_gets): Set it.
++	* ov-usr-fcn.h (octave_user_function::time_checked): New function.
++	(octave_user_function::mark_fcn_file_up_to_date): Ditto.
++	(octave_user_function::t_checked): New data member.
++	* variables.cc (symbol_out_of_date): Only check file time stamp if
++	a prompt has been printed since the last time check.
++
++	* pt-plot.h, pt-plot.cc (subplot_axes): New class.
++	(subplot): Handle axes.
++	(Vgnuplot_command_axes): New static variable.
++	(gnuplot_command_axes): New function.
++	(symbols_of_pt_plot): DEFVAR gnuplot_command_axes.
++	* pt-walk.h (tree_walker::visit_subplot_axes): New virtual function.
++	* parse.y (plot_options): Handle axes.
++	* lex.l (plot_axes_token): New function.
++	(is_keyword): Use it.
++	(is_plot_keyword): Recognize "axes" and "axis".
++	* lex.h (class lexical_feedback): New field, in_plot_axes.
++	(lexical_feedback::init): Reset it.
++
++Tue Apr 14 23:32:27 1998  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* parse.y (parse_fcn_file): New arg, force_script.  Change callers.
++
+ Fri Apr 10 11:01:27 1998  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* help.cc (type): Also print values of variables.
+ 
+ Wed Apr  8 01:00:58 1998  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* pr-output.cc (set_format): Set scale to 1.0 if all elements are
+ 	int or inf or nan.
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -81,16 +81,19 @@ string Vps4;
+ //
+ //   1  ==>  echo commands read from script files
+ //   2  ==>  echo commands from functions
+ //   4  ==>  echo commands read from command line
+ //
+ // more than one state can be active at once.
+ int Vecho_executing_commands;
+ 
++// The time we last printed a prompt.
++time_t Vlast_prompt_time;
++
+ // Character to append after successful command-line completion attempts.
+ static char Vcompletion_append_char;
+ 
+ // Global pointer for eval().
+ string current_eval_string;
+ 
+ // TRUE means get input from current_eval_string.
+ bool get_input_from_eval_string = false;
+@@ -187,16 +190,18 @@ gnu_readline (const string& s, bool forc
+   return retval;
+ }
+ 
+ static string
+ octave_gets (void)
+ {
+   string retval;
+ 
++  Vlast_prompt_time = time (0);
++
+   if ((interactive || forced_interactive)
+       && (! (reading_fcn_file || reading_script_file)))
+     {
+       string ps = (promptflag > 0) ? Vps1 : Vps2;
+ 
+       string prompt = command_editor::decode_prompt_string (ps);
+ 
+       pipe_handler_error_count = 0;
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -21,16 +21,17 @@ Software Foundation, 59 Temple Place - S
+ */
+ 
+ // Use the GNU readline library for command line editing and hisory.
+ 
+ #if !defined (octave_input_h)
+ #define octave_input_h 1
+ 
+ #include <cstdio>
++#include <ctime>
+ 
+ #include <string>
+ 
+ extern int octave_read (char *buf, unsigned max_size);
+ extern FILE *get_input_from_file (const string& name, int warn = 1);
+ extern FILE *get_input_from_stdin (void);
+ 
+ // Global pointer for eval().
+@@ -80,15 +81,17 @@ enum echo_state
+   ECHO_OFF = 0,
+   ECHO_SCRIPTS = 1,
+   ECHO_FUNCTIONS = 2,
+   ECHO_CMD_LINE = 4
+ };
+ 
+ extern int Vecho_executing_commands;
+ 
++extern time_t Vlast_prompt_time;
++
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/lex.h b/src/lex.h
+--- a/src/lex.h
++++ b/src/lex.h
+@@ -156,16 +156,19 @@ public:
+   bool in_plot_range;
+ 
+   // TRUE means we're looking at the using part of a plot command.
+   bool in_plot_using;
+ 
+   // TRUE means we're looking at the style part of a plot command.
+   bool in_plot_style;
+ 
++  // TRUE means we're looking at the axes part of a plot command.
++  bool in_plot_axes;
++
+   // TRUE means we're looking at an indirect reference to a
+   // structure element.
+   bool looking_at_indirect_ref;
+ 
+   // TRUE means that we've already seen the name of this function.
+   // Should only matter if defining_func is also TRUE.
+   bool parsed_function_name;
+ 
+diff --git a/src/lex.l b/src/lex.l
+--- a/src/lex.l
++++ b/src/lex.l
+@@ -830,16 +830,48 @@ plot_style_token (const string& s)
+ 	}
+ 
+       tmp++;
+     }
+ 
+   return retval;
+ }
+ 
++// Check to see if a character string matches any of the possible axes
++// tags for plots.
++
++static string
++plot_axes_token (const string& s)
++{
++  string retval;
++
++  static char *plot_axes[] = 
++    {
++      "x1y1",
++      "x1y2",
++      "x2y1",
++      "x2y2",
++      0,
++    };
++
++  char **tmp = plot_axes;
++  while (*tmp)
++    {
++      if (almost_match (*tmp, s.c_str ()))
++	{
++	  retval = *tmp;
++	  break;
++	}
++
++      tmp++;
++    }
++
++  return retval;
++}
++
+ // Check to see if a character string matches any one of the plot
+ // option keywords.  Don't match abbreviations for clear, since that's
+ // not a gnuplot keyword (users will probably only expect to be able
+ // to abbreviate actual gnuplot keywords).
+ 
+ static int
+ is_plot_keyword (const string& s)
+ {
+@@ -853,42 +885,62 @@ is_plot_keyword (const string& s)
+       lexer_flags.in_plot_using = true;
+       return USING;
+     }
+   else if (almost_match ("with", t))
+     {
+       lexer_flags.in_plot_style = true;
+       return WITH;
+     }
++  else if (almost_match ("axes", t) || almost_match ("axis", t))
++    {
++      lexer_flags.in_plot_axes = true;
++      return AXES;
++    }
+   else if (strcmp ("clear", t) == 0)
+     {
+       return CLEAR;
+     }
+   else
+     {
+       return 0;
+     }
+ }
+ 
+ // Handle keywords.
+ 
+ static int
+ is_keyword (const string& s)
+ {
+-  if (lexer_flags.plotting && lexer_flags.in_plot_style)
++  if (lexer_flags.plotting)
+     {
+-      string sty = plot_style_token (s);
+-
+-      if (! sty.empty ())
++      if (lexer_flags.in_plot_style)
+ 	{
+-	  lexer_flags.in_plot_style = false;
+-	  yylval.tok_val = new token (sty);
+-	  token_stack.push (yylval.tok_val);
+-	  return STYLE;
++	  string sty = plot_style_token (s);
++
++	  if (! sty.empty ())
++	    {
++	      lexer_flags.in_plot_style = false;
++	      yylval.tok_val = new token (sty);
++	      token_stack.push (yylval.tok_val);
++	      return STYLE;
++	    }
+ 	}
++      else if (lexer_flags.in_plot_axes)
++	{
++	  string axes = plot_axes_token (s);
++
++	  if (! axes.empty ())
++	    {
++	      lexer_flags.in_plot_axes = false;
++	      yylval.tok_val = new token (axes);
++	      token_stack.push (yylval.tok_val);
++	      return AXES_TAG;
++	    }
++	}	
+     }
+ 
+   int l = input_line_number;
+   int c = current_input_column;
+ 
+   int len = s.length ();
+ 
+   const octave_kw *kw = octave_kw_lookup (s.c_str (), len);
+@@ -1855,16 +1907,17 @@ lexical_feedback::init (void)
+   // beginning of input. 
+   convert_spaces_to_comma = true;
+   do_comma_insert = false;
+ 
+   // Not initially doing any plotting or setting of plot attributes.
+   doing_set = false;
+   in_plot_range = false;
+   in_plot_style = false;
++  in_plot_axes = false;
+   in_plot_using = false;
+   past_plot_range = false;
+   plotting = false;
+ 
+   // Not initially looking at indirect references.
+   looking_at_indirect_ref = false;
+ 
+   // Quote marks strings intially.
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -75,20 +75,20 @@ octave_user_function::t_name ("user-defi
+ // extrinsic/intrinsic state?).
+ 
+ octave_user_function::octave_user_function
+   (tree_parameter_list *pl, tree_parameter_list *rl,
+    tree_statement_list *cl, symbol_table *st)
+   : octave_function (string (), string ()),
+     param_list (pl), ret_list (rl), cmd_list (cl),
+     sym_tab (st), file_name (), fcn_name (), t_parsed (0),
+-    system_fcn_file (false), call_depth (0), num_named_args (0),
+-    args_passed (), num_args_passed (0), curr_va_arg_number (0),
+-    vr_list (0), symtab_entry (0), argn_sr (0), nargin_sr (0),
+-    nargout_sr (0)
++    t_checked (0), system_fcn_file (false), call_depth (0),
++    num_named_args (0), args_passed (), num_args_passed (0),
++    curr_va_arg_number (0), vr_list (0), symtab_entry (0),
++    argn_sr (0), nargin_sr (0), nargout_sr (0)
+ {
+   install_automatic_vars ();
+ 
+   if (param_list)
+     {
+       num_named_args = param_list->length ();
+       curr_va_arg_number = num_named_args;
+     }
+diff --git a/src/ov-usr-fcn.h b/src/ov-usr-fcn.h
+--- a/src/ov-usr-fcn.h
++++ b/src/ov-usr-fcn.h
+@@ -68,28 +68,37 @@ public:
+   octave_function *function_value (bool) { return this; }
+ 
+   octave_user_function *define_param_list (tree_parameter_list *t);
+ 
+   octave_user_function *define_ret_list (tree_parameter_list *t);
+ 
+   void stash_fcn_file_name (void);
+ 
++  void mark_fcn_file_up_to_date (time_t t)
++    { t_checked = t; }
++
+   void stash_fcn_file_time (time_t t)
+-    { t_parsed = t; }
++    {
++      t_parsed = t;
++      mark_fcn_file_up_to_date (t);
++    }
+ 
+   void stash_symtab_ptr (symbol_record *sr)
+     { symtab_entry = sr; }
+ 
+   string fcn_file_name (void) const
+     { return file_name; }
+ 
+   time_t time_parsed (void) const
+     { return t_parsed; }
+ 
++  time_t time_checked (void) const
++    { return t_checked; }
++
+   void mark_as_system_fcn_file (void);
+ 
+   bool is_system_fcn_file (void) const
+     { return system_fcn_file; }
+ 
+   bool takes_varargs (void) const;
+ 
+   void octave_va_start (void)
+@@ -152,16 +161,20 @@ private:
+   string file_name;
+ 
+   // The name of the function.
+   string fcn_name;
+ 
+   // The time the file was parsed.
+   time_t t_parsed;
+ 
++  // The time the file was last checked to see if it needs to be
++  // parsed again.
++  time_t t_checked;
++
+   // True if this function came from a file that is considered to be a
+   // system function.  This affects whether we check the time stamp
+   // on the file to see if it has changed.
+   bool system_fcn_file;
+ 
+   // Used to keep track of recursion depth.
+   int call_depth;
+ 
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -319,16 +319,17 @@ set_stmt_print_flag (tree_statement_list
+   tree_statement_list *tree_statement_list_type;
+   tree_plot_command *tree_plot_command_type;
+   subplot *subplot_type;
+   subplot_list *subplot_list_type;
+   plot_limits *plot_limits_type;
+   plot_range *plot_range_type;
+   subplot_using *subplot_using_type;
+   subplot_style *subplot_style_type;
++  subplot_axes *subplot_axes_type;
+   octave_user_function *octave_user_function_type;
+ }
+ 
+ // Tokens with line and column information.
+ %token <tok_val> '=' ':' '-' '+' '*' '/'
+ %token <tok_val> ADD_EQ SUB_EQ MUL_EQ DIV_EQ EMUL_EQ EDIV_EQ AND_EQ OR_EQ
+ %token <tok_val> LSHIFT_EQ RSHIFT_EQ LSHIFT RSHIFT
+ %token <tok_val> EXPR_AND_AND EXPR_OR_OR
+@@ -337,29 +338,29 @@ set_stmt_print_flag (tree_statement_list
+ %token <tok_val> LEFTDIV EMUL EDIV ELEFTDIV EPLUS EMINUS
+ %token <tok_val> QUOTE TRANSPOSE
+ %token <tok_val> PLUS_PLUS MINUS_MINUS POW EPOW
+ %token <tok_val> NUM IMAG_NUM
+ %token <tok_val> STRUCT_ELT
+ %token <tok_val> NAME
+ %token <tok_val> END
+ %token <tok_val> PLOT
+-%token <tok_val> TEXT STYLE
++%token <tok_val> TEXT STYLE AXES_TAG
+ %token <tok_val> FOR WHILE
+ %token <tok_val> IF ELSEIF ELSE
+ %token <tok_val> SWITCH CASE OTHERWISE
+ %token <tok_val> BREAK CONTINUE FUNC_RET
+ %token <tok_val> UNWIND CLEANUP
+ %token <tok_val> TRY CATCH
+ %token <tok_val> GLOBAL STATIC
+ 
+ // Other tokens.
+ %token END_OF_INPUT LEXICAL_ERROR
+ %token FCN ELLIPSIS ALL_VA_ARGS
+-%token USING TITLE WITH COLON OPEN_BRACE CLOSE_BRACE CLEAR
++%token USING TITLE WITH AXES COLON OPEN_BRACE CLOSE_BRACE CLEAR
+ 
+ // Nonterminals we construct.
+ %type <sep_type> sep_no_nl opt_sep_no_nl sep opt_sep
+ %type <tree_type> input
+ %type <tree_constant_type> constant magic_colon
+ %type <tree_matrix_type> rows rows1
+ %type <tree_expression_type> title matrix
+ %type <tree_expression_type> primary_expr postfix_expr prefix_expr binary_expr
+@@ -387,16 +388,17 @@ set_stmt_print_flag (tree_statement_list
+ %type <tree_statement_list_type> opt_list input1 function4
+ %type <tree_plot_command_type> plot_command 
+ %type <subplot_type> plot_command2 plot_options
+ %type <subplot_list_type> plot_command1
+ %type <plot_limits_type> ranges
+ %type <plot_range_type> ranges1 
+ %type <subplot_using_type> using using1 
+ %type <subplot_style_type> style
++%type <subplot_axes_type> axes
+ 
+ // Precedence and associativity.
+ %left ';' ',' '\n'
+ %right '=' ADD_EQ SUB_EQ MUL_EQ DIV_EQ EMUL_EQ EDIV_EQ OR_EQ AND_EQ LSHIFT_EQ RSHIFT_EQ
+ %left EXPR_AND_AND EXPR_OR_OR
+ %left EXPR_AND EXPR_OR
+ %left EXPR_LT EXPR_LE EXPR_EQ EXPR_NE EXPR_GE EXPR_GT
+ %left LSHIFT RSHIFT
+@@ -1172,49 +1174,78 @@ plot_command1	: // empty
+ 		    $1->append ($3);
+ 		    $$ = $1;
+ 		  }
+ 		;
+ 
+ plot_command2	: expression
+ 		  { $$ = new subplot ($1); }
+ 		| expression plot_options
+-		  { $$ = $2->set_data ($1); }
++		  { $$ = $2->add_data ($1); }
+ 		;
+ 
+ plot_options	: using
+-		  { $$ = new subplot ($1, 0, 0); }
++		  {
++		    subplot *tmp = new subplot ();
++		    $$ = tmp->add_clause ($1);
++		  }
+ 		| title
+-		  { $$ = new subplot (0, $1, 0); }
++		  {
++		    subplot *tmp = new subplot ();
++		    $$ = tmp->add_clause ($1);
++		  }
+ 		| style
+-		  { $$ = new subplot (0, 0, $1); }
+-		| using title
+-		  { $$ = new subplot ($1, $2, 0); }
+-		| title using		 
+-		  { $$ = new subplot ($2, $1, 0); }
+-		| using style		 
+-		  { $$ = new subplot ($1, 0, $2); }
+-		| style using		 
+-		  { $$ = new subplot ($2, 0, $1); }
+-		| title style		 
+-		  { $$ = new subplot (0, $1, $2); }
+-		| style title		 
+-		  { $$ = new subplot (0, $2, $1); }
+-		| using title style	 
+-		  { $$ = new subplot ($1, $2, $3); }
+-		| using style title	 
+-		  { $$ = new subplot ($1, $3, $2); }
+-		| title using style	 
+-		  { $$ = new subplot ($2, $1, $3); }
+-		| title style using	 
+-		  { $$ = new subplot ($3, $1, $2); }
+-		| style using title	 
+-		  { $$ = new subplot ($2, $3, $1); }
+-		| style title using	 
+-		  { $$ = new subplot ($3, $2, $1); }
++		  {
++		    subplot *tmp = new subplot ();
++		    $$ = tmp->add_clause ($1);
++		  }
++		| axes
++		  {
++		    subplot *tmp = new subplot ();
++		    $$ = tmp->add_clause ($1);
++		  }
++		| plot_options using
++		  {
++		    if (! ($$ = $1->add_clause ($2)))
++		      {
++			yyerror ("only one using option may be specified");
++			ABORT_PARSE;
++		      }
++		  }
++		| plot_options title
++		  {
++		    if (! ($$ = $1->add_clause ($2)))
++		      {
++			yyerror ("only one title option my be specified");
++			ABORT_PARSE;
++		      }
++		  }
++		| plot_options style
++		  {
++		    if (! ($$ = $1->add_clause ($2)))
++		      {
++			yyerror ("only one style option my be specified");
++			ABORT_PARSE;
++		      }
++		  }
++		| plot_options axes
++		  {
++		    if (! ($$ = $1->add_clause ($2)))
++		      {
++			yyerror ("only one axes option may be specified");
++			ABORT_PARSE;
++		      }
++		  }
++		;
++
++axes		: AXES AXES_TAG
++		  {
++		    lexer_flags.in_plot_axes = false;
++		    $$ = new subplot_axes ($2->text ());
++		  }
+ 		;
+ 
+ using		: using1
+ 		  {
+ 		    lexer_flags.in_plot_using = false;
+ 		    $$ = $1;
+ 		  }
+ 		| using1 expression
+@@ -2745,17 +2776,17 @@ restore_command_history (void *)
+ 
+ static void
+ restore_input_stream (void *f)
+ {
+   command_editor::set_input_stream (static_cast<FILE *> (f));
+ }
+ 
+ static bool
+-parse_fcn_file (bool exec_script, const string& ff)
++parse_fcn_file (const string& ff, bool exec_script, bool force_script = false)
+ {
+   unwind_protect::begin_frame ("parse_fcn_file");
+ 
+   int script_file_executed = false;
+ 
+   // Open function file and parse.
+ 
+   bool old_reading_fcn_file_state = reading_fcn_file;
+@@ -2780,17 +2811,17 @@ parse_fcn_file (bool exec_script, const 
+ 
+   unwind_protect::add (safe_fclose, ffile);
+ 
+   if (ffile)
+     {
+       // Check to see if this file defines a function or is just a
+       // list of commands.
+ 
+-      if (is_function_file (ffile))
++      if (! force_script && is_function_file (ffile))
+ 	{
+ 	  // XXX FIXME XXX -- we shouldn't need both the
+ 	  // command_history object and the
+ 	  // Vsaving_history variable...
+ 	  command_history::ignore_entries ();
+ 
+ 	  unwind_protect::add (restore_command_history, 0);
+ 
+@@ -2881,17 +2912,17 @@ load_fcn_from_file (symbol_record *sym_r
+ 
+       unwind_protect_str (curr_fcn_file_name);
+       unwind_protect_str (curr_fcn_file_full_name);
+ 
+       curr_fcn_file_name = nm;
+       curr_fcn_file_full_name = ff;
+ 
+       if (ff.length () > 0)
+-	script_file_executed = parse_fcn_file (exec_script, ff);
++	script_file_executed = parse_fcn_file (ff, exec_script);
+ 
+       if (! (error_state || script_file_executed))
+ 	force_link_to_function (nm);
+ 
+       unwind_protect::run_frame ("load_fcn_from_file");
+     }
+ 
+   return script_file_executed;
+@@ -2910,17 +2941,17 @@ script file but without requiring the fi
+   if (nargin == 1)
+     {
+       string file = args(0).string_value ();
+ 
+       if (! error_state)
+ 	{
+ 	  file = file_ops::tilde_expand (file);
+ 
+-	  parse_fcn_file (true, file);
++	  parse_fcn_file (file, true, true);
+ 
+ 	  if (error_state)
+ 	    error ("source: error sourcing file `%s'", file.c_str ());
+ 	}
+       else
+ 	error ("source: expecting file name as argument");
+     }
+   else
+diff --git a/src/pt-plot.cc b/src/pt-plot.cc
+--- a/src/pt-plot.cc
++++ b/src/pt-plot.cc
+@@ -102,16 +102,17 @@ static oprocstream *plot_stream = 0;
+ static pid_t plot_stream_pid = 0;
+ 
+ // Gnuplot command strings that we use.
+ static string Vgnuplot_command_plot;
+ static string Vgnuplot_command_replot;
+ static string Vgnuplot_command_splot;
+ static string Vgnuplot_command_using;
+ static string Vgnuplot_command_with;
++static string Vgnuplot_command_axes;
+ static string Vgnuplot_command_title;
+ static string Vgnuplot_command_end;
+ 
+ static void
+ plot_stream_death_handler (pid_t pid, int)
+ {
+   close_plot_stream ();
+ 
+@@ -620,22 +621,38 @@ subplot_style::columns_ok (int nc)
+ }
+ 
+ void
+ subplot_style::accept (tree_walker& tw)
+ {
+   tw.visit_subplot_style (*this);
+ }
+ 
++int
++subplot_axes::print (ostrstream& plot_buf)
++{
++  if (! sp_axes.empty ())
++    plot_buf << " " << Vgnuplot_command_axes << " " << sp_axes;
++
++  return 0;
++}
++
++void
++subplot_axes::accept (tree_walker& tw)
++{
++  tw.visit_subplot_axes (*this);
++}
++
+ subplot::~subplot (void)
+ {
+   delete sp_plot_data;
+   delete sp_using_clause;
+   delete sp_title_clause;
+   delete sp_style_clause;
++  delete sp_axes_clause;
+ }
+ 
+ octave_value
+ subplot::extract_plot_data (int ndim, octave_value& data)
+ {
+   octave_value retval;
+ 
+   if (sp_using_clause)
+@@ -755,16 +772,23 @@ subplot::handle_plot_data (int ndim, ost
+ int
+ subplot::print (int ndim, ostrstream& plot_buf)
+ {
+   int status = handle_plot_data (ndim, plot_buf);
+ 
+   if (status < 0)
+     return -1;
+ 
++  if (sp_axes_clause)
++    {
++      int status = sp_axes_clause->print (plot_buf);
++      if (status < 0)
++	return -1;
++    }
++
+   if (sp_title_clause)
+     {
+       octave_value tmp = sp_title_clause->rvalue ();
+ 
+       if (! error_state && tmp.is_string ())
+ 	plot_buf << " " << Vgnuplot_command_title << " "
+ 	  << '"' << tmp.string_value () << '"';
+       else
+@@ -1146,16 +1170,22 @@ gnuplot_command_using (void)
+ 
+ static int
+ gnuplot_command_with (void)
+ {
+   return set_string_var (Vgnuplot_command_with, "gnuplot_command_with");
+ }
+ 
+ static int
++gnuplot_command_axes (void)
++{
++  return set_string_var (Vgnuplot_command_axes, "gnuplot_command_axes");
++}
++
++static int
+ gnuplot_command_title (void)
+ {
+   return set_string_var (Vgnuplot_command_title, "gnuplot_command_title");
+ }
+ 
+ static int
+ gnuplot_command_end (void)
+ {
+@@ -1197,16 +1227,19 @@ symbols_of_pt_plot (void)
+     "");
+ 
+   DEFVAR (gnuplot_command_using, "u", 0, gnuplot_command_using,
+     "");
+ 
+   DEFVAR (gnuplot_command_with, "w", 0, gnuplot_command_with,
+     "");
+ 
++  DEFVAR (gnuplot_command_axes, "ax", 0, gnuplot_command_axes,
++    "");
++
+   DEFVAR (gnuplot_command_title, "t", 0, gnuplot_command_title,
+     "");
+ 
+   DEFVAR (gnuplot_command_end, "\n", 0, gnuplot_command_end,
+     "");
+ 
+ #ifdef GNUPLOT_HAS_FRAMES
+   double with_frames = 1.0;
+diff --git a/src/pt-plot.h b/src/pt-plot.h
+--- a/src/pt-plot.h
++++ b/src/pt-plot.h
+@@ -31,16 +31,17 @@ class ostream;
+ class ostrstream;
+ 
+ class tree_expression;
+ class tree_plot_command;
+ class plot_limits;
+ class plot_range;
+ class subplot_using;
+ class subplot_style;
++class subplot_axes;
+ class subplot;
+ class subplot_list;
+ 
+ class tree_walker;
+ 
+ #include <csignal>
+ 
+ #include <string>
+@@ -260,66 +261,139 @@ private:
+   // No copying!
+ 
+   subplot_style (const subplot_style&);
+ 
+   subplot_style& operator = (const subplot_style&);
+ };
+ 
+ class
++subplot_axes
++{
++public:
++
++  subplot_axes (const string& s = string ())
++    : sp_axes (s) { }
++
++  ~subplot_axes (void) { }
++
++  int print (ostrstream& plot_buf);
++
++  string axes (void) { return sp_axes; }
++
++  void accept (tree_walker& tw);
++
++private:
++
++  // The axes we are using: `x1y1', `x1y2', etc.
++  string sp_axes;
++
++  // No copying!
++
++  subplot_axes (const subplot_axes&);
++
++  subplot_axes& operator = (const subplot_axes&);
++};
++
++class
+ subplot
+ {
+ public:
+ 
+   subplot (tree_expression *data = 0)
+     : sp_plot_data (data), sp_using_clause (0), sp_title_clause (0),
+-      sp_style_clause (0) { }
+-
+-  subplot (subplot_using *u, tree_expression *t, subplot_style *s)
+-    : sp_plot_data (0), sp_using_clause (u), sp_title_clause (t),
+-      sp_style_clause (s) { }
++      sp_style_clause (0), sp_axes_clause (0) { }
+ 
+   ~subplot (void);
+ 
+-  subplot *set_data (tree_expression *data)
++  subplot *add_data (tree_expression *data)
+     {
+       sp_plot_data = data;
+       return this;
+     }
+ 
++  subplot *add_clause (subplot_using *u)
++    {
++      if (! sp_using_clause)
++	{
++	  sp_using_clause = u;
++	  return this;
++	}
++      else
++	return 0;
++    }
++
++  subplot *add_clause (tree_expression *t)
++    {
++      if (! sp_title_clause)
++	{
++	  sp_title_clause = t;
++	  return this;
++	}
++      else
++	return 0;
++    }
++
++  subplot *add_clause (subplot_style *s)
++    {
++      if (! sp_style_clause)
++	{
++	  sp_style_clause = s;
++	  return this;
++	}
++      else
++	return 0;
++    }
++
++  subplot *add_clause (subplot_axes *a)
++    {
++      if (! sp_axes_clause)
++	{
++	  sp_axes_clause = a;
++	  return this;
++	}
++      else
++	return 0;
++    }
++
+   octave_value extract_plot_data (int ndim, octave_value& data);
+ 
+   int handle_plot_data (int ndim, ostrstream& plot_buf);
+ 
+   int print (int ndim, ostrstream& plot_buf);
+ 
+   tree_expression *plot_data (void) { return sp_plot_data; }
+ 
+   subplot_using *using_clause (void) { return sp_using_clause; }
+ 
+   tree_expression *title_clause (void) { return sp_title_clause; }
+ 
+   subplot_style *style_clause (void) { return sp_style_clause; }
+ 
++  subplot_axes *axes_clause (void) { return sp_axes_clause; }
++
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
+   // The data to plot.
+   tree_expression *sp_plot_data;
+ 
+   // The `using' option
+   subplot_using *sp_using_clause;
+ 
+   // The `title' option
+   tree_expression *sp_title_clause;
+ 
+   // The `style' option
+   subplot_style *sp_style_clause;
+ 
++  // The `axes' option
++  subplot_axes *sp_axes_clause;
++
+   // No copying!
+ 
+   subplot (const subplot&);
+ 
+   subplot& operator = (const subplot&);
+ };
+ 
+ class
+diff --git a/src/pt-pr-code.cc b/src/pt-pr-code.cc
+--- a/src/pt-pr-code.cc
++++ b/src/pt-pr-code.cc
+@@ -788,16 +788,21 @@ tree_print_code::visit_subplot (subplot&
+ 
+   if (sp_plot_data)
+     {
+       os << " ";
+ 
+       sp_plot_data->accept (*this);
+     }
+ 
++  subplot_axes *sp_axes_clause = cmd.axes_clause ();
++
++  if (sp_axes_clause)
++    sp_axes_clause->accept (*this);
++
+   subplot_using *sp_using_clause = cmd.using_clause ();
+ 
+   if (sp_using_clause)
+     sp_using_clause->accept (*this);
+ 
+   tree_expression *sp_title_clause = cmd.title_clause ();
+ 
+   if (sp_title_clause)
+@@ -805,16 +810,22 @@ tree_print_code::visit_subplot (subplot&
+ 
+   subplot_style *sp_style_clause = cmd.style_clause ();
+ 
+   if (sp_style_clause)
+     sp_style_clause->accept (*this);
+ }
+ 
+ void
++tree_print_code::visit_subplot_axes (subplot_axes& cmd)
++{
++  os << " axes " << cmd.axes ();
++}
++
++void
+ tree_print_code::visit_subplot_list (subplot_list& lst)
+ {
+   Pix p = lst.first ();
+ 
+   while (p)
+     {
+       subplot *elt = lst (p);
+ 
+diff --git a/src/pt-pr-code.h b/src/pt-pr-code.h
+--- a/src/pt-pr-code.h
++++ b/src/pt-pr-code.h
+@@ -111,16 +111,18 @@ public:
+   void visit_simple_assignment (tree_simple_assignment&);
+ 
+   void visit_statement (tree_statement&);
+ 
+   void visit_statement_list (tree_statement_list&);
+ 
+   void visit_subplot (subplot&);
+ 
++  void visit_subplot_axes (subplot_axes&);
++
+   void visit_subplot_list (subplot_list&);
+ 
+   void visit_subplot_style (subplot_style&);
+ 
+   void visit_subplot_using (subplot_using&);
+ 
+   void visit_switch_case (tree_switch_case&);
+ 
+diff --git a/src/pt-walk.h b/src/pt-walk.h
+--- a/src/pt-walk.h
++++ b/src/pt-walk.h
+@@ -54,16 +54,17 @@ class plot_range;
+ class tree_postfix_expression;
+ class tree_prefix_expression;
+ class tree_return_command;
+ class tree_return_list;
+ class tree_simple_assignment;
+ class tree_statement;
+ class tree_statement_list;
+ class subplot;
++class subplot_axes;
+ class subplot_list;
+ class subplot_style;
+ class subplot_using;
+ class tree_try_catch_command;
+ class tree_unwind_protect_command;
+ class tree_while_command;
+ 
+ class
+@@ -175,16 +176,19 @@ public:
+ 
+   virtual void
+   visit_statement_list (tree_statement_list&) = 0;
+ 
+   virtual void
+   visit_subplot (subplot&) = 0;
+ 
+   virtual void
++  visit_subplot_axes (subplot_axes&) = 0;
++
++  virtual void
+   visit_subplot_list (subplot_list&) = 0;
+ 
+   virtual void
+   visit_subplot_style (subplot_style&) = 0;
+ 
+   virtual void
+   visit_subplot_using (subplot_using&) = 0;
+ 
+diff --git a/src/variables.cc b/src/variables.cc
+--- a/src/variables.cc
++++ b/src/variables.cc
+@@ -36,16 +36,17 @@ Software Foundation, 59 Temple Place - S
+ #include "str-vec.h"
+ 
+ #include <defaults.h>
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "help.h"
++#include "input.h"
+ #include "lex.h"
+ #include "oct-map.h"
+ #include "oct-obj.h"
+ #include "ov.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "symtab.h"
+ #include "toplev.h"
+@@ -505,24 +506,29 @@ symbol_out_of_date (symbol_record *sr)
+       if (tmp)
+ 	{
+ 	  string ff = tmp->fcn_file_name ();
+ 
+ 	  if (! (ff.empty ()
+ 		 || (Vignore_function_time_stamp
+ 		     && tmp->is_system_fcn_file ())))
+ 	    {
+-	      time_t tp = tmp->time_parsed ();
++	      if (tmp->time_checked () < Vlast_prompt_time)
++		{
++		  time_t tp = tmp->time_parsed ();
+ 
+-	      string fname = fcn_file_in_path (ff);
++		  string fname = fcn_file_in_path (ff);
+ 
+-	      file_stat fs (fname);
++		  tmp->mark_fcn_file_up_to_date (time (0));
++
++		  file_stat fs (fname);
+ 
+-	      if (fs && fs.is_newer (tp))
+-		retval = true;
++		  if (fs && fs.is_newer (tp))
++		    retval = true;
++		}
+ 	    }
+ 	}
+     }
+ 
+   return retval;
+ }
+ 
+ bool

@@ -1,0 +1,592 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1375302528 -3600
+#      Wed Jul 31 21:28:48 2013 +0100
+# Node ID c97a26408ee0caee4359b99fb7467d911dadb369
+# Parent  47b504503a3fd207f068361b7e7b1854a0b8a6b3
+Implement PixelRegion option for imread().
+
+* imread.m: document new option.
+* private/__imread__.m: parse new option and set defaults.
+* __magick_read__.cc (calculate region): new option to calculate the region
+  to be read, shifts in memory required, and output image size.
+  (read_indexed_images, read_images): implement reading of only specific
+  regions of an image.
+  (__magick_read__): get octave_scalar_map at start for simplicity.
+
+diff --git a/libinterp/dldfcn/__magick_read__.cc b/libinterp/dldfcn/__magick_read__.cc
+--- a/libinterp/dldfcn/__magick_read__.cc
++++ b/libinterp/dldfcn/__magick_read__.cc
+@@ -39,52 +39,91 @@ along with Octave; see the file COPYING.
+ 
+ #include "gripes.h"
+ 
+ #ifdef HAVE_MAGICK
+ 
+ #include <Magick++.h>
+ #include <clocale>
+ 
++static std::map<std::string, octave_idx_type>
++calculate_region (const octave_scalar_map& options)
++{
++  std::map<std::string, octave_idx_type> region;
++  const Cell pixel_region = options.getfield ("region").cell_value ();
++
++  // Subtract 1 to account for 0 indexing.
++  const Range rows     = pixel_region (0).range_value ();
++  const Range cols     = pixel_region (1).range_value ();
++  region["row_start"]  = rows.base () -1;
++  region["col_start"]  = cols.base () -1;
++  region["row_end"]    = rows.limit () -1;
++  region["col_end"]    = cols.limit () -1;
++
++  // Length of the area to load into the Image Pixel Cache
++  region["row_cache"] = region["row_end"] - region["row_start"] +1;
++  region["col_cache"] = region["col_end"] - region["col_start"] +1;
++
++  // How much we have to shift in the memory when doing the loops.
++  region["row_shift"] = region["col_cache"] * rows.inc ();
++  region["col_shift"] = region["col_cache"] * region["row_cache"] - cols.inc ();
++
++  // The actual height and width of the output image
++  region["row_out"] = floor ((region["row_end"] - region["row_start"]) / rows.inc ()) + 1;
++  region["col_out"] = floor ((region["col_end"] - region["col_start"]) / cols.inc ()) + 1;
++
++  return region;
++}
++
+ template <class T>
+ static octave_value_list
+ read_indexed_images (std::vector<Magick::Image>& imvec,
+                      const Array<octave_idx_type>& frameidx,
+-                     const octave_idx_type nargout)
++                     const octave_idx_type nargout,
++                     const octave_scalar_map& options)
+ {
+   typedef typename T::element_type P;
+ 
+   octave_value_list retval (3, Matrix ());
+ 
+-  const octave_idx_type nRows    = imvec[0].baseRows ();
+-  const octave_idx_type nCols    = imvec[0].baseColumns ();
+-  const octave_idx_type nFrames  = frameidx.length ();
++  std::map<std::string, octave_idx_type> region = calculate_region (options);
++  const octave_idx_type nFrames = frameidx.length ();
++  const octave_idx_type nRows = region["row_out"];
++  const octave_idx_type nCols = region["col_out"];
+ 
+   T img       = T (dim_vector (nRows, nCols, 1, nFrames));
+   P* img_fvec = img.fortran_vec ();
+ 
++  const octave_idx_type row_start  = region["row_start"];
++  const octave_idx_type col_start  = region["col_start"];
++  const octave_idx_type row_shift  = region["row_shift"];
++  const octave_idx_type col_shift  = region["col_shift"];
++  const octave_idx_type row_cache  = region["row_cache"];
++  const octave_idx_type col_cache  = region["col_cache"];
++
+   // When reading PixelPackets from the Image Pixel Cache, they come in
+   // row major order. So we keep moving back and forth there so we can
+   // write the image in column major order.
+   octave_idx_type idx = 0;
+   for (octave_idx_type frame = 0; frame < nFrames; frame++)
+     {
+-      imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++      imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                             col_cache, row_cache);
+ 
+       const Magick::IndexPacket *pix
+         = imvec[frameidx(frame)].getConstIndexes ();
+ 
+       for (octave_idx_type col = 0; col < nCols; col++)
+         {
+           for (octave_idx_type row = 0; row < nRows; row++)
+             {
+               img_fvec[idx++] = static_cast<P> (*pix);
+-              pix += nCols;
++              pix += row_shift;
+             }
+-          pix -= nCols * nRows -1;
++          pix -= col_shift;
+         }
+     }
+   retval(0) = octave_value (img);
+ 
+   // Do we need to get the colormap to interpret the image and alpha channel?
+   if (nargout > 1)
+     {
+       const octave_idx_type mapsize = imvec[0].colorMapSize ();
+@@ -143,27 +182,36 @@ read_indexed_images (std::vector<Magick:
+ // This function is highly repetitive, a bunch of for loops that are
+ // very similar to account for different image types. They are different
+ // enough that trying to reduce the copy and paste would decrease its
+ // readability too much.
+ template <class T>
+ octave_value_list
+ read_images (std::vector<Magick::Image>& imvec,
+              const Array<octave_idx_type>& frameidx,
+-             const octave_idx_type nargout)
++             const octave_idx_type nargout,
++             const octave_scalar_map& options)
+ {
+   typedef typename T::element_type P;
+ 
+   octave_value_list retval (3, Matrix ());
+ 
+-  const octave_idx_type nRows   = imvec[0].baseRows ();
+-  const octave_idx_type nCols   = imvec[0].baseColumns ();
++  std::map<std::string, octave_idx_type> region = calculate_region (options);
+   const octave_idx_type nFrames = frameidx.length ();
++  const octave_idx_type nRows = region["row_out"];
++  const octave_idx_type nCols = region["col_out"];
+   T img;
+ 
++  const octave_idx_type row_start  = region["row_start"];
++  const octave_idx_type col_start  = region["col_start"];
++  const octave_idx_type row_shift  = region["row_shift"];
++  const octave_idx_type col_shift  = region["col_shift"];
++  const octave_idx_type row_cache  = region["row_cache"];
++  const octave_idx_type col_cache  = region["col_cache"];
++
+   // GraphicsMagick (GM) keeps the image values in memory using whatever
+   // QuantumDepth it was built with independently of the original image
+   // bitdepth. Basically this means that if GM was built with quantum 16
+   // all values are scaled in the uint16 range. If the original image
+   // had an 8 bit depth, we need to rescale it for that range.
+   // However, if the image had a bitdepth of 32, then we will be returning
+   // a floating point image. In this case, the values need to be rescaled
+   // for the range [0 1] (this is what Matlab has documented on the page
+@@ -232,88 +280,91 @@ read_images (std::vector<Magick::Image>&
+       {
+         img = T (dim_vector (nRows, nCols, 1, nFrames));
+         P *img_fvec = img.fortran_vec ();
+ 
+         octave_idx_type idx = 0;
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+ 
+             for (octave_idx_type col = 0; col < nCols; col++)
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     img_fvec[idx++] = pix->red / divisor;
+-                    pix += nCols;
++                    pix += row_shift;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         break;
+       }
+ 
+     case Magick::GrayscaleMatteType:    // Grayscale image with opacity
+       {
+         img   = T (dim_vector (nRows, nCols, 1, nFrames));
+         T alpha   (dim_vector (nRows, nCols, 1, nFrames));
+         P *img_fvec = img.fortran_vec ();
+         P *a_fvec   = alpha.fortran_vec ();
+ 
+         octave_idx_type idx = 0;
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+ 
+             for (octave_idx_type col = 0; col < nCols; col++)
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     img_fvec[idx] = pix->red / divisor;
+-                    a_fvec[idx] = pix->opacity / divisor;
+-                    pix += nCols;
++                    a_fvec[idx]   = pix->opacity / divisor;
++                    pix += row_shift;
+                     idx++;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         retval(2) = alpha;
+         break;
+       }
+ 
+     case Magick::PaletteType:           // Indexed color (palette) image
+     case Magick::TrueColorType:         // Truecolor image
+       {
+         img = T (dim_vector (nRows, nCols, 3, nFrames));
+         P *img_fvec = img.fortran_vec ();
+ 
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+ 
+             octave_idx_type idx = 0;
+             img_fvec += nRows * nCols * frame;
+             P *rbuf   = img_fvec;
+             P *gbuf   = img_fvec + nRows * nCols;
+             P *bbuf   = img_fvec + nRows * nCols * 2;
+ 
+             for (octave_idx_type col = 0; col < nCols; col++)
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     rbuf[idx] = pix->red   / divisor;
+                     gbuf[idx] = pix->green / divisor;
+                     bbuf[idx] = pix->blue  / divisor;
+-                    pix += nCols;
++                    pix += row_shift;
+                     idx++;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         break;
+       }
+ 
+     case Magick::PaletteMatteType:      // Indexed color (palette) image with opacity
+     case Magick::TrueColorMatteType:    // Truecolor image with opacity
+       {
+@@ -323,71 +374,73 @@ read_images (std::vector<Magick::Image>&
+         P *a_fvec   = alpha.fortran_vec ();
+ 
+         // Unlike the index for the other channels, this one won't need
+         // to be reset on each frame since it's a separate matrix.
+         octave_idx_type a_idx = 0;
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+ 
+             octave_idx_type idx = 0;
+             img_fvec += nRows * nCols * frame;
+             P *rbuf   = img_fvec;
+             P *gbuf   = img_fvec + nRows * nCols;
+             P *bbuf   = img_fvec + nRows * nCols * 2;
+ 
+             for (octave_idx_type col = 0; col < nCols; col++)
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     rbuf[idx]     = pix->red     / divisor;
+                     gbuf[idx]     = pix->green   / divisor;
+                     bbuf[idx]     = pix->blue    / divisor;
+                     a_fvec[a_idx] = pix->opacity / divisor;
+-                    pix += nCols;
++                    pix += row_shift;
+                     idx++;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         retval(2) = alpha;
+         break;
+       }
+ 
+     case Magick::ColorSeparationType:   // Cyan/Yellow/Magenta/Black (CYMK) image
+       {
+         img   = T (dim_vector (nRows, nCols, 4, nFrames));
+         P *img_fvec = img.fortran_vec ();
+ 
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+ 
+             octave_idx_type idx = 0;
+             img_fvec += nRows * nCols * frame;
+             P *cbuf   = img_fvec;
+             P *mbuf   = img_fvec + nRows * nCols;
+             P *ybuf   = img_fvec + nRows * nCols * 2;
+             P *kbuf   = img_fvec + nRows * nCols * 3;
+ 
+             for (octave_idx_type col = 0; col < nCols; col++)
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     cbuf[idx] = pix->red     / divisor;
+                     mbuf[idx] = pix->green   / divisor;
+                     ybuf[idx] = pix->blue    / divisor;
+                     kbuf[idx] = pix->opacity / divisor;
+-                    pix += nCols;
++                    pix += row_shift;
+                     idx++;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         break;
+       }
+ 
+     // Cyan, magenta, yellow, and black with alpha (opacity) channel
+     case Magick::ColorSeparationMatteType:
+       {
+@@ -397,17 +450,18 @@ read_images (std::vector<Magick::Image>&
+         P *a_fvec   = alpha.fortran_vec ();
+ 
+         // Unlike the index for the other channels, this one won't need
+         // to be reset on each frame since it's a separate matrix.
+         octave_idx_type a_idx = 0;
+         for (octave_idx_type frame = 0; frame < nFrames; frame++)
+           {
+             const Magick::PixelPacket *pix
+-              = imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++              = imvec[frameidx(frame)].getConstPixels (col_start, row_start,
++                                                       col_cache, row_cache);
+             // Note that for CMYKColorspace + matte (CMYKA), the opacity is
+             // stored in the assocated IndexPacket.
+             const Magick::IndexPacket *apix
+               = imvec[frameidx(frame)].getConstIndexes ();
+ 
+             octave_idx_type idx = 0;
+             img_fvec += nRows * nCols * frame;
+             P *cbuf   = img_fvec;
+@@ -419,21 +473,21 @@ read_images (std::vector<Magick::Image>&
+               {
+                 for (octave_idx_type row = 0; row < nRows; row++)
+                   {
+                     cbuf[idx]     = pix->red     / divisor;
+                     mbuf[idx]     = pix->green   / divisor;
+                     ybuf[idx]     = pix->blue    / divisor;
+                     kbuf[idx]     = pix->opacity / divisor;
+                     a_fvec[a_idx] = *apix / divisor;
+-                    pix += nCols;
++                    pix += row_shift;
+                     idx++;
+                     a_idx++;
+                   }
+-                pix -= nRows * nCols -1;
++                pix -= col_shift;
+               }
+           }
+         retval(2) = alpha;
+         break;
+       }
+ 
+     default:
+       error ("__magick_read__: unknown Magick++ image type");
+@@ -519,33 +573,33 @@ use @code{imread}.\n\
+   maybe_initialize_magick ();
+ 
+   if (args.length () != 2 || ! args(0).is_string ())
+     {
+       print_usage ();
+       return output;
+     }
+ 
+-  const octave_map options = args(1).map_value ();
++  const octave_scalar_map options = args(1).scalar_map_value ();
+   if (error_state)
+     {
+       error ("__magick_read__: OPTIONS must be a struct");
+     }
+ 
+   std::vector<Magick::Image> imvec;
+   read_file (args(0).string_value (), imvec);
+   if (error_state)
+     {
+       return output;
+     }
+ 
+   // Prepare an Array with the indexes for the requested frames.
+   const octave_idx_type nFrames = imvec.size ();
+   Array<octave_idx_type> frameidx;
+-  const octave_value indexes = options.getfield ("index")(0);
++  const octave_value indexes = options.getfield ("index");
+   if (indexes.is_string () && indexes.string_value () == "all")
+     {
+       frameidx.resize (dim_vector (1, nFrames));
+       for (octave_idx_type i = 0; i < nFrames; i++)
+         {
+           frameidx(i) = i;
+         }
+     }
+@@ -589,50 +643,50 @@ use @code{imread}.\n\
+   //        A grayscale jpeg image reports being indexed even though the JPEG
+   //        format has no support for indexed images. So we can skip at least
+   //        for that.
+ 
+   if (klass == Magick::PseudoClass && imvec[0].magick () != "JPEG")
+     {
+       if (depth <= 1)
+         {
+-          output = read_indexed_images <boolNDArray> (imvec, frameidx, nargout);
++          output = read_indexed_images <boolNDArray> (imvec, frameidx, nargout, options);
+         }
+       else if (depth <= 8)
+         {
+-          output = read_indexed_images <uint8NDArray> (imvec, frameidx, nargout);
++          output = read_indexed_images <uint8NDArray> (imvec, frameidx, nargout, options);
+         }
+       else if (depth <= 16)
+         {
+-          output = read_indexed_images <uint16NDArray> (imvec, frameidx, nargout);
++          output = read_indexed_images <uint16NDArray> (imvec, frameidx, nargout, options);
+         }
+       else
+         {
+           error ("imread: indexed images with depths greater than 16-bit are not supported");
+           return output;
+         }
+     }
+ 
+   else
+     {
+       if (depth <= 1)
+         {
+-          output = read_images<boolNDArray> (imvec, frameidx, nargout);
++          output = read_images<boolNDArray> (imvec, frameidx, nargout, options);
+         }
+       else if (depth <= 8)
+         {
+-          output = read_images<uint8NDArray> (imvec, frameidx, nargout);
++          output = read_images<uint8NDArray> (imvec, frameidx, nargout, options);
+         }
+       else if (depth <= 16)
+         {
+-          output = read_images<uint16NDArray> (imvec, frameidx, nargout);
++          output = read_images<uint16NDArray> (imvec, frameidx, nargout, options);
+         }
+       else if (depth <= 32)
+         {
+-          output = read_images<FloatNDArray> (imvec, frameidx, nargout);
++          output = read_images<FloatNDArray> (imvec, frameidx, nargout, options);
+         }
+       else
+         {
+           error ("imread: reading of images with %i-bit depth is not supported",
+                  depth);
+         }
+     }
+ 
+diff --git a/scripts/image/imread.m b/scripts/image/imread.m
+--- a/scripts/image/imread.m
++++ b/scripts/image/imread.m
+@@ -60,16 +60,22 @@
+ ## @item "Frames" or "Index"
+ ## This is an alternative method to specify @var{idx}.  When specifying it
+ ## in this way, its value can also be the string "all".
+ ##
+ ## @item "Info"
+ ## This option exists for @sc{Matlab} compatibility and has no effect.  For
+ ## maximum performance while reading multiple images from a single file,
+ ## use the Index option.
++##
++## @item "PixelRegion"
++## Controls the image region that is read.  Takes as value a cell array
++## with two arrays of 3 elements @code{@{@var{rows} @var{cols}@}}.  The
++## elements in the array are the start, increment and end pixel to be
++## read.  If the increment value is ommited, defaults to 1.
+ ## @end table
+ ##
+ ## @seealso{imwrite, imfinfo, imformats}
+ ## @end deftypefn
+ 
+ ## Author: Carnë Draug <carandraug@octave.org>
+ ## Author: Thomas L. Scofield <scofield@calvin.edu>
+ ## Author: Kristian Rumberg <kristianrumberg@gmail.com>
+diff --git a/scripts/image/private/__imread__.m b/scripts/image/private/__imread__.m
+--- a/scripts/image/private/__imread__.m
++++ b/scripts/image/private/__imread__.m
+@@ -51,18 +51,20 @@ function varargout = __imread__ (filenam
+     filename  = [filename "." varargin{offset}];
+     fn        = file_in_path (IMAGE_PATH, filename);
+     offset++;
+   endif
+   if (isempty (fn))
+     error ("imread: cannot find %s", filename);
+   endif
+ 
++  info = imfinfo (fn)(1);
+   ## set default for options
+-  options = struct ("index", 1);
++  options = struct ("index",       1,
++                    "region", {{1:1:info.Height 1:1:info.Width}});
+ 
+   ## Index is the only option that can be defined without the parameter/value
+   ## pair style. When defining it here, the string "all" is invalid though.
+   if (nargin >= offset + 1 && ! ischar (varargin{offset}))
+     if (! is_valid_index_option (options.index))
+       error ("imread: IDX must be a numeric vector");
+     endif
+     options.index = varargin{offset};
+@@ -79,37 +81,41 @@ function varargout = __imread__ (filenam
+ 
+       case {"frames", "index"},
+         options.index = varargin{idx+1};
+         if (! (is_valid_index_option (options.index)) &&
+             ! (ischar (options.index) && strcmpi (options.index, "all")))
+           error ("imread: value for %s must be a vector or the string `all'");
+         endif
+ 
+-## FIXME: commented until it's implemented in __magick_read__
+-##      case "pixelregion",
+-##        options.region = varargin{idx+1};
+-##        if (! iscell (options.region) || numel (options.region) != 2)
+-##          error ("imread: value for %s must be a 2 element cell array",
+-##                 varargin{idx});
+-##        endif
+-##        for reg_idx = 1:2
+-##          if (numel (options.region{reg_idx}) == 3)
+-##            ## do nothing
+-##          elseif (numel (options.region{reg_idx}) == 2)
+-##            options.region{reg_idx}(3) = options.region{reg_idx}(2);
+-##            options.region{reg_idx}(2) = 1;
+-##          else
+-##            error ("imread: range for %s must be a 2 or 3 element vector",
+-##                   varargin{idx});
+-##          endif
+-##          options.region{reg_idx} = floor (options.region{reg_idx}(1)): ...
+-##                                    floor (options.region{reg_idx}(2)): ...
+-##                                    floor (options.region{reg_idx}(3));
+-##        endfor
++      case "pixelregion",
++        options.region = varargin{idx+1};
++        if (! iscell (options.region) || numel (options.region) != 2)
++          error ("imread: value for %s must be a 2 element cell array",
++                 varargin{idx});
++        endif
++        for reg_idx = 1:2
++          if (numel (options.region{reg_idx}) == 3)
++            ## do nothing
++          elseif (numel (options.region{reg_idx}) == 2)
++            options.region{reg_idx}(3) = options.region{reg_idx}(2);
++            options.region{reg_idx}(2) = 1;
++          else
++            error ("imread: range for %s must be a 2 or 3 element vector",
++                   varargin{idx});
++          endif
++          options.region{reg_idx} = floor (options.region{reg_idx}(1)): ...
++                                    floor (options.region{reg_idx}(2)): ...
++                                    floor (options.region{reg_idx}(3));
++        endfor
++        if (options.region{1}(end) > info.Height)
++          error ("imread: end ROWS for PixelRegions option is larger than image height");
++        elseif (options.region{2}(end) > info.Width)
++          error ("imread: end COLS for PixelRegions option is larger than image width");
++        endif
+ 
+       case "info",
+         ## We ignore this option. This parameter exists in Matlab to
+         ## speed up the reading of multipage TIFF.  It makes no difference
+         ## for us since we're already quite efficient.
+ 
+       otherwise
+         error ("imread: invalid PARAMETER `%s'", varargin{idx});

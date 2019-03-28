@@ -1,0 +1,174 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1344907454 18000
+#      Mon Aug 13 20:24:14 2012 -0500
+# Node ID 7a19e8275d41f634c6bc3504eb20c8ade78b434b
+# Parent  a44ff4f0a20b06a051fac985b5d4d09490c78874
+Do not simplify the CFG during type inference
+
+* jit-ir.cc (jit_block::maybe_split): Keep define before use in block list.
+
+* pt-jit.cc (jit_convert::merge_blocks): Removed function.
+(jit_convert::jit_convert, jit_convert::construct_ssa): Do not call
+merge_blocks.
+(tree_jit::initialize): Simplify CFG before optimization passes.
+* pt-jit.h (jit_convert::merge_blocks): Remove declaration.
+
+diff --git a/src/interp-core/jit-ir.cc b/src/interp-core/jit-ir.cc
+--- a/src/interp-core/jit-ir.cc
++++ b/src/interp-core/jit-ir.cc
+@@ -399,21 +399,18 @@ jit_block *
+ jit_block::maybe_split (jit_convert& convert, jit_block *asuccessor)
+ {
+   if (successor_count () > 1)
+     {
+       jit_terminator *term = terminator ();
+       size_t idx = term->successor_index (asuccessor);
+       jit_block *split = convert.create<jit_block> ("phi_split", mvisit_count);
+ 
+-      // try to place splits where they make sense
+-      if (id () < asuccessor->id ())
+-        convert.insert_before (asuccessor, split);
+-      else
+-        convert.insert_after (this, split);
++      // place after this to ensure define before use in the blocks list
++      convert.insert_after (this, split);
+ 
+       term->stash_argument (idx, split);
+       jit_branch *br = split->append (convert.create<jit_branch> (asuccessor));
+       replace_in_phi (asuccessor, split);
+ 
+       if (alive ())
+         {
+           split->mark_alive ();
+diff --git a/src/interp-core/pt-jit.cc b/src/interp-core/pt-jit.cc
+--- a/src/interp-core/pt-jit.cc
++++ b/src/interp-core/pt-jit.cc
+@@ -115,17 +115,16 @@ jit_convert::jit_convert (llvm::Module *
+           if (jit_terminator *term = dynamic_cast<jit_terminator *> (next))
+             append_users_term (term);
+           else
+             append_users (next);
+         }
+     }
+ 
+   remove_dead ();
+-  merge_blocks ();
+   final_block->label ();
+   place_releases ();
+   simplify_phi ();
+ 
+ #ifdef OCTAVE_JIT_DEBUG
+   final_block->label ();
+   std::cout << "-------------------- Compiling tree --------------------\n";
+   std::cout << tee.str_print_code () << std::endl;
+@@ -945,45 +944,18 @@ jit_convert::append_users_term (jit_term
+           jit_terminator *sterm = succ->terminator ();
+           if (sterm)
+             push_worklist (sterm);
+         }
+     }
+ }
+ 
+ void
+-jit_convert::merge_blocks (void)
+-{
+-  std::vector<jit_block *> dead;
+-  for (block_list::iterator iter = blocks.begin (); iter != blocks.end ();
+-       ++iter)
+-    {
+-      jit_block *b = *iter;
+-      jit_block *merged = b->maybe_merge ();
+-
+-      if (merged)
+-        {
+-          if (merged == final_block)
+-            final_block = b;
+-
+-          if (merged == entry_block)
+-            entry_block = b;
+-
+-          dead.push_back (merged);
+-        }
+-    }
+-
+-  for (size_t i = 0; i < dead.size (); ++i)
+-    blocks.erase (dead[i]->location ());
+-}
+-
+-void
+ jit_convert::construct_ssa (void)
+ {
+-  merge_blocks ();
+   final_block->label ();
+   final_block->compute_idom (entry_block);
+   entry_block->compute_df ();
+   entry_block->create_dom_tree ();
+ 
+   // insert phi nodes where needed, this is done on a per variable basis
+   for (vmap_t::iterator iter = vmap.begin (); iter != vmap.end (); ++iter)
+     {
+@@ -1603,16 +1575,17 @@ tree_jit::initialize (void)
+   if (! engine)
+     return false;
+ 
+   module_pass_manager = new llvm::PassManager ();
+   module_pass_manager->add (llvm::createAlwaysInlinerPass ());
+ 
+   pass_manager = new llvm::FunctionPassManager (module);
+   pass_manager->add (new llvm::TargetData(*engine->getTargetData ()));
++  pass_manager->add (llvm::createCFGSimplificationPass ());
+   pass_manager->add (llvm::createBasicAliasAnalysisPass ());
+   pass_manager->add (llvm::createPromoteMemoryToRegisterPass ());
+   pass_manager->add (llvm::createInstructionCombiningPass ());
+   pass_manager->add (llvm::createReassociatePass ());
+   pass_manager->add (llvm::createGVNPass ());
+   pass_manager->add (llvm::createCFGSimplificationPass ());
+   pass_manager->doInitialization ();
+ 
+@@ -2004,9 +1977,23 @@ Test some simple cases that compile.
+ %! a = zeros (1, num);
+ %! i = 1;
+ %! while i <= num
+ %!   a(i) = norm (eye (i));
+ %!   ++i;
+ %! endwhile
+ %! assert (a, ones (1, num));
+ 
++%!function test_compute_idom ()
++%! while (li <= length (l1) && si <= length (s1))
++%!   if (l1 (li) < s1 (si))
++%!     if (li == si)
++%!       break;
++%!     endif;
++%!     li++;
++%!   else
++%!     si++;
++%!   endif;
++%! endwhile
++
++%!error test_compute_idom ()
++
+ */
+diff --git a/src/interp-core/pt-jit.h b/src/interp-core/pt-jit.h
+--- a/src/interp-core/pt-jit.h
++++ b/src/interp-core/pt-jit.h
+@@ -329,18 +329,16 @@ private:
+ 
+   void track_value (jit_value *value)
+   {
+     if (value->type ())
+       constants.push_back (value);
+     all_values.push_back (value);
+   }
+ 
+-  void merge_blocks (void);
+-
+   void construct_ssa (void);
+ 
+   void do_construct_ssa (jit_block& block, size_t avisit_count);
+ 
+   void remove_dead ();
+ 
+   void place_releases (void);
+ 

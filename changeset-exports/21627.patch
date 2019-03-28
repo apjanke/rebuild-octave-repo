@@ -1,0 +1,169 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1460830537 -3600
+#      Sat Apr 16 19:15:37 2016 +0100
+# Node ID 225d88a97104606c0690a6ae4f46c04a77685b2f
+# Parent  1dda942a2514dcd5b1276145bc989a4d291078ad
+hist: reduce memory usage by avoiding conversion to double (bug #47707)
+
+* hist.m: do not convert whole input array to double.  Instead, convert only
+the pieces that are needed (max and min values), and floor the cutoff point
+so they are placed in the right place when sorted (for N > 30 only).  There
+was no issue with overflow as the comments suggested (at least not anymore).
+Further reduce memory by avoiding intermediate variables.  Add more logic so
+that NBINS or specified X can be of class single.  Add tests for all this.
+
+diff --git a/scripts/plot/draw/hist.m b/scripts/plot/draw/hist.m
+--- a/scripts/plot/draw/hist.m
++++ b/scripts/plot/draw/hist.m
+@@ -91,25 +91,35 @@ function [nn, xx] = hist (varargin)
+   endif
+ 
+   if (! isreal (y))
+     error ("hist: Y must be real valued");
+   endif
+ 
+   max_val = max (y(:));
+   min_val = min (y(:));
++  ## Do not convert if input is of class single (or if already is double).
++  if (! isfloat (y))
++    max_val = double (max_val);
++    min_val = double (min_val);
++  endif
+ 
+   iarg = 1;
+   if (nargin == 1 || ischar (varargin{iarg}))
+     n = 10;
+     x = [0.5:n]'/n;
+     x = (max_val - min_val) * x + min_val * ones (size (x));
+   else
+     ## nargin is either 2 or 3
+     x = varargin{iarg++};
++    ## Do not convert if input is of class single (or if already is double).
++    if (! isfloat (x))
++      x = double (x);
++    endif
++
+     if (isscalar (x))
+       n = x;
+       if (n <= 0)
+         error ("hist: number of bins NBINS must be positive");
+       endif
+       x = [0.5:n]'/n;
+       x = (max_val - min_val) * x  + min_val * ones (size (x));
+     elseif (isreal (x))
+@@ -121,39 +131,38 @@ function [nn, xx] = hist (varargin)
+         warning ("hist: bin values not sorted on input");
+         x = xsort;
+       endif
+     else
+       error ("hist: second argument must be a scalar or a vector");
+     endif
+   endif
+ 
+-  ## Avoid issues with integer types for x and y
+-  x = double (x);
+-  y = double (y);
++  cutoff = (x(1:end-1,:) + x(2:end,:)) / 2;
++  if (isinteger (y))
++    cutoff = floor (cutoff);
++  endif
+ 
+-  cutoff = (x(1:end-1,:) + x(2:end,:)) / 2;
+   n = rows (x);
+   y_nc = columns (y);
+   if (n < 30 && columns (x) == 1)
+     ## The following algorithm works fastest for n less than about 30.
+     chist = zeros (n+1, y_nc);
+     for i = 1:n-1
+       chist(i+1,:) = sum (y <= cutoff(i));
+     endfor
+     chist(n+1,:) = sum (! isnan (y));
+   else
+     ## The following algorithm works fastest for n greater than about 30.
+     ## Put cutoff elements between boundaries, integrate over all
+     ## elements, keep totals at boundaries.
+-    [s, idx] = sort ([y; repmat(cutoff, 1, y_nc)]);
+-    len = rows (y);
+-    chist = cumsum (idx <= len);
++    m = (nthargout (2, @sort, [y; repmat(cutoff, 1, y_nc)]) <= rows (y));
++    chist = cumsum (m);
+     chist = [(zeros (1, y_nc));
+-             (reshape (chist(idx > len), rows (cutoff), y_nc));
++             (reshape (chist(! m), rows (cutoff), y_nc));
+              (chist(end,:) - sum (isnan (y)))];
+   endif
+ 
+   freq = diff (chist);
+ 
+   if (nargin > 2 && ! ischar (varargin{iarg}))
+     ## Normalize the histogram.
+     norm = varargin{iarg++};
+@@ -207,8 +216,67 @@ endfunction
+ %!   assert (sum (hist ([1:n], 29)), n);
+ %!   assert (sum (hist ([1:n], 30)), n);
+ %! endfor
+ %!assert (hist (1,1), 1)
+ %!assert (size (hist (randn (750,240), 200)), [200,240])
+ ## Test bug #42394
+ %!assert (isempty (hist (rand (10,2), 0:5, 1)), false)
+ %!assert (isempty (hist (rand (10,2), 0:5, [1 1])), false)
++
++## Test bug #47707
++%!test
++%! y = [1  9  2  2  9  3  8  9  1  7  1  1  3  2  4  4  8  2  1  9  4  1 ...
++%!      2  3  1  1  6  5  5  3  9  9  1  1  8  7  7  2  4  1];
++%! [n, x] = hist (y, 10);
++%! [nn, xx] = hist (uint8 (y), 10);
++%! assert (nn, n)
++%! assert (xx, x)
++%!
++%! ## test again with N > 30 because there's a special case for it
++%! [n, x] = hist (y, 35);
++%! [nn, xx] = hist (uint8 (y), 35);
++%! assert (nn, n)
++%! assert (xx, x)
++
++## Test logical input
++%!test
++%! y = [0  1  0  0  1  0  1  1  0  1  0  0  0  0  0  0  1  0];
++%! [n, x] = hist (y, 10);
++%! [nn, xx] = hist (logical (y), 10);
++%! assert (nn, n)
++%! assert (xx, x)
++%!
++%! ## test again with N > 30 because there's a special case for it
++%! [n, x] = hist (y, 35);
++%! [nn, xx] = hist (logical (y), 35);
++%! assert (nn, n)
++%! assert (xx, x)
++
++## Second output argument must be of class single if data is class single.
++%!assert (class (nthargout (2, @hist, rand (10, 1, "single"))), "single")
++
++## Handle second argument correctly, even when it's class integer
++%!test
++%! y = [2.4 2.5 2.6 5.4 5.5 5.6]
++%! n = [2  3  1];
++%! x = [1  4  7];
++%! [nn, xx] = hist (y, uint8 ([1 4 7]));
++%! assert (nn, n)
++%! assert (xx, x)
++
++%!test
++%! y = [2.4 2.5 2.6 5.4 5.5 5.6];
++%! s = (5.6 - 2.4) / 6;
++%! x = [2.4+s 4.0 5.6-s];
++%! n = [3 0 3];
++%!
++%! [nn, xx] = hist (y, 3);
++%! assert (nn, n)
++%! assert (xx, x)
++%!
++%! [nn, xx] = hist (y, uint8 (3));
++%! assert (nn, n)
++%! assert (xx, x)
++%!
++%! [nn, xx] = hist (y, single (3));
++%! assert (nn, n)
++%! assert (xx, single (x))

@@ -1,0 +1,278 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1501312673 -7200
+#      Sat Jul 29 09:17:53 2017 +0200
+# Node ID 2b1b2a795ba63b42e668e1867f61245710239c37
+# Parent  336f89b6208b7d6c9522026a06e113a1061afa06
+update clickable urls in terminal also when visible terminal has no focus
+
+* QTerminal.h: virtual slot for handling changes in the visibility of the
+  terminal
+
+* QUnixTerminalImp.cpp (handle_visibility_changed): implementation of the
+  virtual slot, calling function TerminalView::visibility_changed for
+  doing required actions
+
+* QUnixTerminalImpl.h: new slothandle_visibility_changed
+
+* TerminalView.cpp (TerminalView): create timer for processing the filters;
+  (blinkCursorEvent): do not update the filters here;
+  (visibility_changed): function called from the visibility changed slot,
+  en-/disabling cyclic timer for processing the filter chain
+
+* TerminalView.h: make processFilters a slot allowing to connect the new
+  timer to it, new function visibility_changed, new class variable holding
+  the time for processing the filter chain
+
+* terminal_dock_widget.cc (terminal_dock_widget): connect the signal for
+  changed visibility to the new slot of the terminal
+
+diff --git a/libgui/qterminal/libqterminal/QTerminal.h b/libgui/qterminal/libqterminal/QTerminal.h
+--- a/libgui/qterminal/libqterminal/QTerminal.h
++++ b/libgui/qterminal/libqterminal/QTerminal.h
+@@ -114,16 +114,18 @@ public slots:
+   virtual void init_terminal_size (void) { }
+ 
+   void terminal_interrupt (void) { emit interrupt_signal (); }
+ 
+   void set_global_shortcuts (bool focus_out);
+ 
+   void edit_file (void);
+ 
++  virtual void handle_visibility_changed (bool) { };
++
+ protected:
+ 
+   QTerminal (QWidget *xparent = nullptr) : QWidget (xparent)
+   {
+     // context menu
+     setContextMenuPolicy (Qt::CustomContextMenu);
+ 
+     _contextMenu = new QMenu (this);
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+@@ -249,8 +249,14 @@ QString QUnixTerminalImpl::selectedText 
+   return m_terminalView->selectedText ();
+ }
+ 
+ void
+ QUnixTerminalImpl::has_extra_interrupt (bool extra)
+ {
+   _extra_interrupt = extra;
+ }
++
++void
++QUnixTerminalImpl::handle_visibility_changed (bool visible)
++{
++  m_terminalView->visibility_changed (visible);
++};
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+@@ -51,16 +51,17 @@ public:
+     QString selectedText();
+     void has_extra_interrupt (bool extra_interrupt);
+     QList<QAction*> get_hotspot_actions (const QPoint& at);
+ 
+ public slots:
+     void copyClipboard();
+     void pasteClipboard();
+     void selectAll();
++    virtual void handle_visibility_changed (bool visible);
+ 
+ protected:
+     void showEvent(QShowEvent *);
+     virtual void resizeEvent(QResizeEvent *);
+ 
+ private:
+     void initialize();
+     void connectToPty();
+diff --git a/libgui/qterminal/libqterminal/unix/TerminalView.cpp b/libgui/qterminal/libqterminal/unix/TerminalView.cpp
+--- a/libgui/qterminal/libqterminal/unix/TerminalView.cpp
++++ b/libgui/qterminal/libqterminal/unix/TerminalView.cpp
+@@ -295,19 +295,25 @@ TerminalView::TerminalView(QWidget *pare
+   setScroll(0,0);
+   _scrollBar->setCursor( Qt::ArrowCursor );
+   connect(_scrollBar, SIGNAL(valueChanged(int)), this,
+           SLOT(scrollBarPositionChanged(int)));
+ 
+   // setup timers for blinking cursor and text
+   _blinkTimer   = new QTimer(this);
+   connect(_blinkTimer, SIGNAL(timeout()), this, SLOT(blinkEvent()));
++
+   _blinkCursorTimer   = new QTimer(this);
+   connect(_blinkCursorTimer, SIGNAL(timeout()), this, SLOT(blinkCursorEvent()));
+ 
++  _process_filter_timer = new QTimer (this);
++  connect (_process_filter_timer, SIGNAL (timeout ()),
++           this, SLOT (processFilters ()));
++  _process_filter_timer->start (300);
++
+   //  QCursor::setAutoHideCursor( this, true );
+ 
+   setUsesMouse(true);
+   setColorTable(base_color_table);
+   setMouseTracking(true);
+ 
+   // Enable drag and drop
+   setAcceptDrops(true); // attempt
+@@ -1392,19 +1398,16 @@ void TerminalView::blinkCursorEvent()
+   if (_hasBlinkingCursor)
+     _cursorBlinking = !_cursorBlinking;
+   else
+     _cursorBlinking = false;
+ 
+   QRect cursorRect = imageToWidget( QRect(cursorPosition(),QSize(1,1)) );
+ 
+   update(cursorRect);
+-
+-  // use this timer event for updating the hot spots
+-  processFilters ();
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+ /*                                                                           */
+ /*                                  Resizing                                 */
+ /*                                                                           */
+ /* ------------------------------------------------------------------------- */
+ 
+@@ -2731,8 +2734,19 @@ void TerminalView::setLineSpacing(uint i
+   setVTFont(font()); // Trigger an update.
+ }
+ 
+ QString TerminalView::selectedText ()
+ {
+   QString text = _screenWindow->selectedText (_preserveLineBreaks);
+   return text;
+ }
++
++void
++TerminalView::visibility_changed (bool visible)
++{
++  // Disable the timer for processing the filter chain, since this might time
++  // consuming
++  if (visible)
++    _process_filter_timer->start (300);
++  else
++    _process_filter_timer->stop ();
++}
+diff --git a/libgui/qterminal/libqterminal/unix/TerminalView.h b/libgui/qterminal/libqterminal/unix/TerminalView.h
+--- a/libgui/qterminal/libqterminal/unix/TerminalView.h
++++ b/libgui/qterminal/libqterminal/unix/TerminalView.h
+@@ -120,32 +120,16 @@ public:
+      * rectangles for markers.
+      *
+      * To add a new filter to the view, call:
+      *      viewWidget->filterChain()->addFilter( filterObject );
+      */
+     FilterChain* filterChain() const;
+ 
+     /**
+-     * Updates the filters in the display's filter chain.  This will cause
+-     * the hotspots to be updated to match the current image.
+-     *
+-     * WARNING:  This function can be expensive depending on the
+-     * image size and number of filters in the filterChain()
+-     *
+-     * TODO - This API does not really allow efficient usage.  Revise it so
+-     * that the processing can be done in a better way.
+-     *
+-     * eg:
+-     *      - Area of interest may be known ( eg. mouse cursor hovering
+-     *      over an area )
+-     */
+-    void processFilters();
+-
+-    /**
+      * Returns a list of menu actions created by the filters for the content
+      * at the given @p position.
+      */
+     QList<QAction*> filterActions(const QPoint& position);
+ 
+     /** Returns true if the cursor is set to blink or false otherwise. */
+     bool blinkingCursor() { return _hasBlinkingCursor; }
+     /** Specifies whether or not the cursor blinks. */
+@@ -385,19 +369,40 @@ public:
+      *
+      * In terms of the model-view paradigm, the ScreenWindow is the model which is rendered
+      * by the TerminalDisplay.
+      */
+     void setScreenWindow( ScreenWindow* window );
+     /** Returns the terminal screen section which is displayed in this widget.  See setScreenWindow() */
+     ScreenWindow* screenWindow() const;
+ 
++    /** Is called, when the terminal's visibility has changed in order to
++     *  stop orstart timers etc.
++     */
++    void visibility_changed (bool visible);
++
+ public slots:
+ 
+     /**
++     * Updates the filters in the display's filter chain.  This will cause
++     * the hotspots to be updated to match the current image.
++     *
++     * WARNING:  This function can be expensive depending on the
++     * image size and number of filters in the filterChain()
++     *
++     * TODO - This API does not really allow efficient usage.  Revise it so
++     * that the processing can be done in a better way.
++     *
++     * eg:
++     *      - Area of interest may be known ( eg. mouse cursor hovering
++     *      over an area )
++     */
++    void processFilters();
++
++    /**
+      * Causes the terminal display to fetch the latest character image from the associated
+      * terminal screen ( see setScreenWindow() ) and redraw the display.
+      */
+     void updateImage();
+     /**
+      * Causes the terminal display to fetch the latest line status flags from the
+      * associated terminal screen ( see setScreenWindow() ).
+      */
+@@ -681,16 +686,17 @@ private:
+     bool _hasBlinker; // has characters to blink
+     bool _cursorBlinking;     // hide cursor in paintEvent
+     bool _hasBlinkingCursor;  // has blinking cursor enabled
+     bool _ctrlDrag;           // require Ctrl key for drag
+     TripleClickMode _tripleClickMode;
+     bool _isFixedSize; //Columns / lines are locked.
+     QTimer* _blinkTimer;  // active when hasBlinker
+     QTimer* _blinkCursorTimer;  // active when hasBlinkingCursor
++    QTimer* _process_filter_timer;  // active when visible, filter processing
+ 
+ //    KMenu* _drop;
+     QString _dropText;
+     int _dndFileCount;
+ 
+     bool _possibleTripleClick;  // is set in mouseDoubleClickEvent and deleted
+                                // after QApplication::doubleClickInterval() delay
+ 
+diff --git a/libgui/src/terminal-dock-widget.cc b/libgui/src/terminal-dock-widget.cc
+--- a/libgui/src/terminal-dock-widget.cc
++++ b/libgui/src/terminal-dock-widget.cc
+@@ -37,16 +37,20 @@ terminal_dock_widget::terminal_dock_widg
+   setWindowIcon (QIcon (":/actions/icons/logo.png"));
+   set_title (tr ("Command Window"));
+ 
+   setWidget (terminal);
+   setFocusProxy (terminal);
+ 
+   connect (terminal, SIGNAL (interrupt_signal (void)),
+            this, SLOT (terminal_interrupt ()));
++
++  // Connect the visibility signal to the terminal for dis-/enabling timers
++  connect (this, SIGNAL (visibilityChanged (bool)),
++           terminal, SLOT (handle_visibility_changed (bool)));
+ }
+ 
+ bool
+ terminal_dock_widget::has_focus (void) const
+ {
+   QWidget *w = widget ();
+ 
+   return w->hasFocus ();

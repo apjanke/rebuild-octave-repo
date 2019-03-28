@@ -1,0 +1,554 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1265624212 -3600
+#      Mon Feb 08 11:16:52 2010 +0100
+# Node ID 3a8c13b71612471c5db8f03e98f9ae98f6094c84
+# Parent  272179888089ab8ce3c36139c6d474c67aae1e02
+implement special-case optimization for sort of index vectors
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,23 @@
++2010-02-08  Jaroslav Hajek  <highegg@gmail.com>
++
++	* idx-vector.h (idx_vector::idx_base_rep::sort_idx): New pure virtual
++	function.
++	(idx_vector::idx_colon_rep::sort_idx,
++	idx_vector::idx_range_rep::sort_idx,
++	idx_vector::idx_scalar_rep::sort_idx,
++	idx_vector::idx_vector_rep::sort_idx,
++	idx_vector::idx_mask_rep::sort_idx): New override decls.
++	idx_vector::sort (Array<octave_idx_type>&): New method.
++	* idx-vector.cc (idx_vector::idx_range_rep::sort_idx,
++	idx_vector::idx_vector_rep::sort_idx): New methods.
++	(idx_vector::idx_vector_rep::sort_uniq_clone): Rewrite
++	to use bucket sort under plausible circumstances.
++
+ 2010-02-08  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* Array.cc (Array<T>::permute): Fix result dimensions when inv=true.
+ 
+ 2010-02-05  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* MArrayN.cc (MArrayN::idx_min, MArrayN::idx_max): New methods.
+ 	* MArrayN.h: Declare them.
+diff --git a/liboctave/idx-vector.cc b/liboctave/idx-vector.cc
+--- a/liboctave/idx-vector.cc
++++ b/liboctave/idx-vector.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <cstdlib>
++#include <memory>
+ 
+ #include <iostream>
+ 
+ #include "idx-vector.h"
+ #include "Array.h"
+ #include "Sparse.h"
+ #include "Range.h"
+ 
+@@ -80,16 +81,26 @@ idx_vector::idx_colon_rep::checkelem (oc
+     {
+       gripe_index_out_of_range ();
+       return 0;
+     }
+   else
+     return i;
+ }
+ 
++idx_vector::idx_base_rep *
++idx_vector::idx_colon_rep::sort_idx (Array<octave_idx_type>&)
++{
++  (*current_liboctave_error_handler)
++    ("internal error: idx_colon_rep::sort_idx");
++
++  count++;
++  return this;
++}
++
+ std::ostream& 
+ idx_vector::idx_colon_rep::print (std::ostream& os) const
+ {
+   return os << ":";
+ }
+ 
+ DEFINE_OCTAVE_ALLOCATOR(idx_vector::idx_range_rep);
+ 
+@@ -157,16 +168,36 @@ idx_vector::idx_range_rep::sort_uniq_clo
+     return new idx_range_rep (start + (len - 1)*step, len, -step, DIRECT);
+   else
+     {
+       count++;
+       return this;
+     }
+ }
+ 
++idx_vector::idx_base_rep *
++idx_vector::idx_range_rep::sort_idx (Array<octave_idx_type>& idx)
++{
++  if (step < 0 && len > 0)
++    {
++      idx.clear (1, len);
++      for (octave_idx_type i = 0; i < len; i++)
++        idx.xelem (i) = len - 1 - i;
++      return new idx_range_rep (start + (len - 1)*step, len, -step, DIRECT);
++    }
++  else
++    {
++      idx.clear (1, len);
++      for (octave_idx_type i = 0; i < len; i++)
++        idx.xelem (i) = i;
++      count++;
++      return this;
++    }
++}
++
+ std::ostream& 
+ idx_vector::idx_range_rep::print (std::ostream& os) const
+ {
+   os << start << ':' << step << ':' << start + len*step;
+   return os;
+ }
+ 
+ Range
+@@ -233,16 +264,25 @@ idx_vector::idx_scalar_rep::idx_scalar_r
+ 
+ octave_idx_type
+ idx_vector::idx_scalar_rep::checkelem (octave_idx_type i) const
+ {
+   if (i != 0) gripe_index_out_of_range ();
+   return data;
+ }
+ 
++idx_vector::idx_base_rep *
++idx_vector::idx_scalar_rep::sort_idx (Array<octave_idx_type>& idx)
++{
++  idx.clear (1, 1);
++  idx.fill (0);
++  count++;
++  return this;
++}
++
+ std::ostream& idx_vector::idx_scalar_rep::print (std::ostream& os) const
+ {
+   return os << data;
+ }
+ 
+ double
+ idx_vector::idx_scalar_rep::unconvert (void) const
+ {
+@@ -380,26 +420,144 @@ idx_vector::idx_vector_rep::checkelem (o
+     }
+ 
+   return xelem (n);
+ }
+ 
+ idx_vector::idx_base_rep *
+ idx_vector::idx_vector_rep::sort_uniq_clone (bool uniq)
+ {
+-  octave_idx_type *new_data = new octave_idx_type[len];
+-  std::copy (data, data + len, new_data);
+-  std::sort (new_data, new_data + len);
+-  octave_idx_type new_len;
+-  if (uniq)
+-    new_len = std::unique (new_data, new_data + len) - new_data;
+-  else 
+-    new_len = len;
++  if (len == 0)
++    {
++      count++;
++      return this;
++    }
++
++  // This is wrapped in auto_ptr so that we don't leak on out-of-memory.
++  std::auto_ptr<idx_vector_rep> new_rep ( 
++    new idx_vector_rep (0, len, ext, orig_dims, DIRECT));
++
++  if (ext > len*xlog2 (1.0 + len))
++    {
++      // Use standard sort via octave_sort.
++      octave_idx_type *new_data = new octave_idx_type[len];
++      new_rep->data = new_data;
++
++      std::copy (data, data + len, new_data);
++      octave_sort<octave_idx_type> lsort;
++      lsort.set_compare (ASCENDING);
++      lsort.sort (new_data, len);
++
++      if (uniq)
++        {
++          octave_idx_type new_len = std::unique (new_data, new_data + len) - new_data;
++          new_rep->len = new_len;
++          if (new_rep->orig_dims.length () == 2 && new_rep->orig_dims(0) == 1)
++            new_rep->orig_dims = dim_vector (1, new_len);
++          else
++            new_rep->orig_dims = dim_vector (new_len, 1);
++        }
++    }
++  else if (uniq)
++    {
++      // Use two-pass bucket sort (only a mask array needed).
++      OCTAVE_LOCAL_BUFFER_INIT (bool, has, ext, false);
++      for (octave_idx_type i = 0; i < len; i++)
++        has[data[i]] = true;
++
++      octave_idx_type new_len = 0;
++      for (octave_idx_type i = 0; i < ext; i++)
++        new_len += has[i];
++
++      new_rep->len = new_len;
++      if (new_rep->orig_dims.length () == 2 && new_rep->orig_dims(0) == 1)
++        new_rep->orig_dims = dim_vector (1, new_len);
++      else
++        new_rep->orig_dims = dim_vector (new_len, 1);
++
++      octave_idx_type *new_data = new octave_idx_type[new_len];
++      new_rep->data = new_data;
++
++      for (octave_idx_type i = 0, j = 0; i < ext; i++)
++        if (has[i])
++          new_data[j++] = i;
++    }
++  else
++    {
++      // Use two-pass bucket sort.
++      OCTAVE_LOCAL_BUFFER_INIT (octave_idx_type, cnt, ext, 0);
++      for (octave_idx_type i = 0; i < len; i++)
++        cnt[data[i]]++;
+ 
+-  return new idx_vector_rep (new_data, new_len, ext, orig_dims, DIRECT);
++      octave_idx_type *new_data = new octave_idx_type[len];
++      new_rep->data = new_data;
++
++      for (octave_idx_type i = 0, j = 0; i < ext; i++)
++        {
++          for (octave_idx_type k = 0; k < cnt[i]; k++)
++            new_data[j++] = i;
++        }
++    }
++
++  return new_rep.release ();
++}
++
++idx_vector::idx_base_rep *
++idx_vector::idx_vector_rep::sort_idx (Array<octave_idx_type>& idx)
++{
++  // This is wrapped in auto_ptr so that we don't leak on out-of-memory.
++  std::auto_ptr<idx_vector_rep> new_rep (
++    new idx_vector_rep (0, len, ext, orig_dims, DIRECT));
++
++  if (ext > len*xlog2 (1.0 + len))
++    {
++      // Use standard sort via octave_sort.
++      idx.clear (orig_dims);
++      octave_idx_type *idx_data = idx.fortran_vec ();
++      for (octave_idx_type i = 0; i < len; i++)
++        idx_data[i] = i;
++
++      octave_idx_type *new_data = new octave_idx_type [len];
++      new_rep->data = new_data;
++      std::copy (data, data + len, new_data);
++
++      octave_sort<octave_idx_type> lsort;
++      lsort.set_compare (ASCENDING);
++      lsort.sort (new_data, idx_data, len);
++    }
++  else
++    {
++      // Use two-pass bucket sort.
++      OCTAVE_LOCAL_BUFFER_INIT (octave_idx_type, cnt, ext, 0);
++
++      for (octave_idx_type i = 0; i < len; i++)
++        cnt[data[i]]++;
++
++      idx.clear (orig_dims);
++      octave_idx_type *idx_data = idx.fortran_vec ();
++
++      octave_idx_type *new_data = new octave_idx_type [len];
++      new_rep->data = new_data;
++
++      for (octave_idx_type i = 0, k = 0; i < ext; i++)
++        {
++          octave_idx_type j = cnt[i];
++          cnt[i] = k;
++          k += j;
++        }
++
++      for (octave_idx_type i = 0; i < len; i++)
++        {
++          octave_idx_type j = data[i], k = cnt[j]++;
++          new_data[k] = j;
++          idx_data[k] = i;
++        }
++    }
++
++  return new_rep.release ();
+ }
+ 
+ std::ostream& 
+ idx_vector::idx_vector_rep::print (std::ostream& os) const
+ {
+   os << '[';
+   for (octave_idx_type ii = 0; ii < len - 1; ii++)
+     os << data[ii] << ',' << ' ';
+@@ -513,16 +671,27 @@ idx_vector::idx_mask_rep::unconvert (voi
+     {
+       Array<bool> retval (orig_dims);
+       for (octave_idx_type i = 0; i < len; i++)
+         retval.xelem (i) = data[i];
+       return retval;
+     }
+ }
+ 
++idx_vector::idx_base_rep *
++idx_vector::idx_mask_rep::sort_idx (Array<octave_idx_type>& idx)
++{
++  idx.clear (len, 1);
++  for (octave_idx_type i = 0; i < len; i++)
++    idx.xelem (i) = i;
++
++  count++;
++  return this;
++}
++
+ const idx_vector idx_vector::colon (new idx_vector::idx_colon_rep ());
+ 
+ idx_vector::idx_vector (const Array<bool>& bnda)
+   : rep (0)
+ {
+   // Convert only if it means saving at least half the memory.
+   static const int factor = (2 * sizeof (octave_idx_type));
+   octave_idx_type nnz = bnda.nnz ();
+diff --git a/liboctave/idx-vector.h b/liboctave/idx-vector.h
+--- a/liboctave/idx-vector.h
++++ b/liboctave/idx-vector.h
+@@ -84,16 +84,18 @@ private:
+     // The maximum index + 1. The actual dimension is passed in.
+     virtual octave_idx_type extent (octave_idx_type n) const = 0;
+ 
+     // Index class.
+     virtual idx_class_type idx_class (void) const { return class_invalid; }
+ 
+     // Sorts, maybe uniqifies, and returns a clone object pointer.
+     virtual idx_base_rep *sort_uniq_clone (bool uniq = false) = 0;
++    // Sorts, and returns a sorting permutation (aka Array::sort).
++    virtual idx_base_rep *sort_idx (Array<octave_idx_type>&) = 0;
+ 
+     // Checks whether the index is colon or a range equivalent to colon.
+     virtual bool is_colon_equiv (octave_idx_type) const
+       { return false; }
+ 
+     // The original dimensions of this object (used when subscribing by matrices).
+     virtual dim_vector orig_dimensions (void) const
+       { return dim_vector (); }
+@@ -130,16 +132,18 @@ private:
+     octave_idx_type extent (octave_idx_type n) const
+       { return n; }
+ 
+     idx_class_type idx_class (void) const { return class_colon; }
+ 
+     idx_base_rep *sort_uniq_clone (bool = false) 
+       { count++; return this; }
+ 
++    idx_base_rep *sort_idx (Array<octave_idx_type>&);
++
+     bool is_colon_equiv (octave_idx_type) const
+       { return true; }
+ 
+     std::ostream& print (std::ostream& os) const;
+ 
+   private:
+ 
+     DECLARE_OCTAVE_ALLOCATOR
+@@ -178,16 +182,18 @@ private:
+ 
+     octave_idx_type extent (octave_idx_type n) const
+       { return len ? std::max (n, (start + 1 + (step < 0 ? 0 : step * (len - 1)))) : n; }
+ 
+     idx_class_type idx_class (void) const { return class_range; }
+ 
+     idx_base_rep *sort_uniq_clone (bool uniq = false);
+ 
++    idx_base_rep *sort_idx (Array<octave_idx_type>&);
++
+     bool is_colon_equiv (octave_idx_type n) const
+       { return start == 0 && step == 1 && len == n; }
+ 
+     dim_vector orig_dimensions (void) const
+       { return dim_vector (1, len); }
+ 
+     octave_idx_type get_start (void) const { return start; }
+ 
+@@ -235,16 +241,18 @@ private:
+     octave_idx_type extent (octave_idx_type n) const
+       { return std::max (n, data + 1); }
+ 
+     idx_class_type idx_class (void) const { return class_scalar; }
+ 
+     idx_base_rep *sort_uniq_clone (bool = false)
+       { count++; return this; }
+ 
++    idx_base_rep *sort_idx (Array<octave_idx_type>&);
++
+     bool is_colon_equiv (octave_idx_type n) const
+       { return n == 1 && data == 0; }
+ 
+     dim_vector orig_dimensions (void) const
+       { return dim_vector (1, 1); }
+ 
+     octave_idx_type get_data (void) const { return data; }
+ 
+@@ -300,16 +308,18 @@ private:
+ 
+     octave_idx_type extent (octave_idx_type n) const
+       { return std::max (n, ext); }
+ 
+     idx_class_type idx_class (void) const { return class_vector; }
+ 
+     idx_base_rep *sort_uniq_clone (bool uniq = false);
+ 
++    idx_base_rep *sort_idx (Array<octave_idx_type>&);
++
+     dim_vector orig_dimensions (void) const
+       { return orig_dims; }
+ 
+     const octave_idx_type *get_data (void) const { return data; }
+ 
+     std::ostream& print (std::ostream& os) const;
+ 
+     Array<double> unconvert (void) const;
+@@ -364,16 +374,18 @@ private:
+     octave_idx_type extent (octave_idx_type n) const
+       { return std::max (n, ext); }
+ 
+     idx_class_type idx_class (void) const { return class_mask; }
+ 
+     idx_base_rep *sort_uniq_clone (bool = false) 
+       { count++; return this; }
+ 
++    idx_base_rep *sort_idx (Array<octave_idx_type>&);
++
+     dim_vector orig_dimensions (void) const
+       { return orig_dims; }
+ 
+     bool is_colon_equiv (octave_idx_type n) const
+       { return len == n && ext == n; }
+ 
+     const bool *get_data (void) const { return data; }
+ 
+@@ -555,16 +567,19 @@ public:
+     { return rep->idx_class () == class_range; }
+ 
+   bool is_colon_equiv (octave_idx_type n) const
+     { return rep->is_colon_equiv (n); }
+ 
+   idx_vector sorted (bool uniq = false) const
+     { return idx_vector (rep->sort_uniq_clone (uniq)); }
+ 
++  idx_vector sorted (Array<octave_idx_type>& sidx) const
++    { return idx_vector (rep->sort_idx (sidx)); }
++
+   dim_vector orig_dimensions (void) const { return rep->orig_dimensions (); }
+ 
+   octave_idx_type orig_rows (void) const
+     { return orig_dimensions () (0); }
+ 
+   octave_idx_type orig_columns (void) const
+     { return orig_dimensions () (1); }
+ 
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,13 @@
++2010-02-08  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov-re-mat.cc (octave_matrix::sort): Special-case sorting a known
++	index vector.
++
+ 2010-02-08  John W. Eaton  <jwe@octave.org>
+ 
+ 	* ov-class.cc (Fclass): If more than 1 argument, check that
+ 	call is inside class constructor first, then check for valid
+ 	arguments.
+ 
+ 2010-02-05  Jaroslav Hajek  <highegg@gmail.com>
+ 
+diff --git a/src/ov-re-mat.cc b/src/ov-re-mat.cc
+--- a/src/ov-re-mat.cc
++++ b/src/ov-re-mat.cc
+@@ -266,16 +266,44 @@ octave_matrix::diag (octave_idx_type k) 
+       && (matrix.rows () == 1 || matrix.columns () == 1))
+     retval = DiagMatrix (DiagArray2<double> (matrix));
+   else
+     retval = octave_base_matrix<NDArray>::diag (k);
+ 
+   return retval;
+ }
+ 
++octave_value 
++octave_matrix::sort (octave_idx_type dim, sortmode mode) const
++{
++  // If this matrix is known to be a valid index, and we're doing a vector sort,
++  // sort via idx_vector which may be more efficient occassionally.
++  if (idx_cache && mode == ASCENDING && ndims () == 2
++      && ((dim == 0 && matrix.columns () == 1) || (dim == 1 && matrix.rows () == 1)))
++    {
++      return index_vector ().sorted ();
++    }
++  else
++    return octave_base_matrix<NDArray>::sort (dim, mode);
++}
++
++octave_value 
++octave_matrix::sort (Array<octave_idx_type> &sidx, octave_idx_type dim,
++                     sortmode mode) const
++{
++  // If this matrix is known to be a valid index, and we're doing a vector sort,
++  // sort via idx_vector which may be more efficient occassionally.
++  if (idx_cache && mode == ASCENDING && ndims () == 2
++      && ((dim == 0 && matrix.columns () == 1) || (dim == 1 && matrix.rows () == 1)))
++    {
++      return index_vector ().sorted (sidx);
++    }
++  else
++    return octave_base_matrix<NDArray>::sort (sidx, dim, mode);
++}
+ octave_value
+ octave_matrix::convert_to_str_internal (bool, bool, char type) const
+ {
+   octave_value retval;
+   dim_vector dv = dims ();
+   octave_idx_type nel = dv.numel ();
+ 
+   charNDArray chm (dv);
+diff --git a/src/ov-re-mat.h b/src/ov-re-mat.h
+--- a/src/ov-re-mat.h
++++ b/src/ov-re-mat.h
+@@ -174,16 +174,20 @@ public:
+   FloatNDArray float_array_value (bool = false) const { return matrix; }
+ 
+   SparseMatrix sparse_matrix_value (bool = false) const;
+ 
+   SparseComplexMatrix sparse_complex_matrix_value (bool = false) const;
+ 
+   octave_value diag (octave_idx_type k = 0) const;
+ 
++  octave_value sort (octave_idx_type dim = 0, sortmode mode = ASCENDING) const;
++  octave_value sort (Array<octave_idx_type> &sidx, octave_idx_type dim = 0,
++		     sortmode mode = ASCENDING) const;
++
+   // Use matrix_ref here to clear index cache.
+   void increment (void) { matrix_ref () += 1.0; }
+ 
+   void decrement (void) { matrix_ref () -= 1.0; }
+ 
+   void changesign (void) { matrix_ref ().changesign (); }
+ 
+   octave_value convert_to_str_internal (bool pad, bool force, char type) const;

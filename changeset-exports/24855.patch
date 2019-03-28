@@ -1,0 +1,243 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1520633692 18000
+#      Fri Mar 09 17:14:52 2018 -0500
+# Node ID 41f80b9af2742cd714a52adaea074395f0478e05
+# Parent  32671b14ed7b3e8cdb7c1b60cf4516c113974e68
+prevent stack overflow crash on deeply nested function calls (bug #47620)
+
+* call-stack.h, call-stack.cc (call_stack::m_max_stack_depth):
+New member variable.
+(call_stack::max_stack_depth): New function.
+(Fmax_stack_depth): New function.
+(call_stack::push): Error if call_stack size exceeds m_max_stack_depth.
+
+* pt-eval.cc (Fmax_recursion_depth): Add @seealso to doc string.
+
+* expr.txi: Document max_stack_depth.
+
+diff --git a/doc/interpreter/expr.txi b/doc/interpreter/expr.txi
+--- a/doc/interpreter/expr.txi
++++ b/doc/interpreter/expr.txi
+@@ -488,19 +488,26 @@ endfunction
+ This function is recursive because it calls itself directly.  It
+ eventually terminates because each time it calls itself, it uses an
+ argument that is one less than was used for the previous call.  Once the
+ argument is no longer greater than zero, it does not call itself, and
+ the recursion ends.
+ 
+ The built-in variable @code{max_recursion_depth} specifies a limit to
+ the recursion depth and prevents Octave from recursing infinitely.
++Similarly, the variable @code{max_stack_depth} specifies a limit to the
++depth of function calls, whether recursive or not.  These limits help
++prevent stack overflow on the computer Octave is running on, so that
++instead of exiting with a signal, the interpreter will throw an error
++and return to the command prompt.
+ 
+ @DOCSTRING(max_recursion_depth)
+ 
++@DOCSTRING(max_stack_depth)
++
+ @node Access via Handle
+ @subsection Access via Handle
+ @cindex function handle
+ @cindex indirect function call
+ 
+ @opindex @@ function handle
+ A function may be abstracted and referenced via a function handle acquired
+ using the special operator @samp{@@}.  For example,
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -20,23 +20,25 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "call-stack.h"
++#include "defun.h"
+ #include "interpreter.h"
+ #include "oct-map.h"
+ #include "ov.h"
+ #include "ov-fcn.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ #include "pager.h"
++#include "variables.h"
+ 
+ // Use static fields for the best efficiency.
+ // NOTE: C++0x will allow these two to be merged into one.
+ static const char *bt_fieldnames[] =
+   { "file", "name", "line", "column", "scope", "context", nullptr };
+ static const octave_fields bt_fields (bt_fieldnames);
+ 
+ namespace octave
+@@ -81,17 +83,17 @@ namespace octave
+       return false;
+     else if (this->fcn_name () != rhs.fcn_name ())
+       return false;
+     else
+       return true;
+   }
+ 
+   call_stack::call_stack (interpreter& interp)
+-    : cs (), curr_frame (0), m_interpreter (interp)
++    : cs (), curr_frame (0), m_max_stack_depth (1024), m_interpreter (interp)
+   {
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+     push (nullptr, symtab.top_scope (), 0);
+   }
+ 
+   int
+   call_stack::current_line (void) const
+@@ -360,16 +362,21 @@ namespace octave
+   }
+ 
+   void
+   call_stack::push (octave_function *fcn, const symbol_scope& scope,
+                     symbol_record::context_id context)
+   {
+     size_t prev_frame = curr_frame;
+     curr_frame = cs.size ();
++
++    // m_max_stack_depth should never be less than zero.
++    if (curr_frame > static_cast<size_t> (m_max_stack_depth))
++      error ("max_stack_depth exceeded");
++
+     cs.push_back (stack_frame (fcn, scope, context, prev_frame));
+ 
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+     symtab.set_scope_and_context (scope, context);
+   }
+ 
+   bool
+@@ -619,9 +626,52 @@ namespace octave
+         cs.pop_back ();
+         const stack_frame& new_elt = cs[curr_frame];
+ 
+         symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+         symtab.set_scope_and_context (new_elt.m_scope, new_elt.m_context);
+       }
+   }
++
++  octave_value
++  call_stack::max_stack_depth (const octave_value_list& args, int nargout)
++  {
++    return set_internal_variable (m_max_stack_depth, args, nargout,
++                                  "max_stack_depth", 0);
++  }
+ }
++
++DEFMETHOD (max_stack_depth, interp, args, nargout,
++           doc: /* -*- texinfo -*-
++@deftypefn  {} {@var{val} =} max_stack_depth ()
++@deftypefnx {} {@var{old_val} =} max_stack_depth (@var{new_val})
++@deftypefnx {} {} max_stack_depth (@var{new_val}, "local")
++Query or set the internal limit on the number of times a function may
++be called recursively.
++
++If the limit is exceeded, an error message is printed and control returns to
++the top level.
++
++When called from inside a function with the @qcode{"local"} option, the
++variable is changed locally for the function and any subroutines it calls.
++The original variable value is restored when exiting the function.
++
++@seealso{max_recursion_depth}
++@end deftypefn */)
++{
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  return cs.max_stack_depth (args, nargout);
++}
++
++/*
++%!test
++%! orig_val = max_stack_depth ();
++%! old_val = max_stack_depth (2*orig_val);
++%! assert (orig_val, old_val);
++%! assert (max_stack_depth (), 2*orig_val);
++%! max_stack_depth (orig_val);
++%! assert (max_stack_depth (), orig_val);
++
++%!error (max_stack_depth (1, 2))
++*/
++
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -27,16 +27,18 @@ along with Octave; see the file COPYING.
+ 
+ #include <deque>
+ #include <string>
+ 
+ class octave_function;
+ class octave_map;
+ class octave_user_code;
+ class octave_user_script;
++class octave_value;
++class octave_value_list;
+ 
+ #include "symscope.h"
+ 
+ namespace octave
+ {
+   class interpreter;
+ 
+   class
+@@ -247,23 +249,27 @@ namespace octave
+     octave_map backtrace (size_t nskip = 0);
+ 
+     octave_map empty_backtrace (void) const;
+ 
+     void pop (void);
+ 
+     void clear (void) { cs.clear (); }
+ 
++    octave_value max_stack_depth (const octave_value_list& args, int nargout);
++
+   private:
+ 
+     // The current call stack.
+     std::deque<stack_frame> cs;
+ 
+     size_t curr_frame;
+ 
++    int m_max_stack_depth;
++
+     interpreter& m_interpreter;
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+ OCTAVE_DEPRECATED (4.4, "use 'octave::call_stack' instead")
+ typedef octave::call_stack octave_call_stack;
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -3237,16 +3237,18 @@ Query or set the internal limit on the n
+ be called recursively.
+ 
+ If the limit is exceeded, an error message is printed and control returns to
+ the top level.
+ 
+ When called from inside a function with the @qcode{"local"} option, the
+ variable is changed locally for the function and any subroutines it calls.
+ The original variable value is restored when exiting the function.
++
++@seealso{max_stack_depth}
+ @end deftypefn */)
+ {
+   octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+   return tw.max_recursion_depth (args, nargout);
+ }
+ 
+ /*

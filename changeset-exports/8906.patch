@@ -1,0 +1,339 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1236107454 18000
+#      Tue Mar 03 14:10:54 2009 -0500
+# Node ID ab87d08d9a1b3d566f983f54b66567b386ba564e
+# Parent  24dd61b36591a1624a62cc8c2162db4746fbc1f9
+improve symbol inheritance for anonymous functions
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,21 @@
+ 2009-03-03  John W. Eaton  <jwe@octave.org>
+ 
++	* symtab.h (symbol_table::do_inherit): Only inherit values for
++	symbols from the donor_scope that already exist in the table.
++	(symbol_table::symbol_record::symbol_record_rep::dup): Now const.
++	(symbol_table::symbol_record::operator=): Decrement rep->count and
++	maybe delete rep.
++	(symbol_table::fcn_info::operator=): Likewise.
++
++	* pt-fcn-handle.cc: (tree_anon_fcn_handle::dup): Transform
++	tree_anon_fcn_handle objects to tree_constant objects containing
++	octave_fcn_handle objects.  New tests.
++
+ 	* pt-assign.cc (tree_simple_assignment::rvalue1): Assign result of
+ 	call to rhs->rvalue1() to an octave_value object, not an
+ 	octave_value_list object.
+ 
+ 2009-03-03  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* oct-stream.h (octave_stream_list::lookup_cache): New member field.
+ 	(octave_stream_list::octave_stream_list): Initialize it.
+diff --git a/src/pt-fcn-handle.cc b/src/pt-fcn-handle.cc
+--- a/src/pt-fcn-handle.cc
++++ b/src/pt-fcn-handle.cc
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <iostream>
+ 
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "ov-fcn-handle.h"
+ #include "pt-fcn-handle.h"
+ #include "pager.h"
++#include "pt-const.h"
+ #include "pt-walk.h"
+ #include "variables.h"
+ 
+ void
+ tree_fcn_handle::print (std::ostream& os, bool pr_as_read_syntax,
+ 			bool pr_orig_text)
+ {
+   print_raw (os, pr_as_read_syntax, pr_orig_text);
+@@ -82,16 +83,19 @@ void
+ tree_fcn_handle::accept (tree_walker& tw)
+ {
+   tw.visit_fcn_handle (*this);
+ }
+ 
+ octave_value
+ tree_anon_fcn_handle::rvalue1 (int)
+ {
++  // FIXME -- should CMD_LIST be limited to a single expression?
++  // I think that is what Matlab does.
++
+   tree_parameter_list *param_list = parameter_list ();
+   tree_parameter_list *ret_list = return_list ();
+   tree_statement_list *cmd_list = body ();
+   symbol_table::scope_id this_scope = scope ();
+ 
+   symbol_table::scope_id new_scope = symbol_table::dup_scope (this_scope);
+ 
+   if (new_scope > 0)
+@@ -122,29 +126,45 @@ tree_anon_fcn_handle::rvalue1 (int)
+ 
+   octave_value ov_fcn (uf);
+ 
+   octave_value fh (new octave_fcn_handle (ov_fcn, "@<anonymous>"));
+ 
+   return fh;
+ }
+ 
++/*
++%!function r = f2 (f, x)
++%!  r = f (x);
++%!function f = f1 (k)
++%!  f = @(x) f2 (@(y) y-k, x);
++%!test
++%! assert ((f1 (3)) (10) == 7)
++%!
++%!shared f, g, h
++%! h = @(x) sin (x);
++%! g = @(f, x) h (x);
++%! f = @() g (@(x) h, pi);
++%!assert (f () == sin (pi))
++*/
++
+ octave_value_list
+ tree_anon_fcn_handle::rvalue (int nargout)
+ {
+   octave_value_list retval;
+ 
+   if (nargout > 1)
+     error ("invalid number of output arguments for anonymous function handle expression");
+   else
+     retval = rvalue1 (nargout);
+ 
+   return retval;
+ }
+ 
++#if 0
+ tree_expression *
+ tree_anon_fcn_handle::dup (symbol_table::scope_id parent_scope,
+ 			   symbol_table::context_id parent_context)
+ {
+   tree_parameter_list *param_list = parameter_list ();
+   tree_parameter_list *ret_list = return_list ();
+   tree_statement_list *cmd_list = body ();
+   symbol_table::scope_id this_scope = scope ();
+@@ -159,16 +179,65 @@ tree_anon_fcn_handle::dup (symbol_table:
+ 			  ret_list ? ret_list->dup (new_scope, 0) : 0,
+ 			  cmd_list ? cmd_list->dup (new_scope, 0) : 0,
+ 			  new_scope, line (), column ());
+ 
+   new_afh->copy_base (*this);
+ 
+   return new_afh;
+ }
++#endif
++
++tree_expression *
++tree_anon_fcn_handle::dup (symbol_table::scope_id, symbol_table::context_id)
++{
++  // Instead of simply duplicating, transform to a tree_constant
++  // object that contains an octave_fcn_handle object with the symbol
++  // table of the referenced function primed with values from the
++  // current scope and context.
++
++  tree_parameter_list *param_list = parameter_list ();
++  tree_parameter_list *ret_list = return_list ();
++  tree_statement_list *cmd_list = body ();
++  symbol_table::scope_id this_scope = scope ();
++
++  symbol_table::scope_id new_scope = symbol_table::dup_scope (this_scope);
++
++  if (new_scope > 0)
++    symbol_table::inherit (new_scope, symbol_table::current_scope (),
++			   symbol_table::current_context ());
++
++  octave_user_function *uf
++    = new octave_user_function (new_scope,
++				param_list ? param_list->dup (new_scope, 0) : 0,
++				ret_list ? ret_list->dup (new_scope, 0) : 0,
++				cmd_list ? cmd_list->dup (new_scope, 0) : 0);
++
++  octave_function *curr_fcn = octave_call_stack::current ();
++
++  if (curr_fcn)
++    {
++      uf->stash_parent_fcn_name (curr_fcn->name ());
++
++      symbol_table::scope_id parent_scope = curr_fcn->parent_fcn_scope ();
++
++      if (parent_scope < 0)
++	parent_scope = curr_fcn->scope ();
++	
++      uf->stash_parent_fcn_scope (parent_scope);
++    }
++
++  uf->mark_as_inline_function ();
++
++  octave_value ov_fcn (uf);
++
++  octave_value fh (new octave_fcn_handle (ov_fcn, "@<anonymous>"));
++
++  return new tree_constant (fh, line (), column ());
++}
+ 
+ void
+ tree_anon_fcn_handle::accept (tree_walker& tw)
+ {
+   tw.visit_anon_fcn_handle (*this);
+ }
+ 
+ 
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -365,17 +365,17 @@ public:
+       }
+ 
+       void erase_persistent (void)
+       {
+ 	unmark_persistent ();
+ 	symbol_table::erase_persistent (name);
+       }
+ 
+-      symbol_record_rep *dup (void)
++      symbol_record_rep *dup (void) const
+       {
+ 	return new symbol_record_rep (name, varval (xcurrent_context),
+ 				      storage_class);
+       }
+ 
+       void dump (std::ostream& os, const std::string& prefix) const;
+ 
+       std::string name;
+@@ -407,16 +407,19 @@ public:
+     { 
+       rep->count++;
+     }
+ 
+     symbol_record& operator = (const symbol_record& sr)
+     {
+       if (this != &sr)
+ 	{
++	  if (--rep->count == 0)
++	    delete rep;
++
+ 	  rep = sr.rep;
+ 	  rep->count++;
+ 	}
+ 
+       return *this;
+     }
+ 
+     ~symbol_record (void)
+@@ -749,26 +752,29 @@ public:
+       fcn_info_rep& operator = (const fcn_info_rep&);
+     };
+ 
+   public:
+ 
+     fcn_info (const std::string& nm = std::string ())
+       : rep (new fcn_info_rep (nm)) { }
+ 
+-    fcn_info (const fcn_info& ov) : rep (ov.rep)
++    fcn_info (const fcn_info& fi) : rep (fi.rep)
+     { 
+       rep->count++;
+     }
+ 
+-    fcn_info& operator = (const fcn_info& ov)
++    fcn_info& operator = (const fcn_info& fi)
+     {
+-      if (this != &ov)
++      if (this != &fi)
+ 	{
+-	  rep = ov.rep;
++	  if (--rep->count == 0)
++	    delete rep;
++
++	  rep = fi.rep;
+ 	  rep->count++;
+ 	}
+ 
+       return *this;
+     }
+ 
+     ~fcn_info (void)
+     {
+@@ -1986,60 +1992,36 @@ private:
+     table_iterator p = table.find (name);
+ 
+     if (p == table.end ())
+       return do_insert (name);
+     else
+       return p->second;
+   }
+ 
+-  void do_inherit (symbol_table& donor_symbol_table, context_id donor_context)
++  void do_inherit (symbol_table& donor_table, context_id donor_context)
+   {
+-    // Copy all variables from the donor scope in case they are needed
+-    // in a subsequent anonymous function.  For example, to allow
+-    //
+-    //   function r = f2 (f, x)
+-    //     r = f (x);
+-    //   end
+-    //
+-    //   function f = f1 (k)
+-    //     f = @(x) f2 (@(y) y-k, x);
+-    //   end
+-    //
+-    //   f = f1 (3)  ==>  @(x) fcn2 (@(y) y - k, x)
+-    //   f (10)      ==>  7
+-    //
+-    // to work as expected.
+-    //
+-    // FIXME -- is there a better way to accomplish this?
+-
+-    std::map<std::string, symbol_record> donor_table = donor_symbol_table.table;
+-
+-    for (table_iterator p = donor_table.begin (); p != donor_table.end (); p++)
++    for (table_iterator p = table.begin (); p != table.end (); p++)
+       {
+-	symbol_record& donor_sr = p->second;
+-
+-	std::string nm = donor_sr.name ();
+-
+-	symbol_record& sr = do_insert (nm);
+-
+-	if (! (sr.is_automatic () || sr.is_formal () || nm == "__retval__"))
++	symbol_record& sr = p->second;
++
++	if (! (sr.is_automatic () || sr.is_formal ()))
+ 	  {
+-	    octave_value val = donor_sr.varval (donor_context);
+-
+-	    if (val.is_defined ())
++	    std::string nm = sr.name ();
++
++	    if (nm != "__retval__")
+ 	      {
+-		// Currently, inherit is always called when creating a
+-		// new table, so it only makes sense to copy values into
+-		// the base context (== 0), but maybe the context
+-		// should be passed in as a parameter instead?
+-
+-		sr.varref (0) = val;
+-
+-		sr.mark_inherited ();
++		octave_value val = donor_table.do_varval (nm, donor_context);
++
++		if (val.is_defined ())
++		  {
++		    sr.varref (0) = val;
++
++		    sr.mark_inherited ();
++		  }
+ 	      }
+ 	  }
+       }
+   }
+ 
+   octave_value
+   do_find (const std::string& name, tree_argument_list *args,
+ 	   const string_vector& arg_names,

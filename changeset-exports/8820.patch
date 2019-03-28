@@ -1,0 +1,521 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1235110089 -3600
+#      Fri Feb 20 07:08:09 2009 +0100
+# Node ID 89b95972e17806caadb6d47f05d4487543e43664
+# Parent  96d87674b818f72f34da798ca3e19ef569a9aadb
+fix previously introduced problem in octave_sort, improve design
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,20 @@
++2009-02-20  Jaroslav Hajek  <highegg@gmail.com>
++
++	* oct-sort.h (octave_sort<T>::MergeState::MergeState): New
++	constructor.
++	(octave_sort<T>::MergeState::~MergeState): New destructor.
++	(octave_sort<T>::MergeState::reset, 
++	octave_sort<T>::MergeState::getmem,
++	octave_sort<T>::MergeState::getmemi): New methods.
++	(octave_sort<T>::sort,
++	octave_sort<T>::merge_lo, octave_sort<T>::merge_hi
++	octave_sort<T>::merge_at): Reflect change.
++
+ 2009-02-19  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* oct-types.h (sortmode): Move enum here.
+ 	* oct-sort.h (octave_sort<T>::ms): Declare as pointer.
+ 	(octave_sort<T>::lookup): New overloaded method.
+ 	* oct-sort.cc: Reflect change to ms.
+ 	(octave_sort<T>::lookup): New overloaded method.
+ 	(out_of_range_pred): New helper class.
+diff --git a/liboctave/oct-sort.cc b/liboctave/oct-sort.cc
+--- a/liboctave/oct-sort.cc
++++ b/liboctave/oct-sort.cc
+@@ -32,16 +32,25 @@ made are
+   new [], delete [] and std::copy and std::copy_backward. Note that replacing
+   memmove by std::copy is possible if the destination starts before the source.
+   If not, std::copy_backward needs to be used.
+   
+ * templatize comparison operator in most methods, provide possible dispatch
+ 
+ * duplicate methods to avoid by-the-way indexed sorting
+ 
++* add methods for verifying sortedness of array
++
++* row sorting via breadth-first tree subsorting
++
++* binary lookup and sequential binary lookup optimized for dense downsampling.
++
++* NOTE: the memory management routines rely on the fact that delete [] silently
++  ignores null pointers. Don't gripe about the missing checks - they're there.
++
+ 
+ The Python license is
+ 
+   PSF LICENSE AGREEMENT FOR PYTHON 2.3
+   --------------------------------------
+ 
+   1. This LICENSE AGREEMENT is between the Python Software Foundation
+   ("PSF"), and the Individual or Organization ("Licensee") accessing and
+@@ -115,17 +124,16 @@ template <class T>
+ octave_sort<T>::octave_sort (compare_fcn_type comp) 
+   : compare (comp), ms (0)
+ { 
+ }
+ 
+ template <class T>
+ octave_sort<T>::~octave_sort () 
+ { 
+-  merge_freemem ();
+   delete ms;
+ }
+ 
+ template <class T>
+ void
+ octave_sort<T>::set_compare (sortmode mode)
+ {
+   if (mode == ASCENDING)
+@@ -474,47 +482,16 @@ octave_sort<T>::gallop_right (T key, T *
+ 	ofs = m;	/* key < a[m] */
+       else
+ 	lastofs = m+1;	/* a[m] <= key */
+     }
+ 
+   return ofs;
+ }
+ 
+-/* Conceptually a MergeState's constructor. */
+-template <class T>
+-void
+-octave_sort<T>::merge_init (void)
+-{
+-  if (! ms) ms = new MergeState;
+-  ms->a = 0;
+-  ms->ia = 0;
+-  ms->alloced = 0;
+-  ms->n = 0;
+-  ms->min_gallop = MIN_GALLOP;
+-}
+-
+-/* Free all the temp memory owned by the MergeState.  This must be called
+- * when you're done with a MergeState, and may be called before then if
+- * you want to free the temp memory early.
+- */
+-template <class T>
+-void
+-octave_sort<T>::merge_freemem (void)
+-{
+-  if (ms)
+-    {
+-      delete [] ms->a;
+-      delete [] ms->ia;
+-      ms->alloced = 0;
+-      ms->a = 0;
+-      ms->ia = 0;
+-    }
+-}
+-
+ static inline octave_idx_type
+ roundupsize (octave_idx_type n)
+ {
+   unsigned int nbits = 3;
+   octave_idx_type n2 = static_cast<octave_idx_type> (n) >> 8;
+ 
+   /* Round up:
+    * If n <       256, to a multiple of        8.
+@@ -546,60 +523,50 @@ roundupsize (octave_idx_type n)
+ 
+   return ((n >> nbits) + 1) << nbits;
+ }
+ 
+ /* Ensure enough temp memory for 'need' array slots is available.
+  * Returns 0 on success and -1 if the memory can't be gotten.
+  */
+ template <class T>
+-int
+-octave_sort<T>::merge_getmem (octave_idx_type need)
++void
++octave_sort<T>::MergeState::getmem (octave_idx_type need)
+ {
+-  if (need <= ms->alloced)
+-    return 0;
++  if (need <= alloced)
++    return;
+ 
+   need = roundupsize (need); 
+   /* Don't realloc!  That can cost cycles to copy the old data, but
+    * we don't care what's in the block.
+    */
+-  merge_freemem ();
+-  ms->a = new T[need];
+-  if (ms->a)
+-    {
+-      ms->alloced = need;
+-      return 0;
+-    }
+-  merge_freemem ();	/* reset to sane state */
++  delete [] a;
++  delete [] ia; // Must do this or fool possible next getmemi.
++  a = new T[need];
++  alloced = need;
+ 
+-  return -1;
+ }
+ 
+ template <class T>
+-int
+-octave_sort<T>::merge_getmemi (octave_idx_type need)
++void
++octave_sort<T>::MergeState::getmemi (octave_idx_type need)
+ {
+-  if (need <= ms->alloced && ms->a && ms->ia)
+-    return 0;
++  if (ia && need <= alloced)
++    return;
+ 
+   need = roundupsize (need); 
+   /* Don't realloc!  That can cost cycles to copy the old data, but
+    * we don't care what's in the block.
+    */
+-  merge_freemem ();
+-  ms->a = new T[need];
+-  ms->ia = new octave_idx_type[need];
+-  if (ms->a && ms->ia)
+-    {
+-      ms->alloced = need;
+-      return 0;
+-    }
+-  merge_freemem ();	/* reset to sane state */
++  delete [] a;
++  delete [] ia;
+ 
+-  return -1;
++  a = new T[need];
++  ia = new octave_idx_type[need];
++  alloced = need;
+ }
+ 
+ /* Merge the na elements starting at pa with the nb elements starting at pb
+  * in a stable way, in-place.  na and nb must be > 0, and pa + na == pb.
+  * Must also have that *pb < *pa, that pa[na-1] belongs at the end of the
+  * merge, and should have na <= nb.  See listsort.txt for more info.
+  * Return 0 if successful, -1 if error.
+  */
+@@ -610,18 +577,18 @@ octave_sort<T>::merge_lo (T *pa, octave_
+                           T *pb, octave_idx_type nb,
+                           Comp comp)
+ {
+   octave_idx_type k;
+   T *dest;
+   int result = -1;	/* guilty until proved innocent */
+   octave_idx_type min_gallop = ms->min_gallop;
+ 
+-  if (merge_getmem (na) < 0)
+-    return -1;
++  ms->getmem (na);
++
+   std::copy (pa, pa + na, ms->a);
+   dest = pa;
+   pa = ms->a;
+ 
+   *dest++ = *pb++;
+   --nb;
+   if (nb == 0)
+     goto Succeed;
+@@ -746,18 +713,18 @@ octave_sort<T>::merge_lo (T *pa, octave_
+                           Comp comp)
+ {
+   octave_idx_type k;
+   T *dest;
+   octave_idx_type *idest;
+   int result = -1;	/* guilty until proved innocent */
+   octave_idx_type min_gallop = ms->min_gallop;
+ 
+-  if (merge_getmemi (na) < 0)
+-    return -1;
++  ms->getmemi (na);
++
+   std::copy (pa, pa + na, ms->a);
+   std::copy (ipa, ipa + na, ms->ia);
+   dest = pa; idest = ipa;
+   pa = ms->a; ipa = ms->ia;
+ 
+   *dest++ = *pb++; *idest++ = *ipb++;
+   --nb;
+   if (nb == 0)
+@@ -893,18 +860,18 @@ octave_sort<T>::merge_hi (T *pa, octave_
+                           Comp comp)
+ {
+   octave_idx_type k;
+   T *dest;
+   int result = -1;	/* guilty until proved innocent */
+   T *basea, *baseb;
+   octave_idx_type min_gallop = ms->min_gallop;
+ 
+-  if (merge_getmem (nb) < 0)
+-    return -1;
++  ms->getmem (nb);
++
+   dest = pb + nb - 1;
+   std::copy (pb, pb + nb, ms->a);
+   basea = pa;
+   baseb = ms->a;
+   pb = ms->a + nb - 1;
+   pa += na - 1;
+ 
+   *dest-- = *pa--;
+@@ -1032,18 +999,18 @@ octave_sort<T>::merge_hi (T *pa, octave_
+   octave_idx_type k;
+   T *dest;
+   octave_idx_type *idest;
+   int result = -1;	/* guilty until proved innocent */
+   T *basea, *baseb;
+   octave_idx_type *ibasea, *ibaseb;
+   octave_idx_type min_gallop = ms->min_gallop;
+ 
+-  if (merge_getmemi (nb) < 0)
+-    return -1;
++  ms->getmemi (nb);
++
+   dest = pb + nb - 1;
+   idest = ipb + nb - 1;
+   std::copy (pb, pb + nb, ms->a);
+   std::copy (ipb, ipb + nb, ms->ia);
+   basea = pa; ibasea = ipa;
+   baseb = ms->a; ibaseb = ms->ia;
+   pb = ms->a + nb - 1; ipb = ms->ia + nb - 1;
+   pa += na - 1; ipa += na - 1;
+@@ -1414,23 +1381,20 @@ octave_sort<T>::merge_compute_minrun (oc
+ }
+ 
+ template <class T>
+ template <class Comp>
+ void
+ octave_sort<T>::sort (T *data, octave_idx_type nel, Comp comp)
+ {
+   /* Re-initialize the Mergestate as this might be the second time called */
+-  if (ms)
+-    {
+-      ms->n = 0;
+-      ms->min_gallop = MIN_GALLOP;
+-    }
+-  else
+-    merge_init ();
++  if (! ms) ms = new MergeState;
++
++  ms->reset ();
++  ms->getmem (1024);
+ 
+   if (nel > 1)
+     {
+       octave_idx_type nremaining = nel; 
+       octave_idx_type lo = 0;
+ 
+       /* March over the array once, left to right, finding natural runs,
+        * and extending short natural runs to minrun elements.
+@@ -1475,16 +1439,22 @@ fail:
+ }
+ 
+ template <class T>
+ template <class Comp>
+ void
+ octave_sort<T>::sort (T *data, octave_idx_type *idx, octave_idx_type nel, 
+                       Comp comp)
+ {
++  /* Re-initialize the Mergestate as this might be the second time called */
++  if (! ms) ms = new MergeState;
++
++  ms->reset ();
++  ms->getmemi (1024);
++
+   if (nel > 1)
+     {
+       octave_idx_type nremaining = nel; 
+       octave_idx_type lo = 0;
+ 
+       /* March over the array once, left to right, finding natural runs,
+        * and extending short natural runs to minrun elements.
+        */
+@@ -1529,27 +1499,16 @@ octave_sort<T>::sort (T *data, octave_id
+ fail:
+   return;
+ }
+ 
+ template <class T>
+ void
+ octave_sort<T>::sort (T *data, octave_idx_type nel)
+ {
+-  /* Re-initialize the Mergestate as this might be the second time called */
+-  if (ms)
+-    {
+-      ms->n = 0;
+-      ms->min_gallop = MIN_GALLOP;
+-    }
+-  else
+-    merge_init ();
+-
+-  merge_getmem (1024);
+-
+ #ifdef INLINE_ASCENDING_SORT
+   if (compare == ascending_compare)
+     sort (data, nel, std::less<T> ());
+   else
+ #endif
+ #ifdef INLINE_DESCENDING_SORT    
+     if (compare == descending_compare)
+       sort (data, nel, std::greater<T> ());
+@@ -1558,27 +1517,16 @@ octave_sort<T>::sort (T *data, octave_id
+     if (compare)
+       sort (data, nel, compare);
+ }
+ 
+ template <class T>
+ void
+ octave_sort<T>::sort (T *data, octave_idx_type *idx, octave_idx_type nel)
+ {
+-  /* Re-initialize the Mergestate as this might be the second time called */
+-  if (ms)
+-    {
+-      ms->n = 0;
+-      ms->min_gallop = MIN_GALLOP;
+-    }
+-  else
+-    merge_init ();
+-
+-  merge_getmemi (1024);
+-
+ #ifdef INLINE_ASCENDING_SORT
+   if (compare == ascending_compare)
+     sort (data, idx, nel, std::less<T> ());
+   else
+ #endif
+ #ifdef INLINE_DESCENDING_SORT    
+     if (compare == descending_compare)
+       sort (data, idx, nel, std::greater<T> ());
+@@ -1681,42 +1629,31 @@ octave_sort<T>::sort_rows (const T *data
+       if (col < cols-1)
+         {
+           octave_idx_type lst = 0;
+           for (octave_idx_type i = 0; i < nel; i++)
+             {
+               if (comp (lbuf[lst], lbuf[i]))
+                 {
+                   if (i > lst + 1)
+-                    runs.push (run_t (col+1, lst, i - lst));
++                    runs.push (run_t (col+1, ofs + lst, i - lst));
+                   lst = i;
+                 }
+             }
+           if (nel > lst + 1)
+-            runs.push (run_t (col+1, lst, nel - lst));
++            runs.push (run_t (col+1, ofs + lst, nel - lst));
+         }
+     }
+ }
+ 
+ template <class T>
+ void 
+ octave_sort<T>::sort_rows (const T *data, octave_idx_type *idx,
+                            octave_idx_type rows, octave_idx_type cols)
+ {
+-  /* Re-initialize the Mergestate as this might be the second time called */
+-  if (ms)
+-    {
+-      ms->n = 0;
+-      ms->min_gallop = MIN_GALLOP;
+-    }
+-  else
+-    merge_init ();
+-
+-  merge_getmemi (1024);
+-
+ #ifdef INLINE_ASCENDING_SORT
+   if (compare == ascending_compare)
+     sort_rows (data, idx, rows, cols, std::less<T> ());
+   else
+ #endif
+ #ifdef INLINE_DESCENDING_SORT    
+     if (compare == descending_compare)
+       sort_rows (data, idx, rows, cols, std::greater<T> ());
+diff --git a/liboctave/oct-sort.h b/liboctave/oct-sort.h
+--- a/liboctave/oct-sort.h
++++ b/liboctave/oct-sort.h
+@@ -166,16 +166,30 @@ private:
+   
+   struct s_slice 
+   {
+     octave_idx_type base, len;
+   };
+   
+   struct MergeState 
+   {
++    MergeState (void) 
++      : a (0), ia (0), alloced (0) 
++      { reset (); }
++    
++    ~MergeState (void) 
++      { delete [] a; delete [] ia; }
++    
++    void reset (void) 
++      { min_gallop = MIN_GALLOP; n = 0; }
++
++    void getmem (octave_idx_type need);
++
++    void getmemi (octave_idx_type need);
++
+     // This controls when we get *into* galloping mode.  It's
+     // initialized to MIN_GALLOP.  merge_lo and merge_hi tend to nudge
+     // it higher for random data, and lower for highly structured
+     // data.
+     octave_idx_type min_gallop;
+ 
+     // 'a' is temp storage to help with merges.  It contains room for
+     // alloced entries.
+@@ -214,24 +228,16 @@ private:
+   template <class Comp>
+   octave_idx_type gallop_left (T key, T *a, octave_idx_type n, octave_idx_type hint,
+                                Comp comp);
+ 
+   template <class Comp>
+   octave_idx_type gallop_right (T key, T *a, octave_idx_type n, octave_idx_type hint,
+                                 Comp comp);
+ 
+-  void merge_init (void);
+-
+-  void merge_freemem (void);
+-
+-  int merge_getmem (octave_idx_type need);
+-
+-  int merge_getmemi (octave_idx_type need);
+-
+   template <class Comp>
+   int merge_lo (T *pa, octave_idx_type na, 
+                 T *pb, octave_idx_type nb,
+                 Comp comp);
+ 
+   template <class Comp>
+   int merge_lo (T *pa, octave_idx_type *ipa, octave_idx_type na, 
+                 T *pb, octave_idx_type *ipb, octave_idx_type nb,
+diff --git a/scripts/general/accumarray.m b/scripts/general/accumarray.m
+--- a/scripts/general/accumarray.m
++++ b/scripts/general/accumarray.m
+@@ -86,16 +86,17 @@ function A = accumarray (subs, val, sz, 
+     isspar = false;
+   endif
+ 
+   if (isspar && ndims > 2)
+     error ("accumarray: sparse matrices limited to 2 dimensions");
+   endif
+ 
+   [subs, idx] = sortrows (subs);
++
+   if (isscalar (val))
+     val = val * ones (size (idx));
+   else
+     val = val(idx);
+   endif
+   cidx = find ([true; (sum (abs (diff (subs)), 2) != 0)]);
+   idx = cell (1, ndims);
+   for i = 1:ndims

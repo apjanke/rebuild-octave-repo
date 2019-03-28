@@ -1,0 +1,853 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1499262241 14400
+#      Wed Jul 05 09:44:01 2017 -0400
+# Node ID b40b7243a78245833de2dcc71cb17c7dbef96163
+# Parent  154c876e241b10bc56dbf4b5e0885bb0f08dd509
+new class for caching file contents for debug and echo
+
+* liboctave/util/file-info.h, liboctave/util/file-info.cc:
+New files.  Move get_file_line function here from bp-table.h and
+bp-table.cc.
+
+* liboctave/util/module.mk: Update.
+
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_code::m_file_info,
+octave_user_code::get_code_line, octave_user_code::get_code_lines):
+New data member and functions.  Change all uses of get_file_line to
+access code lines from info cached in function object.
+
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -551,17 +551,17 @@ is stopped.
+       octave_stdout << "line " << l;
+ 
+       std::string file_name = dbg_fcn->fcn_file_name ();
+ 
+       if (! file_name.empty ())
+         {
+           octave_stdout << " [" << file_name << "]" << std::endl;
+ 
+-          std::string line = get_file_line (file_name, l);
++          std::string line = dbg_fcn->get_code_line (l);
+ 
+           if (! line.empty ())
+             octave_stdout << l << ": " << line << std::endl;
+         }
+       else
+         octave_stdout << std::endl;
+     }
+   else
+@@ -800,17 +800,18 @@ If unspecified @var{n} defaults to 10 (+
+   if (l > 0)
+     {
+       if (have_file)
+         {
+           int l_min = std::max (l - n/2, 0);
+           int l_max = l + n/2;
+           do_dbtype (octave_stdout, name, l_min, l-1);
+ 
+-          std::string line = get_file_line (name, l);
++          std::string line = dbg_fcn->get_code_line (l);
++
+           if (! line.empty ())
+             octave_stdout << l << "-->\t" << line << std::endl;
+ 
+           do_dbtype (octave_stdout, name, l+1, l_max);
+         }
+     }
+   else
+     {
+diff --git a/libinterp/corefcn/input.cc b/libinterp/corefcn/input.cc
+--- a/libinterp/corefcn/input.cc
++++ b/libinterp/corefcn/input.cc
+@@ -538,24 +538,24 @@ initialize_command_input (void)
+ 
+ static void
+ execute_in_debugger_handler (const std::pair<std::string, int>& arg)
+ {
+   octave_link::execute_in_debugger_event (arg.first, arg.second);
+ }
+ 
+ static void
+-get_debug_input (const std::string& prompt)
++get_debug_input (octave::interpreter& interp, const std::string& prompt)
+ {
+   octave::unwind_protect frame;
+ 
+   bool silent = octave::tree_evaluator::quiet_breakpoint_flag;
+   octave::tree_evaluator::quiet_breakpoint_flag = false;
+ 
+-  octave::call_stack& cs = octave::__get_call_stack__ ("get_debug_input");
++  octave::call_stack& cs = interp.get_call_stack ();
+ 
+   octave_user_code *caller = cs.caller_user_code ();
+   std::string nm;
+   int curr_debug_line;
+ 
+   bool have_file = false;
+ 
+   if (caller)
+@@ -602,18 +602,20 @@ get_debug_input (const std::string& prom
+ 
+               octave_link::set_workspace ();
+ 
+               frame.add_fcn (execute_in_debugger_handler,
+                              std::pair<std::string, int> (nm, curr_debug_line));
+ 
+               if (! silent)
+                 {
+-                  std::string line_buf
+-                    = get_file_line (nm, curr_debug_line);
++                  std::string line_buf;
++
++                  if (caller)
++                    line_buf = caller->get_code_line (curr_debug_line);
+ 
+                   if (! line_buf.empty ())
+                     buf << "\n" << curr_debug_line << ": " << line_buf;
+                 }
+             }
+         }
+     }
+ 
+@@ -643,17 +645,17 @@ get_debug_input (const std::string& prom
+ 
+       app->interactive (true);
+ 
+       app->forced_interactive (true);
+     }
+ 
+   octave::parser curr_parser;
+ 
+-  octave::tree_evaluator& tw = octave::__get_evaluator__ ("get_debug_input");
++  octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+   while (Vdebugging)
+     {
+       try
+         {
+           Vtrack_line_num = false;
+ 
+           reset_error_handler ();
+@@ -891,34 +893,34 @@ string @samp{(yes or no) } to it.  The u
+ 
+   if (nargin == 1)
+     prompt = args(0).xstring_value ("yes_or_no: PROMPT must be a string");
+ 
+   return ovl (octave_yes_or_no (prompt));
+ }
+ 
+ octave_value
+-do_keyboard (const octave_value_list& args)
++do_keyboard (octave::interpreter& interp, const octave_value_list& args)
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   assert (nargin == 0 || nargin == 1);
+ 
+   octave::unwind_protect frame;
+ 
+   frame.add_fcn (octave::command_history::ignore_entries,
+                  octave::command_history::ignoring_entries ());
+ 
+   octave::command_history::ignore_entries (false);
+ 
+   frame.protect_var (Vdebugging);
+ 
+-  octave::call_stack& cs = octave::__get_call_stack__ ("do_keyboard");
++  octave::call_stack& cs = interp.get_call_stack ();
+ 
+   frame.add_method (cs, &octave::call_stack::restore_frame,
+                     cs.current_frame ());
+ 
+   // FIXME: probably we just want to print one line, not the
+   // entire statement, which might span many lines...
+   //
+   // tree_print_code tpc (octave_stdout);
+@@ -926,21 +928,29 @@ do_keyboard (const octave_value_list& ar
+ 
+   Vdebugging = true;
+   Vtrack_line_num = false;
+ 
+   std::string prompt = "debug> ";
+   if (nargin > 0)
+     prompt = args(0).string_value ();
+ 
+-  get_debug_input (prompt);
++  get_debug_input (interp, prompt);
+ 
+   return retval;
+ }
+ 
++octave_value
++do_keyboard (const octave_value_list& args)
++{
++  octave::interpreter& interp = octave::__get_interpreter__ ("do_keyboard");
++
++  return do_keyboard (interp, args);
++}
++
+ DEFMETHOD (keyboard, interp, args, ,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {} keyboard ()
+ @deftypefnx {} {} keyboard ("@var{prompt}")
+ Stop m-file execution and enter debug mode.
+ 
+ When the @code{keyboard} function is executed, Octave prints a prompt and
+ waits for user input.  The input strings are then evaluated and the results
+@@ -967,17 +977,17 @@ If @code{keyboard} is invoked without ar
+   // Skip the frame assigned to the keyboard function.
+   cs.goto_frame_relative (0);
+ 
+   octave::tree_evaluator::debug_mode = true;
+   octave::tree_evaluator::quiet_breakpoint_flag = false;
+ 
+   octave::tree_evaluator::current_frame = cs.current_frame ();
+ 
+-  do_keyboard (args);
++  do_keyboard (interp, args);
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (completion_matches, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} completion_matches (@var{hint})
+ Generate possible completions given @var{hint}.
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -21,16 +21,17 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <sstream>
+ 
++#include "file-info.h"
+ #include "str-vec.h"
+ 
+ #include "builtin-defun-decls.h"
+ #include "call-stack.h"
+ #include "defaults.h"
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+@@ -55,16 +56,39 @@ along with Octave; see the file COPYING.
+ #include "parse.h"
+ #include "profiler.h"
+ #include "variables.h"
+ #include "ov-fcn-handle.h"
+ 
+ // Whether to optimize subsasgn method calls.
+ static bool Voptimize_subsasgn_calls = true;
+ 
++octave_user_code::~octave_user_code (void)
++{
++  delete m_file_info;
++}
++
++std::string
++octave_user_code::get_code_line (size_t line)
++{
++  if (! m_file_info)
++    m_file_info = new octave::file_info (fcn_file_name ());
++
++  return m_file_info->get_line (line);
++}
++
++std::deque<std::string>
++octave_user_code::get_code_lines (size_t line, size_t num_lines)
++{
++  if (! m_file_info)
++    m_file_info = new octave::file_info (fcn_file_name ());
++
++  return m_file_info->get_lines (line, num_lines);
++}
++
+ std::map<std::string, octave_value>
+ octave_user_code::subfunctions (void) const
+ {
+   return std::map<std::string, octave_value> ();
+ }
+ 
+ // User defined scripts.
+ 
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -38,16 +38,17 @@ along with Octave; see the file COPYING.
+ #include "unwind-prot.h"
+ 
+ class string_vector;
+ 
+ class octave_value;
+ 
+ namespace octave
+ {
++  class file_info;
+   class tree_parameter_list;
+   class tree_statement_list;
+   class tree_evaluator;
+   class tree_expression;
+   class tree_walker;
+ }
+ 
+ #if defined (HAVE_LLVM)
+@@ -56,36 +57,58 @@ class jit_function_info;
+ 
+ class
+ octave_user_code : public octave_function
+ {
+ protected:
+ 
+   octave_user_code (const std::string& nm,
+                     const std::string& ds = "")
+-    : octave_function (nm, ds) { }
++    : octave_function (nm, ds), curr_unwind_protect_frame (0),
++      m_file_info (0)
++  { }
+ 
+ public:
+ 
+   octave_user_code (void)
+     : octave_function () { }
+ 
+   // No copying!
+ 
+   octave_user_code (const octave_user_code& f) = delete;
+ 
+   octave_user_code& operator = (const octave_user_code& f) = delete;
+ 
+-  ~octave_user_code (void) = default;
++  ~octave_user_code (void);
+ 
+   bool is_user_code (void) const { return true; }
+ 
++  octave::unwind_protect *
++  unwind_protect_frame (void)
++  {
++    return curr_unwind_protect_frame;
++  }
++
++  std::string get_code_line (size_t line);
++
++  std::deque<std::string> get_code_lines (size_t line, size_t num_lines);
++
++
+   virtual std::map<std::string, octave_value> subfunctions (void) const;
+ 
+   virtual octave::tree_statement_list * body (void) = 0;
++
++protected:
++
++  // pointer to the current unwind_protect frame of this function.
++  octave::unwind_protect *curr_unwind_protect_frame;
++
++  // Cached text of function or script code with line offsets
++  // calculated.
++  octave::file_info *m_file_info;
+ };
+ 
+ // Scripts.
+ 
+ class
+ octave_user_script : public octave_user_code
+ {
+ public:
+diff --git a/libinterp/parse-tree/bp-table.cc b/libinterp/parse-tree/bp-table.cc
+--- a/libinterp/parse-tree/bp-table.cc
++++ b/libinterp/parse-tree/bp-table.cc
+@@ -30,17 +30,16 @@ along with Octave; see the file COPYING.
+ #include <list>
+ #include <map>
+ #include <set>
+ #include <string>
+ #include <sstream>
+ #include <iostream>
+ 
+ #include "file-ops.h"
+-#include "file-stat.h"
+ #include "singleton-cleanup.h"
+ 
+ #include "bp-table.h"
+ #include "defun-int.h"
+ #include "call-stack.h"
+ #include "error.h"
+ #include "input.h"
+ #include "interpreter-private.h"
+@@ -59,115 +58,16 @@ along with Octave; see the file COPYING.
+ 
+ // Initialize the singleton object
+ bp_table *bp_table::instance = nullptr;
+ 
+ std::set<std::string> bp_table::errors_that_stop;
+ std::set<std::string> bp_table::caught_that_stop;
+ std::set<std::string> bp_table::warnings_that_stop;
+ 
+-// Read entire file called fname and return the contents as a string
+-static std::string
+-snarf_file (const std::string& fname)
+-{
+-  std::string retval;
+-
+-  octave::sys::file_stat fs (fname);
+-
+-  if (fs)
+-    {
+-      size_t sz = fs.size ();
+-
+-      std::ifstream file (fname.c_str (), std::ios::in | std::ios::binary);
+-
+-      if (file)
+-        {
+-          std::string buf (sz+1, 0);
+-
+-          file.read (&buf[0], sz+1);
+-
+-          if (! file.eof ())
+-            error ("error reading file %s", fname.c_str ());
+-
+-          // Expected to read the entire file.
+-          retval = buf;
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-static std::deque<size_t>
+-get_line_offsets (const std::string& buf)
+-{
+-  // FIXME: This could maybe be smarter.  Is deque the right thing to use here?
+-
+-  std::deque<size_t> offsets;
+-
+-  offsets.push_back (0);
+-
+-  size_t len = buf.length ();
+-
+-  for (size_t i = 0; i < len; i++)
+-    {
+-      char c = buf[i];
+-
+-      if (c == '\r' && ++i < len)
+-        {
+-          c = buf[i];
+-
+-          if (c == '\n')
+-            offsets.push_back (i+1);
+-          else
+-            offsets.push_back (i);
+-        }
+-      else if (c == '\n')
+-        offsets.push_back (i+1);
+-    }
+-
+-  offsets.push_back (len);
+-
+-  return offsets;
+-}
+-
+-std::string
+-get_file_line (const std::string& fname, size_t line)
+-{
+-  std::string retval;
+-
+-  static std::string last_fname;
+-
+-  static std::string buf;
+-
+-  static std::deque<size_t> offsets;
+-
+-  if (fname != last_fname)
+-    {
+-      buf = snarf_file (fname);
+-
+-      offsets = get_line_offsets (buf);
+-    }
+-
+-  if (line > 0)
+-    line--;
+-
+-  if (line < offsets.size () - 1)
+-    {
+-      size_t bol = offsets[line];
+-      size_t eol = offsets[line+1];
+-
+-      while (eol > 0 && eol > bol && (buf[eol-1] == '\n' || buf[eol-1] == '\r'))
+-        eol--;
+-
+-      retval = buf.substr (bol, eol - bol);
+-    }
+-
+-  return retval;
+-}
+-
+ // Return a pointer to the user-defined function FNAME.  If FNAME is
+ // empty, search backward for the first user-defined function in the
+ // current call stack.
+ 
+ octave_user_code *
+ get_user_code (const std::string& fname)
+ {
+   octave_user_code *dbg_fcn = nullptr;
+diff --git a/libinterp/parse-tree/bp-table.h b/libinterp/parse-tree/bp-table.h
+--- a/libinterp/parse-tree/bp-table.h
++++ b/libinterp/parse-tree/bp-table.h
+@@ -193,13 +193,11 @@ private:
+ 
+   void do_remove_all_breakpoints (void);
+ 
+   fname_bp_map do_get_breakpoint_list (const octave_value_list& fname_list);
+ 
+   bool do_have_breakpoints (void) { return (! bp_set.empty ()); }
+ };
+ 
+-extern std::string get_file_line (const std::string& fname, size_t line);
+-
+ extern octave_user_code * get_user_code (const std::string& fname = "");
+ 
+ #endif
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -3029,19 +3029,30 @@ namespace octave
+ 
+     return false;
+   }
+ 
+   void tree_evaluator::echo_code (size_t line)
+   {
+     std::string prefix = command_editor::decode_prompt_string (m_PS4);
+ 
+-    for (size_t i = m_echo_file_pos; i <= line; i++)
+-      octave_stdout << prefix << get_file_line (m_echo_file_name, i)
+-                    << std::endl;
++    octave_function *curr_fcn = m_call_stack.current ();
++
++    if (curr_fcn && curr_fcn->is_user_code ())
++      {
++        octave_user_code *code = dynamic_cast<octave_user_code *> (curr_fcn);
++
++        size_t num_lines = line - m_echo_file_pos + 1;
++
++        std::deque<std::string> lines
++          = code->get_code_lines (m_echo_file_pos, num_lines);
++
++        for (auto& elt : lines)
++          octave_stdout << prefix << elt << std::endl;
++      }
+   }
+ }
+ 
+ DEFMETHOD (max_recursion_depth, interp, args, nargout,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} max_recursion_depth ()
+ @deftypefnx {} {@var{old_val} =} max_recursion_depth (@var{new_val})
+ @deftypefnx {} {} max_recursion_depth (@var{new_val}, "local")
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -441,16 +441,18 @@ namespace octave
+     // more than one state can be active at once.
+     int m_echo;
+ 
+     // Are we currently echoing commands?  This state is set by the
+     // functions that execute fucntions and scripts.
+     bool m_echo_state;
+ 
+     std::string m_echo_file_name;
++
++    // Next line to echo, counting from 1.
+     size_t m_echo_file_pos;
+ 
+     std::map<std::string, bool> m_echo_files;
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+diff --git a/liboctave/util/file-info.cc b/liboctave/util/file-info.cc
+new file mode 100644
+--- /dev/null
++++ b/liboctave/util/file-info.cc
+@@ -0,0 +1,139 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++Copyright (C) 2001-2017 Ben Sapp
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include <deque>
++#include <fstream>
++#include <iostream>
++
++#include "file-info.h"
++#include "file-stat.h"
++#include "lo-error.h"
++
++namespace octave
++{
++  std::string file_info::get_line (size_t line) const
++  {
++    std::string retval;
++
++    if (line == 0)
++      return retval;
++
++    if (line < m_offsets.size ())
++      {
++        size_t bol = m_offsets[line-1];
++        size_t eol = m_offsets[line];
++
++        while (eol > 0 && eol > bol
++               && (m_file_buf[eol-1] == '\n' || m_file_buf[eol-1] == '\r'))
++          eol--;
++
++        retval = m_file_buf.substr (bol, eol - bol);
++      }
++
++    return retval;
++  }
++
++  std::deque<std::string>
++  file_info::get_lines (size_t line, size_t num_lines) const
++  {
++    std::deque<std::string> retval;
++
++    for (size_t i = line; i < line+num_lines; i++)
++      retval.push_back (get_line (i));
++
++    return retval;
++  }
++
++  // Read entire file called fname and return the contents as a string
++
++  std::string file_info::snarf_file (const std::string& fname)
++  {
++    std::string retval;
++
++    sys::file_stat fs (fname);
++
++    if (! fs)
++      (*current_liboctave_error_handler) ("no such file, '%s'", fname.c_str ());
++
++    size_t sz = fs.size ();
++
++    std::ifstream file (fname.c_str (), std::ios::in | std::ios::binary);
++
++    if (file)
++      {
++        std::string buf (sz+1, 0);
++
++        file.read (&buf[0], sz+1);
++
++        if (! file.eof ())
++          (*current_liboctave_error_handler)
++            ("error reading file %s", fname.c_str ());
++
++        // Expected to read the entire file.
++        retval = buf;
++      }
++
++    return retval;
++  }
++
++  std::vector<size_t> file_info::get_line_offsets (const std::string& buf)
++  {
++    std::deque<size_t> tmp_offsets;
++
++    tmp_offsets.push_back (0);
++
++    size_t len = buf.length ();
++
++    for (size_t i = 0; i < len; i++)
++      {
++        char c = buf[i];
++
++        if (c == '\r' && ++i < len)
++          {
++            c = buf[i];
++
++            if (c == '\n')
++              tmp_offsets.push_back (i+1);
++            else
++              tmp_offsets.push_back (i);
++          }
++        else if (c == '\n')
++          tmp_offsets.push_back (i+1);
++      }
++
++    tmp_offsets.push_back (len-1);
++
++    size_t n = tmp_offsets.size ();
++
++    std::vector<size_t> retval (n);
++    size_t i = 0;
++    for (auto& elt : tmp_offsets)
++      retval[i++] = elt;
++
++    return retval;
++  }
++}
+diff --git a/liboctave/util/file-info.h b/liboctave/util/file-info.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/util/file-info.h
+@@ -0,0 +1,89 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++Copyright (C) 2001-2017 Ben Sapp
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_file_info_h)
++#define octave_file_info_h 1
++
++#include "octave-config.h"
++
++#include <deque>
++#include <map>
++#include <string>
++#include <vector>
++
++#include "oct-time.h"
++
++namespace octave
++{
++  class file_info
++  {
++  public:
++
++    file_info (void)
++      : m_file_buf (), m_offsets (), m_timestamp (static_cast<time_t> (0))
++    { }
++
++    file_info (const std::string& fname)
++      : m_file_buf (snarf_file (fname)),
++        m_offsets (get_line_offsets (m_file_buf)),
++        m_timestamp ()
++    { }
++
++    file_info (const file_info&) = default;
++
++    file_info& operator = (const file_info&) = default;
++
++    ~file_info (void) = default;
++
++    std::string get_line (size_t line) const;
++
++    std::deque<std::string> get_lines (size_t line, size_t num_lines) const;
++
++    size_t num_lines (void) const { return m_offsets.size (); }
++
++    std::string text (void) const { return m_file_buf; }
++
++    std::vector<size_t> line_offsets (void) const { return m_offsets; }
++
++    sys::time timestamp (void) const { return m_timestamp; }
++
++    size_t size (void) const { return m_file_buf.length (); }
++
++  private:
++
++    // File contents as a string.
++    std::string m_file_buf;
++
++    // Offsets to line beginnings.
++    std::vector<size_t> m_offsets;
++
++    sys::time m_timestamp;
++
++    // Read entire file called fname and return the contents as a string
++    static std::string snarf_file (const std::string& fname);
++
++    static std::vector<size_t> get_line_offsets (const std::string& buf);
++  };
++}
++
++#endif
+diff --git a/liboctave/util/module.mk b/liboctave/util/module.mk
+--- a/liboctave/util/module.mk
++++ b/liboctave/util/module.mk
+@@ -1,16 +1,17 @@
+ UTIL_INC = \
+   %reldir%/action-container.h \
+   %reldir%/base-list.h \
+   %reldir%/byte-swap.h \
+   %reldir%/caseless-str.h \
+   %reldir%/cmd-edit.h \
+   %reldir%/cmd-hist.h \
+   %reldir%/data-conv.h \
++  %reldir%/file-info.h \
+   %reldir%/functor.h \
+   %reldir%/glob-match.h \
+   %reldir%/lo-array-errwarn.h \
+   %reldir%/lo-array-gripes.h \
+   %reldir%/lo-cutils.h \
+   %reldir%/lo-hash.h \
+   %reldir%/lo-ieee.h \
+   %reldir%/lo-regexp.h \
+@@ -61,16 +62,17 @@ UTIL_C_SRC = \
+   %reldir%/lo-error.c \
+   %reldir%/oct-rl-edit.c \
+   %reldir%/oct-rl-hist.c
+ 
+ UTIL_SRC = \
+   %reldir%/cmd-edit.cc \
+   %reldir%/cmd-hist.cc \
+   %reldir%/data-conv.cc \
++  %reldir%/file-info.cc \
+   %reldir%/glob-match.cc \
+   %reldir%/kpse.cc \
+   %reldir%/lo-array-errwarn.cc \
+   %reldir%/lo-array-gripes.cc \
+   %reldir%/lo-hash.cc \
+   %reldir%/lo-ieee.cc \
+   %reldir%/lo-regexp.cc \
+   %reldir%/lo-utils.cc \

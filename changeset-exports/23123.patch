@@ -1,0 +1,726 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1485888702 18000
+#      Tue Jan 31 13:51:42 2017 -0500
+# Node ID c6ca5fe1505cc050962c87c4c476a964d89b4139
+# Parent  e310b5b6da6fd625ea486603c99a8d3cab77f763
+use wrappers for uniconv functions; style fixes for unicode conv fcns
+
+* boostrap.conf (gnulib_modules): Include localcharset,
+uniconv/u8-conv-from-enc, and uniconv/u8-conv-to-enc in the list.
+Remove libunistring from the list.
+
+* liboctave/wrappers/localcharset-wrapper.c,
+liboctave/wrappers/localcharset-wrapper.h,
+liboctave/wrappers/uniconv-wrappers.c,
+liboctave/wrappers/uniconv-wrappers.h: New files.
+* liboctave/wrappers/module.mk: Update.
+
+* strfns.cc: Include uniconv-wrappers.h, not uniconv.
+Assume uniconv functions are available (provided by gnulib).
+(F__native2unicode__, F__unicode2native__): Use wrapper functions.
+Simplify.
+(F__unicode2native__): Return uint8 array.
+
+* native2unicode.m, unicode2native.m: Style fixes.
+Update tests.  Use assert directly, not testif.
+Use error <> ..., not fail.
+
+diff --git a/bootstrap.conf b/bootstrap.conf
+--- a/bootstrap.conf
++++ b/bootstrap.conf
+@@ -14,17 +14,16 @@
+ # WITHOUT ANY WARRANTY; without even the implied warranty of
+ # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ # GNU General Public License for more details.
+ #
+ # You should have received a copy of the GNU General Public License
+ # along with Octave; see the file COPYING.  If not, see
+ # <http://www.gnu.org/licenses/>.
+ 
+-
+ # gnulib modules used by this package.
+ gnulib_modules="
+   areadlink
+   base64
+   canonicalize
+   chdir
+   close
+   closedir
+@@ -47,18 +46,18 @@ gnulib_modules="
+   getcwd
+   gethostname
+   getopt-gnu
+   getrusage
+   gettimeofday
+   glob
+   isatty
+   largefile
+-  libunistring
+   link
++  localcharset
+   lstat
+   malloc-gnu
+   mkdir
+   mkfifo
+   mkostemp
+   mktime
+   nanosleep
+   nproc
+@@ -85,16 +84,18 @@ gnulib_modules="
+   symlink
+   sys_stat
+   sys_time
+   sys_times
+   sys_wait
+   tempname
+   tmpfile
+   uname
++  uniconv/u8-conv-from-enc
++  uniconv/u8-conv-to-enc
+   unistd
+   unlink
+   unsetenv
+   vasprintf
+   waitpid
+ "
+ 
+ # Additional xgettext options to use.  Use "\\\newline" to break lines.
+diff --git a/libinterp/corefcn/strfns.cc b/libinterp/corefcn/strfns.cc
+--- a/libinterp/corefcn/strfns.cc
++++ b/libinterp/corefcn/strfns.cc
+@@ -24,21 +24,19 @@ along with Octave; see the file COPYING.
+ #  include "config.h"
+ #endif
+ 
+ #include <cctype>
+ 
+ #include <queue>
+ #include <sstream>
+ 
+-#ifdef HAVE_LIBUNISTRING
+-#  include <uniconv.h>
+-#endif
+-
+ #include "dMatrix.h"
++#include "localcharset-wrapper.h"
++#include "uniconv-wrappers.h"
+ 
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "unwind-prot.h"
+@@ -734,104 +732,105 @@ This is just the opposite of the corresp
+ %!assert (strncmpi ("abc123", "ABC456", 3), true)
+ */
+ 
+ DEFUN (__native2unicode__, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {@var{utf8_str} =} __native2unicode__ (@var{native_bytes}, @var{codepage})
+ Convert byte stream @var{native_bytes} to UTF-8 using @var{codepage}.
+ 
+-
+ @seealso{native2unicode, __unicode2native__}
+ @end deftypefn */)
+ {
+-#ifdef HAVE_LIBUNISTRING
+   int nargin = args.length ();
+ 
+-  if (nargin < 1 || nargin > 2)
++  if (nargin != 2)
+     print_usage ();
+ 
+   if (args(0).is_string ())
+-    return ovl(args(0));
++    return ovl (args(0));
+ 
+-  // codepage
+-  const char *codepage = locale_charset ();
+-  string_vector tmp; 
+-  if (! args(1).is_numeric_type ())
+-    {
+-      tmp = args(1).string_vector_value ();
+-      codepage = tmp(0).c_str ();
+-    }
++  std::string tmp = args(1).xstring_value ("CODEPAGE must be a string");
++  const char *codepage
++    = tmp.empty () ? octave_locale_charset_wrapper () : tmp.c_str ();
++  
++  charNDArray native_bytes = args(0).char_array_value ();
+ 
+-  // convert byte stream with local encoding to UTF-8
+-  charNDArray native_bytes = args(0).char_array_value ();
++  const char *src = native_bytes.data ();
++  size_t srclen = native_bytes.numel ();
++
+   size_t length;
+-  char *utf8_str = reinterpret_cast<char *>
+-                   (u8_conv_from_encoding (codepage, iconveh_question_mark,
+-                                           native_bytes.fortran_vec (),
+-                                           native_bytes.numel (), NULL,
+-                                           NULL, &length));
+-  if (utf8_str == NULL)
+-    error("native2unicode: Error '%s' converting from codepage '%s' to UTF-8.",
+-          std::strerror (errno), codepage);
++  uint8_t *utf8_str = 0;
++
++  octave::unwind_protect frame;
++
++  frame.add_fcn (::free, static_cast<void *> (utf8_str));
++
++  utf8_str = octave_u8_conv_from_encoding (codepage, src, srclen, &length);
+ 
+-  std::string ret_val = std::string (utf8_str, length);
+-  free (utf8_str);
+-  return ovl (charNDArray (ret_val));
+-#else
+-  octave_unused_parameter (args);
++  if (! utf8_str)
++    error ("native2unicode: converting from codepage '%s' to UTF-8: %s",
++           codepage, std::strerror (errno));
++
++  octave_idx_type len = length;
+ 
+-  err_disabled_feature ("__native2unicode__", "libunistring");
+-#endif
++  charNDArray retval (dim_vector (1, len));
++
++  for (octave_idx_type i = 0; i < len; i++)
++    retval.xelem(i) = utf8_str[i];
++
++  return ovl (retval);
+ }
+ 
+ DEFUN (__unicode2native__, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {@var{native_bytes} =} __unicode2native__ (@var{utf8_str}, @var{codepage})
+ Convert UTF-8 string @var{utf8_str} to byte stream @var{native_bytes} using
+ @var{codepage}.
+ 
+-
+ @seealso{unicode2native, __native2unicode__}
+ @end deftypefn */)
+ {
+-#ifdef HAVE_LIBUNISTRING
+   int nargin = args.length ();
+ 
+   if (nargin != 2)
+     print_usage ();
+ 
+-  // codepage
+-  const char *codepage = locale_charset ();
+-  string_vector tmp; 
+-  if (! args(1).is_numeric_type ())
+-    {
+-      tmp = args(1).string_vector_value ();
+-      codepage = tmp(0).c_str ();
+-    }
++  std::string tmp = args(1).xstring_value ("CODEPAGE must be a string");
++  const char *codepage
++    = tmp.empty () ? octave_locale_charset_wrapper () : tmp.c_str ();
+ 
+-  // convert UTF-8 string vector to byte-stream with local encoding
+-  charNDArray utf8_str = args(0).char_array_value ();
++  charNDArray utf8_str = args(0).xchar_array_value ("UTF8_STR must be a string");
++
++  const uint8_t *src = reinterpret_cast<const uint8_t *> (utf8_str.data ());
++  size_t srclen = utf8_str.numel ();
++
+   size_t length;
+-  char *native_bytes = u8_conv_to_encoding (codepage, iconveh_question_mark,
+-                            reinterpret_cast<uint8_t*> (utf8_str.fortran_vec ()),
+-                            utf8_str.numel (), NULL, NULL, &length);
+-  if (native_bytes == NULL)
+-    error("native2unicode: Error '%s' converting from UTF-8 to codepage '%s'.",
+-          std::strerror (errno), codepage);
++  char *native_bytes = 0;
++
++  octave::unwind_protect frame;
++
++  frame.add_fcn (::free, static_cast<void *> (native_bytes));
++
++  native_bytes = octave_u8_conv_to_encoding (codepage, src, srclen, &length);
+ 
+-  std::string ret_val = std::string (native_bytes, length);
+-  free (native_bytes);
+-  return ovl (NDArray (ret_val));
+-#else
+-  octave_unused_parameter (args);
++  if (! native_bytes)
++    error ("native2unicode: converting from UTF-8 to codepage '%s': %s",
++           codepage, std::strerror (errno));
++
++  octave_idx_type len = length;
+ 
+-  err_disabled_feature ("__unicode2native__", "libunistring");
+-#endif
++  uint8NDArray retval (dim_vector (1, len));
++
++  for (octave_idx_type i = 0; i < len; i++)
++    retval.xelem(i) = native_bytes[i];
++
++  return ovl (retval);
+ }
++
+ DEFUN (list_in_columns, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} list_in_columns (@var{arg}, @var{width}, @var{prefix})
+ Return a string containing the elements of @var{arg} listed in columns with
+ an overall maximum width of @var{width} and optional prefix @var{prefix}.
+ 
+ The argument @var{arg} must be a cell array of character strings or a
+ character array.
+diff --git a/liboctave/wrappers/localcharset-wrapper.c b/liboctave/wrappers/localcharset-wrapper.c
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/localcharset-wrapper.c
+@@ -0,0 +1,40 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include "localcharset.h"
++
++#include "localcharset-wrapper.h"
++
++// The locale_charset function is provided by gnulib.  We don't include
++// gnulib headers directly in Octave's C++ source files to avoid
++// problems that may be caused by the way that gnulib overrides standard
++// library functions.
++
++const char *
++octave_locale_charset_wrapper (void)
++{
++  return locale_charset ();
++}
+diff --git a/liboctave/wrappers/localcharset-wrapper.h b/liboctave/wrappers/localcharset-wrapper.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/localcharset-wrapper.h
+@@ -0,0 +1,36 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_localcharset_wrapper_h)
++#define octave_localcharset_wrapper_h 1
++
++#if defined __cplusplus
++extern "C" {
++#endif
++
++extern const char *octave_locale_charset_wrapper (void);
++  
++#if defined __cplusplus
++}
++#endif
++
++#endif
+diff --git a/liboctave/wrappers/module.mk b/liboctave/wrappers/module.mk
+--- a/liboctave/wrappers/module.mk
++++ b/liboctave/wrappers/module.mk
+@@ -6,32 +6,34 @@ NOINSTALL_WRAPPERS_INC = \
+   liboctave/wrappers/dirent-wrappers.h \
+   liboctave/wrappers/fcntl-wrappers.h \
+   liboctave/wrappers/filepos-wrappers.h \
+   liboctave/wrappers/fpucw-wrappers.h \
+   liboctave/wrappers/gen-tempname-wrapper.h \
+   liboctave/wrappers/getopt-wrapper.h \
+   liboctave/wrappers/glob-wrappers.h \
+   liboctave/wrappers/hash-wrappers.h \
++  liboctave/wrappers/localcharset-wrapper.h \
+   liboctave/wrappers/math-wrappers.h \
+   liboctave/wrappers/mkostemp-wrapper.h \
+   liboctave/wrappers/nanosleep-wrapper.h \
+   liboctave/wrappers/nproc-wrapper.h \
+   liboctave/wrappers/octave-popen2.h \
+   liboctave/wrappers/putenv-wrapper.h \
+   liboctave/wrappers/set-program-name-wrapper.h \
+   liboctave/wrappers/signal-wrappers.h \
+   liboctave/wrappers/stat-wrappers.h \
+   liboctave/wrappers/strdup-wrapper.h \
+   liboctave/wrappers/strftime-wrapper.h \
+   liboctave/wrappers/strmode-wrapper.h \
+   liboctave/wrappers/strptime-wrapper.h \
+   liboctave/wrappers/time-wrappers.h \
+   liboctave/wrappers/tmpfile-wrapper.h \
+   liboctave/wrappers/uname-wrapper.h \
++  liboctave/wrappers/uniconv-wrappers.h \
+   liboctave/wrappers/unistd-wrappers.h \
+   liboctave/wrappers/unsetenv-wrapper.h \
+   liboctave/wrappers/vasprintf-wrapper.h \
+   liboctave/wrappers/wait-for-input.h \
+   liboctave/wrappers/wait-wrappers.h
+ 
+ WRAPPERS_SRC = \
+   liboctave/wrappers/areadlink-wrapper.c \
+@@ -41,32 +43,34 @@ WRAPPERS_SRC = \
+   liboctave/wrappers/dirent-wrappers.c \
+   liboctave/wrappers/fcntl-wrappers.c \
+   liboctave/wrappers/filepos-wrappers.c \
+   liboctave/wrappers/fpucw-wrappers.c \
+   liboctave/wrappers/gen-tempname-wrapper.c \
+   liboctave/wrappers/getopt-wrapper.c \
+   liboctave/wrappers/glob-wrappers.c \
+   liboctave/wrappers/hash-wrappers.c \
++  liboctave/wrappers/localcharset-wrapper.c \
+   liboctave/wrappers/math-wrappers.c \
+   liboctave/wrappers/mkostemp-wrapper.c \
+   liboctave/wrappers/nanosleep-wrapper.c \
+   liboctave/wrappers/nproc-wrapper.c \
+   liboctave/wrappers/octave-popen2.c \
+   liboctave/wrappers/putenv-wrapper.c \
+   liboctave/wrappers/set-program-name-wrapper.c \
+   liboctave/wrappers/signal-wrappers.c \
+   liboctave/wrappers/stat-wrappers.c \
+   liboctave/wrappers/strdup-wrapper.c \
+   liboctave/wrappers/strftime-wrapper.c \
+   liboctave/wrappers/strmode-wrapper.c \
+   liboctave/wrappers/strptime-wrapper.c \
+   liboctave/wrappers/time-wrappers.c \
+   liboctave/wrappers/tmpfile-wrapper.c \
+   liboctave/wrappers/uname-wrapper.c \
++  liboctave/wrappers/uniconv-wrappers.c \
+   liboctave/wrappers/unistd-wrappers.c \
+   liboctave/wrappers/unsetenv-wrapper.c \
+   liboctave/wrappers/vasprintf-wrapper.c \
+   liboctave/wrappers/wait-for-input.c \
+   liboctave/wrappers/wait-wrappers.c \
+   $(NOINSTALL_WRAPPERS_INC)
+ 
+ noinst_LTLIBRARIES += liboctave/wrappers/libwrappers.la
+diff --git a/liboctave/wrappers/uniconv-wrappers.c b/liboctave/wrappers/uniconv-wrappers.c
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/uniconv-wrappers.c
+@@ -0,0 +1,50 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++// The conversion functions are provided by gnulib.  We don't include
++// gnulib headers directly in Octave's C++ source files to avoid
++// problems that may be caused by the way that gnulib overrides standard
++// library functions.
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include "uniconv.h"
++
++#include "uniconv-wrappers.h"
++
++uint8_t *
++octave_u8_conv_from_encoding (const char *fromcode, const char *src,
++                              size_t srclen, size_t *lengthp)
++{
++  return u8_conv_from_encoding (fromcode, iconveh_question_mark,
++                                src, srclen, NULL, NULL, lengthp);
++}
++
++extern char *
++octave_u8_conv_to_encoding (const char *tocode, const uint8_t *src,
++                            size_t srclen, size_t *lengthp)
++{
++  return u8_conv_to_encoding (tocode, iconveh_question_mark,
++                              src, srclen, NULL, NULL, lengthp);
++}
+diff --git a/liboctave/wrappers/uniconv-wrappers.h b/liboctave/wrappers/uniconv-wrappers.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/uniconv-wrappers.h
+@@ -0,0 +1,45 @@
++/*
++
++Copyright (C) 2017 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_uniconv_wrappers_h)
++#define octave_uniconv_wrappers_h 1
++
++#if defined __cplusplus
++extern "C" {
++#endif
++
++// Since we omit arguments we don't care about in Octave, these aren't
++// named with the _wrapper suffix.
++
++extern uint8_t *
++octave_u8_conv_from_encoding (const char *fromcode, const char *src,
++                              size_t srclen, size_t *lengthp);
++
++extern char *
++octave_u8_conv_to_encoding (const char *tocode, const uint8_t *src,
++                            size_t srclen, size_t *lengthp);
++
++#if defined __cplusplus
++}
++#endif
++
++#endif
+diff --git a/scripts/strings/native2unicode.m b/scripts/strings/native2unicode.m
+--- a/scripts/strings/native2unicode.m
++++ b/scripts/strings/native2unicode.m
+@@ -29,76 +29,60 @@
+ ## Examples for valid codepages are "ISO 8859-1", "Latin-1" or "Shift-JIS".
+ ## If @var{codepage} is omitted or empty, the system default codepage is used.
+ ##
+ ## If @var{native_bytes} is a string vector, it is returned as is.
+ ##
+ ## @seealso{unicode2native}
+ ## @end deftypefn
+ 
+-function utf8_str = native2unicode (native_bytes, codepage)
++function utf8_str = native2unicode (native_bytes, codepage = "")
+ 
+-  ## check input
+   if (nargin < 1 || nargin > 2)
+     print_usage ();
+   endif
+ 
+   if (ischar (native_bytes))
+     utf8_str = native_bytes;
+-    return
++    return;
+   endif
+ 
+   if (! isnumeric (native_bytes) || ! isvector (native_bytes))
+-    error ("native2unicode: NATIVE_BYTES must be a numeric vector.")
++    error ("native2unicode: NATIVE_BYTES must be a numeric vector");
+   endif
+ 
+-  is_column = false;
+-  if (! isrow (native_bytes))
+-    is_column = true;
+-    native_bytes = native_bytes';
++  if (! ischar (codepage))
++    error ("native2unicode: CODEPAGE must be a string")
+   endif
+ 
+-  if (nargin < 2 || isempty (codepage))
+-    codepage = 0;
+-  endif
+-
+-  if (! ischar (codepage) && codepage != 0)
+-    error ("native2unicode: CODEPAGE must be a string or 0.")
+-  endif
++  ## FIXME: would it be better to do this by converting to uint8?  Or to
++  ## let __native2unicode to the clipping?  Multiple steps here means
++  ## looping through the data and allocating memory multiple times.
+ 
+   native_bytes = round (native_bytes);
+   native_bytes(native_bytes < 0) = 0;
+   native_bytes(native_bytes > 255) = 255;
+ 
+-  ## pass to internal function
+   utf8_str = __native2unicode__ (native_bytes, codepage);
+ 
+-  if (is_column)
++  if (iscolumn (native_bytes))
+     utf8_str = utf8_str';
+   endif
+ 
+ endfunction
+ 
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (double (native2unicode (164:170, 'ISO 8859-5')),
+-%!         [208 132 208 133 208 134 208 135 208 136 208 137 208 138]);  # "ЄЅІЇЈЉЊ"
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (double (native2unicode ([164:166 0 167:170], 'ISO 8859-5')),
+-%!         [208 132 208 133 208 134 0 208 135 208 136 208 137 208 138]);  # ["ЄЅІ" 0 "ЇЈЉЊ"]
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (native2unicode ("foobar"), "foobar");
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (double (native2unicode ([0 0 120.3 0 0 122.6 0 0])),
+-%!         [0 0 120 0 0 123 0 0]);
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode ([1 2; 3 4])", "NATIVE_BYTES must be a numeric vector");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode ({1 2 3 4})", "NATIVE_BYTES must be a numeric vector");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode (164:170, 123)", "CODEPAGE must be a string or 0");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode (234, 'foo')", 
+-%!       "Error .* converting from codepage 'foo' to UTF-8");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode ()", "Invalid call");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("native2unicode (1, 'Latin-1', 'test')", "Invalid call");
+- 
+\ No newline at end of file
++## "ЄЅІЇЈЉЊ"
++%!assert (double (native2unicode (164:170, 'ISO 8859-5')),
++%!        [208 132 208 133 208 134 208 135 208 136 208 137 208 138]);
++%!assert (double (native2unicode ([164:166 0 167:170], 'ISO 8859-5')),
++%!        [208 132 208 133 208 134 0 208 135 208 136 208 137 208 138]);
++
++## ["ЄЅІ" 0 "ЇЈЉЊ"]
++%!assert (native2unicode ("foobar"), "foobar");
++%!assert (double (native2unicode ([0 0 120.3 0 0 122.6 0 0])),
++%!        [0 0 120 0 0 123 0 0]);
++
++%!error <NATIVE_BYTES must be a numeric vector> native2unicode ([1 2; 3 4])
++%!error <NATIVE_BYTES must be a numeric vector> native2unicode ({1 2 3 4})
++%!error <CODEPAGE must be a string> native2unicode (164:170, 123)
++%!error <converting from codepage 'foo' to UTF-8> native2unicode (234, 'foo')
++%!error <Invalid call> native2unicode ()
++%!error <Invalid call> native2unicode (1, 'Latin-1', 'test')
+diff --git a/scripts/strings/unicode2native.m b/scripts/strings/unicode2native.m
+--- a/scripts/strings/unicode2native.m
++++ b/scripts/strings/unicode2native.m
+@@ -29,61 +29,39 @@
+ ##
+ ## If any of the characters cannot be mapped into the codepage @var{codepage},
+ ## they are replaced with the appropriate substitution sequence for that
+ ## codepage.
+ ##
+ ## @seealso{native2unicode}
+ ## @end deftypefn
+ 
+-function native_bytes = unicode2native (utf8_str, codepage)
++function native_bytes = unicode2native (utf8_str, codepage = "")
+ 
+-  ## check input
+   if (nargin < 1 || nargin > 2)
+     print_usage ();
+   endif
+ 
+-
+   if (! ischar (utf8_str) || ! isvector (utf8_str))
+-    error ("unicode2native: UTF8_STR must be a character vector.")
+-  endif
+-
+-  is_column = false;
+-  if (! isrow (utf8_str))
+-    is_column = true;
+-    utf8_str = utf8_str';
++    error ("unicode2native: UTF8_STR must be a character vector");
+   endif
+ 
+-  if (nargin < 2 || isempty (codepage))
+-    codepage = 0;
++  if (! ischar (codepage))
++    error ("unicode2native: CODEPAGE must be a string");
+   endif
+ 
+-  if (! ischar (codepage) && codepage != 0)
+-    error ("unicode2native: CODEPAGE must be a string or 0.")
+-  endif
+-
+-  ## pass to internal function
+   native_bytes = __unicode2native__ (utf8_str, codepage);
+ 
+-  if (is_column)
++  if (iscolumn (utf8_str))
+     native_bytes = native_bytes';
+   endif
+ 
+ endfunction
+ 
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (unicode2native ("ЄЅІЇЈЉЊ", "ISO 8859-5"), 164:170);
+-%!testif(HAVE_LIBUNISTRING)
+-%! assert (unicode2native (["ЄЅІ" 0 "ЇЈЉЊ"], "ISO 8859-5"), [164:166 0 167:170]);
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native (['ab'; 'cd'])", "UTF8_STR must be a character vector");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native ({1 2 3 4})", "UTF8_STR must be a character vector");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native ('ЄЅІЇЈЉЊ', 123)", "CODEPAGE must be a string or 0");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native ('a', 'foo')",
+-%!       "Error .* converting from UTF-8 to codepage 'foo'");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native ()", "Invalid call");
+-%!testif(HAVE_LIBUNISTRING)
+-%! fail ("unicode2native ('a', 'Latin-1', 'test')", "Invalid call");
+- 
+\ No newline at end of file
++%!assert (unicode2native ("ЄЅІЇЈЉЊ", "ISO 8859-5"), uint8 (164:170));
++%!assert (unicode2native (["ЄЅІ" 0 "ЇЈЉЊ"], "ISO 8859-5"), uint8 ([164:166 0 167:170]));
++
++%!error <UTF8_STR must be a character vector> unicode2native (['ab'; 'cd'])
++%!error <UTF8_STR must be a character vector> unicode2native ({1 2 3 4})
++%!error <CODEPAGE must be a string> unicode2native ('ЄЅІЇЈЉЊ', 123)
++%!error <converting from UTF-8 to codepage 'foo'> unicode2native ('a', 'foo')
++%!error <Invalid call> unicode2native ()
++%!error <Invalid call> unicode2native ('a', 'Latin-1', 'test')

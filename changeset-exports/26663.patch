@@ -1,0 +1,228 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1549053855 0
+#      Fri Feb 01 20:44:15 2019 +0000
+# Node ID fad3f19de1bef5d10c6a2098554096269b5d4990
+# Parent  05fc703b419a14b3bd1a1a1a47b2d5ac7e5069b5
+don't fail if symbol in script can't be found (bug #55626)
+
+* stack-frame.h, stack-frame.cc
+(script_stack_frame::get_val_offsets_internal): New function.
+(script_stack_frame::get_val_offsets): Return flag indicating whether
+symbol is found instead of crashing if it is missing.  If frame_offset
+is zero and data_offset is out of range, call get_val_offsets_internal
+to attempt to find symbol in parent scopes.
+(script_stack_frame::varval): If symbol can't be found, return
+undefined value.
+(script_stack_frame::scope_flag): If symbol can't be found, return
+LOCAL flag.
+
+diff --git a/libinterp/corefcn/stack-frame.cc b/libinterp/corefcn/stack-frame.cc
+--- a/libinterp/corefcn/stack-frame.cc
++++ b/libinterp/corefcn/stack-frame.cc
+@@ -753,46 +753,128 @@ namespace octave
+ 
+     assert (sym);
+ 
+     resize_and_update_script_offsets (sym);
+ 
+     return sym;
+   }
+ 
+-  void script_stack_frame::get_val_offsets (const symbol_record& sym,
++  // Similar to set_script_offsets_internal except that we only return
++  // frame and data offsets for symbols found by name in parent scopes
++  // instead of updating the offsets stored in the script frame itself.
++
++  bool
++  script_stack_frame::get_val_offsets_internal (const symbol_record& script_sr,
++                                                size_t& frame_offset,
++                                                size_t& data_offset) const
++  {
++    bool found = false;
++
++    // This scope will be used to evaluate the script.  Find symbols
++    // here by name.
++
++    symbol_scope eval_scope = m_access_link->get_scope ();
++
++    if (eval_scope.is_nested ())
++      {
++        std::string name = script_sr.name ();
++
++        symbol_scope parent_scope = eval_scope;
++
++        size_t count = 1;
++
++        while (parent_scope)
++          {
++            const std::map<std::string, symbol_record>& parent_scope_symbols
++              = parent_scope.symbols ();
++
++            auto p = parent_scope_symbols.find (name);
++
++            if (p != parent_scope_symbols.end ())
++              {
++                found = true;
++                symbol_record parent_scope_sr = p->second;
++
++                frame_offset = parent_scope_sr.frame_offset () + 1;
++
++                data_offset = parent_scope_sr.data_offset ();
++
++                break;
++              }
++            else
++              {
++                count++;
++                parent_scope = parent_scope.parent_scope ();
++              }
++          }
++      }
++    else
++      {
++        const std::map<std::string, symbol_record>& eval_scope_symbols
++          = eval_scope.symbols ();
++
++        std::string name = script_sr.name ();
++
++        auto p = eval_scope_symbols.find (name);
++
++        symbol_record eval_scope_sr;
++
++        if (p != eval_scope_symbols.end ())
++          {
++            found = true;
++            eval_scope_sr = p->second;
++
++            // The +1 is for going from the script frame to the eval
++            // frame.  Only one access_link should need to be followed.
++
++            frame_offset = eval_scope_sr.frame_offset () + 1;
++
++            data_offset = eval_scope_sr.data_offset ();
++          }
++      }
++
++    return found;
++  }
++
++  bool script_stack_frame::get_val_offsets (const symbol_record& sym,
+                                             size_t& frame_offset,
+                                             size_t& data_offset) const
+   {
+     data_offset = sym.data_offset ();
+     frame_offset = sym.frame_offset ();
+ 
+     if (frame_offset == 0)
+       {
+-        // An out of range data_offset value here indicates an error in
+-        // the implementation.
++        // An out of range data_offset value here means that we have a
++        // symbol that was not originally in the script.  But this
++        // function is called in places where we can't insert a new
++        // symbol, so we fail and it is up to the caller to decide what
++        // to do.
+ 
+         if (data_offset >= size ())
+-          panic_impossible ();
++          return get_val_offsets_internal (sym, frame_offset, data_offset);
+ 
+         // Use frame and value offsets stored in this stack frame,
+         // indexed by data_offset from the symbol_record to find the
+         // values.  These offsets were determined by
+         // script_stack_frame::set_script_offsets when this script was
+         // invoked.
+ 
+         frame_offset = m_lexical_frame_offsets.at (data_offset);
+         data_offset = m_value_offsets.at (data_offset);
+       }
+     else
+       {
+         // If frame_offset is not zero, then then we must have a symbol
+         // that was not originally in the script.  The values should
+         // have been determined by the script_stack_frame::lookup function.
+       }
++
++    return true;
+   }
+ 
+   void script_stack_frame::get_val_offsets_with_insert (const symbol_record& sym,
+                                                         size_t& frame_offset,
+                                                         size_t& data_offset)
+   {
+     data_offset = sym.data_offset ();
+     frame_offset = sym.frame_offset ();
+@@ -825,17 +907,22 @@ namespace octave
+       }
+   }
+ 
+   stack_frame::scope_flags
+   script_stack_frame::scope_flag (const symbol_record& sym) const
+   {
+     size_t frame_offset;
+     size_t data_offset;
+-    get_val_offsets (sym, frame_offset, data_offset);
++
++    bool found = get_val_offsets (sym, frame_offset, data_offset);
++
++    // It can't be global or persistent, so call it local.
++    if (! found)
++      return LOCAL;
+ 
+     // Follow frame_offset access links to stack frame that holds
+     // the value.
+ 
+     const stack_frame *frame = this;
+ 
+     for (size_t i = 0; i < frame_offset; i++)
+       frame = frame->access_link ();
+@@ -848,17 +935,21 @@ namespace octave
+ 
+     return frame->get_scope_flag (data_offset);
+   }
+ 
+   octave_value script_stack_frame::varval (const symbol_record& sym) const
+   {
+     size_t frame_offset;
+     size_t data_offset;
+-    get_val_offsets (sym, frame_offset, data_offset);
++
++    bool found = get_val_offsets (sym, frame_offset, data_offset);
++
++    if (! found)
++      return octave_value ();
+ 
+     // Follow frame_offset access links to stack frame that holds
+     // the value.
+ 
+     const stack_frame *frame = this;
+ 
+     for (size_t i = 0; i < frame_offset; i++)
+       frame = frame->access_link ();
+diff --git a/libinterp/corefcn/stack-frame.h b/libinterp/corefcn/stack-frame.h
+--- a/libinterp/corefcn/stack-frame.h
++++ b/libinterp/corefcn/stack-frame.h
+@@ -720,17 +720,21 @@ namespace octave
+       m_lexical_frame_offsets.resize (size, 0);
+       m_value_offsets.resize (size, 0);
+     }
+ 
+     void get_val_offsets_with_insert (const symbol_record& sym,
+                                       size_t& frame_offset,
+                                       size_t& data_offset);
+ 
+-    void get_val_offsets (const symbol_record& sym, size_t& frame_offset,
++    bool get_val_offsets_internal (const symbol_record& sym,
++                                   size_t& frame_offset,
++                                   size_t& data_offset) const;
++
++    bool get_val_offsets (const symbol_record& sym, size_t& frame_offset,
+                           size_t& data_offset) const;
+ 
+     scope_flags scope_flag (const symbol_record& sym) const;
+ 
+     void set_auto_fcn_var (auto_var_type avt, const octave_value& val)
+     {
+       m_access_link->set_auto_fcn_var (avt, val);
+     }

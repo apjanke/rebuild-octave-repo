@@ -1,0 +1,1024 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1380771601 14400
+#      Wed Oct 02 23:40:01 2013 -0400
+# Node ID 92541ff4cc3c3fcafb8935b6f34fb4c816c27622
+# Parent  e7a9be8fdd21703fc9c8df430371fbb4e0f4865d
+improve implementation of ftp object handles
+
+* urlwrite.cc (curl_handles): Delete class.
+(handles): Delete static variable.
+(ch_manager): New class.
+(make_handle_fraction): New function.
+(F__ftp_pwd__, F__ftp_cwd__, F__ftp_dir__, F__ftp_ascii__,
+F__ftp_binary__, F__ftp_mode__, F__ftp_delete__, F__ftp_rmdir__,
+F__ftp_mkdir__, F__ftp_rename__, F__ftp_mput__, F__ftp_mget__):
+Find curl object corresponding to given handle using ch_manager
+instead of looking in handles map.
+(F__ftp__): Return handle instead of accepting it as argument.
+Change all uses.
+
+diff --git a/libinterp/dldfcn/urlwrite.cc b/libinterp/dldfcn/urlwrite.cc
+--- a/libinterp/dldfcn/urlwrite.cc
++++ b/libinterp/dldfcn/urlwrite.cc
+@@ -33,17 +33,19 @@ along with Octave; see the file COPYING.
+ #include <fstream>
+ #include <iomanip>
+ #include <iostream>
+ 
+ #include "dir-ops.h"
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "oct-env.h"
++#include "oct-handle.h"
+ #include "glob-match.h"
++#include "singleton-cleanup.h"
+ 
+ #include "defun-dld.h"
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "ov-cell.h"
+ #include "pager.h"
+ #include "oct-map.h"
+ #include "oct-refcount.h"
+@@ -594,79 +596,241 @@ private:
+ 
+       setopt (CURLOPT_POSTQUOTE, 0);
+       setopt (CURLOPT_QUOTE, 0);
+     }
+ 
+ #undef setopt
+ };
+ 
+-class
+-curl_handles
++typedef octave_handle curl_handle;
++
++class OCTINTERP_API ch_manager
+ {
++protected:
++
++  ch_manager (void)
++    : handle_map (), handle_free_list (),
++      next_handle (-1.0 - (rand () + 1.0) / (RAND_MAX + 2.0)) { }
++
+ public:
+ 
+-  typedef std::map<std::string, curl_object>::iterator iterator;
+-  typedef std::map<std::string, curl_object>::const_iterator const_iterator;
++  static void create_instance (void);
++
++  static bool instance_ok (void)
++  {
++    bool retval = true;
++
++    if (! instance)
++      create_instance ();
++
++    if (! instance)
++      {
++        ::error ("unable to create ch_manager!");
++
++        retval = false;
++      }
++
++    return retval;
++  }
++
++  static void cleanup_instance (void) { delete instance; instance = 0; }
++
++  static curl_handle get_handle (void)
++  {
++    return instance_ok ()
++      ? instance->do_get_handle () : curl_handle ();
++  }
++
++  static void free (const curl_handle& h)
++  {
++    if (instance_ok ())
++      instance->do_free (h);
++  }
++
++  static curl_handle lookup (double val)
++  {
++    return instance_ok () ? instance->do_lookup (val) : curl_handle ();
++  }
++
++  static curl_handle lookup (const octave_value& val)
++  {
++    return val.is_real_scalar ()
++      ? lookup (val.double_value ()) : curl_handle ();
++  }
+ 
+-  curl_handles (void) : map ()
+-   {
+-     curl_global_init (CURL_GLOBAL_DEFAULT);
+-   }
++  static curl_object get_object (double val)
++  {
++    return get_object (lookup (val));
++  }
++
++  static curl_object get_object (const octave_value& val)
++  {
++    return get_object (lookup (val));
++  }
++
++  static curl_object get_object (const curl_handle& h)
++  {
++    return instance_ok () ? instance->do_get_object (h) : curl_object ();
++  }
++
++  static curl_handle make_curl_handle (const std::string& host,
++                                       const std::string& user,
++                                       const std::string& passwd)
++  {
++    return instance_ok ()
++      ? instance->do_make_curl_handle (host, user, passwd) : curl_handle ();
++  }
++
++  static Matrix handle_list (void)
++  {
++    return instance_ok () ? instance->do_handle_list () : Matrix ();
++  }
++
++private:
++
++  static ch_manager *instance;
++
++  typedef std::map<curl_handle, curl_object>::iterator iterator;
++  typedef std::map<curl_handle, curl_object>::const_iterator const_iterator;
++
++  typedef std::set<curl_handle>::iterator free_list_iterator;
++  typedef std::set<curl_handle>::const_iterator const_free_list_iterator;
++
++  // A map of handles to curl objects.
++  std::map<curl_handle, curl_object> handle_map;
++
++  // The available curl handles.
++  std::set<curl_handle> handle_free_list;
++
++  // The next handle available if handle_free_list is empty.
++  double next_handle;
+ 
+-  ~curl_handles (void)
++  curl_handle do_get_handle (void);
++
++  void do_free (const curl_handle& h);
++
++  curl_handle do_lookup (double val)
++  {
++    iterator p = (xisnan (val) ? handle_map.end () : handle_map.find (val));
++
++    return (p != handle_map.end ()) ? p->first : curl_handle ();
++  }
++
++  curl_object do_get_object (const curl_handle& h)
++  {
++    iterator p = (h.ok () ? handle_map.find (h) : handle_map.end ());
++
++    return (p != handle_map.end ()) ? p->second : curl_object ();
++  }
++
++  curl_handle do_make_curl_handle (const std::string& host,
++                                   const std::string& user,
++                                   const std::string& passwd)
++  {
++    curl_handle h = get_handle ();
++
++    curl_object obj (host, user, passwd);
++
++    if (! error_state)
++      handle_map[h] = obj;
++    else
++      {
++        do_free (h);
++
++        h = curl_handle ();
++      }
++
++    return h;
++  }
++
++  Matrix do_handle_list (void)
++  {
++    Matrix retval (1, handle_map.size ());
++
++    octave_idx_type i = 0;
++    for (const_iterator p = handle_map.begin (); p != handle_map.end (); p++)
++      {
++        curl_handle h = p->first;
++
++        retval(i++) = h.value ();
++      }
++
++    return retval;
++  }
++};
++
++void
++ch_manager::create_instance (void)
++{
++  instance = new ch_manager ();
++
++  if (instance)
++    singleton_cleanup_list::add (cleanup_instance);
++}
++
++static double
++make_handle_fraction (void)
++{
++  static double maxrand = RAND_MAX + 2.0;
++
++  return (rand () + 1.0) / maxrand;
++}
++
++curl_handle
++ch_manager::do_get_handle (void)
++{
++  curl_handle retval;
++
++  // Curl handles are negative integers plus some random fractional
++  // part.  To avoid running out of integers, we recycle the integer
++  // part but tack on a new random part each time.
++
++  free_list_iterator p = handle_free_list.begin ();
++
++  if (p != handle_free_list.end ())
+     {
+-      // Remove the elements of the map explicitly as they should
+-      // be deleted before the call to curl_global_cleanup
+-      map.erase (begin (), end ());
++      retval = *p;
++      handle_free_list.erase (p);
++    }
++  else
++    {
++      retval = curl_handle (next_handle);
+ 
+-      curl_global_cleanup ();
++      next_handle = std::ceil (next_handle) - 1.0 - make_handle_fraction ();
+     }
+ 
+-  iterator begin (void) { return iterator (map.begin ()); }
+-  const_iterator begin (void) const { return const_iterator (map.begin ()); }
++  return retval;
++}
+ 
+-  iterator end (void) { return iterator (map.end ()); }
+-  const_iterator end (void) const { return const_iterator (map.end ()); }
+-
+-  iterator seek (const std::string& k) { return map.find (k); }
+-  const_iterator seek (const std::string& k) const { return map.find (k); }
++void
++ch_manager::do_free (const curl_handle& h)
++{
++  if (h.ok ())
++    {
++      iterator p = handle_map.find (h);
+ 
+-  std::string key (const_iterator p) const { return p->first; }
++      if (p != handle_map.end ())
++        {
++          // Curl handles are negative integers plus some random
++          // fractional part.  To avoid running out of integers, we
++          // recycle the integer part but tack on a new random part
++          // each time.
+ 
+-  curl_object& contents (const std::string& k)
+-    {
+-      return map[k];
+-    }
++          handle_map.erase (p);
+ 
+-  curl_object contents (const std::string& k) const
+-    {
+-      const_iterator p = seek (k);
+-      return p != end () ? p->second : curl_object ();
++          if (h.value () < 0)
++            handle_free_list.insert (std::ceil (h.value ()) - make_handle_fraction ());
++        }
++      else
++        error ("ch_manager::free: invalid object %g", h.value ());
+     }
+-
+-  curl_object& contents (iterator p)
+-    { return p->second; }
+-
+-  curl_object contents (const_iterator p) const
+-    { return p->second; }
++}
+ 
+-  void del (const std::string& k)
+-    {
+-      iterator p = map.find (k);
+-
+-      if (p != map.end ())
+-        map.erase (p);
+-    }
+-
+-private:
+-  std::map<std::string, curl_object> map;
+-};
+-
+-static curl_handles handles;
++ch_manager *ch_manager::instance = 0;
+ 
+ static void
+ cleanup_urlwrite (std::string filename)
+ {
+   octave_unlink (filename);
+ }
+ 
+ static void
+@@ -964,81 +1128,79 @@ s = urlread (\"http://www.google.com/sea
+   gripe_disabled_feature ("urlread", "urlread");
+ #endif
+ 
+   return retval;
+ }
+ 
+ DEFUN_DLD (__ftp__, args, ,
+   "-*- texinfo -*-\n\
+-@deftypefn  {Loadable Function} {} __ftp__ (@var{handle}, @var{host})\n\
+-@deftypefnx {Loadable Function} {} __ftp__ (@var{handle}, @var{host}, @var{username}, @var{password})\n\
++@deftypefn  {Loadable Function} {@var{handle} =} __ftp__ (@var{host})\n\
++@deftypefnx {Loadable Function} {@var{handle} =} __ftp__ (@var{host}, @var{username}, @var{password})\n\
+ Undocumented internal function\n\
+ @end deftypefn")
+ {
++  octave_value retval;
++
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+-  std::string handle;
+   std::string host;
+   std::string user = "anonymous";
+   std::string passwd = "";
+ 
+-  if (nargin < 2 || nargin > 4)
+-    error ("incorrect number of arguments");
++  if (nargin < 1 || nargin > 3)
++    {
++      print_usage ();
++      return retval;
++    }
+   else
+     {
+-      handle = args(0).string_value ();
+-      host = args(1).string_value ();
++      host = args(0).string_value ();
+ 
+       if (nargin > 1)
+-        user = args(2).string_value ();
++        user = args(1).string_value ();
+ 
+       if (nargin > 2)
+-        passwd = args(3).string_value ();
++        passwd = args(2).string_value ();
+ 
+-      if (!error_state)
++      if (! error_state)
+         {
+-          handles.contents (handle) = curl_object (host, user, passwd);
++          curl_handle ch = ch_manager::make_curl_handle (host, user, passwd);
+ 
+-          if (error_state)
+-            handles.del (handle);
++          if (! error_state)
++            retval = ch.value ();
+         }
+     }
+ #else
+   gripe_disabled_feature ("__ftp__", "FTP");
+ #endif
+ 
+-  return octave_value ();
++  return retval;
+ }
+ 
+ DEFUN_DLD (__ftp_pwd__, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Loadable Function} {} __ftp_pwd__ (@var{handle})\n\
+ Undocumented internal function\n\
+ @end deftypefn")
+ {
+   octave_value retval;
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_pwd__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-
+-      if (!error_state)
+-        {
+-          const curl_object curl = handles.contents (handle);
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-          if (curl.is_valid ())
+-            retval = curl.pwd ();
+-          else
+-            error ("__ftp_pwd__: invalid ftp handle");
+-        }
++      if (curl.is_valid ())
++        retval = curl.pwd ();
++      else
++        error ("__ftp_pwd__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_pwd__", "FTP");
+ #endif
+ 
+   return retval;
+ }
+ 
+@@ -1050,31 +1212,32 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1 && nargin != 2)
+     error ("__ftp_cwd__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string path = "";
+-
+-      if (nargin > 1)
+-        path  = args(1).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string path = "";
+ 
+-          if (curl.is_valid ())
++          if (nargin > 1)
++            path = args(1).string_value ();
++
++          if (! error_state)
+             curl.cwd (path);
+           else
+-            error ("__ftp_cwd__: invalid ftp handle");
++            error ("__ftp_cwd__: expecting path as second argument");
+         }
++      else
++        error ("__ftp_cwd__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_cwd__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1087,74 +1250,75 @@ Undocumented internal function\n\
+   octave_value retval;
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_dir__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          if (nargout == 0)
++            curl.dir ();
++          else
++            {
++              string_vector sv = curl.list ();
++              octave_idx_type n = sv.length ();
+ 
+-          if (curl.is_valid ())
+-            {
+-              if (nargout == 0)
+-                curl.dir ();
++              if (n == 0)
++                {
++                  string_vector flds (5);
++
++                  flds(0) = "name";
++                  flds(1) = "date";
++                  flds(2) = "bytes";
++                  flds(3) = "isdir";
++                  flds(4) = "datenum";
++
++                  retval = octave_map (flds);
++                }
+               else
+                 {
+-                  string_vector sv = curl.list ();
+-                  octave_idx_type n = sv.length ();
+-                  if (n == 0)
++                  octave_map st;
++
++                  Cell filectime (dim_vector (n, 1));
++                  Cell filesize (dim_vector (n, 1));
++                  Cell fileisdir (dim_vector (n, 1));
++                  Cell filedatenum (dim_vector (n, 1));
++
++                  st.assign ("name", Cell (sv));
++
++                  for (octave_idx_type i = 0; i < n; i++)
+                     {
+-                      string_vector flds (5);
+-                      flds(0) = "name";
+-                      flds(1) = "date";
+-                      flds(2) = "bytes";
+-                      flds(3) = "isdir";
+-                      flds(4) = "datenum";
+-                      retval = octave_map (flds);
+-                    }
+-                  else
+-                    {
+-                      octave_map st;
+-                      Cell filectime (dim_vector (n, 1));
+-                      Cell filesize (dim_vector (n, 1));
+-                      Cell fileisdir (dim_vector (n, 1));
+-                      Cell filedatenum (dim_vector (n, 1));
++                      time_t ftime;
++                      bool fisdir;
++                      double fsize;
+ 
+-                      st.assign ("name", Cell (sv));
+-
+-                      for (octave_idx_type i = 0; i < n; i++)
+-                        {
+-                          time_t ftime;
+-                          bool fisdir;
+-                          double fsize;
+-
+-                          curl.get_fileinfo (sv(i), fsize, ftime, fisdir);
++                      curl.get_fileinfo (sv(i), fsize, ftime, fisdir);
+ 
+-                          fileisdir (i) = fisdir;
+-                          filectime (i) = ctime (&ftime);
+-                          filesize (i) = fsize;
+-                          filedatenum (i) = double (ftime);
+-                        }
+-                      st.assign ("date", filectime);
+-                      st.assign ("bytes", filesize);
+-                      st.assign ("isdir", fileisdir);
+-                      st.assign ("datenum", filedatenum);
+-                      retval = st;
++                      fileisdir (i) = fisdir;
++                      filectime (i) = ctime (&ftime);
++                      filesize (i) = fsize;
++                      filedatenum (i) = double (ftime);
+                     }
++
++                  st.assign ("date", filectime);
++                  st.assign ("bytes", filesize);
++                  st.assign ("isdir", fileisdir);
++                  st.assign ("datenum", filedatenum);
++
++                  retval = st;
+                 }
+             }
+-          else
+-            error ("__ftp_dir__: invalid ftp handle");
+         }
++      else
++        error ("__ftp_dir__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_dir__", "FTP");
+ #endif
+ 
+   return retval;
+ }
+ 
+@@ -1166,27 +1330,22 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_ascii__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-
+-      if (!error_state)
+-        {
+-          const curl_object curl = handles.contents (handle);
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-          if (curl.is_valid ())
+-            curl.ascii ();
+-          else
+-            error ("__ftp_ascii__: invalid ftp handle");
+-        }
++      if (curl.is_valid ())
++        curl.ascii ();
++      else
++        error ("__ftp_ascii__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_ascii__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1198,27 +1357,22 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_binary__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-
+-      if (!error_state)
+-        {
+-          const curl_object curl = handles.contents (handle);
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-          if (curl.is_valid ())
+-            curl.binary ();
+-          else
+-            error ("__ftp_binary__: invalid ftp handle");
+-        }
++      if (curl.is_valid ())
++        curl.binary ();
++      else
++        error ("__ftp_binary__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_binary__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1230,20 +1384,22 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_close__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
++      curl_handle h = ch_manager::lookup (args(0));
+ 
+-      if (! error_state)
+-        handles.del (handle);
++      if (h.ok ())
++        ch_manager::free (h);
++      else
++        error ("__ftp_close__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_close__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1256,28 +1412,22 @@ Undocumented internal function\n\
+   octave_value retval;
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 1)
+     error ("__ftp_mode__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (! error_state)
+-        {
+-          const curl_object curl = handles.contents (handle);
+-
+-          if (curl.is_valid ())
+-            retval = (curl.is_ascii () ? "ascii" : "binary");
+-          else
+-            error ("__ftp_binary__: invalid ftp handle");
+-        }
++      if (curl.is_valid ())
++        retval = (curl.is_ascii () ? "ascii" : "binary");
++      else
++        error ("__ftp_binary__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_mode__", "FTP");
+ #endif
+ 
+   return retval;
+ }
+ 
+@@ -1289,28 +1439,29 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 2)
+     error ("__ftp_delete__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string file = args(1).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string file = args(1).string_value ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             curl.del (file);
+           else
+-            error ("__ftp_delete__: invalid ftp handle");
++            error ("__ftp_delete__: expecting file name as second argument");
+         }
++      else
++        error ("__ftp_delete__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_delete__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1322,28 +1473,29 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 2)
+     error ("__ftp_rmdir__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string dir = args(1).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string dir = args(1).string_value ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             curl.rmdir (dir);
+           else
+-            error ("__ftp_rmdir__: invalid ftp handle");
++            error ("__ftp_rmdir__: expecting directory name as second argument");
+         }
++      else
++        error ("__ftp_rmdir__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_rmdir__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1355,28 +1507,29 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 2)
+     error ("__ftp_mkdir__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string dir = args(1).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string dir = args(1).string_value ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             curl.mkdir (dir);
+           else
+-            error ("__ftp_mkdir__: invalid ftp handle");
++            error ("__ftp_mkdir__: expecting directory name as second argument");
+         }
++      else
++        error ("__ftp_mkdir__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_mkdir__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1388,29 +1541,30 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 3)
+     error ("__ftp_rename__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string oldname = args(1).string_value ();
+-      std::string newname = args(2).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string oldname = args(1).string_value ();
++          std::string newname = args(2).string_value ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             curl.rename (oldname, newname);
+           else
+-            error ("__ftp_rename__: invalid ftp handle");
++            error ("__ftp_rename__: expecting file names for second and third arguments");
+         }
++      else
++        error ("__ftp_rename__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_rename__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+ 
+@@ -1510,24 +1664,23 @@ Undocumented internal function\n\
+ 
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 2)
+     error ("__ftp_mput__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string pat = args(1).string_value ();
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (!error_state)
++      if (curl.is_valid ())
+         {
+-          const curl_object curl = handles.contents (handle);
++          std::string pat = args(1).string_value ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             {
+               glob_match pattern (file_ops::tilde_expand (pat));
+               string_vector files = pattern.glob ();
+ 
+               for (octave_idx_type i = 0; i < files.length (); i++)
+                 {
+                   std::string file = files (i);
+ 
+@@ -1564,18 +1717,20 @@ Undocumented internal function\n\
+                       if (error_state)
+                         break;
+ 
+                       retval.append (file);
+                     }
+                 }
+             }
+           else
+-            error ("__ftp_mput__: invalid ftp handle");
++            error ("__ftp_mput__: expecting file name patter as second argument");
+         }
++      else
++        error ("__ftp_mput__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_mput__", "FTP");
+ #endif
+ 
+   return (nargout > 0 ? octave_value (retval) : octave_value ());
+ }
+ 
+@@ -1662,28 +1817,27 @@ Undocumented internal function\n\
+ {
+ #ifdef HAVE_CURL
+   int nargin = args.length ();
+ 
+   if (nargin != 2 && nargin != 3)
+     error ("__ftp_mget__: incorrect number of arguments");
+   else
+     {
+-      std::string handle = args(0).string_value ();
+-      std::string file = args(1).string_value ();
+-      std::string target;
++      const curl_object curl = ch_manager::get_object (args(0));
+ 
+-      if (nargin == 3)
+-        target = args(2).string_value () + file_ops::dir_sep_str ();
++      if (curl.is_valid ())
++        {
++          std::string file = args(1).string_value ();
++          std::string target;
+ 
+-      if (! error_state)
+-        {
+-          const curl_object curl = handles.contents (handle);
++          if (nargin == 3)
++            target = args(2).string_value () + file_ops::dir_sep_str ();
+ 
+-          if (curl.is_valid ())
++          if (! error_state)
+             {
+               string_vector sv = curl.list ();
+               octave_idx_type n = 0;
+               glob_match pattern (file);
+ 
+               for (octave_idx_type i = 0; i < sv.length (); i++)
+                 {
+                   if (pattern.match (sv(i)))
+@@ -1726,16 +1880,20 @@ Undocumented internal function\n\
+ 
+                       if (error_state)
+                         break;
+                     }
+                 }
+               if (n == 0)
+                 error ("__ftp_mget__: file not found");
+             }
++          else
++            error ("__ftp_mget__: expecting file name and target as second and third arguments");
+         }
++      else
++        error ("__ftp_mget__: invalid ftp handle");
+     }
+ #else
+   gripe_disabled_feature ("__ftp_mget__", "FTP");
+ #endif
+ 
+   return octave_value ();
+ }
+diff --git a/scripts/@ftp/ftp.m b/scripts/@ftp/ftp.m
+--- a/scripts/@ftp/ftp.m
++++ b/scripts/@ftp/ftp.m
+@@ -48,14 +48,14 @@ function obj = ftp (host = "", username 
+   if (nargin == 1 && isa (host, "ftp"))
+     obj = host;   # Copy constructor
+   else
+     p.host = host;
+     p.username = username;
+     p.password = password;
+     p.curlhandle = tmpnam ("ftp-");
+     if (nargin > 0)
+-      __ftp__ (p.curlhandle, host, username, password);
++      p.curlhandle = __ftp__ (host, username, password);
+     endif
+     obj = class (p, "ftp");
+   endif
+ endfunction
+ 
+diff --git a/scripts/@ftp/loadobj.m b/scripts/@ftp/loadobj.m
+--- a/scripts/@ftp/loadobj.m
++++ b/scripts/@ftp/loadobj.m
+@@ -16,18 +16,17 @@
+ ## along with Octave; see the file COPYING.  If not, see
+ ## <http://www.gnu.org/licenses/>.
+ 
+ function b = loadobj (a)
+   b = a;
+   if (isfield (b, "jobject"))
+     b = rmfield (b, "jobject");
+   endif
+-  b.curlhandle = tmpnam ("ftp-");
+-  __ftp__ (b.curlhandle, b.host, b.username, b.password);
++  b.curlhandle = __ftp__ (b.host, b.username, b.password);
+   if (isfield (b, "dir"))
+     if (! isempty (b.dir))
+       __ftp_cwd__ (b.curlhandle, b.dir);
+     endif
+     b = rmfield (b, "dir");
+   elseif (isfield (b, "remotePwd"))
+     ## FIXME: Can we read matlab java stringBuffer objects?
+     warning ("can not change remote directory in loaded FTP object");

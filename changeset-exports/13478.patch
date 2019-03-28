@@ -1,0 +1,247 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1303381830 -7200
+#      Thu Apr 21 12:30:30 2011 +0200
+# Node ID a51ad78b51c5b8d96ba69251dab3c80f85cc6072
+# Parent  ca767e4055c57dd0fb32bf5f89bc9efb7959d07f
+Fetching variables was not threadsafe, now it is.
+
+diff --git a/gui//src/MainWindow.h b/gui//src/MainWindow.h
+--- a/gui//src/MainWindow.h
++++ b/gui//src/MainWindow.h
+@@ -157,17 +157,17 @@ public:
+           m_mainWindow(mainWindow) {
+     }
+ 
+ protected:
+     void run() {
+         while(m_mainWindow->isRunning()) {
+ 
+         // Get a full variable list.
+-        QList<SymbolRecord> symbolTable = OctaveLink::instance()->workspace();
++        QList<SymbolRecord> symbolTable = OctaveLink::instance()->currentSymbolTable();
+         if(symbolTable.size()) {
+             m_mainWindow->variablesDockWidget()->setVariablesList(symbolTable);
+         }
+ 
+         // Check whether any requested variables have been returned.
+         QList<OctaveLink::RequestedVariable> reqVars
+                 = OctaveLink::instance()->requestedVariables();
+ 
+diff --git a/gui//src/OctaveLink.cpp b/gui//src/OctaveLink.cpp
+--- a/gui//src/OctaveLink.cpp
++++ b/gui//src/OctaveLink.cpp
+@@ -78,32 +78,44 @@ QString OctaveLink::octaveValueAsQString
+     // If everything else does not fit, we could not recognize the type.
+     } else {
+         return QString("<Type not recognized>");
+     }
+ }
+ 
+ //*************************************************************************
+ OctaveLink::OctaveLink()
+-    : m_previousHistoryLength(0) {
++    : QObject(),
++      m_previousHistoryLength(0) {
++    m_symbolTableSemaphore = new QSemaphore(1);
+ }
+ 
+ OctaveLink::~OctaveLink() {
+ }
+ 
+-/*******************************************************************************
+- *******************************************************************************
+- * CLIENT SIDE FUNCTIONS
+- *******************************************************************************
+- *******************************************************************************/
++void OctaveLink::fetchSymbolTable() {
++    m_symbolTableSemaphore->acquire();
++    m_symbolTableBuffer.clear();
++    std::list<SymbolRecord> allVariables = symbol_table::all_variables();
++    std::list<SymbolRecord>::iterator iterator;
++    for(iterator = allVariables.begin(); iterator != allVariables.end(); iterator++)
++        m_symbolTableBuffer.append(*iterator);
++    m_symbolTableSemaphore->release();
++}
+ 
+-//*************************************************************************
+-QList<SymbolRecord> OctaveLink::workspace() {
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    return m_variableSymbolTableList;
++QList<SymbolRecord> OctaveLink::currentSymbolTable() {
++    QList<SymbolRecord> m_symbolTableCopy;
++
++    // Generate a deep copy of the current symbol table.
++    m_symbolTableSemaphore->acquire();
++    foreach(SymbolRecord symbolRecord, m_symbolTableBuffer)
++        m_symbolTableCopy.append(symbolRecord);
++    m_symbolTableSemaphore->release();
++
++    return m_symbolTableCopy;
+ }
+ 
+ 
+ //*************************************************************************
+ QList<OctaveLink::RequestedVariable> OctaveLink::requestedVariables() {
+     QMutexLocker mutexLocker(&m_internalAccessMutex);
+     return m_requestedVariables;
+ }
+@@ -188,34 +200,26 @@ int OctaveLink::setBreakpointAction (Bre
+  *******************************************************************************
+  * SERVER SIDE FUNCTIONS
+  *******************************************************************************
+  *******************************************************************************/
+ 
+ //*************************************************************************
+ int OctaveLink::processOctaveServerData(void) {
+     QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+     process_breakpoint_action();
+     processBreakpointAndRemoveModify();
+     processRequestedVariables();
+-    retrieveVariables();
++    fetchSymbolTable();
+     setHistoryList();
+     setBreakPointList();
+     return 0;
+ }
+ 
+-//*************************************************************************
+-void OctaveLink::retrieveVariables() {
+-    m_variableSymbolTableList.clear();
+-    std::list<SymbolRecord> allVariables = symbol_table::all_variables();
+-    std::list<SymbolRecord>::iterator iterator;
+-    for(iterator = allVariables.begin(); iterator != allVariables.end(); iterator++)
+-        m_variableSymbolTableList.append(*iterator);
+-}
++
+ 
+ 
+ //*************************************************************************
+ int OctaveLink::processRequestedVariables( void )
+ {
+   /*
+ 
+   // Clear the list of existing requested variables
+diff --git a/gui//src/OctaveLink.h b/gui//src/OctaveLink.h
+--- a/gui//src/OctaveLink.h
++++ b/gui//src/OctaveLink.h
+@@ -67,26 +67,29 @@
+ 
+ // Qt includes
+ #include <QMutexLocker>
+ #include <QMutex>
+ #include <QFileInfo>
+ #include <QList>
+ #include <QString>
+ #include <QVector>
++#include <QSemaphore>
++#include <QObject>
+ 
+ typedef symbol_table::symbol_record SymbolRecord;
+ typedef octave_value OctaveValue;
+ 
+ /**
+   * \class OctaveLink
+   * Manages a link to an octave instance.
+   */
+-class OctaveLink
++class OctaveLink : QObject
+ {
++    Q_OBJECT
+ public:
+     static OctaveLink *instance() { return &m_singleton; }
+     static int readlineEventHook(void);
+     static QString octaveValueAsQString(OctaveValue octaveValue);
+ 
+     /**
+      * Enumeration used to identify breakpoint actions
+      */
+@@ -145,18 +148,17 @@ public:
+     int	removeBreakpoint(BreakPoint bp_info);
+ 
+     /** TODO: Describe. */
+     int	modifyBreakpoint(BreakPoint old_bp_info, BreakPoint new_bp_info);
+ 
+     /** TODO: Describe. */
+     int	setBreakpointAction(BreakPointAction action);
+ 
+-    /** Variable related methods. */
+-    QList<SymbolRecord> workspace(void);
++    QList<SymbolRecord> currentSymbolTable();
+ 
+     /** TODO: Describe. */
+     QList<RequestedVariable> requestedVariables(void);
+ 
+     /** TODO: Describe. */
+     int	setRequestedVariableNames(QList<QString> variableNames);
+ 
+     /**
+@@ -178,17 +180,17 @@ public:
+      * Calls all the appropriate functions that follow to update Octave
+      * according to the data sent from the client in a thread-safe manner.
+      *
+      * Algorithm:
+      *   Acquire lock
+      *   process_breakpoint_add_remove_modify
+      *   set_current_breakpoint
+      *   set_breakpoint_list
+-     *   ...
++     *   ...http://oregano.gforge.lug.fi.uba.ar/
+      *   Release lock
+      */
+     int processOctaveServerData(void);
+ 
+     /** Debugging related methods. */
+     /** TODO: Describe. */
+     int setBreakPointList(void);
+ 
+@@ -199,42 +201,46 @@ public:
+     /** TODO: Describe. */
+     int processBreakpointAndRemoveModify(void);
+ 
+     /** TODO: Describe. */
+     int process_breakpoint_action(void);
+ 
+     /** Variable related methods. */
+     /** Retrieves all variables from Octave. */
+-    void retrieveVariables(void);
++    void fetchSymbolTable(void);
+ 
+     /** TODO: Describe. */
+     int processRequestedVariables(void);
+ 
+     /** History related methods. */
+     /** TODO: Describe. */
+     int setHistoryList(void);
+ 
++signals:
++    void symbolTableChanged();
++
+ private:
+     OctaveLink();
+     ~OctaveLink();
+ 
+     /** Mutex variable used to protect access to internal class data. */
+     QMutex m_internalAccessMutex;
+ 
+     std::vector<BreakPoint> m_currentBreakpoints;
+     std::vector<BreakPoint> m_reachedBreakpoints;
+     std::vector<BreakPoint> m_addedBreakpoints;
+     std::vector<BreakPoint> m_removedBreakpoints;
+     std::vector<BreakPoint> m_modifiedBreakpointsOld;
+     std::vector<BreakPoint> m_modifiedBreakpointsNew;
+     BreakPointAction m_breakPointAction;
+ 
+     /** Variable related member variables. */
+-    QList<SymbolRecord> m_variableSymbolTableList;
++    QSemaphore *m_symbolTableSemaphore;
++    QList<SymbolRecord> m_symbolTableBuffer;
+     QList<QString> m_variablesRequestList;
+ 
+     // NOTE: Create an overloaded operator<< for octave_value to do the
+     // flattening.  This will allow us to append easily to an ostringstream
+     // for output.
+     QList<RequestedVariable> m_requestedVariables;
+ 
+     /** History related member variables. */

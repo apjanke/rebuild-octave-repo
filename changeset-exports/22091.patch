@@ -1,0 +1,2659 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1468271133 14400
+#      Mon Jul 11 17:05:33 2016 -0400
+# Node ID 0f6fc2ec3b1ab690c755b89a85608706a2cca835
+# Parent  66db9a493c84b0f86d56739ad48f4c9f4d9078ef
+move call_stack class to a separate file
+
+* call-stack.h, call-stack.cc: New files.  Move call_stack class here
+from toplev.h and toplev.cc.  Update include file lists in other files
+as needed.
+
+* libinterp/corefcn/module.mk: Update.
+
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/call-stack.cc
+@@ -0,0 +1,583 @@
++/*
++
++Copyright (C) 1995-2015 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include "singleton-cleanup.h"
++
++#include "call-stack.h"
++#include "oct-map.h"
++#include "ov.h"
++#include "ov-fcn.h"
++#include "ov-usr-fcn.h"
++
++octave_call_stack *octave_call_stack::instance = 0;
++
++std::string
++octave_call_stack::stack_frame::fcn_file_name (void) const
++{
++  return m_fcn ? m_fcn->fcn_file_name () : "";
++}
++
++std::string
++octave_call_stack::stack_frame::fcn_name (bool print_subfn) const
++{
++  std::string retval;
++
++  if (m_fcn)
++    {
++      std::string parent_fcn_name = m_fcn->parent_fcn_name ();
++
++      if (print_subfn && ! parent_fcn_name.empty ())
++        retval = parent_fcn_name + Vfilemarker;
++
++      retval += m_fcn->name ();
++    }
++  else
++    retval = "<unknown>";
++
++  return retval;
++}
++
++bool
++octave_call_stack::stack_frame::operator== (const octave_call_stack::stack_frame &rhs) const
++{
++  if (this->line () != rhs.line ())
++    return false;
++  else if (this->column () != rhs.column ())
++    return false;
++  else if (this->fcn_file_name () != rhs.fcn_file_name ())
++    return false;
++  else if (this->fcn_name () != rhs.fcn_name ())
++    return false;
++  else
++    return true;
++}
++
++void
++octave_call_stack::create_instance (void)
++{
++  instance = new octave_call_stack ();
++
++  if (instance)
++    {
++      instance->do_push (0, symbol_table::top_scope (), 0);
++
++      singleton_cleanup_list::add (cleanup_instance);
++    }
++}
++
++int
++octave_call_stack::do_current_line (void) const
++{
++  int retval = -1;
++
++  if (! cs.empty ())
++    {
++      const stack_frame& elt = cs[curr_frame];
++      retval = elt.m_line;
++    }
++
++  return retval;
++}
++
++int
++octave_call_stack::do_current_column (void) const
++{
++  int retval = -1;
++
++  if (! cs.empty ())
++    {
++      const stack_frame& elt = cs[curr_frame];
++      retval = elt.m_column;
++    }
++
++  return retval;
++}
++
++size_t
++octave_call_stack::do_num_user_code_frames
++  (octave_idx_type& curr_user_frame) const
++{
++  size_t retval = 0;
++
++  curr_user_frame = 0;
++
++  // Look for the caller of dbstack.
++  size_t xframe = cs[curr_frame].m_prev;
++
++  bool found = false;
++
++  size_t k = cs.size ();
++
++  for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
++    {
++      octave_function *f = (*p).m_fcn;
++
++      if (--k == xframe)
++        found = true;
++
++      if (f && f->is_user_code ())
++        {
++          if (! found)
++            curr_user_frame++;
++
++          retval++;
++        }
++    }
++
++  // We counted how many user frames were not the one, in reverse.
++  // Now set curr_user_frame to be the index in the other direction.
++  curr_user_frame = retval - curr_user_frame - 1;
++
++  return retval;
++}
++
++octave_user_code *
++octave_call_stack::do_caller_user_code (size_t nskip) const
++{
++  octave_user_code *retval = 0;
++
++  const_iterator p = cs.end ();
++
++  while (p != cs.begin ())
++    {
++      const stack_frame& elt = *(--p);
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          if (nskip > 0)
++            nskip--;
++          else
++            {
++              retval = dynamic_cast<octave_user_code *> (f);
++              break;
++            }
++        }
++    }
++
++  return retval;
++}
++
++int
++octave_call_stack::do_caller_user_code_line (void) const
++{
++  int retval = -1;
++
++  const_iterator p = cs.end ();
++
++  while (p != cs.begin ())
++    {
++      const stack_frame& elt = *(--p);
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          if (elt.m_line > 0)
++            {
++              retval = elt.m_line;
++              break;
++            }
++        }
++    }
++
++  return retval;
++}
++
++int
++octave_call_stack::do_caller_user_code_column (void) const
++{
++  int retval = -1;
++
++  const_iterator p = cs.end ();
++
++  while (p != cs.begin ())
++    {
++      const stack_frame& elt = *(--p);
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          if (elt.m_column)
++            {
++              retval = elt.m_column;
++              break;
++            }
++        }
++    }
++
++  return retval;
++}
++
++octave_user_code *
++octave_call_stack::do_debug_user_code (void) const
++{
++  octave_user_code *retval = 0;
++
++  // This should never happen...
++  if (curr_frame == 0)
++    return retval;
++
++  // Start looking with the caller of the calling debug function.
++  size_t i = cs[curr_frame].m_prev;
++
++  while (i != 0)
++    {
++      const stack_frame& elt = cs[i--];
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          retval = dynamic_cast<octave_user_code *> (f);
++          break;
++        }
++    }
++
++  return retval;
++}
++
++int
++octave_call_stack::do_debug_user_code_line (void) const
++{
++  int retval = -1;
++
++  // This should never happen...
++  if (curr_frame == 0)
++    return retval;
++
++  // Start looking with the caller of the calling debug function.
++  size_t i = cs[curr_frame].m_prev;
++
++  while (i != 0)
++    {
++      const stack_frame& elt = cs[i--];
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          if (elt.m_line)
++            {
++              retval = elt.m_line;
++              break;
++            }
++        }
++    }
++
++  return retval;
++}
++
++int
++octave_call_stack::do_debug_user_code_column (void) const
++{
++  int retval = -1;
++
++  // This should never happen...
++  if (curr_frame == 0)
++    return retval;
++
++  // Start looking with the caller of the calling debug function.
++  size_t i = cs[curr_frame].m_prev;
++
++  while (i != 0)
++    {
++      const stack_frame& elt = cs[i--];
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && f->is_user_code ())
++        {
++          if (elt.m_column)
++            {
++              retval = elt.m_column;
++              break;
++            }
++        }
++    }
++
++  return retval;
++}
++
++bool
++octave_call_stack::do_all_scripts (void) const
++{
++  bool retval = true;
++
++  const_iterator p = cs.end ();
++
++  while (p != cs.begin ())
++    {
++      const stack_frame& elt = *(--p);
++
++      octave_function *f = elt.m_fcn;
++
++      if (f && ! f->is_user_script ())
++        {
++          retval = false;
++          break;
++        }
++    }
++
++  return retval;
++}
++
++// Use static fields for the best efficiency.
++// NOTE: C++0x will allow these two to be merged into one.
++static const char *bt_fieldnames[] = { "file", "name", "line",
++                                       "column", "scope", "context", 0
++                                     };
++static const octave_fields bt_fields (bt_fieldnames);
++
++octave_map
++octave_call_stack::empty_backtrace (void)
++{
++  return octave_map (dim_vector (0, 1), bt_fields);
++}
++
++std::list<octave_call_stack::stack_frame>
++octave_call_stack::do_backtrace_frames (size_t nskip,
++                                        octave_idx_type& curr_user_frame) const
++{
++  std::list<octave_call_stack::stack_frame> retval;
++
++  size_t user_code_frames = do_num_user_code_frames (curr_user_frame);
++
++  size_t nframes = nskip <= user_code_frames ? user_code_frames - nskip : 0;
++
++  // Our list is reversed.
++  curr_user_frame = nframes - curr_user_frame - 1;
++
++  if (nframes > 0)
++    {
++      for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
++        {
++          const stack_frame& elt = *p;
++
++          octave_function *f = elt.m_fcn;
++
++          if (f && f->is_user_code ())
++            {
++              if (nskip > 0)
++                nskip--;
++              else
++                retval.push_back (elt);
++            }
++        }
++    }
++
++  return retval;
++}
++
++octave_map
++octave_call_stack::do_backtrace (size_t nskip,
++                                 octave_idx_type& curr_user_frame,
++                                 bool print_subfn) const
++{
++  std::list<octave_call_stack::stack_frame> frames
++    = do_backtrace_frames (nskip, curr_user_frame);
++
++  size_t nframes = frames.size ();
++
++  octave_map retval (dim_vector (nframes, 1), bt_fields);
++
++  Cell& file = retval.contents (0);
++  Cell& name = retval.contents (1);
++  Cell& line = retval.contents (2);
++  Cell& column = retval.contents (3);
++  Cell& scope = retval.contents (4);
++  Cell& context = retval.contents (5);
++
++  octave_idx_type k = 0;
++
++  for (std::list<octave_call_stack::stack_frame>::const_iterator p = frames.begin ();
++       p != frames.end (); p++)
++    {
++      const stack_frame& elt = *p;
++
++      scope(k) = elt.m_scope;
++      context(k) = elt.m_context;
++      file(k) = elt.fcn_file_name ();
++      name(k) = elt.fcn_name (print_subfn);
++      line(k) = elt.m_line;
++      column(k) = elt.m_column;
++
++      k++;
++    }
++
++  return retval;
++}
++
++bool
++octave_call_stack::do_goto_frame (size_t n, bool verbose)
++{
++  bool retval = false;
++
++  if (n < cs.size ())
++    {
++      retval = true;
++
++      curr_frame = n;
++
++      const stack_frame& elt = cs[n];
++
++      symbol_table::set_scope_and_context (elt.m_scope, elt.m_context);
++
++      if (verbose)
++        octave_stdout << "stopped in " << elt.fcn_name ()
++                      << " at line " << elt.m_line
++                      << " column " << elt.m_column
++                      << " [" << elt.fcn_file_name () << "] "
++                      << " (scope = " << elt.m_scope
++                      << "[context = " << elt.m_context << "])"
++                      << std::endl;
++    }
++
++  return retval;
++}
++
++bool
++octave_call_stack::do_goto_frame_relative (int nskip, bool verbose)
++{
++  bool retval = false;
++
++  int incr = 0;
++
++  if (nskip < 0)
++    incr = -1;
++  else if (nskip > 0)
++    incr = 1;
++
++  // Start looking with the caller of dbup/dbdown/keyboard.
++  size_t xframe = cs[curr_frame].m_prev;
++
++  while (true)
++    {
++      if ((incr < 0 && xframe == 0) || (incr > 0 && xframe == cs.size () - 1))
++        break;
++
++      xframe += incr;
++
++      const stack_frame& elt = cs[xframe];
++
++      octave_function *f = elt.m_fcn;
++
++      if (xframe == 0 || (f && f->is_user_code ()))
++        {
++          if (nskip > 0)
++            nskip--;
++          else if (nskip < 0)
++            nskip++;
++
++          if (nskip == 0)
++            {
++              curr_frame = xframe;
++              cs[cs.size () - 1].m_prev = curr_frame;
++
++              symbol_table::set_scope_and_context (elt.m_scope, elt.m_context);
++
++              if (verbose)
++                {
++                  std::ostringstream buf;
++
++                  if (f)
++                    buf << "stopped in " << elt.fcn_name ()
++                        << " at line " << elt.m_line
++                        << " [" << elt.fcn_file_name () << "] "
++                        << std::endl;
++                  else
++                    buf << "at top level" << std::endl;
++
++                  octave_stdout << buf.str ();
++                }
++
++              retval = true;
++              break;
++            }
++        }
++      else if (incr == 0)  // Break out of infinite loop by choosing an incr.
++        incr = -1;
++
++      // There is no need to set scope and context here.  That will
++      // happen when the dbup/dbdown/keyboard frame is popped and we
++      // jump to the new "prev" frame set above.
++    }
++
++  return retval;
++}
++
++void
++octave_call_stack::do_goto_caller_frame (void)
++{
++  size_t xframe = curr_frame;
++
++  bool skipped = false;
++
++  while (xframe != 0)
++    {
++      xframe = cs[xframe].m_prev;
++
++      const stack_frame& elt = cs[xframe];
++
++      octave_function *f = elt.m_fcn;
++
++      if (elt.m_scope == cs[0].m_scope || (f && f->is_user_code ()))
++        {
++          if (! skipped)
++            // We found the current user code frame, so skip it.
++            skipped = true;
++          else
++            {
++              // We found the caller user code frame.
++              stack_frame tmp (elt);
++              tmp.m_prev = curr_frame;
++
++              curr_frame = cs.size ();
++
++              cs.push_back (tmp);
++
++              symbol_table::set_scope_and_context (tmp.m_scope, tmp.m_context);
++
++              break;
++            }
++        }
++    }
++}
++
++void
++octave_call_stack::do_goto_base_frame (void)
++{
++  stack_frame tmp (cs[0]);
++  tmp.m_prev = curr_frame;
++
++  curr_frame = cs.size ();
++
++  cs.push_back (tmp);
++
++  symbol_table::set_scope_and_context (tmp.m_scope, tmp.m_context);
++}
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/call-stack.h
+@@ -0,0 +1,478 @@
++/*
++
++Copyright (C) 1993-2015 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_call_stack_h)
++#define octave_call_stack_h 1
++
++#include "octave-config.h"
++
++#include <deque>
++#include <string>
++
++class octave_function;
++class octave_user_code;
++class octave_user_script;
++
++#include "input.h"
++#include "oct-map.h"
++#include "symtab.h"
++
++class
++OCTINTERP_API
++octave_call_stack
++{
++protected:
++
++  octave_call_stack (void) : cs (), curr_frame (0) { }
++
++public:
++
++  class stack_frame
++  {
++  public:
++
++    friend class octave_call_stack;
++
++    stack_frame (octave_function *fcn = 0, symbol_table::scope_id scope = 0,
++                 symbol_table::context_id context = 0, size_t prev = 0)
++      : m_fcn (fcn), m_line (-1), m_column (-1), m_scope (scope),
++        m_context (context), m_prev (prev)
++    { }
++
++    stack_frame (const stack_frame& elt)
++      : m_fcn (elt.m_fcn), m_line (elt.m_line), m_column (elt.m_column),
++        m_scope (elt.m_scope), m_context (elt.m_context), m_prev (elt.m_prev)
++    { }
++
++    int line (void) const { return m_line; }
++
++    int column (void) const { return m_column; }
++
++    std::string fcn_file_name (void) const;
++
++    std::string fcn_name (bool print_subfn = true) const;
++
++    bool operator== (const stack_frame &rhs) const;
++
++  private:
++
++    octave_function *m_fcn;
++    int m_line;
++    int m_column;
++    symbol_table::scope_id m_scope;
++    symbol_table::context_id m_context;
++    size_t m_prev;
++  };
++
++  typedef std::deque<stack_frame>::iterator iterator;
++  typedef std::deque<stack_frame>::const_iterator const_iterator;
++
++  typedef std::deque<stack_frame>::reverse_iterator reverse_iterator;
++  typedef std::deque<stack_frame>::const_reverse_iterator const_reverse_iterator;
++
++  static void create_instance (void);
++
++  static bool instance_ok (void)
++  {
++    bool retval = true;
++
++    if (! instance)
++      create_instance ();
++
++    if (! instance)
++      error ("unable to create call stack object!");
++
++    return retval;
++  }
++
++  // Current function (top of stack).
++  static octave_function *current (void)
++  {
++    return instance_ok () ? instance->do_current () : 0;
++  }
++
++  // Current line in current function.
++  static int current_line (void)
++  {
++    return instance_ok () ? instance->do_current_line () : -1;
++  }
++
++  // Current column in current function.
++  static int current_column (void)
++  {
++    return instance_ok () ? instance->do_current_column () : -1;
++  }
++
++  // Caller function, may be built-in.
++  static octave_function *caller (void)
++  {
++    return instance_ok () ? instance->do_caller () : 0;
++  }
++
++  static size_t current_frame (void)
++  {
++    return instance_ok () ? instance->do_current_frame () : 0;
++  }
++
++  static size_t size (void)
++  {
++    return instance_ok () ? instance->do_size () : 0;
++  }
++
++  static size_t num_user_code_frames (octave_idx_type& curr_user_frame)
++  {
++    return instance_ok ()
++           ? instance->do_num_user_code_frames (curr_user_frame) : 0;
++  }
++
++  static symbol_table::scope_id current_scope (void)
++  {
++    return instance_ok () ? instance->do_current_scope () : 0;
++  }
++
++  static symbol_table::context_id current_context (void)
++  {
++    return instance_ok () ? instance->do_current_context () : 0;
++  }
++
++#if 0
++  static stack_frame frame (size_t idx)
++  {
++    return instance_ok () ? instance->do_frame (idx) : stack_frame ();
++  }
++#endif
++
++  // Function at location N on the call stack (N == 0 is current), may
++  // be built-in.
++  static octave_function *element (size_t n)
++  {
++    return instance_ok () ? instance->do_element (n) : 0;
++  }
++
++  // User code caller.
++  static octave_user_code *caller_user_code (size_t nskip = 0)
++  {
++    return instance_ok () ? instance->do_caller_user_code (nskip) : 0;
++  }
++
++  // Line in user code caller.
++  static int caller_user_code_line (void)
++  {
++    return instance_ok () ? instance->do_caller_user_code_line () : -1;
++  }
++
++  // Column in user code caller.
++  static int caller_user_code_column (void)
++  {
++    return instance_ok () ? instance->do_caller_user_code_column () : -1;
++  }
++
++  // Current function that we are debugging.
++  static octave_user_code *debug_user_code (void)
++  {
++    return instance_ok () ? instance->do_debug_user_code () : 0;
++  }
++
++  // Line number in current function that we are debugging.
++  static int debug_user_code_line (void)
++  {
++    return instance_ok () ? instance->do_debug_user_code_line () : 0;
++  }
++
++  // Column number in current function that we are debugging.
++  static int debug_user_code_column (void)
++  {
++    return instance_ok () ? instance->do_debug_user_code_column () : 0;
++  }
++
++  // Return TRUE if all elements on the call stack are scripts.
++  static bool all_scripts (void)
++  {
++    return instance_ok () ? instance->do_all_scripts () : false;
++  }
++
++  static void
++  push (octave_function *f,
++        symbol_table::scope_id scope = symbol_table::current_scope (),
++        symbol_table::context_id context = symbol_table::current_context ())
++  {
++    if (instance_ok ())
++      instance->do_push (f, scope, context);
++  }
++
++  static void
++  push (symbol_table::scope_id scope = symbol_table::current_scope (),
++        symbol_table::context_id context = symbol_table::current_context ())
++  {
++    if (instance_ok ())
++      instance->do_push (0, scope, context);
++  }
++
++  static void set_location (int l, int c)
++  {
++    if (instance_ok ())
++      instance->do_set_location (l, c);
++  }
++
++  static void set_line (int l)
++  {
++    if (instance_ok ())
++      instance->do_set_line (l);
++  }
++
++  static void set_column (int c)
++  {
++    if (instance_ok ())
++      instance->do_set_column (c);
++  }
++
++  static bool goto_frame (size_t n = 0, bool verbose = false)
++  {
++    return instance_ok () ? instance->do_goto_frame (n, verbose) : false;
++  }
++
++  static void restore_frame (size_t n)
++  {
++    goto_frame (n);
++  }
++
++  static bool goto_frame_relative (int n, bool verbose = false)
++  {
++    return instance_ok ()
++           ? instance->do_goto_frame_relative (n, verbose) : false;
++  }
++
++  static void goto_caller_frame (void)
++  {
++    if (instance_ok ())
++      instance->do_goto_caller_frame ();
++  }
++
++  static void goto_base_frame (void)
++  {
++    if (instance_ok ())
++      instance->do_goto_base_frame ();
++  }
++
++  static octave_map backtrace (size_t nskip = 0)
++  {
++    octave_idx_type curr_user_frame = -1;
++
++    return instance_ok ()
++           ? instance->do_backtrace (nskip, curr_user_frame, true)
++           : octave_map ();
++  }
++
++  static octave_map backtrace (size_t nskip, octave_idx_type& curr_user_frame,
++                               bool print_subfn = true)
++  {
++    return instance_ok ()
++           ? instance->do_backtrace (nskip, curr_user_frame, print_subfn)
++           : octave_map ();
++  }
++
++  static std::list<octave_call_stack::stack_frame>
++  backtrace_frames (size_t nskip = 0)
++  {
++    octave_idx_type curr_user_frame = -1;
++
++    return instance_ok ()
++           ? instance->do_backtrace_frames (nskip, curr_user_frame)
++           : std::list<octave_call_stack::stack_frame> ();
++  }
++
++  static std::list<octave_call_stack::stack_frame>
++  backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame)
++  {
++    return instance_ok ()
++           ? instance->do_backtrace_frames (nskip, curr_user_frame)
++           : std::list<octave_call_stack::stack_frame> ();
++  }
++
++  static octave_map empty_backtrace (void);
++
++  static void pop (void)
++  {
++    if (instance_ok ())
++      instance->do_pop ();
++  }
++
++  static void clear (void)
++  {
++    if (instance_ok ())
++      instance->do_clear ();
++  }
++
++private:
++
++  // The current call stack.
++  std::deque<stack_frame> cs;
++
++  size_t curr_frame;
++
++  static octave_call_stack *instance;
++
++  static void cleanup_instance (void) { delete instance; instance = 0; }
++
++  int do_current_line (void) const;
++
++  int do_current_column (void) const;
++
++  octave_function *do_caller (void) const
++  {
++    return curr_frame > 1 ? cs[curr_frame-1].m_fcn : cs[0].m_fcn;
++  }
++
++  size_t do_current_frame (void) { return curr_frame; }
++
++  size_t do_size (void) { return cs.size (); }
++
++  size_t do_num_user_code_frames (octave_idx_type& curr_user_frame) const;
++
++  symbol_table::scope_id do_current_scope (void) const
++  {
++    return curr_frame > 0 && curr_frame < cs.size ()
++           ? cs[curr_frame].m_scope : 0;
++  }
++
++  symbol_table::context_id do_current_context (void) const
++  {
++    return curr_frame > 0 && curr_frame < cs.size ()
++           ? cs[curr_frame].m_context : 0;
++  }
++
++#if 0
++  const stack_frame& do_frame (size_t idx)
++  {
++    static stack_frame foobar;
++
++    return idx < cs.size () ? cs[idx] : foobar;
++  }
++#endif
++
++  octave_function *do_element (size_t n)
++  {
++    octave_function *retval = 0;
++
++    if (cs.size () > n)
++      {
++        stack_frame& elt = cs[n];
++        retval = elt.m_fcn;
++      }
++
++    return retval;
++  }
++
++  octave_user_code *do_caller_user_code (size_t nskip) const;
++  int do_caller_user_code_line (void) const;
++  int do_caller_user_code_column (void) const;
++
++  octave_user_code *do_debug_user_code (void) const;
++  int do_debug_user_code_line (void) const;
++  int do_debug_user_code_column (void) const;
++
++  bool do_all_scripts (void) const;
++
++  void do_push (octave_function *fcn, symbol_table::scope_id scope,
++                symbol_table::context_id context)
++  {
++    size_t prev_frame = curr_frame;
++    curr_frame = cs.size ();
++    cs.push_back (stack_frame (fcn, scope, context, prev_frame));
++    symbol_table::set_scope_and_context (scope, context);
++  }
++
++  octave_function *do_current (void) const
++  {
++    octave_function *retval = 0;
++
++    if (! cs.empty ())
++      {
++        const stack_frame& elt = cs[curr_frame];
++        retval = elt.m_fcn;
++      }
++
++    return retval;
++  }
++
++  void do_set_location (int l, int c)
++  {
++    if (! cs.empty ())
++      {
++        stack_frame& elt = cs.back ();
++
++        elt.m_line = l;
++        elt.m_column = c;
++      }
++  }
++
++  void do_set_line (int l)
++  {
++    if (! cs.empty ())
++      {
++        stack_frame& elt = cs.back ();
++
++        elt.m_line = l;
++      }
++  }
++
++  void do_set_column (int c)
++  {
++    if (! cs.empty ())
++      {
++        stack_frame& elt = cs.back ();
++
++        elt.m_column = c;
++      }
++  }
++
++  std::list<octave_call_stack::stack_frame>
++  do_backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame) const;
++
++  octave_map do_backtrace (size_t nskip,
++                           octave_idx_type& curr_user_frame,
++                           bool print_subfn) const;
++
++  bool do_goto_frame (size_t n, bool verbose);
++
++  bool do_goto_frame_relative (int n, bool verbose);
++
++  void do_goto_caller_frame (void);
++
++  void do_goto_base_frame (void);
++
++  void do_pop (void)
++  {
++    if (cs.size () > 1)
++      {
++        const stack_frame& elt = cs.back ();
++        curr_frame = elt.m_prev;
++        cs.pop_back ();
++        const stack_frame& new_elt = cs[curr_frame];
++        symbol_table::set_scope_and_context (new_elt.m_scope, new_elt.m_context);
++      }
++  }
++
++  void do_clear (void) { cs.clear (); }
++};
++
++#endif
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -30,16 +30,17 @@ along with Octave; see the file COPYING.
+ #include <iostream>
+ #include <limits>
+ #include <set>
+ #include <string>
+ 
+ #include "file-stat.h"
+ #include "singleton-cleanup.h"
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "file-ops.h"
+ #include "help.h"
+ #include "input.h"
+ #include "pager.h"
+ #include "octave-link.h"
+ #include "ovl.h"
+diff --git a/libinterp/corefcn/defun.cc b/libinterp/corefcn/defun.cc
+--- a/libinterp/corefcn/defun.cc
++++ b/libinterp/corefcn/defun.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <sstream>
+ #include <iostream>
+ #include <string>
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "dynamic-ld.h"
+ #include "error.h"
+ #include "help.h"
+ #include "ov.h"
+ #include "ov-builtin.h"
+ #include "ov-dld-fcn.h"
+ #include "ov-fcn.h"
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <cstdarg>
+ #include <cstring>
+ 
+ #include <iomanip>
+ #include <iostream>
+ #include <sstream>
+ #include <string>
+ 
++#include "call-stack.h"
+ #include "debug.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "input.h"
+ #include "octave.h"
+ #include "pager.h"
+ #include "ovl.h"
+ #include "oct-map.h"
+diff --git a/libinterp/corefcn/help.cc b/libinterp/corefcn/help.cc
+--- a/libinterp/corefcn/help.cc
++++ b/libinterp/corefcn/help.cc
+@@ -35,16 +35,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "cmd-edit.h"
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "oct-locbuf.h"
+ #include "str-vec.h"
+ 
++#include "call-stack.h"
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "help.h"
+ #include "input.h"
+diff --git a/libinterp/corefcn/input.cc b/libinterp/corefcn/input.cc
+--- a/libinterp/corefcn/input.cc
++++ b/libinterp/corefcn/input.cc
+@@ -35,16 +35,17 @@ along with Octave; see the file COPYING.
+ #include <sstream>
+ #include <string>
+ 
+ #include "cmd-edit.h"
+ #include "file-ops.h"
+ #include "quit.h"
+ #include "str-vec.h"
+ 
++#include "call-stack.h"
+ #include "debug.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "help.h"
+ #include "hook-fcn.h"
+ #include "input.h"
+diff --git a/libinterp/corefcn/ls-mat5.cc b/libinterp/corefcn/ls-mat5.cc
+--- a/libinterp/corefcn/ls-mat5.cc
++++ b/libinterp/corefcn/ls-mat5.cc
+@@ -46,16 +46,17 @@ along with Octave; see the file COPYING.
+ #include "oct-env.h"
+ #include "oct-time.h"
+ #include "quit.h"
+ #include "str-vec.h"
+ #include "file-stat.h"
+ #include "oct-locbuf.h"
+ 
+ #include "Cell.h"
++#include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "load-save.h"
+ #include "load-path.h"
+ #include "ovl.h"
+ #include "oct-map.h"
+ #include "ov-cell.h"
+diff --git a/libinterp/corefcn/mex.cc b/libinterp/corefcn/mex.cc
+--- a/libinterp/corefcn/mex.cc
++++ b/libinterp/corefcn/mex.cc
+@@ -33,16 +33,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <set>
+ 
+ #include "f77-fcn.h"
+ #include "lo-ieee.h"
+ #include "oct-locbuf.h"
+ 
+ #include "Cell.h"
++#include "call-stack.h"
+ #include "error.h"
+ // mxArray must be declared as a class before including mexproto.h.
+ #include "mxarray.h"
+ #include "mexproto.h"
+ #include "oct-map.h"
+ #include "ovl.h"
+ #include "ov.h"
+ #include "ov-mex-fcn.h"
+diff --git a/libinterp/corefcn/module.mk b/libinterp/corefcn/module.mk
+--- a/libinterp/corefcn/module.mk
++++ b/libinterp/corefcn/module.mk
+@@ -21,16 +21,17 @@ JIT_INC = \
+   libinterp/corefcn/jit-typeinfo.h \
+   libinterp/corefcn/jit-ir.h \
+   libinterp/corefcn/pt-jit.h
+ 
+ COREFCN_INC = \
+   libinterp/corefcn/base-text-renderer.h \
+   libinterp/corefcn/Cell.h \
+   libinterp/corefcn/c-file-ptr-stream.h \
++  libinterp/corefcn/call-stack.h \
+   libinterp/corefcn/cdisplay.h \
+   libinterp/corefcn/comment-list.h \
+   libinterp/corefcn/data.h \
+   libinterp/corefcn/debug.h \
+   libinterp/corefcn/defun-dld.h \
+   libinterp/corefcn/defun-int.h \
+   libinterp/corefcn/defun.h \
+   libinterp/corefcn/dirfns.h \
+@@ -124,16 +125,17 @@ COREFCN_SRC = \
+   libinterp/corefcn/__pchip_deriv__.cc \
+   libinterp/corefcn/__qp__.cc \
+   libinterp/corefcn/balance.cc \
+   libinterp/corefcn/besselj.cc \
+   libinterp/corefcn/betainc.cc \
+   libinterp/corefcn/bitfcns.cc \
+   libinterp/corefcn/bsxfun.cc \
+   libinterp/corefcn/c-file-ptr-stream.cc \
++  libinterp/corefcn/call-stack.cc \
+   libinterp/corefcn/cdisplay.c \
+   libinterp/corefcn/cellfun.cc \
+   libinterp/corefcn/colloc.cc \
+   libinterp/corefcn/coct-hdf5-types.c \
+   libinterp/corefcn/comment-list.cc \
+   libinterp/corefcn/conv2.cc \
+   libinterp/corefcn/daspk.cc \
+   libinterp/corefcn/dasrt.cc \
+diff --git a/libinterp/corefcn/octave-link.cc b/libinterp/corefcn/octave-link.cc
+--- a/libinterp/corefcn/octave-link.cc
++++ b/libinterp/corefcn/octave-link.cc
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "cmd-edit.h"
+ #include "defun.h"
+ #include "oct-env.h"
+ #include "oct-mutex.h"
++#include "pager.h"
+ #include "singleton-cleanup.h"
+ #include "toplev.h"
+ 
+ #include "octave-link.h"
+ 
+ static int
+ octave_readline_hook (void)
+ {
+diff --git a/libinterp/corefcn/toplev.cc b/libinterp/corefcn/toplev.cc
+--- a/libinterp/corefcn/toplev.cc
++++ b/libinterp/corefcn/toplev.cc
+@@ -52,16 +52,17 @@ along with Octave; see the file COPYING.
+ #include "quit.h"
+ #include "signal-wrappers.h"
+ #include "singleton-cleanup.h"
+ #include "str-vec.h"
+ #include "wait-for-input.h"
+ 
+ #include "build-env.h"
+ #include "liboctinterp-build-info.h"
++#include "call-stack.h"
+ #include "defaults.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "file-io.h"
+ #include "graphics.h"
+ #include "input.h"
+ #include "lex.h"
+ #include "load-save.h"
+@@ -102,566 +103,16 @@ int exit_status = 0;
+ 
+ // TRUE means we are ready to interpret commands, but not everything
+ // is ready for interactive use.
+ bool octave_interpreter_ready = false;
+ 
+ // TRUE means we've processed all the init code and we are good to go.
+ bool octave_initialized = false;
+ 
+-octave_call_stack *octave_call_stack::instance = 0;
+-
+-std::string
+-octave_call_stack::stack_frame::fcn_file_name (void) const
+-{
+-  return m_fcn ? m_fcn->fcn_file_name () : "";
+-}
+-
+-std::string
+-octave_call_stack::stack_frame::fcn_name (bool print_subfn) const
+-{
+-  std::string retval;
+-
+-  if (m_fcn)
+-    {
+-      std::string parent_fcn_name = m_fcn->parent_fcn_name ();
+-
+-      if (print_subfn && ! parent_fcn_name.empty ())
+-        retval = parent_fcn_name + Vfilemarker;
+-
+-      retval += m_fcn->name ();
+-    }
+-  else
+-    retval = "<unknown>";
+-
+-  return retval;
+-}
+-
+-bool
+-octave_call_stack::stack_frame::operator== (const octave_call_stack::stack_frame &rhs) const
+-{
+-  if (this->line () != rhs.line ())
+-    return false;
+-  else if (this->column () != rhs.column ())
+-    return false;
+-  else if (this->fcn_file_name () != rhs.fcn_file_name ())
+-    return false;
+-  else if (this->fcn_name () != rhs.fcn_name ())
+-    return false;
+-  else
+-    return true;
+-}
+-
+-void
+-octave_call_stack::create_instance (void)
+-{
+-  instance = new octave_call_stack ();
+-
+-  if (instance)
+-    {
+-      instance->do_push (0, symbol_table::top_scope (), 0);
+-
+-      singleton_cleanup_list::add (cleanup_instance);
+-    }
+-}
+-
+-int
+-octave_call_stack::do_current_line (void) const
+-{
+-  int retval = -1;
+-
+-  if (! cs.empty ())
+-    {
+-      const stack_frame& elt = cs[curr_frame];
+-      retval = elt.m_line;
+-    }
+-
+-  return retval;
+-}
+-
+-int
+-octave_call_stack::do_current_column (void) const
+-{
+-  int retval = -1;
+-
+-  if (! cs.empty ())
+-    {
+-      const stack_frame& elt = cs[curr_frame];
+-      retval = elt.m_column;
+-    }
+-
+-  return retval;
+-}
+-
+-size_t
+-octave_call_stack::do_num_user_code_frames
+-  (octave_idx_type& curr_user_frame) const
+-{
+-  size_t retval = 0;
+-
+-  curr_user_frame = 0;
+-
+-  // Look for the caller of dbstack.
+-  size_t xframe = cs[curr_frame].m_prev;
+-
+-  bool found = false;
+-
+-  size_t k = cs.size ();
+-
+-  for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
+-    {
+-      octave_function *f = (*p).m_fcn;
+-
+-      if (--k == xframe)
+-        found = true;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (! found)
+-            curr_user_frame++;
+-
+-          retval++;
+-        }
+-    }
+-
+-  // We counted how many user frames were not the one, in reverse.
+-  // Now set curr_user_frame to be the index in the other direction.
+-  curr_user_frame = retval - curr_user_frame - 1;
+-
+-  return retval;
+-}
+-
+-octave_user_code *
+-octave_call_stack::do_caller_user_code (size_t nskip) const
+-{
+-  octave_user_code *retval = 0;
+-
+-  const_iterator p = cs.end ();
+-
+-  while (p != cs.begin ())
+-    {
+-      const stack_frame& elt = *(--p);
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (nskip > 0)
+-            nskip--;
+-          else
+-            {
+-              retval = dynamic_cast<octave_user_code *> (f);
+-              break;
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-int
+-octave_call_stack::do_caller_user_code_line (void) const
+-{
+-  int retval = -1;
+-
+-  const_iterator p = cs.end ();
+-
+-  while (p != cs.begin ())
+-    {
+-      const stack_frame& elt = *(--p);
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (elt.m_line > 0)
+-            {
+-              retval = elt.m_line;
+-              break;
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-int
+-octave_call_stack::do_caller_user_code_column (void) const
+-{
+-  int retval = -1;
+-
+-  const_iterator p = cs.end ();
+-
+-  while (p != cs.begin ())
+-    {
+-      const stack_frame& elt = *(--p);
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (elt.m_column)
+-            {
+-              retval = elt.m_column;
+-              break;
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-octave_user_code *
+-octave_call_stack::do_debug_user_code (void) const
+-{
+-  octave_user_code *retval = 0;
+-
+-  // This should never happen...
+-  if (curr_frame == 0)
+-    return retval;
+-
+-  // Start looking with the caller of the calling debug function.
+-  size_t i = cs[curr_frame].m_prev;
+-
+-  while (i != 0)
+-    {
+-      const stack_frame& elt = cs[i--];
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          retval = dynamic_cast<octave_user_code *> (f);
+-          break;
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-int
+-octave_call_stack::do_debug_user_code_line (void) const
+-{
+-  int retval = -1;
+-
+-  // This should never happen...
+-  if (curr_frame == 0)
+-    return retval;
+-
+-  // Start looking with the caller of the calling debug function.
+-  size_t i = cs[curr_frame].m_prev;
+-
+-  while (i != 0)
+-    {
+-      const stack_frame& elt = cs[i--];
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (elt.m_line)
+-            {
+-              retval = elt.m_line;
+-              break;
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-int
+-octave_call_stack::do_debug_user_code_column (void) const
+-{
+-  int retval = -1;
+-
+-  // This should never happen...
+-  if (curr_frame == 0)
+-    return retval;
+-
+-  // Start looking with the caller of the calling debug function.
+-  size_t i = cs[curr_frame].m_prev;
+-
+-  while (i != 0)
+-    {
+-      const stack_frame& elt = cs[i--];
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && f->is_user_code ())
+-        {
+-          if (elt.m_column)
+-            {
+-              retval = elt.m_column;
+-              break;
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-bool
+-octave_call_stack::do_all_scripts (void) const
+-{
+-  bool retval = true;
+-
+-  const_iterator p = cs.end ();
+-
+-  while (p != cs.begin ())
+-    {
+-      const stack_frame& elt = *(--p);
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (f && ! f->is_user_script ())
+-        {
+-          retval = false;
+-          break;
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-// Use static fields for the best efficiency.
+-// NOTE: C++0x will allow these two to be merged into one.
+-static const char *bt_fieldnames[] = { "file", "name", "line",
+-                                       "column", "scope", "context", 0
+-                                     };
+-static const octave_fields bt_fields (bt_fieldnames);
+-
+-octave_map
+-octave_call_stack::empty_backtrace (void)
+-{
+-  return octave_map (dim_vector (0, 1), bt_fields);
+-}
+-
+-std::list<octave_call_stack::stack_frame>
+-octave_call_stack::do_backtrace_frames (size_t nskip,
+-                                        octave_idx_type& curr_user_frame) const
+-{
+-  std::list<octave_call_stack::stack_frame> retval;
+-
+-  size_t user_code_frames = do_num_user_code_frames (curr_user_frame);
+-
+-  size_t nframes = nskip <= user_code_frames ? user_code_frames - nskip : 0;
+-
+-  // Our list is reversed.
+-  curr_user_frame = nframes - curr_user_frame - 1;
+-
+-  if (nframes > 0)
+-    {
+-      for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
+-        {
+-          const stack_frame& elt = *p;
+-
+-          octave_function *f = elt.m_fcn;
+-
+-          if (f && f->is_user_code ())
+-            {
+-              if (nskip > 0)
+-                nskip--;
+-              else
+-                retval.push_back (elt);
+-            }
+-        }
+-    }
+-
+-  return retval;
+-}
+-
+-octave_map
+-octave_call_stack::do_backtrace (size_t nskip,
+-                                 octave_idx_type& curr_user_frame,
+-                                 bool print_subfn) const
+-{
+-  std::list<octave_call_stack::stack_frame> frames
+-    = do_backtrace_frames (nskip, curr_user_frame);
+-
+-  size_t nframes = frames.size ();
+-
+-  octave_map retval (dim_vector (nframes, 1), bt_fields);
+-
+-  Cell& file = retval.contents (0);
+-  Cell& name = retval.contents (1);
+-  Cell& line = retval.contents (2);
+-  Cell& column = retval.contents (3);
+-  Cell& scope = retval.contents (4);
+-  Cell& context = retval.contents (5);
+-
+-  octave_idx_type k = 0;
+-
+-  for (std::list<octave_call_stack::stack_frame>::const_iterator p = frames.begin ();
+-       p != frames.end (); p++)
+-    {
+-      const stack_frame& elt = *p;
+-
+-      scope(k) = elt.m_scope;
+-      context(k) = elt.m_context;
+-      file(k) = elt.fcn_file_name ();
+-      name(k) = elt.fcn_name (print_subfn);
+-      line(k) = elt.m_line;
+-      column(k) = elt.m_column;
+-
+-      k++;
+-    }
+-
+-  return retval;
+-}
+-
+-bool
+-octave_call_stack::do_goto_frame (size_t n, bool verbose)
+-{
+-  bool retval = false;
+-
+-  if (n < cs.size ())
+-    {
+-      retval = true;
+-
+-      curr_frame = n;
+-
+-      const stack_frame& elt = cs[n];
+-
+-      symbol_table::set_scope_and_context (elt.m_scope, elt.m_context);
+-
+-      if (verbose)
+-        octave_stdout << "stopped in " << elt.fcn_name ()
+-                      << " at line " << elt.m_line
+-                      << " column " << elt.m_column
+-                      << " [" << elt.fcn_file_name () << "] "
+-                      << " (scope = " << elt.m_scope
+-                      << "[context = " << elt.m_context << "])"
+-                      << std::endl;
+-    }
+-
+-  return retval;
+-}
+-
+-bool
+-octave_call_stack::do_goto_frame_relative (int nskip, bool verbose)
+-{
+-  bool retval = false;
+-
+-  int incr = 0;
+-
+-  if (nskip < 0)
+-    incr = -1;
+-  else if (nskip > 0)
+-    incr = 1;
+-
+-  // Start looking with the caller of dbup/dbdown/keyboard.
+-  size_t xframe = cs[curr_frame].m_prev;
+-
+-  while (true)
+-    {
+-      if ((incr < 0 && xframe == 0) || (incr > 0 && xframe == cs.size () - 1))
+-        break;
+-
+-      xframe += incr;
+-
+-      const stack_frame& elt = cs[xframe];
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (xframe == 0 || (f && f->is_user_code ()))
+-        {
+-          if (nskip > 0)
+-            nskip--;
+-          else if (nskip < 0)
+-            nskip++;
+-
+-          if (nskip == 0)
+-            {
+-              curr_frame = xframe;
+-              cs[cs.size () - 1].m_prev = curr_frame;
+-
+-              symbol_table::set_scope_and_context (elt.m_scope, elt.m_context);
+-
+-              if (verbose)
+-                {
+-                  std::ostringstream buf;
+-
+-                  if (f)
+-                    buf << "stopped in " << elt.fcn_name ()
+-                        << " at line " << elt.m_line
+-                        << " [" << elt.fcn_file_name () << "] "
+-                        << std::endl;
+-                  else
+-                    buf << "at top level" << std::endl;
+-
+-                  octave_stdout << buf.str ();
+-                }
+-
+-              retval = true;
+-              break;
+-            }
+-        }
+-      else if (incr == 0)  // Break out of infinite loop by choosing an incr.
+-        incr = -1;
+-
+-      // There is no need to set scope and context here.  That will
+-      // happen when the dbup/dbdown/keyboard frame is popped and we
+-      // jump to the new "prev" frame set above.
+-    }
+-
+-  return retval;
+-}
+-
+-void
+-octave_call_stack::do_goto_caller_frame (void)
+-{
+-  size_t xframe = curr_frame;
+-
+-  bool skipped = false;
+-
+-  while (xframe != 0)
+-    {
+-      xframe = cs[xframe].m_prev;
+-
+-      const stack_frame& elt = cs[xframe];
+-
+-      octave_function *f = elt.m_fcn;
+-
+-      if (elt.m_scope == cs[0].m_scope || (f && f->is_user_code ()))
+-        {
+-          if (! skipped)
+-            // We found the current user code frame, so skip it.
+-            skipped = true;
+-          else
+-            {
+-              // We found the caller user code frame.
+-              stack_frame tmp (elt);
+-              tmp.m_prev = curr_frame;
+-
+-              curr_frame = cs.size ();
+-
+-              cs.push_back (tmp);
+-
+-              symbol_table::set_scope_and_context (tmp.m_scope, tmp.m_context);
+-
+-              break;
+-            }
+-        }
+-    }
+-}
+-
+-void
+-octave_call_stack::do_goto_base_frame (void)
+-{
+-  stack_frame tmp (cs[0]);
+-  tmp.m_prev = curr_frame;
+-
+-  curr_frame = cs.size ();
+-
+-  cs.push_back (tmp);
+-
+-  symbol_table::set_scope_and_context (tmp.m_scope, tmp.m_context);
+-}
+-
+ void
+ recover_from_exception (void)
+ {
+   octave::can_interrupt = true;
+   octave_interrupt_immediately = 0;
+   octave_interrupt_state = 0;
+   octave_signal_caught = 0;
+   octave_exception_state = octave_no_exception;
+diff --git a/libinterp/corefcn/toplev.h b/libinterp/corefcn/toplev.h
+--- a/libinterp/corefcn/toplev.h
++++ b/libinterp/corefcn/toplev.h
+@@ -20,35 +20,20 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if ! defined (octave_toplev_h)
+ #define octave_toplev_h 1
+ 
+ #include "octave-config.h"
+ 
+-#include <cstdio>
+-
+-#include <deque>
+ #include <string>
+ 
+-class octave_value;
+-class octave_value_list;
+-class octave_function;
+-class octave_user_script;
+-class tree_statement;
+-class tree_statement_list;
+-class charMatrix;
+-
+ #include "quit.h"
+ 
+-#include "input.h"
+-#include "oct-map.h"
+-#include "symtab.h"
+-
+ typedef void (*octave_exit_func) (int);
+ extern OCTINTERP_API octave_exit_func octave_exit;
+ 
+ extern OCTINTERP_API bool quit_allowed;
+ 
+ extern OCTINTERP_API bool quitting_gracefully;
+ 
+ extern OCTINTERP_API int exit_status;
+@@ -68,455 +53,16 @@ octave_remove_atexit_function (const std
+ 
+ // TRUE means we are ready to interpret commands, but not everything
+ // is ready for interactive use.
+ extern OCTINTERP_API bool octave_interpreter_ready;
+ 
+ // TRUE means we've processed all the init code and we are good to go.
+ extern OCTINTERP_API bool octave_initialized;
+ 
+-class
+-OCTINTERP_API
+-octave_call_stack
+-{
+-protected:
+-
+-  octave_call_stack (void) : cs (), curr_frame (0) { }
+-
+-public:
+-
+-  class stack_frame
+-  {
+-  public:
+-
+-    friend class octave_call_stack;
+-
+-    stack_frame (octave_function *fcn = 0, symbol_table::scope_id scope = 0,
+-                 symbol_table::context_id context = 0, size_t prev = 0)
+-      : m_fcn (fcn), m_line (-1), m_column (-1), m_scope (scope),
+-        m_context (context), m_prev (prev)
+-    { }
+-
+-    stack_frame (const stack_frame& elt)
+-      : m_fcn (elt.m_fcn), m_line (elt.m_line), m_column (elt.m_column),
+-        m_scope (elt.m_scope), m_context (elt.m_context), m_prev (elt.m_prev)
+-    { }
+-
+-    int line (void) const { return m_line; }
+-
+-    int column (void) const { return m_column; }
+-
+-    std::string fcn_file_name (void) const;
+-
+-    std::string fcn_name (bool print_subfn = true) const;
+-
+-    bool operator== (const stack_frame &rhs) const;
+-
+-  private:
+-
+-    octave_function *m_fcn;
+-    int m_line;
+-    int m_column;
+-    symbol_table::scope_id m_scope;
+-    symbol_table::context_id m_context;
+-    size_t m_prev;
+-  };
+-
+-  typedef std::deque<stack_frame>::iterator iterator;
+-  typedef std::deque<stack_frame>::const_iterator const_iterator;
+-
+-  typedef std::deque<stack_frame>::reverse_iterator reverse_iterator;
+-  typedef std::deque<stack_frame>::const_reverse_iterator const_reverse_iterator;
+-
+-  static void create_instance (void);
+-
+-  static bool instance_ok (void)
+-  {
+-    bool retval = true;
+-
+-    if (! instance)
+-      create_instance ();
+-
+-    if (! instance)
+-      error ("unable to create call stack object!");
+-
+-    return retval;
+-  }
+-
+-  // Current function (top of stack).
+-  static octave_function *current (void)
+-  {
+-    return instance_ok () ? instance->do_current () : 0;
+-  }
+-
+-  // Current line in current function.
+-  static int current_line (void)
+-  {
+-    return instance_ok () ? instance->do_current_line () : -1;
+-  }
+-
+-  // Current column in current function.
+-  static int current_column (void)
+-  {
+-    return instance_ok () ? instance->do_current_column () : -1;
+-  }
+-
+-  // Caller function, may be built-in.
+-  static octave_function *caller (void)
+-  {
+-    return instance_ok () ? instance->do_caller () : 0;
+-  }
+-
+-  static size_t current_frame (void)
+-  {
+-    return instance_ok () ? instance->do_current_frame () : 0;
+-  }
+-
+-  static size_t size (void)
+-  {
+-    return instance_ok () ? instance->do_size () : 0;
+-  }
+-
+-  static size_t num_user_code_frames (octave_idx_type& curr_user_frame)
+-  {
+-    return instance_ok ()
+-           ? instance->do_num_user_code_frames (curr_user_frame) : 0;
+-  }
+-
+-  static symbol_table::scope_id current_scope (void)
+-  {
+-    return instance_ok () ? instance->do_current_scope () : 0;
+-  }
+-
+-  static symbol_table::context_id current_context (void)
+-  {
+-    return instance_ok () ? instance->do_current_context () : 0;
+-  }
+-
+-#if 0
+-  static stack_frame frame (size_t idx)
+-  {
+-    return instance_ok () ? instance->do_frame (idx) : stack_frame ();
+-  }
+-#endif
+-
+-  // Function at location N on the call stack (N == 0 is current), may
+-  // be built-in.
+-  static octave_function *element (size_t n)
+-  {
+-    return instance_ok () ? instance->do_element (n) : 0;
+-  }
+-
+-  // User code caller.
+-  static octave_user_code *caller_user_code (size_t nskip = 0)
+-  {
+-    return instance_ok () ? instance->do_caller_user_code (nskip) : 0;
+-  }
+-
+-  // Line in user code caller.
+-  static int caller_user_code_line (void)
+-  {
+-    return instance_ok () ? instance->do_caller_user_code_line () : -1;
+-  }
+-
+-  // Column in user code caller.
+-  static int caller_user_code_column (void)
+-  {
+-    return instance_ok () ? instance->do_caller_user_code_column () : -1;
+-  }
+-
+-  // Current function that we are debugging.
+-  static octave_user_code *debug_user_code (void)
+-  {
+-    return instance_ok () ? instance->do_debug_user_code () : 0;
+-  }
+-
+-  // Line number in current function that we are debugging.
+-  static int debug_user_code_line (void)
+-  {
+-    return instance_ok () ? instance->do_debug_user_code_line () : 0;
+-  }
+-
+-  // Column number in current function that we are debugging.
+-  static int debug_user_code_column (void)
+-  {
+-    return instance_ok () ? instance->do_debug_user_code_column () : 0;
+-  }
+-
+-  // Return TRUE if all elements on the call stack are scripts.
+-  static bool all_scripts (void)
+-  {
+-    return instance_ok () ? instance->do_all_scripts () : false;
+-  }
+-
+-  static void
+-  push (octave_function *f,
+-        symbol_table::scope_id scope = symbol_table::current_scope (),
+-        symbol_table::context_id context = symbol_table::current_context ())
+-  {
+-    if (instance_ok ())
+-      instance->do_push (f, scope, context);
+-  }
+-
+-  static void
+-  push (symbol_table::scope_id scope = symbol_table::current_scope (),
+-        symbol_table::context_id context = symbol_table::current_context ())
+-  {
+-    if (instance_ok ())
+-      instance->do_push (0, scope, context);
+-  }
+-
+-  static void set_location (int l, int c)
+-  {
+-    if (instance_ok ())
+-      instance->do_set_location (l, c);
+-  }
+-
+-  static void set_line (int l)
+-  {
+-    if (instance_ok ())
+-      instance->do_set_line (l);
+-  }
+-
+-  static void set_column (int c)
+-  {
+-    if (instance_ok ())
+-      instance->do_set_column (c);
+-  }
+-
+-  static bool goto_frame (size_t n = 0, bool verbose = false)
+-  {
+-    return instance_ok () ? instance->do_goto_frame (n, verbose) : false;
+-  }
+-
+-  static void restore_frame (size_t n)
+-  {
+-    goto_frame (n);
+-  }
+-
+-  static bool goto_frame_relative (int n, bool verbose = false)
+-  {
+-    return instance_ok ()
+-           ? instance->do_goto_frame_relative (n, verbose) : false;
+-  }
+-
+-  static void goto_caller_frame (void)
+-  {
+-    if (instance_ok ())
+-      instance->do_goto_caller_frame ();
+-  }
+-
+-  static void goto_base_frame (void)
+-  {
+-    if (instance_ok ())
+-      instance->do_goto_base_frame ();
+-  }
+-
+-  static octave_map backtrace (size_t nskip = 0)
+-  {
+-    octave_idx_type curr_user_frame = -1;
+-
+-    return instance_ok ()
+-           ? instance->do_backtrace (nskip, curr_user_frame, true)
+-           : octave_map ();
+-  }
+-
+-  static octave_map backtrace (size_t nskip, octave_idx_type& curr_user_frame,
+-                               bool print_subfn = true)
+-  {
+-    return instance_ok ()
+-           ? instance->do_backtrace (nskip, curr_user_frame, print_subfn)
+-           : octave_map ();
+-  }
+-
+-  static std::list<octave_call_stack::stack_frame>
+-  backtrace_frames (size_t nskip = 0)
+-  {
+-    octave_idx_type curr_user_frame = -1;
+-
+-    return instance_ok ()
+-           ? instance->do_backtrace_frames (nskip, curr_user_frame)
+-           : std::list<octave_call_stack::stack_frame> ();
+-  }
+-
+-  static std::list<octave_call_stack::stack_frame>
+-  backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame)
+-  {
+-    return instance_ok ()
+-           ? instance->do_backtrace_frames (nskip, curr_user_frame)
+-           : std::list<octave_call_stack::stack_frame> ();
+-  }
+-
+-  static octave_map empty_backtrace (void);
+-
+-  static void pop (void)
+-  {
+-    if (instance_ok ())
+-      instance->do_pop ();
+-  }
+-
+-  static void clear (void)
+-  {
+-    if (instance_ok ())
+-      instance->do_clear ();
+-  }
+-
+-private:
+-
+-  // The current call stack.
+-  std::deque<stack_frame> cs;
+-
+-  size_t curr_frame;
+-
+-  static octave_call_stack *instance;
+-
+-  static void cleanup_instance (void) { delete instance; instance = 0; }
+-
+-  int do_current_line (void) const;
+-
+-  int do_current_column (void) const;
+-
+-  octave_function *do_caller (void) const
+-  {
+-    return curr_frame > 1 ? cs[curr_frame-1].m_fcn : cs[0].m_fcn;
+-  }
+-
+-  size_t do_current_frame (void) { return curr_frame; }
+-
+-  size_t do_size (void) { return cs.size (); }
+-
+-  size_t do_num_user_code_frames (octave_idx_type& curr_user_frame) const;
+-
+-  symbol_table::scope_id do_current_scope (void) const
+-  {
+-    return curr_frame > 0 && curr_frame < cs.size ()
+-           ? cs[curr_frame].m_scope : 0;
+-  }
+-
+-  symbol_table::context_id do_current_context (void) const
+-  {
+-    return curr_frame > 0 && curr_frame < cs.size ()
+-           ? cs[curr_frame].m_context : 0;
+-  }
+-
+-#if 0
+-  const stack_frame& do_frame (size_t idx)
+-  {
+-    static stack_frame foobar;
+-
+-    return idx < cs.size () ? cs[idx] : foobar;
+-  }
+-#endif
+-
+-  octave_function *do_element (size_t n)
+-  {
+-    octave_function *retval = 0;
+-
+-    if (cs.size () > n)
+-      {
+-        stack_frame& elt = cs[n];
+-        retval = elt.m_fcn;
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_user_code *do_caller_user_code (size_t nskip) const;
+-  int do_caller_user_code_line (void) const;
+-  int do_caller_user_code_column (void) const;
+-
+-  octave_user_code *do_debug_user_code (void) const;
+-  int do_debug_user_code_line (void) const;
+-  int do_debug_user_code_column (void) const;
+-
+-  bool do_all_scripts (void) const;
+-
+-  void do_push (octave_function *fcn, symbol_table::scope_id scope,
+-                symbol_table::context_id context)
+-  {
+-    size_t prev_frame = curr_frame;
+-    curr_frame = cs.size ();
+-    cs.push_back (stack_frame (fcn, scope, context, prev_frame));
+-    symbol_table::set_scope_and_context (scope, context);
+-  }
+-
+-  octave_function *do_current (void) const
+-  {
+-    octave_function *retval = 0;
+-
+-    if (! cs.empty ())
+-      {
+-        const stack_frame& elt = cs[curr_frame];
+-        retval = elt.m_fcn;
+-      }
+-
+-    return retval;
+-  }
+-
+-  void do_set_location (int l, int c)
+-  {
+-    if (! cs.empty ())
+-      {
+-        stack_frame& elt = cs.back ();
+-
+-        elt.m_line = l;
+-        elt.m_column = c;
+-      }
+-  }
+-
+-  void do_set_line (int l)
+-  {
+-    if (! cs.empty ())
+-      {
+-        stack_frame& elt = cs.back ();
+-
+-        elt.m_line = l;
+-      }
+-  }
+-
+-  void do_set_column (int c)
+-  {
+-    if (! cs.empty ())
+-      {
+-        stack_frame& elt = cs.back ();
+-
+-        elt.m_column = c;
+-      }
+-  }
+-
+-  std::list<octave_call_stack::stack_frame>
+-  do_backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame) const;
+-
+-  octave_map do_backtrace (size_t nskip,
+-                           octave_idx_type& curr_user_frame,
+-                           bool print_subfn) const;
+-
+-  bool do_goto_frame (size_t n, bool verbose);
+-
+-  bool do_goto_frame_relative (int n, bool verbose);
+-
+-  void do_goto_caller_frame (void);
+-
+-  void do_goto_base_frame (void);
+-
+-  void do_pop (void)
+-  {
+-    if (cs.size () > 1)
+-      {
+-        const stack_frame& elt = cs.back ();
+-        curr_frame = elt.m_prev;
+-        cs.pop_back ();
+-        const stack_frame& new_elt = cs[curr_frame];
+-        symbol_table::set_scope_and_context (new_elt.m_scope, new_elt.m_context);
+-      }
+-  }
+-
+-  void do_clear (void) { cs.clear (); }
+-};
+-
+ // Call a function with exceptions handled to avoid problems with
+ // errors while shutting down.
+ 
+ #define OCTAVE_IGNORE_EXCEPTION(E) \
+   catch (E) \
+     { \
+       std::cerr << "error: ignoring " #E " while preparing to exit" << std::endl; \
+       recover_from_exception (); \
+diff --git a/libinterp/corefcn/variables.cc b/libinterp/corefcn/variables.cc
+--- a/libinterp/corefcn/variables.cc
++++ b/libinterp/corefcn/variables.cc
+@@ -34,16 +34,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "file-ops.h"
+ #include "glob-match.h"
+ #include "lo-regexp.h"
+ #include "str-vec.h"
+ 
++#include "call-stack.h"
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "help.h"
+ #include "input.h"
+diff --git a/libinterp/octave-value/ov-base.cc b/libinterp/octave-value/ov-base.cc
+--- a/libinterp/octave-value/ov-base.cc
++++ b/libinterp/octave-value/ov-base.cc
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include <iostream>
+ #include <limits>
+ 
+ #include "lo-ieee.h"
+ #include "lo-mappers.h"
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "errwarn.h"
+ #include "mxarray.h"
+ #include "oct-map.h"
+ #include "ovl.h"
+ #include "oct-hdf5.h"
+ #include "oct-lvalue.h"
+ #include "oct-stream.h"
+diff --git a/libinterp/octave-value/ov-builtin.cc b/libinterp/octave-value/ov-builtin.cc
+--- a/libinterp/octave-value/ov-builtin.cc
++++ b/libinterp/octave-value/ov-builtin.cc
+@@ -19,16 +19,17 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
++#include "call-stack.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "ovl.h"
+ #include "ov-builtin.h"
+ #include "ov.h"
+ #include "profiler.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+diff --git a/libinterp/octave-value/ov-class.cc b/libinterp/octave-value/ov-class.cc
+--- a/libinterp/octave-value/ov-class.cc
++++ b/libinterp/octave-value/ov-class.cc
+@@ -28,16 +28,17 @@ along with Octave; see the file COPYING.
+ #include <iostream>
+ 
+ #include "Array-util.h"
+ #include "byte-swap.h"
+ #include "oct-locbuf.h"
+ #include "lo-mappers.h"
+ 
+ #include "Cell.h"
++#include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "file-ops.h"
+ #include "errwarn.h"
+ #include "load-path.h"
+ #include "ls-hdf5.h"
+ #include "ls-oct-text.h"
+ #include "ls-oct-binary.h"
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -21,16 +21,17 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <algorithm>
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "load-path.h"
+ #include "ov-builtin.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-typeinfo.h"
+ #include "ov-usr-fcn.h"
+ #include "pt-assign.h"
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -29,16 +29,17 @@ along with Octave; see the file COPYING.
+ #include <iostream>
+ #include <list>
+ #include <sstream>
+ #include <vector>
+ 
+ #include "file-ops.h"
+ #include "oct-locbuf.h"
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "input.h"
+ #include "oct-hdf5.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-fcn-handle.h"
+diff --git a/libinterp/octave-value/ov-fcn-inline.cc b/libinterp/octave-value/ov-fcn-inline.cc
+--- a/libinterp/octave-value/ov-fcn-inline.cc
++++ b/libinterp/octave-value/ov-fcn-inline.cc
+@@ -30,16 +30,17 @@ Open Source Initiative (www.opensource.o
+ 
+ #include <istream>
+ #include <iostream>
+ #include <sstream>
+ #include <vector>
+ 
+ #include "oct-locbuf.h"
+ 
++#include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "oct-hdf5.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-fcn-inline.h"
+ #include "ov-usr-fcn.h"
+diff --git a/libinterp/octave-value/ov-mex-fcn.cc b/libinterp/octave-value/ov-mex-fcn.cc
+--- a/libinterp/octave-value/ov-mex-fcn.cc
++++ b/libinterp/octave-value/ov-mex-fcn.cc
+@@ -21,16 +21,17 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "oct-shlib.h"
+ 
++#include "call-stack.h"
+ #include <defaults.h>
+ #include "dynamic-ld.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "ovl.h"
+ #include "ov-mex-fcn.h"
+ #include "ov.h"
+ #include "profiler.h"
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <sstream>
+ 
+ #include "str-vec.h"
+ 
++#include "call-stack.h"
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "builtins.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "input.h"
+ #include "ovl.h"
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -38,26 +38,27 @@ along with Octave; see the file COPYING.
+ #include <cassert>
+ #include <cstdio>
+ #include <cstdlib>
+ 
+ #include <iostream>
+ #include <map>
+ #include <sstream>
+ 
+-#include "Cell.h"
+ #include "Matrix.h"
+ #include "cmd-edit.h"
+ #include "cmd-hist.h"
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "oct-time.h"
+ #include "quit.h"
+ 
++#include "Cell.h"
++#include "call-stack.h"
+ #include "comment-list.h"
+ #include "defaults.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "dynamic-ld.h"
+ #include "error.h"
+ #include "input.h"
+ #include "lex.h"
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <cctype>
+ 
+ #include <iostream>
+ 
+ #include <fstream>
+ #include <typeinfo>
+ 
++#include "call-stack.h"
+ #include "debug.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "input.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ #include "variables.h"
+diff --git a/libinterp/parse-tree/pt-fcn-handle.cc b/libinterp/parse-tree/pt-fcn-handle.cc
+--- a/libinterp/parse-tree/pt-fcn-handle.cc
++++ b/libinterp/parse-tree/pt-fcn-handle.cc
+@@ -21,16 +21,17 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <iostream>
+ 
++#include "call-stack.h"
+ #include "error.h"
+ #include "ovl.h"
+ #include "ov-fcn-handle.h"
+ #include "pt-fcn-handle.h"
+ #include "pager.h"
+ #include "pt-const.h"
+ #include "pt-walk.h"
+ #include "variables.h"
+diff --git a/libinterp/parse-tree/pt-mat.cc b/libinterp/parse-tree/pt-mat.cc
+--- a/libinterp/parse-tree/pt-mat.cc
++++ b/libinterp/parse-tree/pt-mat.cc
+@@ -28,16 +28,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "oct-locbuf.h"
+ #include "quit.h"
+ 
+ #include "data.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
++#include "oct-map.h"
+ #include "ovl.h"
+ #include "pt-arg-list.h"
+ #include "pt-bp.h"
+ #include "pt-exp.h"
+ #include "pt-mat.h"
+ #include "pt-walk.h"
+ #include "utils.h"
+ #include "ov.h"

@@ -1,0 +1,244 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1340858586 18000
+#      Wed Jun 27 23:43:06 2012 -0500
+# Node ID f649b66ef1afddb287d5c1edf733affb594cc279
+# Parent  d3f9801b1f29e1e706116487429690bcfe1d2d3e
+Add short circult operators to JIT
+
+* src/pt-jit.cc (jit_convert::jit_convert): Initialize short_count.
+  (jit_convert::visit_binary_expression): Add support for short circut
+    operators.
+  (jit_convert::visit_if_command_list): Remove duplicate check append.
+  (jit_convert::visit_simple_assignment): Store result.
+  (jit_convert::convert_llvm::visit): New overload.
+* src/pt-jit.h (jit_const_bool): New specialization of jit_const.
+  (jit_convert::short_count): New variable.
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -1831,17 +1831,17 @@ jit_call::infer (void)
+       return true;
+     }
+ 
+   return false;
+ }
+ 
+ // -------------------- jit_convert --------------------
+ jit_convert::jit_convert (llvm::Module *module, tree &tee)
+-  : iterator_count (0), breaking (false)
++  : iterator_count (0), short_count (0), breaking (false)
+ {
+   jit_instruction::reset_ids ();
+ 
+   entry_block = create<jit_block> ("body");
+   final_block = create<jit_block> ("final");
+   append (entry_block);
+   entry_block->mark_alive ();
+   block = entry_block;
+@@ -1937,28 +1937,75 @@ void
+ jit_convert::visit_argument_list (tree_argument_list&)
+ {
+   fail ();
+ }
+ 
+ void
+ jit_convert::visit_binary_expression (tree_binary_expression& be)
+ {
+-  // this is the case for bool_or and bool_and
+   if (be.op_type () >= octave_value::num_binary_ops)
+-    fail ("Unsupported binary operator");
+-
+-  tree_expression *lhs = be.lhs ();
+-  jit_value *lhsv = visit (lhs);
+-
+-  tree_expression *rhs = be.rhs ();
+-  jit_value *rhsv = visit (rhs);
+-
+-  const jit_function& fn = jit_typeinfo::binary_op (be.op_type ());
+-  result = create_checked (fn, lhsv, rhsv);
++    {
++      tree_boolean_expression *boole;
++      boole = dynamic_cast<tree_boolean_expression *> (&be);
++      assert (boole);
++      bool is_and = boole->op_type () == tree_boolean_expression::bool_and;
++
++      std::stringstream ss;
++      ss << "#short_result" << short_count++;
++
++      std::string short_name = ss.str ();
++      jit_variable *short_result = create<jit_variable> (short_name);
++      vmap[short_name] = short_result;
++
++      jit_block *done = create<jit_block> (block->name ());
++      tree_expression *lhs = be.lhs ();
++      jit_value *lhsv = visit (lhs);
++      lhsv = create_checked (&jit_typeinfo::logically_true, lhsv);
++
++      jit_block *short_early = create<jit_block> ("short_early");
++      append (short_early);
++
++      jit_block *short_cont = create<jit_block> ("short_cont");
++
++      if (is_and)
++        block->append (create<jit_cond_branch> (lhsv, short_cont, short_early));
++      else
++        block->append (create<jit_cond_branch> (lhsv, short_early, short_cont));
++
++      block = short_early;
++
++      jit_value *early_result = create<jit_const_bool> (! is_and);
++      block->append (create<jit_assign> (short_result, early_result));
++      block->append (create<jit_branch> (done));
++
++      append (short_cont);
++      block = short_cont;
++
++      tree_expression *rhs = be.rhs ();
++      jit_value *rhsv = visit (rhs);
++      rhsv = create_checked (&jit_typeinfo::logically_true, rhsv);
++      block->append (create<jit_assign> (short_result, rhsv));
++      block->append (create<jit_branch> (done));
++
++      append (done);
++      block = done;
++      result = short_result;
++    }
++  else
++    {
++      tree_expression *lhs = be.lhs ();
++      jit_value *lhsv = visit (lhs);
++
++      tree_expression *rhs = be.rhs ();
++      jit_value *rhsv = visit (rhs);
++
++      const jit_function& fn = jit_typeinfo::binary_op (be.op_type ());
++      result = create_checked (fn, lhsv, rhsv);
++    }
+ }
+ 
+ void
+ jit_convert::visit_break_command (tree_break_command&)
+ {
+   breaks.push_back (block);
+   breaking = true;
+ }
+@@ -2191,18 +2238,16 @@ jit_convert::visit_if_command_list (tree
+         append (entry_blocks[i]);
+ 
+       if (! tic->is_else_clause ())
+         {
+           tree_expression *expr = tic->condition ();
+           jit_value *cond = visit (expr);
+           jit_call *check = create_checked (&jit_typeinfo::logically_true,
+                                             cond);
+-          block->append (check);
+-
+           jit_block *body = create<jit_block> (i == 0 ? "if_body"
+                                                : "ifelse_body");
+           append (body);
+ 
+           jit_instruction *br = create<jit_cond_branch> (check, body,
+                                                         entry_blocks[i + 1]);
+           block->append (br);
+           block = body;
+@@ -2324,17 +2369,17 @@ jit_convert::visit_simple_assignment (tr
+ {
+   if (tsa.op_type () != octave_value::op_asn_eq)
+     fail ("Unsupported assign");
+ 
+   // resolve rhs
+   tree_expression *rhs = tsa.right_hand_side ();
+   jit_value *rhsv = visit (rhs);
+ 
+-  do_assign (tsa.left_hand_side (), rhsv);
++  result = do_assign (tsa.left_hand_side (), rhsv);
+ }
+ 
+ void
+ jit_convert::visit_statement (tree_statement& stmt)
+ {
+   tree_command *cmd = stmt.command ();
+   tree_expression *expr = stmt.expression ();
+ 
+@@ -2975,16 +3020,22 @@ jit_convert::convert_llvm::finish_phi (j
+ 
+ void
+ jit_convert::convert_llvm::visit (jit_const_string& cs)
+ {
+   cs.stash_llvm (builder.CreateGlobalStringPtr (cs.value ()));
+ }
+ 
+ void
++jit_convert::convert_llvm::visit (jit_const_bool& cb)
++{
++  cb.stash_llvm (llvm::ConstantInt::get (cb.type_llvm (), cb.value ()));
++}
++
++void
+ jit_convert::convert_llvm::visit (jit_const_scalar& cs)
+ {
+   cs.stash_llvm (llvm::ConstantFP::get (cs.type_llvm (), cs.value ()));
+ }
+ 
+ void jit_convert::convert_llvm::visit (jit_const_index& ci)
+ {
+   ci.stash_llvm (llvm::ConstantInt::get (ci.type_llvm (), ci.value ()));
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -770,16 +770,17 @@ private:
+   JIT_METH(store_argument);                     \
+   JIT_METH(phi);                                \
+   JIT_METH(variable);                           \
+   JIT_METH(error_check);                        \
+   JIT_METH(assign)                              \
+   JIT_METH(argument)
+ 
+ #define JIT_VISIT_IR_CONST                      \
++  JIT_METH(const_bool);                         \
+   JIT_METH(const_scalar);                       \
+   JIT_METH(const_index);                        \
+   JIT_METH(const_string);                       \
+   JIT_METH(const_range)
+ 
+ #define JIT_VISIT_IR_CLASSES                    \
+   JIT_VISIT_IR_NOTEMPLATE                       \
+   JIT_VISIT_IR_CONST
+@@ -797,16 +798,17 @@ class jit_convert;
+ // ABCs which aren't included in  JIT_VISIT_IR_ALL
+ class jit_instruction;
+ class jit_terminator;
+ 
+ template <typename T, jit_type *(*EXTRACT_T)(void), typename PASS_T = T,
+           bool QUOTE=false>
+ class jit_const;
+ 
++typedef jit_const<bool, jit_typeinfo::get_bool> jit_const_bool;
+ typedef jit_const<double, jit_typeinfo::get_scalar> jit_const_scalar;
+ typedef jit_const<octave_idx_type, jit_typeinfo::get_index> jit_const_index;
+ 
+ typedef jit_const<std::string, jit_typeinfo::get_string, const std::string&,
+                   true> jit_const_string;
+ typedef jit_const<jit_range, jit_typeinfo::get_range, const jit_range&>
+ jit_const_range;
+ 
+@@ -2218,16 +2220,17 @@ private:
+ 
+   std::list<jit_instruction *> worklist;
+ 
+   std::list<jit_value *> constants;
+ 
+   std::list<jit_value *> all_values;
+ 
+   size_t iterator_count;
++  size_t short_count;
+ 
+   typedef std::map<std::string, jit_variable *> vmap_t;
+   vmap_t vmap;
+ 
+   jit_call *create_checked_impl (jit_call *ret)
+   {
+     block->append (ret);
+     create_check (ret);

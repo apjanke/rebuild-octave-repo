@@ -1,0 +1,319 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1277967074 -7200
+#      Thu Jul 01 08:51:14 2010 +0200
+# Node ID 76079e505f9d7d26d71d24f59115c3b098f2c107
+# Parent  d9e57045b9e19d354cc4a272434e73dcc0069df6
+optimize cellfun with uniform struct output
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,22 @@
++2010-07-01  Jaroslav Hajek  <highegg@gmail.com>
++
++	* oct-map.cc (octave_fields::equal_up_to_order (const octave_fields&,
++	octave_idx_type *)): New overload.
++	(octave_fields::equal_up_to_order (const octave_fields&,
++	Array<octave_idx_type>&)): Use it here.
++	(octave_map::fast_elem_insert,
++	octave_map::fast_elem_extract): New methods.
++	* oct-map.h: Update decls.
++	* ov-struct.cc (octave_struct::fast_elem_extract,
++	octave_struct::fast_elem_insert,
++	octave_scalar_struct::fast_elem_insert_self): New methods.
++	* ov-struct.h: Update decls.
++
+ 2010-06-28  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* data.cc (single_type_concat): Optimize all scalars case where
+ 	applicable.
+ 	(single_type_concat_map, do_single_type_concat_map): New funcs.
+ 	* pt-mat.cc (get_concat_class): Handle cell and struct concats.
+ 
+ 
+diff --git a/src/oct-map.cc b/src/oct-map.cc
+--- a/src/oct-map.cc
++++ b/src/oct-map.cc
+@@ -103,43 +103,52 @@ octave_fields::orderfields (Array<octave
+       octave_idx_type j = q->second;
+       q->second = i;
+       perm(i++) = j;
+     }
+ }
+ 
+ bool 
+ octave_fields::equal_up_to_order (const octave_fields& other,
+-                                  Array<octave_idx_type>& perm) const
++                                  octave_idx_type* perm) const
+ {
+   bool retval = true;
+ 
+   octave_idx_type n = nfields ();
+-  if (perm.length () != n)
+-    perm.clear (1, n);
+-  else
+-    perm.make_unique (); // optimization
+ 
+   iterator p = begin (), q = other.begin ();
+   for (; p != end () && q != other.end (); p++, q++)
+     {
+       if (p->first == q->first)
+-        perm.xelem(p->second) = q->second;
++        perm[p->second] = q->second;
+       else
+         {
+           retval = false;
+           break;
+         }
+     }
+ 
+   retval = (p == end () && q == other.end ());
+ 
+   return retval;
+ }
+ 
++bool 
++octave_fields::equal_up_to_order (const octave_fields& other,
++                                  Array<octave_idx_type>& perm) const
++{
++  bool retval = true;
++
++  octave_idx_type n = nfields ();
++  if (perm.length () != n)
++    perm.clear (1, n);
++
++  return equal_up_to_order (other, perm.fortran_vec ());
++}
++
+ string_vector
+ octave_fields::fieldnames (void) const
+ {
+   octave_idx_type n = nfields ();
+   string_vector retval(n);
+ 
+   for (iterator p = begin (); p != end (); p++)
+     retval.xelem(p->second) = p->first;
+@@ -377,16 +386,55 @@ octave_map::checkelem (const Array<octav
+   octave_scalar_map retval (xkeys);
+ 
+   // Optimize this so that there is just one check.
+   extract_scalar (retval, compute_index (ra_idx, dimensions));
+ 
+   return retval;
+ }
+ 
++octave_scalar_map
++octave_map::fast_elem_extract (octave_idx_type n) const
++{
++  octave_scalar_map retval (xkeys);
++
++  extract_scalar (retval, n);
++
++  return retval;
++}
++
++bool
++octave_map::fast_elem_insert (octave_idx_type n, 
++                              const octave_scalar_map& rhs)
++{
++  bool retval = false;
++
++  octave_idx_type nf = nfields ();
++  if (rhs.xkeys.is_same (xkeys))
++    {
++      for (octave_idx_type i = 0; i < nf; i++)
++        xvals[i](n) = rhs.xvals[i];
++
++      retval = true;
++    }
++  else
++    {
++      OCTAVE_LOCAL_BUFFER (octave_idx_type, perm, nf);
++      if (xkeys.equal_up_to_order (rhs.xkeys, perm))
++        {
++          for (octave_idx_type i = 0; i < nf; i++)
++            xvals[i](n) = rhs.xvals[perm[i]];
++
++          retval = true;
++        }
++    }
++
++  return retval;
++}
++
+ octave_map
+ octave_map::squeeze (void) const
+ {
+   octave_map retval (*this);
+   octave_idx_type nf = nfields ();
+ 
+   retval.dimensions = dimensions.squeeze ();
+   
+diff --git a/src/oct-map.h b/src/oct-map.h
+--- a/src/oct-map.h
++++ b/src/oct-map.h
+@@ -119,16 +119,19 @@ public:
+   // order the fields of this map. creates a permutation
+   // used to order the fields.
+   void orderfields (Array<octave_idx_type>& perm);
+ 
+   // compares two instances for equality up to order of fields.
+   // returns a permutation needed to bring the fields of *other*
+   // into the order of *this*.
+   bool equal_up_to_order (const octave_fields& other,
++                          octave_idx_type* perm) const;
++
++  bool equal_up_to_order (const octave_fields& other,
+                           Array<octave_idx_type>& perm) const;
+ 
+   bool is_same (const octave_fields& other) const
+     { return rep == other.rep; }
+ 
+   // Returns the fields as a vector of strings.
+   string_vector fieldnames (void) const;
+ 
+@@ -427,16 +430,22 @@ public:
+   void delete_elements (int dim, const idx_vector& i);
+ 
+   void delete_elements (const Array<idx_vector>& ia);
+ 
+   void delete_elements (const octave_value_list&);
+ 
+   octave_map concat (const octave_map& rb, const Array<octave_idx_type>& ra_idx);
+ 
++  // like checkelem, but no check.
++  octave_scalar_map fast_elem_extract (octave_idx_type n) const;
++
++  // element assignment, no bounds check
++  bool fast_elem_insert (octave_idx_type n, const octave_scalar_map& rhs);
++
+ private:
+ 
+   octave_fields xkeys;
+   std::vector<Cell> xvals;
+   dim_vector dimensions;
+ 
+   void optimize_dimensions (void);
+   void extract_scalar (octave_scalar_map& dest, 
+diff --git a/src/ov-struct.cc b/src/ov-struct.cc
+--- a/src/ov-struct.cc
++++ b/src/ov-struct.cc
+@@ -1069,16 +1069,43 @@ octave_struct::as_mxArray (void) const
+       mwIndex k = 0;
+       for (mwIndex j = i; j < ntot; j += nf)
+         elts[j] = new mxArray (p[k++]);
+     }
+ 
+   return retval;
+ }
+ 
++octave_value
++octave_struct::fast_elem_extract (octave_idx_type n) const
++{
++  if (n < map.numel ())
++    return map.checkelem (n);
++  else
++    return octave_value ();
++}
++
++bool
++octave_struct::fast_elem_insert (octave_idx_type n, 
++                                 const octave_value& x)
++{
++  bool retval = false;
++
++  if (n < map.numel ())
++    {
++      // To avoid copying the scalar struct, it just stores a pointer to
++      // itself.
++      const octave_scalar_map *sm_ptr;
++      void *here = reinterpret_cast<void *>(&sm_ptr);
++      return (x.get_rep().fast_elem_insert_self (here, btyp_struct)
++              && map.fast_elem_insert (n, *sm_ptr));
++    }
++
++  return retval;
++}
+ DEFINE_OCTAVE_ALLOCATOR(octave_scalar_struct);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA(octave_scalar_struct, "scalar struct", "struct");
+ 
+ octave_value
+ octave_scalar_struct::dotref (const octave_value_list& idx, bool auto_add)
+ {
+   assert (idx.length () == 1);
+@@ -1677,16 +1704,28 @@ octave_scalar_struct::as_mxArray (void) 
+ 
+ 
+ octave_value
+ octave_scalar_struct::to_array (void)
+ {
+   return new octave_struct (octave_map (map));
+ }
+ 
++bool
++octave_scalar_struct::fast_elem_insert_self (void *where, builtin_type_t btyp) const
++{
++
++  if (btyp == btyp_struct)
++    {
++      *(reinterpret_cast<const octave_scalar_map **>(where)) = &map;
++      return true;
++    }
++  else
++    return false;
++}
+ /*
+ %!shared x
+ %! x(1).a=1; x(2).a=2; x(1).b=3; x(2).b=3;
+ %!assert(struct('a',1,'b',3),x(1))
+ %!assert(isempty(x([])))
+ %!assert(isempty(struct('a',{},'b',{})))
+ %!assert(struct('a',{1,2},'b',{3,3}),x)
+ %!assert(struct('a',{1,2},'b',3),x)
+diff --git a/src/ov-struct.h b/src/ov-struct.h
+--- a/src/ov-struct.h
++++ b/src/ov-struct.h
+@@ -148,16 +148,22 @@ public:
+ #if defined (HAVE_HDF5)
+   bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
+ 
+   bool load_hdf5 (hid_t loc_id, const char *name);
+ #endif
+ 
+   mxArray *as_mxArray (void) const;
+ 
++  octave_value
++  fast_elem_extract (octave_idx_type n) const;
++
++  bool
++  fast_elem_insert (octave_idx_type n, const octave_value& x);
++
+ protected:
+ 
+   // The associative array used to manage the structure data.
+   octave_map map;
+ 
+ private:
+ 
+   DECLARE_OCTAVE_ALLOCATOR
+@@ -263,16 +269,18 @@ public:
+ #if defined (HAVE_HDF5)
+   bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
+ 
+   bool load_hdf5 (hid_t loc_id, const char *name);
+ #endif
+ 
+   mxArray *as_mxArray (void) const;
+ 
++  bool fast_elem_insert_self (void *where, builtin_type_t btyp) const;
++
+ protected:
+ 
+   // The associative array used to manage the structure data.
+   octave_scalar_map map;
+ 
+ private:
+ 
+   octave_value to_array (void);

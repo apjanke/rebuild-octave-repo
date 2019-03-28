@@ -1,0 +1,201 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1260867874 -3600
+#      Tue Dec 15 10:04:34 2009 +0100
+# Node ID 672e1b49e01e39dbb326a9d3697761569cfe97fe
+# Parent  43a29eeda9949eae63aaeee54f1e5271cd35aed4
+optimize indexing of ranges by single subscripts
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,14 @@
++2009-12-15  Jaroslav Hajek  <highegg@gmail.com>
++
++	* Range.cc (Range::elem, Range::checkelem, Range::index):
++	New methods.
++	* Range.h: Declare them.
++
+ 2009-12-15  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* idx-vector.h (idx_vector::loop, idx_vector::bloop): Fix behavior for
+ 	masks.
+ 
+ 2009-12-13  Rik <octave@nomad.inbox5.com>
+ 
+ 	* Makefile.am: Use DISTCLEANFILES rather than distclean-local rule.
+diff --git a/liboctave/Range.cc b/liboctave/Range.cc
+--- a/liboctave/Range.cc
++++ b/liboctave/Range.cc
+@@ -76,16 +76,67 @@ Range::matrix_value (void) const
+       if ((rng_inc > 0 && cache(rng_nelem-1) > rng_limit)
+ 	  || (rng_inc < 0 && cache(rng_nelem-1) < rng_limit))
+ 	cache(rng_nelem-1) = rng_limit;
+     }
+ 
+   return cache;
+ }
+ 
++double
++Range::checkelem (octave_idx_type i) const
++{
++  if (i < 0 || i >= rng_nelem)
++    (*current_liboctave_error_handler) ("Range::elem (%d): range error", i);
++
++  return rng_base + rng_inc * i;
++}
++
++struct _rangeidx_helper
++{
++  double *array, base, inc;
++  _rangeidx_helper (double *a, double b, double i) 
++    : array (a), base (b), inc (i) { }
++  void operator () (octave_idx_type i)
++    { *array++ = base + i * inc; }
++};
++
++Array<double> 
++Range::index (const idx_vector& i) const
++{
++  Array<double> retval;
++
++  octave_idx_type n = rng_nelem;
++
++  if (i.is_colon ())
++    {
++      retval = matrix_value ().reshape (dim_vector (rng_nelem, 1));
++    }
++  else if (i.extent (n) != n)
++    {
++      (*current_liboctave_error_handler)
++        ("A(I): Index exceeds matrix dimension.");
++    }
++  else
++    {
++      dim_vector rd = i.orig_dimensions ();
++      octave_idx_type il = i.length (n);
++
++      // taken from Array.cc.
++
++      if (n != 1 && rd.is_vector ())
++        rd = dim_vector (1, il);
++
++      retval.clear (rd);
++
++      i.loop (n, _rangeidx_helper (retval.fortran_vec (), rng_base, rng_inc));
++    }
++
++  return retval;
++}
+ 
+ // NOTE: max and min only return useful values if nelem > 0.
+ 
+ double
+ Range::min (void) const
+ {
+   double retval = 0.0;
+   if (rng_nelem > 0)
+diff --git a/liboctave/Range.h b/liboctave/Range.h
+--- a/liboctave/Range.h
++++ b/liboctave/Range.h
+@@ -72,16 +72,31 @@ Range
+ 
+   Range sort (octave_idx_type dim = 0, sortmode mode = ASCENDING) const;
+ 
+   Range sort (Array<octave_idx_type>& sidx, octave_idx_type dim = 0,
+ 	      sortmode mode = ASCENDING) const;
+ 
+   sortmode is_sorted (sortmode mode = ASCENDING) const;
+ 
++  // Support for single-index subscripting, without generating matrix cache.
++
++  double checkelem (octave_idx_type i) const;
++
++  double elem (octave_idx_type i) const
++    {
++#if defined (BOUNDS_CHECKING)
++      return checkelem (i);
++#else
++      return rng_base + rng_inc * i;
++#endif
++    }
++
++  Array<double> index (const idx_vector& i) const;
++
+   void set_base (double b)
+   {
+     if (rng_base != b)
+       {
+ 	rng_base = b;
+ 	clear_cache ();
+       }
+   }
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,13 @@
++2009-12-14  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov-range.cc (octave_range::do_index_op): Defer single subscript to
++	new Range methods.
++
+ 2009-12-14  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* symtab.cc (symbol_table::cleanup): New static method.
+ 	* symtab.h: Declare it.
+ 	* toplev.cc (clean_up_and_exit): Call it here.
+ 
+ 2009-12-12  Shai Ayal  <shaiay@users.sourceforge.net>
+ 
+diff --git a/src/ov-range.cc b/src/ov-range.cc
+--- a/src/ov-range.cc
++++ b/src/ov-range.cc
+@@ -113,29 +113,38 @@ octave_range::subsref (const std::string
+     }
+ 
+   return retval.next_subsref (type, idx);
+ }
+ 
+ octave_value
+ octave_range::do_index_op (const octave_value_list& idx, bool resize_ok)
+ {
+-  // FIXME -- this doesn't solve the problem of
+-  //
+-  //   a = 1:5; a(1, 1, 1)
+-  //
+-  // and similar constructions.  Hmm...
++  if (idx.length () == 1 && ! resize_ok)
++    {
++      octave_value retval;
+ 
+-  // FIXME -- using this constructor avoids possibly narrowing
+-  // the range to a scalar value.  Need a better solution to this
+-  // problem.
++      // The range can handle a single subscript.
++      idx_vector i = idx(0).index_vector ();
++      if (! error_state)
++        {
++          if (i.is_scalar () && i(0) < range.nelem ())
++            retval = range.elem (i(0));
++          else
++            retval = range.index (i);
++        }
+ 
+-  octave_value tmp (new octave_matrix (range.matrix_value ()));
++      return retval;
++    }
++  else
++    {
++      octave_value tmp (new octave_matrix (range.matrix_value ()));
+ 
+-  return tmp.do_index_op (idx, resize_ok);
++      return tmp.do_index_op (idx, resize_ok);
++    }
+ }
+ 
+ double
+ octave_range::double_value (bool) const
+ {
+   double retval = lo_ieee_nan_value ();
+ 
+   octave_idx_type nel = range.nelem ();

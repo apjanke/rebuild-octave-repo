@@ -1,0 +1,747 @@
+# HG changeset patch
+# User jwe
+# Date 1015542010 0
+#      Thu Mar 07 23:00:10 2002 +0000
+# Node ID 55648fc616c853eef235bb6b5174f988deb82b72
+# Parent  a134e5cfdc01ee4358aeead816cba0f7c169576b
+[project @ 2002-03-07 23:00:09 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,31 @@
++2002-03-07  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* pt-loop.cc (evaluating_looping_command): New global.
++	(tree_while_command::eval): Protect evaluating_looping_command.
++	Set it to true while evaluating loop.
++	(tree_do_until_command::eval): Ditto.
++	(tree_simple_for_command::eval): Ditto.
++	(tree_complex_for_command::eval): Ditto.
++	* pt-loop.h (evaluating_looping_command): Provide decl.
++	* parse.y (parse_fcn_file): Protect get_input_from_eval_string.
++	Set get_input_from_eval_string to false before calling yyparse.
++	(make_break_command): Also check evaluating_looping_command.
++	(make_continue_command): Also check evaluating_looping_command.
++	(eval_string (const std::string&, bool, int&, int)): Loop over
++	yyparse to handle multi-line strings.
++	Move call to unwind_protect::run_frame to end of function.
++	Don't reset parser before calling yyparse.
++	Correctly handle return, break, and continue.
++
++	* input.cc (input_from_eval_string_pending): New global variable.
++	(get_usr_input): Use it.
++	* input.h (input_from_eval_string_pending): Provide decl.
++
+ 2002-03-06  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* ov-usr-fcn.cc (octave_user_function::do_multi_index_op):
+ 	Don't unwind_protect num_named_args (it doesn't change on
+ 	recursive calls).
+ 	Do re-initialize curr_va_arg_number to num_named_args after
+ 	unwind_protecting.
+ 
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -93,16 +93,20 @@ octave_time Vlast_prompt_time;
+ static char Vcompletion_append_char;
+ 
+ // Global pointer for eval().
+ std::string current_eval_string;
+ 
+ // TRUE means get input from current_eval_string.
+ bool get_input_from_eval_string = false;
+ 
++// TRUE means we haven't been asked for the input from
++// current_eval_string yet.
++bool input_from_eval_string_pending = false;
++
+ // TRUE means we're parsing a function file.
+ bool reading_fcn_file = false;
+ 
+ // Simple name of function file we are reading.
+ std::string curr_fcn_file_name;
+ 
+ // Full name of file we are reading.
+ std::string curr_fcn_file_full_name;
+@@ -244,22 +248,27 @@ octave_gets (void)
+ 
+ static std::string
+ get_user_input (void)
+ {
+   std::string retval;
+ 
+   if (get_input_from_eval_string)
+     {
+-      retval = current_eval_string;
++      if (input_from_eval_string_pending)
++	{
++	  input_from_eval_string_pending = false;
++
++	  retval = current_eval_string;
+ 
+-      size_t len = retval.length ();
++	  size_t len = retval.length ();
+ 
+-      if (retval[len-1] != '\n')
+-	retval.append ("\n");
++	  if (retval[len-1] != '\n')
++	    retval.append ("\n");
++	}
+     }
+   else
+     retval = octave_gets ();
+ 
+   current_input_line = retval;
+ 
+   if (! get_input_from_eval_string)
+     input_line_number++;
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -40,16 +40,20 @@ extern FILE *get_input_from_file (const 
+ extern FILE *get_input_from_stdin (void);
+ 
+ // Global pointer for eval().
+ extern std::string current_eval_string;
+ 
+ // TRUE means get input from current_eval_string.
+ extern bool get_input_from_eval_string;
+ 
++// TRUE means we haven't been asked for the input from
++// current_eval_string yet.
++extern bool input_from_eval_string_pending;
++
+ // TRUE means we're parsing a function file.
+ extern bool reading_fcn_file;
+ 
+ // Simple name of function file we are reading.
+ extern std::string curr_fcn_file_name;
+ 
+ // Full name of file we are reading.
+ extern std::string curr_fcn_file_full_name;
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -2199,17 +2199,18 @@ static tree_command *
+ make_break_command (token *break_tok)
+ {
+   tree_command *retval = 0;
+ 
+   int l = break_tok->line ();
+   int c = break_tok->column ();
+ 
+   if (lexer_flags.looping || lexer_flags.defining_func
+-      || reading_script_file || evaluating_function_body)
++      || reading_script_file || evaluating_function_body
++      || evaluating_looping_command)
+     retval = new tree_break_command (l, c);
+   else
+     retval = new tree_no_op_command ("break", l, c);
+ 
+   return retval;
+ }
+ 
+ // Build a continue command.
+@@ -2217,17 +2218,17 @@ make_break_command (token *break_tok)
+ static tree_command *
+ make_continue_command (token *continue_tok)
+ {
+   tree_command *retval = 0;
+ 
+   int l = continue_tok->line ();
+   int c = continue_tok->column ();
+ 
+-  if (lexer_flags.looping)
++  if (lexer_flags.looping || evaluating_looping_command)
+     retval = new tree_continue_command (l, c);
+   else
+     retval = new tree_no_op_command ("continue", l, c);
+ 
+   return retval;
+ }
+ 
+ // Build a return command.
+@@ -3130,21 +3131,23 @@ parse_fcn_file (const std::string& ff, b
+ 	  command_history::ignore_entries ();
+ 
+ 	  unwind_protect::add (restore_command_history, 0);
+ 
+ 	  unwind_protect_int (Vecho_executing_commands);
+ 	  unwind_protect_bool (Vsaving_history);
+ 	  unwind_protect_bool (reading_fcn_file);
+ 	  unwind_protect_bool (input_from_command_line_file);
++	  unwind_protect_bool (get_input_from_eval_string);
+ 
+ 	  Vecho_executing_commands = ECHO_OFF;
+ 	  Vsaving_history = false;
+ 	  reading_fcn_file = true;
+ 	  input_from_command_line_file = false;
++	  get_input_from_eval_string = false;
+ 
+ 	  YY_BUFFER_STATE old_buf = current_buffer ();
+ 	  YY_BUFFER_STATE new_buf = create_buffer (ffile);
+ 
+ 	  unwind_protect::add (restore_input_buffer, (void *) old_buf);
+ 	  unwind_protect::add (delete_input_buffer, (void *) new_buf);
+ 
+ 	  switch_to_buffer (new_buf);
+@@ -3385,57 +3388,69 @@ by name, and use @code{feval} to call th
+     print_usage ("feval");
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ eval_string (const std::string& s, bool silent, int& parse_status, int nargout)
+ {
++  octave_value_list retval;
++
+   unwind_protect::begin_frame ("eval_string");
+ 
+   unwind_protect_bool (get_input_from_eval_string);
++  unwind_protect_bool (input_from_eval_string_pending);
+   unwind_protect_bool (input_from_command_line_file);
+-  unwind_protect_ptr (global_command);
+   unwind_protect_str (current_eval_string);
+ 
+   get_input_from_eval_string = true;
++  input_from_eval_string_pending = true;
+   input_from_command_line_file = false;
+   current_eval_string = s;
+ 
++  unwind_protect_ptr (global_command);
++
+   YY_BUFFER_STATE old_buf = current_buffer ();
+   YY_BUFFER_STATE new_buf = create_buffer (0);
+ 
+   unwind_protect::add (restore_input_buffer, old_buf);
+   unwind_protect::add (delete_input_buffer, new_buf);
+ 
+   switch_to_buffer (new_buf);
+ 
+   unwind_protect_ptr (curr_sym_tab);
+ 
+-  reset_parser ();
+-
+-  parse_status = yyparse ();
+-
+-  // Important to reset the idea of where input is coming from before
+-  // trying to eval the command we just parsed -- it might contain the
+-  // name of an function file that still needs to be parsed!
+-
+-  tree_statement_list *command = global_command;
++  do
++    {
++      parse_status = yyparse ();
++
++      tree_statement_list *command = global_command;
++
++      if (parse_status == 0 && command)
++        {
++	  retval = command->eval (silent, nargout);
++
++	  delete command;
++
++	  command = 0;
++
++	  if (error_state
++	      || tree_return_command::returning
++	      || tree_break_command::breaking
++	      || tree_continue_command::continuing)
++	    break;
++	}
++      else
++	break;
++    }
++  while (parse_status == 0);
+ 
+   unwind_protect::run_frame ("eval_string");
+ 
+-  octave_value_list retval;
+-
+-  if (parse_status == 0 && command)
+-    {
+-      retval = command->eval (silent, nargout);
+-      delete command;
+-    }
+-
+   return retval;
+ }
+ 
+ octave_value
+ eval_string (const std::string& s, bool silent, int& parse_status)
+ {
+   octave_value retval;
+ 
+diff --git a/src/pt-loop.cc b/src/pt-loop.cc
+--- a/src/pt-loop.cc
++++ b/src/pt-loop.cc
+@@ -36,16 +36,20 @@ Software Foundation, 59 Temple Place - S
+ #include "pt-arg-list.h"
+ #include "pt-bp.h"
+ #include "pt-cmd.h"
+ #include "pt-exp.h"
+ #include "pt-jump.h"
+ #include "pt-loop.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
++#include "unwind-prot.h"
++
++// TRUE means we are evaluating some kind of looping construct.
++bool evaluating_looping_command = false;
+ 
+ // Decide if it's time to quit a for or while loop.
+ static inline bool
+ quit_loop_now (void)
+ {
+   // Maybe handle `continue N' someday...
+ 
+   if (tree_continue_command::continuing)
+@@ -73,40 +77,49 @@ tree_while_command::~tree_while_command 
+ }
+ 
+ void
+ tree_while_command::eval (void)
+ {
+   if (error_state)
+     return;
+ 
++  unwind_protect::begin_frame ("while_command::eval");
++
++  unwind_protect_bool (evaluating_looping_command);
++
++  evaluating_looping_command = true;
++
+   if (! expr)
+     panic_impossible ();
+ 
+   for (;;)
+     {
+       if (expr->is_logically_true ("while"))
+ 	{
+ 	  if (list)
+ 	    {
+ 	      list->eval ();
+ 
+ 	      if (error_state)
+ 		{
+ 		  eval_error ();
+-		  return;
++		  goto cleanup;
+ 		}
+ 	    }
+ 
+ 	  if (quit_loop_now ())
+ 	    break;
+ 	}
+       else
+ 	break;
+     }
++
++ cleanup:
++  unwind_protect::run_frame ("while_command::eval");
+ }
+ 
+ void
+ tree_while_command::eval_error (void)
+ {
+   if (error_state > 0)
+     ::error ("evaluating while command near line %d, column %d",
+ 	     line (), column ());
+@@ -121,37 +134,46 @@ tree_while_command::accept (tree_walker&
+ // Do-Until
+ 
+ void
+ tree_do_until_command::eval (void)
+ {
+   if (error_state)
+     return;
+ 
++  unwind_protect::begin_frame ("do_until_command::eval");
++
++  unwind_protect_bool (evaluating_looping_command);
++
++  evaluating_looping_command = true;
++
+   if (! expr)
+     panic_impossible ();
+ 
+   for (;;)
+     {
+       MAYBE_DO_BREAKPOINT;
+ 
+       if (list)
+ 	{
+ 	  list->eval ();
+ 
+ 	  if (error_state)
+ 	    {
+ 	      eval_error ();
+-	      return;
++	      goto cleanup;
+ 	    }
+ 	}
+ 
+       if (quit_loop_now () || expr->is_logically_true ("do-until"))
+ 	break;
+     }
++
++ cleanup:
++  unwind_protect::run_frame ("do_until_command::eval");
+ }
+ 
+ void
+ tree_do_until_command::eval_error (void)
+ {
+   if (error_state > 0)
+     ::error ("evaluating do-until command near line %d, column %d",
+ 	     line (), column ());
+@@ -218,154 +240,165 @@ tree_simple_for_command::do_for_loop_onc
+   while (0)
+ 
+ void
+ tree_simple_for_command::eval (void)
+ {
+   if (error_state)
+     return;
+ 
++  unwind_protect::begin_frame ("simple_for_command::eval");
++
++  unwind_protect_bool (evaluating_looping_command);
++
++  evaluating_looping_command = true;
++
+   octave_value rhs = expr->rvalue ();
+ 
+   if (error_state || rhs.is_undefined ())
+     {
+       eval_error ();
+-      return;
+-    }
+-
+-  octave_lvalue ult = lhs->lvalue ();
+-
+-  if (error_state)
+-    {
+-      eval_error ();
+-      return;
++      goto cleanup;
+     }
+ 
+-  if (rhs.is_range ())
+-    {
+-      Range rng = rhs.range_value ();
++  {
++    octave_lvalue ult = lhs->lvalue ();
+ 
+-      int steps = rng.nelem ();
+-      double b = rng.base ();
+-      double increment = rng.inc ();
++    if (error_state)
++      {
++	eval_error ();
++	goto cleanup;
++      }
++
++    if (rhs.is_range ())
++      {
++	Range rng = rhs.range_value ();
+ 
+-      for (int i = 0; i < steps; i++)
+-	{
+-	  MAYBE_DO_BREAKPOINT;
++	int steps = rng.nelem ();
++	double b = rng.base ();
++	double increment = rng.inc ();
+ 
+-	  double tmp_val = b + i * increment;
++	for (int i = 0; i < steps; i++)
++	  {
++	    MAYBE_DO_BREAKPOINT;
+ 
+-	  octave_value val (tmp_val);
++	    double tmp_val = b + i * increment;
++
++	    octave_value val (tmp_val);
+ 
+-	  bool quit = false;
++	    bool quit = false;
+ 
+-	  do_for_loop_once (ult, val, quit);
++	    do_for_loop_once (ult, val, quit);
+ 
+-	  if (quit)
+-	    break;
+-	}
+-    }
+-  else if (rhs.is_scalar_type ())
+-    {
+-      bool quit = false;
+-      
+-      MAYBE_DO_BREAKPOINT;
++	    if (quit)
++	      break;
++	  }
++      }
++    else if (rhs.is_scalar_type ())
++      {
++	bool quit = false;
++
++	MAYBE_DO_BREAKPOINT;
+ 
+-      do_for_loop_once (ult, rhs, quit);
+-    }
+-  else if (rhs.is_string ())
+-    {
+-      charMatrix chm_tmp = rhs.char_matrix_value ();
+-      int nr = chm_tmp.rows ();
+-      int steps = chm_tmp.columns ();
++	do_for_loop_once (ult, rhs, quit);
++      }
++    else if (rhs.is_string ())
++      {
++	charMatrix chm_tmp = rhs.char_matrix_value ();
++	int nr = chm_tmp.rows ();
++	int steps = chm_tmp.columns ();
+ 
+-      if (error_state)
+-	return;
++	if (error_state)
++	  goto cleanup;
+ 
+-      if (nr == 1)
+-	DO_LOOP (chm_tmp (0, i));
+-      else
+-	{
+-	  for (int i = 0; i < steps; i++)
+-	    {
+-	      MAYBE_DO_BREAKPOINT;
++	if (nr == 1)
++	  DO_LOOP (chm_tmp (0, i));
++	else
++	  {
++	    for (int i = 0; i < steps; i++)
++	      {
++		MAYBE_DO_BREAKPOINT;
+ 
+-	      octave_value val (chm_tmp.extract (0, i, nr-1, i), true);
++		octave_value val (chm_tmp.extract (0, i, nr-1, i), true);
+ 
+-	      bool quit = false;
++		bool quit = false;
+ 
+-	      do_for_loop_once (ult, val, quit);
++		do_for_loop_once (ult, val, quit);
+ 
+-	      if (quit)
+-		break;
+-	    }
+-	}
+-    }
+-  else if (rhs.is_matrix_type ())
+-    {
+-      Matrix m_tmp;
+-      ComplexMatrix cm_tmp;
++		if (quit)
++		  break;
++	      }
++	  }
++      }
++    else if (rhs.is_matrix_type ())
++      {
++	Matrix m_tmp;
++	ComplexMatrix cm_tmp;
+ 
+-      int nr;
+-      int steps;
++	int nr;
++	int steps;
+ 
+-      if (rhs.is_real_matrix ())
+-	{
+-	  m_tmp = rhs.matrix_value ();
+-	  nr = m_tmp.rows ();
+-	  steps = m_tmp.columns ();
+-	}
+-      else
+-	{
+-	  cm_tmp = rhs.complex_matrix_value ();
+-	  nr = cm_tmp.rows ();
+-	  steps = cm_tmp.columns ();
+-	}
++	if (rhs.is_real_matrix ())
++	  {
++	    m_tmp = rhs.matrix_value ();
++	    nr = m_tmp.rows ();
++	    steps = m_tmp.columns ();
++	  }
++	else
++	  {
++	    cm_tmp = rhs.complex_matrix_value ();
++	    nr = cm_tmp.rows ();
++	    steps = cm_tmp.columns ();
++	  }
+ 
+-      if (error_state)
+-	return;
++	if (error_state)
++	  goto cleanup;
+ 
+-      if (rhs.is_real_matrix ())
+-	{
+-	  if (nr == 1)
+-	    DO_LOOP (m_tmp (0, i));
+-	  else
+-	    DO_LOOP (m_tmp.extract (0, i, nr-1, i));
+-	}
+-      else
+-	{
+-	  if (nr == 1)
+-	    DO_LOOP (cm_tmp (0, i));
+-	  else
+-	    DO_LOOP (cm_tmp.extract (0, i, nr-1, i));
+-	}
+-    }
+-  else if (rhs.is_map ())
+-    {
+-      Octave_map tmp_val (rhs.map_value ());
++	if (rhs.is_real_matrix ())
++	  {
++	    if (nr == 1)
++	      DO_LOOP (m_tmp (0, i));
++	    else
++	      DO_LOOP (m_tmp.extract (0, i, nr-1, i));
++	  }
++	else
++	  {
++	    if (nr == 1)
++	      DO_LOOP (cm_tmp (0, i));
++	    else
++	      DO_LOOP (cm_tmp.extract (0, i, nr-1, i));
++	  }
++      }
++    else if (rhs.is_map ())
++      {
++	Octave_map tmp_val (rhs.map_value ());
+ 
+-      for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
+-	{
+-	  MAYBE_DO_BREAKPOINT;
++	for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
++	  {
++	    MAYBE_DO_BREAKPOINT;
+ 
+-	  octave_value val = tmp_val.contents (p);
++	    octave_value val = tmp_val.contents (p);
+ 
+-	  bool quit = false;
++	    bool quit = false;
+ 
+-	  do_for_loop_once (ult, val, quit);
++	    do_for_loop_once (ult, val, quit);
+ 
+-	  if (quit)
+-	    break;
+-	}
+-    }
+-  else
+-    {
+-      ::error ("invalid type in for loop expression near line %d, column %d",
+-	       line (), column ());
+-    }
++	    if (quit)
++	      break;
++	  }
++      }
++    else
++      {
++	::error ("invalid type in for loop expression near line %d, column %d",
++		 line (), column ());
++      }
++  }
++
++ cleanup:
++  unwind_protect::run_frame ("simple_for_command::eval");
+ }
+ 
+ void
+ tree_simple_for_command::eval_error (void)
+ {
+   if (error_state > 0)
+     ::error ("evaluating for command near line %d, column %d",
+ 	     line (), column ());
+@@ -414,22 +447,28 @@ tree_complex_for_command::do_for_loop_on
+ }
+ 
+ void
+ tree_complex_for_command::eval (void)
+ {
+   if (error_state)
+     return;
+ 
++  unwind_protect::begin_frame ("complex_for_command::eval");
++
++  unwind_protect_bool (evaluating_looping_command);
++
++  evaluating_looping_command = true;
++
+   octave_value rhs = expr->rvalue ();
+ 
+   if (error_state || rhs.is_undefined ())
+     {
+       eval_error ();
+-      return;
++      goto cleanup;
+     }
+ 
+   if (rhs.is_map ())
+     {
+       // Cycle through structure elements.  First element of id_list
+       // is set to value and the second is set to the name of the
+       // structure element.
+ 
+@@ -455,16 +494,19 @@ tree_complex_for_command::eval (void)
+ 	  do_for_loop_once (key_ref, val_ref, key, val, quit);
+ 
+ 	  if (quit)
+ 	    break;
+ 	}
+     }
+   else
+     error ("in statement `for [X, Y] = VAL', VAL must be a structure");
++
++ cleanup:
++  unwind_protect::run_frame ("complex_for_command::eval");
+ }
+ 
+ void
+ tree_complex_for_command::eval_error (void)
+ {
+   if (error_state > 0)
+     ::error ("evaluating for command near line %d, column %d",
+ 	     line (), column ());
+diff --git a/src/pt-loop.h b/src/pt-loop.h
+--- a/src/pt-loop.h
++++ b/src/pt-loop.h
+@@ -34,16 +34,19 @@ class tree_argument_list;
+ class tree_expression;
+ class tree_statement_list;
+ 
+ class tree_walker;
+ 
+ #include "comment-list.h"
+ #include "pt-cmd.h"
+ 
++// TRUE means we are evaluating some kind of looping construct.
++extern bool evaluating_looping_command;
++
+ // While.
+ 
+ class
+ tree_while_command : public tree_command
+ {
+ public:
+ 
+   tree_while_command (int l = -1, int c = -1)

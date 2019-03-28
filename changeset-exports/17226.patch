@@ -1,0 +1,502 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1375980110 -3600
+#      Thu Aug 08 17:41:50 2013 +0100
+# Node ID 46805642048f4329314a6be6dd8871a9b88417b6
+# Parent  06824c3b1ff3fc1584d34db80ef999020d48709c
+Implement writing of indexed images.
+
+* __magick_read__.cc (encode_indexed_images): new function to create a
+  Magick::Image object from an indexed image and colormap.
+  (encode_uint_image): remove section about indexed image which was
+  unfinished and is now completely done by a separate function.
+  (encode_map): remove commented function for dealing with colormap
+  which was never finished.
+  (__magick_write__): implement writing of indexed images (integers only);
+  refactor the actual writing of the file and dealing of the WriteMode
+  option to make flow simpler.
+* private/__imwrite__.m: remove hack with ind2rgb() since writing of indexed
+  images is now implemented; conversion of floating point indexed images to
+  integer since it looks ugly in C++; also validate size 4 in the 3rd dimension
+  of an image for CMYK images.
+
+diff --git a/libinterp/dldfcn/__magick_read__.cc b/libinterp/dldfcn/__magick_read__.cc
+--- a/libinterp/dldfcn/__magick_read__.cc
++++ b/libinterp/dldfcn/__magick_read__.cc
+@@ -303,17 +303,17 @@ read_images (std::vector<Magick::Image>&
+           }
+         case Magick::ColorSeparationMatteType:
+           {
+             type = Magick::ColorSeparationType;
+             break;
+           }
+         default:
+           {
+-            // do nothing, other than silencing warnings about enumeration
++            // Do nothing other than silencing warnings about enumeration
+             // values not being handled in switch.
+           }
+         }
+     }
+ 
+   switch (type)
+     {
+     case Magick::BilevelType:           // Monochrome bi-level image
+@@ -533,17 +533,16 @@ read_images (std::vector<Magick::Image>&
+       error ("__magick_read__: unknown Magick++ image type");
+       return retval;
+     }
+ 
+   retval(0) = img;
+   return retval;
+ }
+ 
+-
+ void static
+ read_file (const std::string filename, std::vector<Magick::Image>& imvec)
+ {
+   try
+     {
+       // Read a file into vector of image objects
+       Magick::readImages (&imvec, filename);
+     }
+@@ -559,17 +558,16 @@ read_file (const std::string filename, s
+     }
+   catch (Magick::Exception& e)
+     {
+       error ("Magick++ exception: %s", e.what ());
+       error_state = 1;
+     }
+ }
+ 
+-
+ static void
+ maybe_initialize_magick (void)
+ {
+   static bool initialized = false;
+ 
+   if (! initialized)
+     {
+       // Save locale as GraphicsMagick might change this (fixed in
+@@ -743,16 +741,96 @@ use @code{imread}.\n\
+ 
+ /*
+ ## No test needed for internal helper function.
+ %!assert (1)
+ */
+ 
+ #ifdef HAVE_MAGICK
+ 
++template <class T>
++static void
++encode_indexed_images (std::vector<Magick::Image>& imvec,
++                       const T& img,
++                       const Matrix cmap)
++{
++  typedef typename T::element_type P;
++  const octave_idx_type nFrames   = img.ndims () < 4 ? 1 : img.dims ()(3);
++  const octave_idx_type nRows     = img.rows ();
++  const octave_idx_type nCols     = img.columns ();
++  const octave_idx_type cmap_size = cmap.rows ();
++  const octave_idx_type bitdepth  =
++    sizeof (P) * std::numeric_limits<unsigned char>::digits;
++
++  // There is no colormap object, we need to build a new one for each frame,
++  // even if it's always the same. We can least get a vector for the Colors.
++  std::vector<Magick::ColorRGB> colormap;
++  {
++    const double* cmap_fvec = cmap.fortran_vec ();
++    const octave_idx_type G_offset = cmap_size;
++    const octave_idx_type B_offset = cmap_size * 2;
++    for (octave_idx_type map_idx = 0; map_idx < cmap_size; map_idx++)
++      {
++        colormap.push_back (Magick::ColorRGB (cmap_fvec[map_idx],
++                                              cmap_fvec[map_idx + G_offset],
++                                              cmap_fvec[map_idx + B_offset]));
++      }
++  }
++
++  for (octave_idx_type frame = 0; frame < nFrames; frame++)
++    {
++      Magick::Image m_img (Magick::Geometry (nCols, nRows), "black");
++
++      // Ensure that there are no other references to this image.
++      m_img.modifyImage ();
++
++      m_img.classType (Magick::PseudoClass);
++      m_img.type (Magick::PaletteType);
++      // FIXME: for some reason, setting bitdepth doesn't seem to work for
++      //        indexed images.
++      m_img.depth (bitdepth);
++
++      // Insert colormap.
++      m_img.colorMapSize (cmap_size);
++      for (octave_idx_type map_idx = 0; map_idx < cmap_size; map_idx++)
++        {
++          m_img.colorMap (map_idx, colormap[map_idx]);
++        }
++      // Why are we also setting the pixel values instead of only the
++      // index values? We don't know if a file format supports indexed
++      // images. If we only set the indexes and then try to save the
++      // image as JPEG for example, the indexed values get discarded,
++      // there is no conversion from the indexes, it's the initial values
++      // that get used. An alternative would be to only set the pixel
++      // values (no indexes), then set the image as PseudoClass and GM
++      // would create a colormap for us. However, we wouldn't have control
++      // over the order of that colormap. And that's why we set both.
++      Magick::PixelPacket* pix  = m_img.getPixels (0, 0, nCols, nRows);
++      Magick::IndexPacket* ind  = m_img.getIndexes ();
++      const P* img_fvec = img.fortran_vec ();
++
++      octave_idx_type GM_idx = 0;
++      for (octave_idx_type column = 0; column < nCols; column++)
++        {
++          for (octave_idx_type row = 0; row < nRows; row++)
++            {
++              ind[GM_idx] = double (*img_fvec);
++              pix[GM_idx] = m_img.colorMap (double (*img_fvec));
++              img_fvec++;
++              GM_idx += nCols;
++            }
++          GM_idx -= nCols * nRows - 1;
++        }
++
++      // Save changes to underlying image.
++      m_img.syncPixels ();
++      imvec.push_back (m_img);
++    }
++}
++
+ static void
+ encode_bool_image (std::vector<Magick::Image>& imvec, const octave_value& img)
+ {
+   unsigned int nframes = 1;
+   boolNDArray m = img.bool_array_value ();
+ 
+   dim_vector dsizes = m.dims ();
+   if (dsizes.length () == 4)
+@@ -794,18 +872,17 @@ encode_bool_image (std::vector<Magick::I
+ 
+       imvec.push_back (im);
+     }
+ }
+ 
+ template <class T>
+ static void
+ encode_uint_image (std::vector<Magick::Image>& imvec,
+-                   const octave_value& img,
+-                   const bool has_map)
++                   const octave_value& img)
+ {
+   unsigned int bitdepth = 0;
+   T m;
+ 
+   if (img.is_uint8_type ())
+     {
+       bitdepth = 8;
+       m = img.uint8_array_value ();
+@@ -833,20 +910,17 @@ encode_uint_image (std::vector<Magick::I
+   unsigned int div_factor = (1 << bitdepth) - 1;
+ 
+   for (unsigned int ii = 0; ii < nframes; ii++)
+     {
+       Magick::Image im (Magick::Geometry (columns, rows), "black");
+ 
+       im.depth (bitdepth);
+ 
+-      if (has_map)
+-        im.classType (Magick::PseudoClass);
+-      else
+-        im.classType (Magick::DirectClass);
++      im.classType (Magick::DirectClass);
+ 
+       if (is_color)
+         {
+           if (has_alpha)
+             im.type (Magick::TrueColorMatteType);
+           else
+             im.type (Magick::TrueColorType);
+ 
+@@ -922,56 +996,16 @@ encode_uint_image (std::vector<Magick::I
+           im.quantizeColors (1 << bitdepth);
+           im.quantize ();
+         }
+ 
+       imvec.push_back (im);
+     }
+ }
+ 
+-// FIXME: this will be needed to write indexed images
+-//static void
+-//encode_map (std::vector<Magick::Image>& imvec, const NDArray& cmap)
+-//{
+-//  unsigned int mapsize = cmap.dim1 ();
+-
+-//  for (size_t fnum = 0; fnum < imvec.size (); fnum++)
+-//    {
+-//      imvec[fnum].colorMapSize (mapsize);
+-//      imvec[fnum].type (Magick::PaletteType);
+-//    }
+-
+-//  for (unsigned int ii = 0; ii < mapsize; ii++)
+-//    {
+-//      Magick::ColorRGB c (cmap(ii,0), cmap(ii,1), cmap(ii,2));
+-
+-//      // FIXME -- is this case needed?
+-//      if (cmap.dim2 () == 4)
+-//        c.alpha (cmap(ii,3));
+-
+-//      try
+-//        {
+-//          for_each (imvec.begin (), imvec.end (),
+-//                    Magick::colorMapImage (ii, c));
+-//        }
+-//      catch (Magick::Warning& w)
+-//        {
+-//          warning ("Magick++ warning: %s", w.what ());
+-//        }
+-//      catch (Magick::ErrorCoder& e)
+-//        {
+-//          warning ("Magick++ coder error: %s", e.what ());
+-//        }
+-//      catch (Magick::Exception& e)
+-//        {
+-//          error ("Magick++ exception: %s", e.what ());
+-//        }
+-//    }
+-//}
+-
+ void static
+ write_file (const std::string filename,
+             const std::string ext,
+             std::vector<Magick::Image>& imvec)
+ {
+   try
+     {
+       Magick::writeImages (imvec.begin (), imvec.end (), ext + ":" + filename);
+@@ -1015,100 +1049,106 @@ use @code{imwrite}.\n\
+   if (args.length () != 5 || ! args(0).is_string () || ! args(1).is_string ())
+     {
+       print_usage ();
+       return retval;
+     }
+   const std::string filename = args(0).string_value ();
+   const std::string ext      = args(1).string_value ();
+ 
+-  const octave_map options   = args(4).map_value ();
++  const octave_scalar_map options = args(4).scalar_map_value ();
+   if (error_state)
+     {
+       error ("__magick_write__: OPTIONS must be a struct");
++      return retval;
+     }
+ 
+   const octave_value img  = args(2);
+   const Matrix       cmap = args(3).matrix_value ();
+   if (error_state)
+     {
+       error ("__magick_write__: invalid IMG or MAP");
++      return retval;
+     }
+-  const bool is_indexed = ! cmap.is_empty ();
++  // Create vector for the images to be written.
++  std::vector<Magick::Image> imvec;
+ 
+-  // Create vector with the images to write
+-  std::vector<Magick::Image> imvec;
+-  if (img.is_bool_type ())
++  if (cmap.is_empty ())
+     {
+-      encode_bool_image (imvec, img);
+-    }
+-  else if (img.is_uint8_type ())
+-    {
+-      encode_uint_image<uint8NDArray> (imvec, img, is_indexed);
+-    }
+-  else if (img.is_uint16_type ())
+-    {
+-      encode_uint_image<uint16NDArray> (imvec, img, is_indexed);
++      if (img.is_bool_type ())
++        {
++          encode_bool_image (imvec, img);
++        }
++      else if (img.is_uint8_type ())
++        {
++          encode_uint_image<uint8NDArray> (imvec, img);
++        }
++      else if (img.is_uint16_type ())
++        {
++          encode_uint_image<uint16NDArray> (imvec, img);
++        }
++      else
++        {
++          error ("__magick_write__: image type not supported");
++          return retval;
++        }
+     }
+   else
+     {
+-      error ("__magick_write__: image type not supported");
+-      return retval;
++      // We should not get floating point indexed images here because we
++      // converted them in __imwrite__.m. We should probably do it here
++      // but it would look much messier.
++      if (img.is_uint8_type ())
++        {
++          encode_indexed_images<uint8NDArray> (imvec, img.uint8_array_value (), cmap);
++        }
++      else if (img.is_uint16_type ())
++        {
++          encode_indexed_images<uint16NDArray> (imvec, img.uint16_array_value (), cmap);
++        }
++      else
++        {
++          error ("__magick_write__: indexed image must be uint8, uint16 or float.");
++          return retval;
++        }
+     }
+-  const int nframes = imvec.size ();
+ 
+-  // Add colormap to image
+-  if (is_indexed)
+-    {
+-    // FIXME: this should be implemented. At the moment, imwrite is doing the
+-    //        conversion in case of indexed images.
+-      error ("__magick_write__: direct saving of indexed images not currently supported; use ind2rgb and save converted image");
+-//      encode_map (imvec, cmap);
+-      return retval;
+-    }
++  const octave_idx_type nFrames = imvec.size ();
+ 
+   // Set quality.
+   // FIXME What happens when we try to set with formats that do not support it?
+-  const unsigned int quality = options.getfield ("quality")(0).int_value ();
+-  for (int i = 0; i < nframes; i++)
++  const octave_idx_type quality = options.getfield ("quality").int_value ();
++  for (octave_idx_type i = 0; i < nFrames; i++)
+     {
+       imvec[i].quality (quality);
+     }
+ 
+-  // Finally, save the file.
+-  // If writemode is set to append, read the image first, append to it,
+-  // and then save it. But even if set to append, make sure anything was
+-  // read at all.
+-  const std::string writemode = options.getfield ("writemode")(0).string_value ();
+-  std::vector<Magick::Image> ini_imvec;
++  // If writemode is set to append, read the image and append to it. Even
++  // if set to append, make sure that something was read at all.
++  const std::string writemode = options.getfield ("writemode").string_value ();
+   if (writemode == "append" && file_stat (filename).exists ())
+     {
++      std::vector<Magick::Image> ini_imvec;
+       read_file (filename, ini_imvec);
+       if (error_state)
+         {
+           return retval;
+         }
++      if (ini_imvec.size () > 0)
++        {
++          ini_imvec.insert (ini_imvec.end (), imvec.begin (), imvec.end ());
++          ini_imvec.swap (imvec);
++        }
+     }
+ 
+-  if (ini_imvec.size () > 0)
++  // Finally, save the damn thing.
++  write_file (filename, ext, imvec);
++  if (error_state)
+     {
+-      ini_imvec.insert (ini_imvec.end (), imvec.begin (), imvec.end ());
+-      write_file (filename, ext, ini_imvec);
+-      if (error_state)
+-        {
+-          return retval;
+-        }
+-    }
+-  else
+-    {
+-      write_file (filename, ext, imvec);
+-      if (error_state)
+-        {
+-          return retval;
+-        }
++      return retval;
+     }
+ 
+ #endif
+   return retval;
+ }
+ 
+ /*
+ ## No test needed for internal helper function.
+diff --git a/scripts/image/private/__imwrite__.m b/scripts/image/private/__imwrite__.m
+--- a/scripts/image/private/__imwrite__.m
++++ b/scripts/image/private/__imwrite__.m
+@@ -30,17 +30,18 @@ function __imwrite__ (img, varargin)
+ 
+   [filename, ext, map, param_list] = imwrite_filename (varargin{:});
+ 
+   if (rem (numel (param_list), 2) != 0)
+     error ("imwrite: no pair for all arguments (odd number left)");
+   endif
+ 
+   ## set default for options
+-  options = struct ("writemode", "overwrite", "quality", 75);
++  options = struct ("writemode", "overwrite",
++                    "quality", 75);
+ 
+   for idx = 1:2:numel (param_list)
+ 
+     switch (tolower (param_list{idx}))
+ 
+       case "writemode",
+         options.writemode = param_list{idx+1};
+         if (! ischar (options.writemode)
+@@ -66,34 +67,30 @@ function __imwrite__ (img, varargin)
+   endfor
+ 
+   if (! isempty (map))
+     if (! iscolormap (map))
+       error ("imwrite: invalid MAP for indexed image");
+     elseif (ndims (img) != 2 && ndims (img) != 4)
+       error ("imwrite: indexed image must have 2 or 4 dimensions (found %i)", ndims (img));
+     endif
+-    ## FIXME: we should really be writing indexed images but that needs
+-    ##        to be implemented in  __magick_write__(). So we convert
+-    ##        them to RGB and write them "normally".
+-    warned = false;
+-    if (! warned)
+-      warning ("imwrite: saving of indexed images is not yet implemented.  Will save an RGB image.");
+-      warned = true;
++    ## If the image is floating point, then we convert it to integer (makes
++    ## it easier in __magick_write__ since it only handles integers. Also,
++    ## if it's floating point, it has an offset of 1
++    if (isfloat (img))
++      if (rows (map) <= 256)
++        img = uint8 (img - 1);
++      else
++        img = uint16 (img - 1);
++      endif
+     endif
+-    img = ind2rgb (img, map);
+-    map = [];
+   endif
+ 
+   if (ndims (img) > 4)
+     error ("imwrite: invalid %d-dimensional image data", ndims (img));
+-  elseif (all (size (img, 3) != [1 3]))
+-    ## This test needs to be adjusted if one day we implement alternative
+-    ## colorspaces. In the mean time, we only have grayscale and RGB images,
+-    ## but CMYK means length 4 in the 3rd dimension.
+-    error ("imwrite: IMG 3rd dimension must be 1 or 3");
++  elseif (all (size (img, 3) != [1 3 4]))
++    ## 1, 3, or 4 for grayscle, RGB, and CMYK respectively
++    error ("imwrite: IMG 3rd dimension must be 1, 3, or 4");
+   endif
+ 
+-  ## FIXME: do we need to convert the image class?
+   __magick_write__ (filename, ext, img, map, options);
+ 
+ endfunction
+-

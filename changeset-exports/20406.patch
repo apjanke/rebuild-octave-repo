@@ -1,0 +1,170 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1438101803 -3600
+#      Tue Jul 28 17:43:23 2015 +0100
+# Node ID 5b8e4f668c538517a5fa5816a882a07422c87bfc
+# Parent  e3f84a8c6788666d0e2449cd85b340ba34138d92
+Add compression option to imwrite and default to "none" (bug #45565)
+
+* libinterp/dldfcn/__magick_read__.cc: we did not specify compression type
+  and let it up to GM coder.  However, Matlab users seem to be expect it to
+  be uncompressed since Matlab only does that (except for jpeg).  So we
+  add the compression method and apply to the images being writen.
+* scripts/image/imwrite.m: document new option and add tests (bug was about
+  bmp and type compression is defined at offset byte 30)
+* scripts/image/private/__imwrite__.m: parse new compression option.
+
+diff --git a/libinterp/dldfcn/__magick_read__.cc b/libinterp/dldfcn/__magick_read__.cc
+--- a/libinterp/dldfcn/__magick_read__.cc
++++ b/libinterp/dldfcn/__magick_read__.cc
+@@ -1546,16 +1546,33 @@ Use @code{imwrite} instead.\n\
+   // LoopCount only on the first image) that value will go nowhere.
+   // See https://sourceforge.net/p/graphicsmagick/bugs/248/
+   // Because of this, we document to set LoopCount on every iteration
+   // (in Matlab will cause a lot of warnings), or pass a 4D matrix with
+   // all frames (won't work in Matlab at all).
+   // Note that this only needs to be set on the first frame
+   imvec[0].animationIterations (options.getfield ("loopcount").uint_value ());
+ 
++  const std::string compression = options.getfield ("compression").string_value ();
++#define COMPRESS_MAGICK_IMAGE_VECTOR(COMPRESSION_STRING, GM_TYPE) \
++  if (compression == COMPRESSION_STRING) \
++    for (std::vector<Magick::Image>::size_type i = 0; i < imvec.size (); i++) \
++      imvec[i].compressType (GM_TYPE);
++
++  COMPRESS_MAGICK_IMAGE_VECTOR("none", Magick::NoCompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("bzip", Magick::BZipCompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("fax3", Magick::FaxCompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("fax4", Magick::Group4Compression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("jpeg", Magick::JPEGCompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("lzw", Magick::LZWCompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("rle", Magick::RLECompression)
++  else COMPRESS_MAGICK_IMAGE_VECTOR("deflate", Magick::ZipCompression)
++
++#undef COMPRESS_MAGICK_IMAGE_VECTOR
++
+   write_file (filename, ext, imvec);
+   if (error_state)
+     return retval;
+ 
+ #endif
+   return retval;
+ }
+ 
+diff --git a/scripts/image/imwrite.m b/scripts/image/imwrite.m
+--- a/scripts/image/imwrite.m
++++ b/scripts/image/imwrite.m
+@@ -41,16 +41,22 @@
+ ##
+ ## @table @samp
+ ## @item Alpha
+ ## Alpha (transparency) channel for the image.  This must be a matrix with
+ ## same class, and number of rows and columns of @var{img}.  In case of a
+ ## multipage image, the size of the 4th dimension must also match and the third
+ ## dimension must be a singleton.  By default, image will be completely opaque.
+ ##
++## @item Compression
++## Compression to use one the image.  Can be one of the following: "none"
++## (default), "bzip", "fax3", "fax4", "jpeg", "lzw", "rle", or "deflate".
++## Note that not all compression types are available for all image formats
++## in which it defaults to your Magick library.
++##
+ ## @item DelayTime
+ ## For formats that accept animations (such as GIF), controls for how long a
+ ## frame is displayed until it moves to the next one.  The value must be scalar
+ ## (which will applied to all frames in @var{img}), or a vector of length
+ ## equal to the number of frames in @var{im}.  The value is in seconds, must
+ ## be between 0 and 655.35, and defaults to 0.5.
+ ##
+ ## @item DisposalMethod
+@@ -195,8 +201,37 @@ endfunction
+ %! [g] = write_and_read (".jpeg", gray);
+ %! assert (g, gray, 2)
+ 
+ %!testif HAVE_MAGICK
+ %! gray = repmat (uint8 (0:255), 100, 1);
+ %! [g] = write_and_read (".jpeg", gray, "quality", 100);
+ %! assert (g, gray)
+ 
++%!function [compression] = get_bmp_compression (ext, cmap = [], varargin)
++%!  gray = repmat (uint8 (0:255), 100, 1);
++%!  filename = [tempname() ext];
++%!  unwind_protect
++%!    if (isempty (cmap))
++%!      imwrite (gray, filename, varargin{1:end});
++%!    else
++%!      imwrite (gray, cmap, filename, varargin{1:end});
++%!    endif
++%!    fid = fopen (filename);
++%!    unwind_protect
++%!      compression = fread (fid, 31)(end);
++%!    unwind_protect_cleanup
++%!      fclose (fid);
++%!    end_unwind_protect
++%!  unwind_protect_cleanup
++%!    unlink (filename);
++%!  end_unwind_protect
++%!endfunction
++
++## BMP images must be saved uncompressed by default (bug #45565)
++%!testif HAVE_MAGICK
++%! assert (get_bmp_compression ("", [], "BMP"), 0)
++%! assert (get_bmp_compression ("", [], "bmp"), 0)
++%! assert (get_bmp_compression (".BMP"), 0)
++%! assert (get_bmp_compression (".bmp"), 0)
++%! assert (get_bmp_compression (".bmp", [], "bmp"), 0)
++%! assert (get_bmp_compression ("", gray (256), "bmp"), 0)
++%! assert (get_bmp_compression (".bmp", gray (256), "Compression", "rle"), 1)
+diff --git a/scripts/image/private/__imwrite__.m b/scripts/image/private/__imwrite__.m
+--- a/scripts/image/private/__imwrite__.m
++++ b/scripts/image/private/__imwrite__.m
+@@ -41,17 +41,18 @@ function __imwrite__ (img, varargin)
+   endif
+ 
+   ## set default for options
+   options = struct ("writemode", "overwrite",
+                     "disposalmethod", {repmat({"doNotSpecify"}, 1, size (img, 4))},
+                     "quality",   75,
+                     "delaytime", ones (1, size (img, 4)) *500, # 0.5 seconds
+                     "loopcount", 0, ## this is actually Inf
+-                    "alpha",     cast ([], class (img)));
++                    "alpha",     cast ([], class (img)),
++                    "compression", "none");
+ 
+   for idx = 1:2:numel (param_list)
+ 
+     switch (tolower (param_list{idx}))
+ 
+       case "alpha"
+         options.alpha = param_list{idx+1};
+         if (! isnumeric (options.alpha))
+@@ -62,16 +63,29 @@ function __imwrite__ (img, varargin)
+                  param_list{idx});
+         elseif (ndims (options.alpha) > 4
+                 || any (size (options.alpha)([1 2]) != size (img)([1 2]))
+                 || size (options.alpha, 4) != size (img, 4))
+           error ("imwrite: matrix for %s must have same dimension as image",
+                  param_list{idx});
+         endif
+ 
++      case "compression"
++        options.compression = param_list{idx+1};
++        if (! ischar (options.compression))
++          error ("imwrite: value for %s option must be a string",
++                 param_list{idx});
++        endif
++        options.compression = tolower (options.compression);
++        if (! any (strcmp (options.compression, {"none", "bzip", "fax3", ...
++                                                 "fax4", "jpeg", "lzw", ...
++                                                 "rle", "deflate"})))
++          error ("imwrite: invalid compression `%s'", options.compression);
++        endif
++
+       case "delaytime"
+         options.delaytime = param_list{idx+1};
+         if (! isnumeric (options.delaytime))
+           error ("imwrite: value for %s option must be numeric",
+                  param_list{idx});
+         endif
+         options.delaytime *= 100; # convert to 1/100ths of second
+         if (isscalar (options.delaytime))

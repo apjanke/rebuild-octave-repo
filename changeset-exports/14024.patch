@@ -1,0 +1,2344 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1323659997 18000
+#      Sun Dec 11 22:19:57 2011 -0500
+# Node ID fc9f204faea0b520a8ea9d455e4f5c865b1b09a0
+# Parent  d51b321b5fef9470eae473989d83756ed8e73fec
+refactor regexp (bug #34440)
+
+* liboctave/regexp.h, liboctave/regexp.cc: New files.
+Provide classes and functions for regular expressions.
+Adapted from src/DLD-FUNCTIONS/regexp.cc.
+* regex-match.h, regex-match.cc: Delete
+* liboctave/Makefile.am (INCS, LIBOCTAVE_CXX_SOURCES): Update.
+
+* variables.cc (name_matches_any_pattern): Use new regexp class.
+* symtab.h (symbol_table::regexp_global_variables,
+symbol_table::do_clear_variable_regexp, symbol_table::do_regexp):
+Likewise.
+
+* DLD-FUNCTIONS/regexp.cc (parse_options): New function.
+(octregexp, octcellregexp, octregexprep): Extract matching code for
+use in new regexp class.  Use new regexp class to provide required
+functionality.
+
+diff --git a/liboctave/Makefile.am b/liboctave/Makefile.am
+--- a/liboctave/Makefile.am
++++ b/liboctave/Makefile.am
+@@ -239,17 +239,17 @@ INCS = \
+   oct-syscalls.h \
+   oct-time.h \
+   oct-uname.h \
+   pathlen.h \
+   pathsearch.h \
+   randgamma.h \
+   randmtzig.h \
+   randpoisson.h \
+-  regex-match.h \
++  regexp.h \
+   singleton-cleanup.h \
+   sparse-sort.h \
+   sparse-util.h \
+   statdefs.h \
+   str-vec.h \
+   sun-utils.h \
+   sysdir.h \
+   syswait.h \
+@@ -448,17 +448,17 @@ LIBOCTAVE_CXX_SOURCES = \
+   oct-passwd.cc \
+   oct-rand.cc \
+   oct-shlib.cc \
+   oct-spparms.cc \
+   oct-syscalls.cc \
+   oct-time.cc \
+   oct-uname.cc \
+   pathsearch.cc \
+-  regex-match.cc \
++  regexp.cc \
+   singleton-cleanup.cc \
+   sparse-sort.cc \
+   sparse-util.cc \
+   str-vec.cc \
+   $(TI_SRC) \
+   $(MATRIX_SRC)
+ 
+ include vx-op-src.mk
+diff --git a/liboctave/regex-match.cc b/liboctave/regexp.cc
+rename from liboctave/regex-match.cc
+rename to liboctave/regexp.cc
+--- a/liboctave/regex-match.cc
++++ b/liboctave/regexp.cc
+@@ -1,11 +1,13 @@
+ /*
+ 
+-Copyright (C) 2008-2011 David Bateman
++Copyright (C) 2011 John W. Eaton
++Copyright (C) 2005-2011 David Bateman
++Copyright (C) 2002-2005 Paul Kienzle
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -19,131 +21,555 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <list>
++#include <sstream>
++#include <string>
+ #include <vector>
+-#include <iostream>
+-#include <string>
+ 
+-#include "regex-match.h"
+-#include "str-vec.h"
+-#include "oct-locbuf.h"
++#include <pcre.h>
+ 
+-regex_match&
+-regex_match::operator = (const regex_match& gm)
+-{
+-  if (this != &gm)
+-    {
+-#if HAVE_REGEX
+-      for (int i = 0; i < pat.length (); i++)
+-        regfree (compiled +i);
+-      delete [] compiled;
+-#endif
+-      pat = gm.pat;
+-      case_insen = gm.case_insen;
+-      init ();
+-    }
+-  return *this;
+-}
++#include "Matrix.h"
++#include "base-list.h"
++#include "lo-error.h"
++#include "oct-locbuf.h"
++#include "quit.h"
++#include "regexp.h"
++#include "str-vec.h"
+ 
+-regex_match::~regex_match (void)
+-{
+-#if HAVE_REGEX
+-  for (int i = 0; i < pat.length (); i++)
+-    regfree (compiled +i);
+-  delete [] compiled;
+-#endif
+-}
++// Define the maximum number of retries for a pattern that possibly
++// results in an infinite recursion.
++#define PCRE_MATCHLIMIT_MAX 10
+ 
++// FIXME -- should this be configurable?
++#define MAXLOOKBEHIND 10
++
++static bool lookbehind_warned = false;
++
++// FIXME -- don't bother collecting and composing return values the user
++// doesn't want.
+ 
+ void
+-regex_match::set_pattern (const std::string& p)
++regexp::free (void)
+ {
+-#if HAVE_REGEX
+-  for (int i = 0; i < pat.length (); i++)
+-    regfree (compiled +i);
+-  delete [] compiled;
+-#endif
+-  pat = p;
+-  init ();
+-}
+-
+-void
+-regex_match::set_pattern (const string_vector& p)
+-{
+-#if HAVE_REGEX
+-  for (int i = 0; i < pat.length (); i++)
+-    regfree (compiled +i);
+-  delete [] compiled;
+-#endif
+-  pat = p;
+-  init ();
++  if (data)
++    pcre_free (static_cast<pcre *> (data));
+ }
+ 
+ void
+-regex_match::init (void)
++regexp::compile_internal (void)
+ {
+-#ifdef HAVE_REGEX
+-  int npat = pat.length ();
+-  int err = 0;
+-  int i;
++  // If we had a previously compiled pattern, release it.
++  free ();
++
++  size_t max_length = MAXLOOKBEHIND;
++
++  size_t pos = 0;
++  size_t new_pos;
++  int inames = 0;
++  std::ostringstream buf;
++
++  while ((new_pos = pattern.find ("(?", pos)) != std::string::npos)
++    {
++      if (pattern.at (new_pos + 2) == '<'
++          && !(pattern.at (new_pos + 3) == '='
++               || pattern.at (new_pos + 3) == '!'))
++        {
++          // The syntax of named tokens in pcre is "(?P<name>...)" while
++          // we need a syntax "(?<name>...)", so fix that here. Also an
++          // expression like
++          // "(?<first>\w+)\s+(?<last>\w+)|(?<last>\w+),\s+(?<first>\w+)"
++          // should be perfectly legal, while pcre does not allow the same
++          // named token name on both sides of the alternative. Also fix
++          // that here by replacing name tokens by dummy names, and dealing
++          // with the dummy names later.
++
++          size_t tmp_pos = pattern.find_first_of ('>', new_pos);
++
++          if (tmp_pos == std::string::npos)
++            {
++              (*current_liboctave_error_handler)
++                ("regexp: syntax error in pattern");
++              return;
++            }
++
++          std::string tmp_name =
++            pattern.substr (new_pos+3, tmp_pos-new_pos-3);
++
++          bool found = false;
++
++          for (int i = 0; i < nnames; i++)
++            {
++              if (named_pats(i) == tmp_name)
++                {
++                  named_idx.resize (dim_vector (inames+1, 1));
++                  named_idx(inames) = i;
++                  found = true;
++                  break;
++                }
++            }
++
++          if (! found)
++            {
++              named_idx.resize (dim_vector (inames+1, 1));
++              named_idx(inames) = nnames;
++              named_pats.append (tmp_name);
++              nnames++;
++            }
++
++          if (new_pos - pos > 0)
++            buf << pattern.substr (pos, new_pos-pos);
++          if (inames < 10)
++            buf << "(?P<n00" << inames++;
++          else if (inames < 100)
++            buf << "(?P<n0" << inames++;
++          else
++            buf << "(?P<n" << inames++;
+ 
+-  compiled = new regex_t [npat];
++          pos = tmp_pos;
++        }
++      else if (pattern.at (new_pos + 2) == '<')
++        {
++          // Find lookbehind operators of arbitrary length (ie like
++          // "(?<=[a-z]*)") and replace with a maximum length operator
++          // as PCRE can not yet handle arbitrary length lookahead
++          // operators. Use the string length as the maximum length to
++          // avoid issues.
++
++          int brackets = 1;
++          size_t tmp_pos1 = new_pos + 2;
++          size_t tmp_pos2 = tmp_pos1;
++
++          while (tmp_pos1 <= pattern.length () && brackets > 0)
++            {
++              char ch = pattern.at (tmp_pos1);
++
++              if (ch == '(')
++                brackets++;
++              else if (ch == ')')
++                {
++                  if (brackets > 1)
++                    tmp_pos2 = tmp_pos1;
++
++                  brackets--;
++                }
++
++              tmp_pos1++;
++            }
++
++          if (brackets != 0)
++            {
++              buf << pattern.substr (pos, new_pos - pos) << "(?";
++              pos = new_pos + 2;
++            }
++          else
++            {
++              size_t tmp_pos3 = pattern.find_first_of ("*+", tmp_pos2);
+ 
+-  for (i = 0; i < npat; i++)
+-    {
+-      err = regcomp (compiled + i, pat(i).c_str (),
+-                     (REG_NOSUB | REG_EXTENDED |
+-                      (case_insen ? REG_ICASE : 0)));
+-      if (err)
+-        break;
++              if (tmp_pos3 != std::string::npos && tmp_pos3 < tmp_pos1)
++                {
++                  if (!lookbehind_warned)
++                    {
++                      lookbehind_warned = true;
++                      (*current_liboctave_warning_handler)
++                        ("%s: arbitrary length lookbehind patterns are only supported up to length %d",
++                               who.c_str (), MAXLOOKBEHIND);
++                    }
++
++                  buf << pattern.substr (pos, new_pos - pos) << "(";
++
++                  size_t i;
++
++                  if (pattern.at (tmp_pos3) == '*')
++                    i = 0;
++                  else
++                    i = 1;
++
++                  for (; i < max_length + 1; i++)
++                    {
++                      buf << pattern.substr (new_pos, tmp_pos3 - new_pos)
++                          << "{" << i << "}";
++                      buf << pattern.substr (tmp_pos3 + 1,
++                                             tmp_pos1 - tmp_pos3 - 1);
++                      if (i != max_length)
++                        buf << "|";
++                    }
++                  buf << ")";
++                }
++              else
++                buf << pattern.substr (pos, tmp_pos1 - pos);
++
++              pos = tmp_pos1;
++            }
++        }
++      else
++        {
++          buf << pattern.substr (pos, new_pos - pos) << "(?";
++          pos = new_pos + 2;
++        }
++
+     }
+ 
+-  if (err)
++  buf << pattern.substr (pos);
++
++  const char *err;
++  int erroffset;
++  std::string buf_str = buf.str ();
++
++  int pcre_options
++    = ((options.case_insensitive () ? PCRE_CASELESS : 0)
++       | (options.dotexceptnewline () ? 0 : PCRE_DOTALL)
++       | (options.lineanchors () ? PCRE_MULTILINE : 0)
++       | (options.freespacing () ? PCRE_EXTENDED : 0));
++
++  data = pcre_compile (buf_str.c_str (), pcre_options, &err, &erroffset, 0);
++
++  if (! data)
++    (*current_liboctave_error_handler)
++      ("%s: %s at position %d of expression", who.c_str (),
++       err, erroffset);
++}
++
++regexp::match_data
++regexp::match (const std::string& buffer)
++{
++  regexp::match_data retval;
++
++  std::list<regexp::match_element> lst;
++
++  int subpatterns;
++  int namecount;
++  int nameentrysize;
++  char *nametable;
++  size_t idx = 0;
++
++  pcre *re = static_cast <pcre *> (data);
++
++  pcre_fullinfo (re, 0, PCRE_INFO_CAPTURECOUNT,  &subpatterns);
++  pcre_fullinfo (re, 0, PCRE_INFO_NAMECOUNT, &namecount);
++  pcre_fullinfo (re, 0, PCRE_INFO_NAMEENTRYSIZE, &nameentrysize);
++  pcre_fullinfo (re, 0, PCRE_INFO_NAMETABLE, &nametable);
++
++  OCTAVE_LOCAL_BUFFER (int, ovector, (subpatterns+1)*3);
++  OCTAVE_LOCAL_BUFFER (int, nidx, namecount);
++
++  for (int i = 0; i < namecount; i++)
+     {
+-      int len = regerror (err, compiled + i, 0, 0);
+-      OCTAVE_LOCAL_BUFFER (char, errmsg, len);
+-      regerror(err, compiled + i, errmsg, len);
+-      (*current_liboctave_error_handler) ("%s in pattern (%s)", errmsg,
+-                                          pat(i).c_str());
++      // Index of subpattern in first two bytes MSB first of name.
++      // Extract index.
++      nidx[i] = (static_cast<int> (nametable[i*nameentrysize])) << 8
++        | static_cast<int> (nametable[i*nameentrysize+1]);
++    }
++
++  while (true)
++    {
++      OCTAVE_QUIT;
++
++      int matches = pcre_exec (re, 0, buffer.c_str (),
++                               buffer.length (), idx,
++                               (idx ? PCRE_NOTBOL : 0),
++                               ovector, (subpatterns+1)*3);
++
++      if (matches == PCRE_ERROR_MATCHLIMIT)
++        {
++          // Try harder; start with default value for MATCH_LIMIT
++          // and increase it.
++          (*current_liboctave_warning_handler)
++            ("your pattern caused PCRE to hit its MATCH_LIMIT; trying harder now, but this will be slow");
++
++          pcre_extra pe;
++
++          pcre_config (PCRE_CONFIG_MATCH_LIMIT,
++                       static_cast <void *> (&pe.match_limit));
++
++          pe.flags = PCRE_EXTRA_MATCH_LIMIT;
++
++          int i = 0;
++          while (matches == PCRE_ERROR_MATCHLIMIT
++                 && i++ < PCRE_MATCHLIMIT_MAX)
++            {
++              OCTAVE_QUIT;
++
++              pe.match_limit *= 10;
++              matches = pcre_exec (re, &pe, buffer.c_str (),
++                                   buffer.length (), idx,
++                                   (idx ? PCRE_NOTBOL : 0),
++                                   ovector, (subpatterns+1)*3);
++            }
++        }
+ 
+-      for (int j = 0; j < i + 1; j++)
+-        regfree (compiled + j);
++      if (matches < 0 && matches != PCRE_ERROR_NOMATCH)
++        {
++          (*current_liboctave_error_handler)
++            ("%s: internal error calling pcre_exec; error code from pcre_exec is %i",
++             who.c_str (), matches);
++          return retval;
++        }
++      else if (matches == PCRE_ERROR_NOMATCH)
++        break;
++      else if (ovector[1] <= ovector[0])
++        {
++          // Zero sized match.  Skip to next char.
++          idx = ovector[0] + 1;
++          if (idx < buffer.length ())
++            continue;
++          else
++            break;
++        }
++      else
++        {
++          int pos_match = 0;
++          Matrix token_extents (matches-1, 2);
++
++          for (int i = 1; i < matches; i++)
++            {
++              if (ovector[2*i] >= 0 && ovector[2*i+1] > 0
++                  && (i == 1 || ovector[2*i] != ovector[2*i-2]
++                      || ovector[2*i-1] != ovector[2*i+1])
++                  && ovector[2*i] >= 0 && ovector[2*i+1] > 0)
++                {
++                  token_extents(pos_match,0) = double (ovector[2*i]+1);
++                  token_extents(pos_match++,1) = double (ovector[2*i+1]);
++                }
++            }
++
++          token_extents.resize (pos_match, 2);
++
++          double start = double (ovector[0]+1);
++          double end = double (ovector[1]);
++
++          const char **listptr;
++          int status = pcre_get_substring_list (buffer.c_str (), ovector,
++                                                matches, &listptr);
++
++          if (status == PCRE_ERROR_NOMEMORY)
++            {
++              (*current_liboctave_error_handler)
++                ("%s: cannot allocate memory in pcre_get_substring_list",
++                 who.c_str ());
++              return retval;
++            }
++
++          string_vector tokens (pos_match);
++          string_vector named_tokens (nnames);
++          int pos_offset = 0;
++          pos_match = 0;
++
++          for (int i = 1; i < matches; i++)
++            {
++              if (ovector[2*i] >= 0 && ovector[2*i+1] > 0)
++                {
++                  if (i == 1 || ovector[2*i] != ovector[2*i-2]
++                      || ovector[2*i-1] != ovector[2*i+1])
++                    {
++                      if (namecount > 0)
++                        named_tokens(named_idx(i-pos_offset-1)) =
++                          std::string (*(listptr+nidx[i-pos_offset-1]));
++
++                      tokens(pos_match++) = std::string (*(listptr+i));
++                    }
++                  else
++                    pos_offset++;
++                }
++            }
++
++          std::string match_string = std::string (*listptr);
++
++          pcre_free_substring_list (listptr);
++
++          regexp::match_element new_elem (named_tokens, tokens, match_string,
++                                          token_extents, start, end);
++          lst.push_back (new_elem);
++          idx = ovector[1];
++
++          if (options.once () || idx >= buffer.length ())
++            break;
++        }
+     }
+-#else
+-  (*current_liboctave_error_handler)
+-    ("regex not available in this version of Octave");
+-#endif
++
++  retval = regexp::match_data (lst, named_pats);
++
++  return retval;
+ }
+ 
+ bool
+-regex_match::match (const std::string& s)
++regexp::is_match (const std::string& buffer)
+ {
+-#if HAVE_REGEX
+-  int npat = pat.length ();
+-
+-  const char *str = s.c_str ();
++  regexp::match_data rx_lst = match (buffer);
+ 
+-  for (int i = 0; i < npat; i++)
+-    if (regexec (compiled + i, str, 0, 0, 0) == 0)
+-      return true;
+-#endif
++  regexp::match_data::const_iterator p = rx_lst.begin ();
+ 
+-  return false;
++  std::string match_string = p->match_string ();
++
++  return ! match_string.empty ();
+ }
+ 
+ Array<bool>
+-regex_match::match (const string_vector& s)
++regexp::is_match (const string_vector& buffer)
+ {
+-  int n = s.length ();
++  octave_idx_type len = buffer.length ();
+ 
+-  Array<bool> retval (dim_vector (n, 1));
++  Array<bool> retval (len, 1);
+ 
+-  for (int i = 0; i < n; i++)
+-    retval(i) = match (s[i]);
++  for (octave_idx_type i = 0; i < buffer.length (); i++)
++    retval(i) = is_match (buffer(i));
+ 
+   return retval;
+ }
++
++std::string
++regexp::replace (const std::string& buffer, const std::string& replacement)
++{
++  std::string retval;
++
++  // Identify replacement tokens; build a vector of group numbers in
++  // the replacement string so that we can quickly calculate the size
++  // of the replacement.
++
++  int tokens = 0;
++  for (size_t i=1; i < replacement.size (); i++)
++    {
++      if (replacement[i-1]=='$' && isdigit (replacement[i]))
++        {
++          tokens++;
++          i++;
++        }
++    }
++  std::vector<int> token (tokens);
++
++  int kk = 0;
++  for (size_t i = 1; i < replacement.size (); i++)
++    {
++      if (replacement[i-1]=='$' && isdigit (replacement[i]))
++        {
++          token[kk++] = replacement[i]-'0';
++          i++;
++        }
++    }
++
++  regexp::match_data rx_lst = match (buffer);
++
++  size_t sz = rx_lst.size ();
++
++  if (sz == 0)
++    {
++      retval = buffer;
++      return retval;
++    }
++
++  std::string rep;
++
++  if (tokens > 0)
++    {
++      // Determine replacement length
++      const size_t replen = replacement.size () - 2*tokens;
++      int delta = 0;
++      regexp::match_data::const_iterator p = rx_lst.begin ();
++      for (size_t i = 0; i < sz; i++)
++        {
++          OCTAVE_QUIT;
++
++          double start = p->start ();
++          double end = p->end ();
++
++          const Matrix pairs (p->token_extents ());
++          size_t pairlen = 0;
++          for (int j = 0; j < tokens; j++)
++            {
++              if (token[j] == 0)
++                pairlen += static_cast<size_t> (end - start) + 1;
++              else if (token[j] <= pairs.rows ())
++                pairlen += static_cast<size_t> (pairs(token[j]-1,1)
++                                                - pairs(token[j]-1,0)) + 1;
++            }
++          delta += (static_cast<int> (replen + pairlen)
++                    - static_cast<int> (end - start + 1));
++          p++;
++        }
++
++      // Build replacement string
++      rep.reserve (buffer.size () + delta);
++      size_t from = 0;
++      p = rx_lst.begin ();
++      for (size_t i = 0; i < sz; i++)
++        {
++          OCTAVE_QUIT;
++
++          double start = p->start ();
++          double end = p->end ();
++
++          const Matrix pairs (p->token_extents ());
++          rep.append (&buffer[from], static_cast<size_t> (start - 1) - from);
++          from = static_cast<size_t> (end - 1) + 1;
++
++          for (size_t j = 1; j < replacement.size (); j++)
++            {
++              if (replacement[j-1]=='$' && isdigit (replacement[j]))
++                {
++                  int k = replacement[j]-'0';
++                  if (k == 0)
++                    {
++                      // replace with entire match
++                      rep.append (&buffer[static_cast<size_t> (end - 1)],
++                                  static_cast<size_t> (end - start) + 1);
++                    }
++                  else if (k <= pairs.rows ())
++                    {
++                      // replace with group capture
++                      rep.append (&buffer[static_cast<size_t> (pairs(k-1,0)-1)],
++                                  static_cast<size_t> (pairs(k-1,1)
++                                                       - pairs(k-1,0)) + 1);
++                    }
++                  else
++                    {
++                      // replace with nothing
++                    }
++                  j++;
++                }
++              else
++                rep.append (1, replacement[j-1]);
++
++              if (j+1 == replacement.size ())
++                rep.append (1, replacement[j]);
++            }
++          p++;
++        }
++      rep.append (&buffer[from], buffer.size () - from);
++    }
++  else
++    {
++      // Determine replacement length
++      const size_t replen = replacement.size ();
++      int delta = 0;
++      regexp::match_data::const_iterator p = rx_lst.begin ();
++      for (size_t i = 0; i < sz; i++)
++        {
++          OCTAVE_QUIT;
++          delta += static_cast<int> (replen)
++            - static_cast<int> (p->end () - p->start () + 1);
++          p++;
++        }
++
++      // Build replacement string
++      rep.reserve (buffer.size () + delta);
++      size_t from = 0;
++      p = rx_lst.begin ();
++      for (size_t i = 0; i < sz; i++)
++        {
++          OCTAVE_QUIT;
++          rep.append (&buffer[from],
++                      static_cast<size_t> (p->start () - 1) - from);
++          from = static_cast<size_t> (p->end () - 1) + 1;
++          rep.append (replacement);
++          p++;
++        }
++      rep.append (&buffer[from], buffer.size () - from);
++    }
++
++  retval = rep;
++  return retval;
++}
+diff --git a/liboctave/regex-match.h b/liboctave/regexp.h
+rename from liboctave/regex-match.h
+rename to liboctave/regexp.h
+--- a/liboctave/regex-match.h
++++ b/liboctave/regexp.h
+@@ -1,11 +1,12 @@
+ /*
+ 
+-Copyright (C) 2008-2011 David Bateman
++Copyright (C) 2011 John W. Eaton
++Copyright (C) 2005-2011 David Bateman
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -15,85 +16,266 @@ FITNESS FOR A PARTICULAR PURPOSE.  See t
+ for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+-#if !defined (octave_regex_match_h)
+-#define octave_regex_match_h 1
++#if !defined (octave_regexp_match_h)
++#define octave_regexp_match_h 1
+ 
++#include <list>
++#include <sstream>
+ #include <string>
+ 
+-#if defined (HAVE_REGEX)
+-#if defined (__MINGW32__)
+-#define __restrict
+-#endif
+-#include <sys/types.h>
+-#include <regex.h>
+-#endif
+-
+ #include "Array.h"
++#include "Matrix.h"
++#include "base-list.h"
+ #include "str-vec.h"
+ 
+-class
+-OCTAVE_API
+-regex_match
++class regexp
+ {
+ public:
+ 
+-  regex_match (const std::string& p, bool insen = false)
+-    : pat (p), case_insen (insen)
+-#if HAVE_REGEX
+-      , compiled (0)
+-#endif
++  class opts;
++  class match_data;
++
++  regexp (const std::string& pat = "",
++          const regexp::opts& opt = regexp::opts (),
++          const std::string& w = "regexp")
++    : pattern (pat), options (opt), data (0), named_pats (),
++      nnames (0), named_idx (), who (w)
++  {
++    compile_internal ();
++  }
++
++  regexp (const regexp& rx)
++    : pattern (rx.pattern), data (rx.data), named_pats (rx.named_pats),
++      nnames (rx.nnames), named_idx (rx.named_idx)
++  { }
++
++  regexp& operator = (const regexp& rx)
++  {
++    if (this != &rx)
++      {
++        pattern = rx.pattern;
++        data = rx.data;
++        named_pats = rx.named_pats;
++        nnames = rx.nnames;
++        named_idx = rx.named_idx;
++      }
++
++    return *this;
++  }
++
++  ~regexp (void) { free (); }
++
++  void compile (const std::string& pat,
++                const regexp::opts& opt = regexp::opts ())
++  {
++    pattern = pat;
++    options = opt;
++    compile_internal ();
++  }
++
++  match_data match (const std::string& buffer);
++
++  bool is_match (const std::string& buffer);
++
++  Array<bool> is_match (const string_vector& buffer);
++
++  std::string replace (const std::string& buffer,
++                       const std::string& replacement);
++
++  struct opts
++  {
++  public:
++
++    opts (void)
++      : x_case_insensitive (false), x_dotexceptnewline (false),
++        x_freespacing (false), x_lineanchors (false), x_once (false) { }
++
++    opts (const opts& o)
++      : x_case_insensitive (o.x_case_insensitive),
++        x_dotexceptnewline (o.x_dotexceptnewline),
++        x_freespacing (o.x_freespacing),
++        x_lineanchors (o.x_lineanchors),
++        x_once (o.x_once)
++    { }
++
++    opts& operator = (const opts& o)
+     {
+-      init ();
+-    }
++      if (this != &o)
++        {
++          x_case_insensitive = o.x_case_insensitive;
++          x_dotexceptnewline = o.x_dotexceptnewline;
++          x_freespacing = o.x_freespacing;
++          x_lineanchors = o.x_lineanchors;
++          x_once = o.x_once;
++        }
+ 
+-  regex_match (const string_vector& p = string_vector (), bool insen = false)
+-    : pat (p), case_insen (insen)
+-#if HAVE_REGEX
+-      , compiled (0)
+-#endif
+-    {
+-      init ();
++      return *this;
+     }
+ 
+-  regex_match (const regex_match& gm)
+-    : pat (gm.pat), case_insen (gm.case_insen)
+-#if HAVE_REGEX
+-      , compiled (0)
+-#endif
++    ~opts (void) { }
++
++    void case_insensitive (bool val) { x_case_insensitive = val; }
++    void dotexceptnewline (bool val) { x_dotexceptnewline = val; }
++    void freespacing (bool val) { x_freespacing = val; }
++    void lineanchors (bool val) { x_lineanchors = val; }
++    void once (bool val) { x_once = val; }
++
++    bool case_insensitive (void) const { return x_case_insensitive; }
++    bool dotexceptnewline (void) const { return x_dotexceptnewline; }
++    bool freespacing (void) const { return x_freespacing; }
++    bool lineanchors (void) const { return x_lineanchors; }
++    bool once (void) const { return x_once; }
++
++  private:
++
++    bool x_case_insensitive;
++    bool x_dotexceptnewline;
++    bool x_freespacing;
++    bool x_lineanchors;
++    bool x_once;
++  };
++
++  class match_element
++  {
++  public:
++
++    match_element (const string_vector& nt, const string_vector& t,
++                   const std::string& ms, const Matrix& te,
++                   double s, double e)
++      : x_match_string (ms), x_named_tokens (nt), x_tokens (t),
++        x_token_extents (te), x_start (s), x_end (e)
++    { }
++
++    match_element (const match_element &a)
++      : x_match_string (a.x_match_string),
++        x_named_tokens (a.x_named_tokens), x_tokens (a.x_tokens),
++        x_token_extents (a.x_token_extents),
++        x_start (a.x_start), x_end (a.x_end)
++    { }
++
++    std::string match_string (void) const { return x_match_string; }
++    string_vector named_tokens (void) const { return x_named_tokens; }
++    string_vector tokens (void) const { return x_tokens; }
++    Matrix token_extents (void) const { return x_token_extents; }
++    double start (void) const { return x_start; }
++    double end (void) const { return x_end; }
++
++  private:
++
++    std::string x_match_string;
++    string_vector x_named_tokens;
++    string_vector x_tokens;
++    Matrix x_token_extents;
++    double x_start;
++    double x_end;
++  };
++
++  class match_data : public octave_base_list<match_element>
++  {
++  public:
++
++    match_data (void)
++      : octave_base_list<match_element> (), named_pats ()
++    { }
++
++    match_data (const std::list<match_element>& l, const string_vector& np)
++      : octave_base_list<match_element> (l), named_pats (np)
++    { }
++
++    match_data (const match_data& rx_lst)
++      : octave_base_list<match_element> (rx_lst),
++        named_pats (rx_lst.named_pats)
++    { }
++
++    match_data& operator = (const match_data& rx_lst)
+     {
+-      init ();
++      if (this != &rx_lst)
++        {
++          octave_base_list<match_element>::operator = (rx_lst);
++          named_pats = rx_lst.named_pats;
++        }
++
++      return *this;
+     }
+ 
+-  regex_match& operator = (const regex_match& gm);
++    ~match_data (void) { }
+ 
+-  ~regex_match (void);
+-
+-  void set_pattern (const std::string& p);
++    string_vector named_patterns (void) { return named_pats; }
+ 
+-  void set_pattern (const string_vector& p);
++  private:
+ 
+-  bool match (const std::string&);
+-
+-  Array<bool> match (const string_vector&);
++    string_vector named_pats;
++  };
+ 
+ private:
+ 
+-  void init (void);
++  // The pattern we've been asked to match.
++  std::string pattern;
+ 
+-  // Regex pattern(s).
+-  string_vector pat;
++  opts options;
++
++  // Internal data describing the regular expression.
++  void *data;
+ 
+-  // Should match be case insensitive
+-  bool case_insen;
++  std::string m;
++  string_vector named_pats;
++  int nnames;
++  Array<int> named_idx;
++  std::string who;
+ 
+-#if HAVE_REGEX
+-  regex_t *compiled;
+-#endif
++  void free (void);
++
++  void compile_internal (void);
+ };
+ 
++inline regexp::match_data
++regexp_match (const std::string& pat,
++              const std::string& buffer,
++              const regexp::opts& opt = regexp::opts (),
++              const std::string& who = "regexp")
++{
++  regexp rx (pat, opt, who);
++
++  return rx.match (buffer);
++}
++
++inline bool
++is_regexp_match (const std::string& pat,
++                 const std::string& buffer,
++                 const regexp::opts& opt = regexp::opts (),
++                 const std::string& who = "regexp")
++{
++  regexp rx (pat, opt, who);
++
++  return rx.is_match (buffer);
++}
++
++inline Array<bool>
++is_regexp_match (const std::string& pat,
++                 const string_vector& buffer,
++                 const regexp::opts& opt = regexp::opts (),
++                 const std::string& who = "regexp")
++{
++  regexp rx (pat, opt, who);
++
++  return rx.is_match (buffer);
++}
++
++inline std::string
++regexp_replace (const std::string& pat,
++                const std::string& buffer,
++                const std::string& replacement,
++                const regexp::opts& opt = regexp::opts (),
++                const std::string& who = "regexp")
++{
++  regexp rx (pat, opt, who);
++
++  return rx.replace (buffer, replacement);
++}
++
+ #endif
+diff --git a/src/DLD-FUNCTIONS/regexp.cc b/src/DLD-FUNCTIONS/regexp.cc
+--- a/src/DLD-FUNCTIONS/regexp.cc
++++ b/src/DLD-FUNCTIONS/regexp.cc
+@@ -20,607 +20,225 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+-#include <algorithm>
++#include <list>
+ #include <sstream>
+ 
+-#include "defun-dld.h"
+-#include "error.h"
+-#include "gripes.h"
+-#include "oct-obj.h"
+-#include "utils.h"
+-
+-#include "Cell.h"
+-#include "oct-map.h"
+-#include "str-vec.h"
+-#include "quit.h"
+-#include "parse.h"
+-#include "oct-locbuf.h"
+-
+ #include <pcre.h>
+ 
+-// Define the maximum number of retries for a pattern that
+-// possibly results in an infinite recursion.
+-#define PCRE_MATCHLIMIT_MAX 10
+-
+-// The regexp is constructed as a linked list to avoid resizing the
+-// return values in arrays at each new match.
+-
+-// FIXME don't bother collecting and composing return values the user
+-// doesn't want.
+-
+-class regexp_elem
+-{
+-public:
+-  regexp_elem (const string_vector& _named_token, const Cell& _t,
+-               const std::string& _m, const Matrix& _te, double _s,
+-               double _e) :
+-    named_token (_named_token), t (_t), m (_m), te (_te), s (_s), e (_e) { }
+-
+-  regexp_elem (const regexp_elem &a) : named_token (a.named_token), t (a.t),
+-                                       m (a.m), te (a.te), s (a.s), e (a.e)
+-                                       { }
+-
+-  string_vector named_token;
+-  Cell t;
+-  std::string m;
+-  Matrix te;
+-  double s;
+-  double e;
+-};
+-
+-typedef std::list<regexp_elem>::const_iterator const_iterator;
+-
+-#define MAXLOOKBEHIND 10
+-static bool lookbehind_warned = false;
++#include "base-list.h"
++#include "oct-locbuf.h"
++#include "quit.h"
++#include "regexp.h"
++#include "str-vec.h"
+ 
+-static int
+-octregexp_list (const octave_value_list &args, const std::string &nm,
+-                bool case_insensitive, std::list<regexp_elem> &lst,
+-                string_vector &named, int &nopts, bool &once)
+-{
+-  int sz = 0;
+-
+-  int nargin = args.length ();
+-  bool lineanchors = false;
+-  bool dotexceptnewline = false;
+-  bool freespacing = false;
+-
+-  nopts = nargin - 2;
+-  once = false;
++#include "defun-dld.h"
++#include "Cell.h"
++#include "error.h"
++#include "gripes.h"
++#include "oct-map.h"
++#include "oct-obj.h"
++#include "utils.h"
+ 
+-  std::string buffer = args(0).string_value ();
+-  size_t max_length = (buffer.length () > MAXLOOKBEHIND ?
+-                       MAXLOOKBEHIND: buffer.length ());
+-
+-  if (error_state)
+-    {
+-      gripe_wrong_type_arg (nm.c_str (), args(0));
+-      return 0;
+-    }
++static void
++parse_options (regexp::opts& options, const octave_value_list& args,
++               const std::string& who, int skip, bool& extra_args)
++{
++  int nargin = args.length ();
+ 
+-  std::string pattern = args(1).string_value ();
++  extra_args = false;
+ 
+-  if (error_state)
+-    {
+-      gripe_wrong_type_arg (nm.c_str (), args(1));
+-      return 0;
+-    }
+-
+-  for (int i = 2; i < nargin; i++)
++  for (int i = skip; i < nargin; i++)
+     {
+       std::string str = args(i).string_value ();
+ 
+       if (error_state)
+         {
+-          error ("%s: optional arguments must be strings", nm.c_str ());
++          error ("%s: optional arguments must be character strings",
++                 who.c_str ());
+           break;
+         }
+ 
+       std::transform (str.begin (), str.end (), str.begin (), tolower);
+ 
+       if (str.find ("once", 0) == 0)
+-        {
+-          once = true;
+-          nopts--;
+-        }
++        options.once (true);
+       else if (str.find ("matchcase", 0) == 0)
+-        {
+-          case_insensitive = false;
+-          nopts--;
+-        }
++        options.case_insensitive (false);
+       else if (str.find ("ignorecase", 0) == 0)
+-        {
+-          case_insensitive = true;
+-          nopts--;
+-        }
++        options.case_insensitive (true);
+       else if (str.find ("dotall", 0) == 0)
+-        {
+-          dotexceptnewline = false;
+-          nopts--;
+-        }
++        options.dotexceptnewline (false);
+       else if (str.find ("stringanchors", 0) == 0)
+-        {
+-          lineanchors = false;
+-          nopts--;
+-        }
++        options.lineanchors (false);
+       else if (str.find ("literalspacing", 0) == 0)
+-        {
+-          freespacing = false;
+-          nopts--;
+-        }
++        options.freespacing (false);
+       else if (str.find ("dotexceptnewline", 0) == 0)
+-        {
+-          dotexceptnewline = true;
+-          nopts--;
+-        }
++        options.dotexceptnewline (true);
+       else if (str.find ("lineanchors", 0) == 0)
+-        {
+-          lineanchors = true;
+-          nopts--;
+-        }
++        options.lineanchors (true);
+       else if (str.find ("freespacing", 0) == 0)
+-        {
+-          freespacing = true;
+-          nopts--;
+-        }
+-      else if (str.find ("start", 0) && str.find ("end", 0)
+-               && str.find ("tokenextents", 0) && str.find ("match", 0)
+-               && str.find ("tokens", 0) && str.find ("names", 0)
+-               && str.find ("split", 0))
+-        error ("%s: unrecognized option", nm.c_str ());
++        options.freespacing (true);
++      else if (str.find ("start", 0) == 0
++               || str.find ("end", 0) == 0
++               || str.find ("tokenextents", 0) == 0
++               || str.find ("match", 0) == 0
++               || str.find ("tokens", 0) == 0
++               || str.find ("names", 0) == 0
++               || str.find ("split", 0) == 0)
++        extra_args = true;
++      else
++        error ("%s: unrecognized option", who.c_str ());
+     }
+-
+-  if (!error_state)
+-    {
+-      Cell t;
+-      std::string m;
+-      double s, e;
+-
+-      // named tokens "(?<name>...)" are only treated with PCRE not regex.
+-
+-      size_t pos = 0;
+-      size_t new_pos;
+-      int nnames = 0;
+-      int inames = 0;
+-      std::ostringstream buf;
+-      Array<int> named_idx;
+-
+-      while ((new_pos = pattern.find ("(?", pos)) != std::string::npos)
+-        {
+-          if (pattern.at (new_pos + 2) == '<'
+-              && !(pattern.at (new_pos + 3) == '='
+-                   || pattern.at (new_pos + 3) == '!'))
+-            {
+-              // The syntax of named tokens in pcre is "(?P<name>...)" while
+-              // we need a syntax "(?<name>...)", so fix that here. Also an
+-              // expression like
+-              // "(?<first>\w+)\s+(?<last>\w+)|(?<last>\w+),\s+(?<first>\w+)"
+-              // should be perfectly legal, while pcre does not allow the same
+-              // named token name on both sides of the alternative. Also fix
+-              // that here by replacing name tokens by dummy names, and dealing
+-              // with the dummy names later.
+-
+-              size_t tmp_pos = pattern.find_first_of ('>', new_pos);
+-
+-              if (tmp_pos == std::string::npos)
+-                {
+-                  error ("regexp: syntax error in pattern");
+-                  break;
+-                }
+-
+-              std::string tmp_name =
+-                pattern.substr (new_pos+3, tmp_pos-new_pos-3);
+-
+-              bool found = false;
+-
+-              for (int i = 0; i < nnames; i++)
+-                {
+-                  if (named(i) == tmp_name)
+-                    {
+-                      named_idx.resize (dim_vector (inames+1, 1));
+-                      named_idx(inames) = i;
+-                      found = true;
+-                      break;
+-                    }
+-                }
+-
+-              if (! found)
+-                {
+-                  named_idx.resize (dim_vector (inames+1, 1));
+-                  named_idx(inames) = nnames;
+-                  named.append (tmp_name);
+-                  nnames++;
+-                }
+-
+-              if (new_pos - pos > 0)
+-                buf << pattern.substr (pos, new_pos-pos);
+-              if (inames < 10)
+-                buf << "(?P<n00" << inames++;
+-              else if (inames < 100)
+-                buf << "(?P<n0" << inames++;
+-              else
+-                buf << "(?P<n" << inames++;
+-
+-              pos = tmp_pos;
+-            }
+-          else if (pattern.at (new_pos + 2) == '<')
+-            {
+-              // Find lookbehind operators of arbitrary length (ie like
+-              // "(?<=[a-z]*)") and replace with a maximum length operator
+-              // as PCRE can not yet handle arbitrary length lookahead
+-              // operators. Use the string length as the maximum length to
+-              // avoid issues.
+-
+-              int brackets = 1;
+-              size_t tmp_pos1 = new_pos + 2;
+-              size_t tmp_pos2 = tmp_pos1;
+-
+-              while (tmp_pos1 <= pattern.length () && brackets > 0)
+-                {
+-                  char ch = pattern.at (tmp_pos1);
+-
+-                  if (ch == '(')
+-                    brackets++;
+-                  else if (ch == ')')
+-                    {
+-                      if (brackets > 1)
+-                        tmp_pos2 = tmp_pos1;
+-
+-                      brackets--;
+-                    }
+-
+-                  tmp_pos1++;
+-                }
+-
+-              if (brackets != 0)
+-                {
+-                  buf << pattern.substr (pos, new_pos - pos) << "(?";
+-                  pos = new_pos + 2;
+-                }
+-              else
+-                {
+-                  size_t tmp_pos3 = pattern.find_first_of ("*+", tmp_pos2);
+-
+-                  if (tmp_pos3 != std::string::npos && tmp_pos3 < tmp_pos1)
+-                    {
+-                      if (!lookbehind_warned)
+-                        {
+-                          lookbehind_warned = true;
+-                          warning ("%s: arbitrary length lookbehind patterns are only supported up to length %d",
+-                                   nm.c_str (), MAXLOOKBEHIND);
+-                        }
+-
+-                      buf << pattern.substr (pos, new_pos - pos) << "(";
+-
+-                      size_t i;
+-
+-                      if (pattern.at (tmp_pos3) == '*')
+-                        i = 0;
+-                      else
+-                        i = 1;
+-
+-                      for (; i < max_length + 1; i++)
+-                        {
+-                          buf << pattern.substr (new_pos, tmp_pos3 - new_pos)
+-                              << "{" << i << "}";
+-                          buf << pattern.substr (tmp_pos3 + 1,
+-                                                 tmp_pos1 - tmp_pos3 - 1);
+-                          if (i != max_length)
+-                            buf << "|";
+-                        }
+-                      buf << ")";
+-                    }
+-                  else
+-                    buf << pattern.substr (pos, tmp_pos1 - pos);
+-
+-                  pos = tmp_pos1;
+-                }
+-            }
+-          else
+-            {
+-              buf << pattern.substr (pos, new_pos - pos) << "(?";
+-              pos = new_pos + 2;
+-            }
+-
+-        }
+-
+-      buf << pattern.substr (pos);
+-
+-      if (error_state)
+-        return 0;
+-
+-      // Compile expression
+-      const char *err;
+-      int erroffset;
+-      std::string buf_str = buf.str ();
+-
+-      pcre *re = pcre_compile (buf_str.c_str (),
+-                               ((case_insensitive ? PCRE_CASELESS : 0)
+-                                | (dotexceptnewline ? 0 : PCRE_DOTALL)
+-                                | (lineanchors ? PCRE_MULTILINE : 0)
+-                                | (freespacing ? PCRE_EXTENDED : 0)),
+-                               &err, &erroffset, 0);
+-
+-      if (re == 0)
+-        {
+-          error ("%s: %s at position %d of expression", nm.c_str (),
+-                 err, erroffset);
+-          return 0;
+-        }
+-
+-      int subpatterns;
+-      int namecount;
+-      int nameentrysize;
+-      char *nametable;
+-      int idx = 0;
+-
+-      pcre_fullinfo (re, 0, PCRE_INFO_CAPTURECOUNT,  &subpatterns);
+-      pcre_fullinfo (re, 0, PCRE_INFO_NAMECOUNT, &namecount);
+-      pcre_fullinfo (re, 0, PCRE_INFO_NAMEENTRYSIZE, &nameentrysize);
+-      pcre_fullinfo (re, 0, PCRE_INFO_NAMETABLE, &nametable);
+-
+-      OCTAVE_LOCAL_BUFFER (int, ovector, (subpatterns+1)*3);
+-      OCTAVE_LOCAL_BUFFER (int, nidx, namecount);
+-
+-      for (int i = 0; i < namecount; i++)
+-        {
+-          // Index of subpattern in first two bytes MSB first of name.
+-          // Extract index.
+-          nidx[i] = (static_cast<int> (nametable[i*nameentrysize])) << 8
+-            | static_cast<int> (nametable[i*nameentrysize+1]);
+-        }
+-
+-      while (true)
+-        {
+-          OCTAVE_QUIT;
+-
+-          int matches = pcre_exec (re, 0, buffer.c_str (),
+-                                   buffer.length (), idx,
+-                                   (idx ? PCRE_NOTBOL : 0),
+-                                   ovector, (subpatterns+1)*3);
+-
+-          if (matches == PCRE_ERROR_MATCHLIMIT)
+-            {
+-              // Try harder; start with default value for MATCH_LIMIT
+-              // and increase it.
+-              warning ("your pattern caused PCRE to hit its MATCH_LIMIT; trying harder now, but this will be slow");
+-
+-              pcre_extra pe;
+-
+-              pcre_config (PCRE_CONFIG_MATCH_LIMIT,
+-                           static_cast <void *> (&pe.match_limit));
+-
+-              pe.flags = PCRE_EXTRA_MATCH_LIMIT;
+-
+-              int i = 0;
+-              while (matches == PCRE_ERROR_MATCHLIMIT
+-                     && i++ < PCRE_MATCHLIMIT_MAX)
+-                {
+-                  OCTAVE_QUIT;
+-
+-                  pe.match_limit *= 10;
+-                  matches = pcre_exec (re, &pe, buffer.c_str (),
+-                                       buffer.length (), idx,
+-                                       (idx ? PCRE_NOTBOL : 0),
+-                                       ovector, (subpatterns+1)*3);
+-                }
+-            }
+-
+-          if (matches < 0 && matches != PCRE_ERROR_NOMATCH)
+-            {
+-              error ("%s: internal error calling pcre_exec; error code from pcre_exec is %i",
+-                     nm.c_str (), matches);
+-              pcre_free (re);
+-              return 0;
+-            }
+-          else if (matches == PCRE_ERROR_NOMATCH)
+-            break;
+-          else if (ovector[1] <= ovector[0])
+-            {
+-              // Zero sized match.  Skip to next char.
+-              idx = ovector[0] + 1;
+-              if (idx < buffer.length ())
+-                continue;
+-              else
+-                break;
+-            }
+-          else
+-            {
+-              int pos_match = 0;
+-              Matrix te (matches-1, 2);
+-
+-              for (int i = 1; i < matches; i++)
+-                {
+-                  if (ovector[2*i] >= 0 && ovector[2*i+1] > 0
+-                      && (i == 1 || ovector[2*i] != ovector[2*i-2]
+-                          || ovector[2*i-1] != ovector[2*i+1])
+-                      && ovector[2*i] >= 0 && ovector[2*i+1] > 0)
+-                    {
+-                      te(pos_match,0) = double (ovector[2*i]+1);
+-                      te(pos_match++,1) = double (ovector[2*i+1]);
+-                    }
+-                }
+-
+-              te.resize (pos_match, 2);
+-
+-              s = double (ovector[0]+1);
+-              e = double (ovector[1]);
+-
+-              const char **listptr;
+-              int status = pcre_get_substring_list (buffer.c_str (), ovector,
+-                                                   matches, &listptr);
+-
+-              if (status == PCRE_ERROR_NOMEMORY)
+-                {
+-                  error ("%s: cannot allocate memory in pcre_get_substring_list",
+-                        nm.c_str ());
+-                  pcre_free (re);
+-                  return 0;
+-                }
+-
+-              Cell cell_t (dim_vector (1, pos_match));
+-              string_vector named_tokens (nnames);
+-              int pos_offset = 0;
+-              pos_match = 0;
+-
+-              for (int i = 1; i < matches; i++)
+-                {
+-                  if (ovector[2*i] >= 0 && ovector[2*i+1] > 0)
+-                    {
+-                      if (i == 1 || ovector[2*i] != ovector[2*i-2]
+-                          || ovector[2*i-1] != ovector[2*i+1])
+-                        {
+-                          if (namecount > 0)
+-                            named_tokens(named_idx(i-pos_offset-1)) =
+-                              std::string (*(listptr+nidx[i-pos_offset-1]));
+-                          cell_t(pos_match++) =
+-                            std::string (*(listptr+i));
+-                        }
+-                      else
+-                        pos_offset++;
+-                    }
+-                }
+-
+-              m =  std::string (*listptr);
+-              t = cell_t;
+-
+-              pcre_free_substring_list (listptr);
+-
+-              regexp_elem new_elem (named_tokens, t, m, te, s, e);
+-              lst.push_back (new_elem);
+-              idx = ovector[1];
+-              sz++;
+-
+-              if (once || idx >= buffer.length ())
+-                break;
+-
+-            }
+-        }
+-
+-      pcre_free (re);
+-    }
+-
+-  return sz;
+ }
+ 
+ static octave_value_list
+-octregexp (const octave_value_list &args, int nargout, const std::string &nm,
+-           bool case_insensitive)
++octregexp (const octave_value_list &args, int nargout,
++           const std::string &who, bool case_insensitive = false)
+ {
+   octave_value_list retval;
++
+   int nargin = args.length ();
+-  std::list<regexp_elem> lst;
+-  string_vector named;
+-  int nopts;
+-  bool once;
++
++  // Make sure we have string, pattern
++  const std::string buffer = args(0).string_value ();
++  if (error_state)
++    return retval;
++
++  const std::string pattern = args(1).string_value ();
++  if (error_state)
++    return retval;
+ 
+-  int sz = octregexp_list (args, nm, case_insensitive, lst, named, nopts, once);
++  regexp::opts options;
++  options.case_insensitive (case_insensitive);
++  bool extra_options = false;
++  parse_options (options, args, who, 2, extra_options);
++  if (error_state)
++    return retval;
++
++  regexp::match_data rx_lst = regexp_match (pattern, buffer, options, who);
++
++  string_vector named_pats = rx_lst.named_patterns ();
++
++  size_t sz = rx_lst.size ();
+ 
+   if (! error_state)
+     {
+       // Converted the linked list in the correct form for the return values
+ 
+       octave_idx_type i = 0;
+       octave_scalar_map nmap;
+ 
+       retval.resize (7);
+ 
+       if (sz == 1)
+         {
+-          for (int j = 0; j < named.length (); j++)
+-            nmap.assign (named(j), lst.begin()->named_token (j));
++          string_vector named_tokens = rx_lst.begin()->named_tokens ();
++
++          for (int j = 0; j < named_pats.length (); j++)
++            nmap.assign (named_pats(j), named_tokens(j));
+ 
+           retval(5) = nmap;
+         }
+       else
+         {
+-          for (int j = 0; j < named.length (); j++)
++          for (int j = 0; j < named_pats.length (); j++)
+             {
+               Cell tmp (dim_vector (1, sz));
+ 
+               i = 0;
+-              for (const_iterator p = lst.begin (); p != lst.end (); p++)
+-                tmp(i++) = p->named_token (j);
++              for (regexp::match_data::const_iterator p = rx_lst.begin ();
++                   p != rx_lst.end (); p++)
++                {
++                  string_vector named_tokens = p->named_tokens ();
+ 
+-              nmap.assign (named(j), octave_value (tmp));
++                  tmp(i++) = named_tokens(j);
++                }
++
++              nmap.assign (named_pats(j), octave_value (tmp));
+             }
+ 
+           retval(5) = nmap;
+         }
+ 
+-      std::string buffer = args(0).string_value ();
+-
+-      if (once)
++      if (options.once ())
+         {
+-          retval(4) = sz ? lst.front ().t : Cell ();
+-          retval(3) = sz ? lst.front ().m : std::string ();
+-          retval(2) = sz ? lst.front ().te : Matrix ();
++          regexp::match_data::const_iterator p = rx_lst.begin ();
++
++          retval(4) = sz ? p->tokens () : Cell ();
++          retval(3) = sz ? p->match_string () : std::string ();
++          retval(2) = sz ? p->token_extents () : Matrix ();
+ 
+           if (sz)
+             {
+-              double e = lst.front ().e;
+-              double s = lst.front ().s;
++              double start = p->start ();
++              double end = p->end ();
+ 
+-              Cell sp (dim_vector (1, 2));
+-              sp(0) = buffer.substr (0, s-1);
+-              sp(1) = buffer.substr (e);
++              Cell split (dim_vector (1, 2));
++              split(0) = buffer.substr (0, start-1);
++              split(1) = buffer.substr (end);
+ 
+-              retval(6) = sp;
+-              retval(1) = e;
+-              retval(0) = s;
++              retval(6) = split;
++              retval(1) = end;
++              retval(0) = start;
+             }
+           else
+             {
+               retval(6) = buffer;
+               retval(1) = Matrix ();
+               retval(0) = Matrix ();
+             }
+         }
+       else
+         {
+-          Cell t (dim_vector (1, sz));
+-          Cell m (dim_vector (1, sz));
+-          Cell te (dim_vector (1, sz));
+-          NDArray e (dim_vector (1, sz));
+-          NDArray s (dim_vector (1, sz));
+-          Cell sp (dim_vector (1, sz+1));
++          Cell tokens (dim_vector (1, sz));
++          Cell match_string (dim_vector (1, sz));
++          Cell token_extents (dim_vector (1, sz));
++          NDArray end (dim_vector (1, sz));
++          NDArray start (dim_vector (1, sz));
++          Cell split (dim_vector (1, sz+1));
+           size_t sp_start = 0;
+ 
+           i = 0;
+-          for (const_iterator p = lst.begin (); p != lst.end (); p++)
++          for (regexp::match_data::const_iterator p = rx_lst.begin ();
++               p != rx_lst.end (); p++)
+             {
+-              t(i) = p->t;
+-              m(i) = p->m;
+-              te(i) = p->te;
+-              e(i) = p->e;
+-              s(i) = p->s;
+-              sp(i) = buffer.substr (sp_start, p->s-sp_start-1);
+-              sp_start = p->e;
++              double s = p->start ();
++              double e = p->end ();
++
++              string_vector tmp = p->tokens ();
++              tokens(i) = Cell (dim_vector (1, tmp.length ()), tmp);
++              match_string(i) = p->match_string ();
++              token_extents(i) = p->token_extents ();
++              end(i) = e;
++              start(i) = s;
++              split(i) = buffer.substr (sp_start, s-sp_start-1);
++              sp_start = e;
+               i++;
+             }
+ 
+-          sp(i) = buffer.substr (sp_start);
++          split(i) = buffer.substr (sp_start);
+ 
+-          retval(6) = sp;
+-          retval(4) = t;
+-          retval(3) = m;
+-          retval(2) = te;
+-          retval(1) = e;
+-          retval(0) = s;
++          retval(6) = split;
++          retval(4) = tokens;
++          retval(3) = match_string;
++          retval(2) = token_extents;
++          retval(1) = end;
++          retval(0) = start;
+         }
+ 
+       // Alter the order of the output arguments
+-      if (nopts > 0)
++
++      if (extra_options)
+         {
+           int n = 0;
+           octave_value_list new_retval;
+           new_retval.resize (nargout);
+ 
+           OCTAVE_LOCAL_BUFFER (int, arg_used, 6);
+           for (int j = 0; j < 6; j++)
+             arg_used[j] = false;
+@@ -677,17 +295,17 @@ octregexp (const octave_value_list &args
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ static octave_value_list
+ octcellregexp (const octave_value_list &args, int nargout,
+-               const std::string &nm, bool case_insensitive)
++               const std::string &who, bool case_insensitive = false)
+ {
+   octave_value_list retval;
+ 
+   if (args(0).is_cell ())
+     {
+       OCTAVE_LOCAL_BUFFER (Cell, newretval, nargout);
+       octave_value_list new_args = args;
+       Cell cellstr = args(0).cell_value ();
+@@ -700,17 +318,17 @@ octcellregexp (const octave_value_list &
+               for (int j = 0; j < nargout; j++)
+                 newretval[j].resize (cellstr.dims ());
+ 
+               new_args(1) = cellpat(0);
+ 
+               for (octave_idx_type i = 0; i < cellstr.numel (); i++)
+                 {
+                   new_args(0) = cellstr(i);
+-                  octave_value_list tmp = octregexp (new_args, nargout, nm,
++                  octave_value_list tmp = octregexp (new_args, nargout, who,
+                                                      case_insensitive);
+ 
+                   if (error_state)
+                     break;
+ 
+                   for (int j = 0; j < nargout; j++)
+                     newretval[j](i) = tmp(j);
+                 }
+@@ -720,42 +338,42 @@ octcellregexp (const octave_value_list &
+               for (int j = 0; j < nargout; j++)
+                 newretval[j].resize (cellpat.dims ());
+ 
+               new_args(0) = cellstr(0);
+ 
+               for (octave_idx_type i = 0; i < cellpat.numel (); i++)
+                 {
+                   new_args(1) = cellpat(i);
+-                  octave_value_list tmp = octregexp (new_args, nargout, nm,
++                  octave_value_list tmp = octregexp (new_args, nargout, who,
+                                                      case_insensitive);
+ 
+                   if (error_state)
+                     break;
+ 
+                   for (int j = 0; j < nargout; j++)
+                     newretval[j](i) = tmp(j);
+                 }
+             }
+           else if (cellstr.numel () == cellpat.numel ())
+             {
+ 
+               if (cellstr.dims () != cellpat.dims ())
+-                error ("%s: Inconsistent cell array dimensions", nm.c_str ());
++                error ("%s: inconsistent cell array dimensions", who.c_str ());
+               else
+                 {
+                   for (int j = 0; j < nargout; j++)
+                     newretval[j].resize (cellstr.dims ());
+ 
+                   for (octave_idx_type i = 0; i < cellstr.numel (); i++)
+                     {
+                       new_args(0) = cellstr(i);
+                       new_args(1) = cellpat(i);
+ 
+-                      octave_value_list tmp = octregexp (new_args, nargout, nm,
++                      octave_value_list tmp = octregexp (new_args, nargout, who,
+                                                          case_insensitive);
+ 
+                       if (error_state)
+                         break;
+ 
+                       for (int j = 0; j < nargout; j++)
+                         newretval[j](i) = tmp(j);
+                     }
+@@ -767,17 +385,17 @@ octcellregexp (const octave_value_list &
+       else
+         {
+           for (int j = 0; j < nargout; j++)
+             newretval[j].resize (cellstr.dims ());
+ 
+           for (octave_idx_type i = 0; i < cellstr.numel (); i++)
+             {
+               new_args(0) = cellstr(i);
+-              octave_value_list tmp = octregexp (new_args, nargout, nm,
++              octave_value_list tmp = octregexp (new_args, nargout, who,
+                                                  case_insensitive);
+ 
+               if (error_state)
+                 break;
+ 
+               for (int j = 0; j < nargout; j++)
+                 newretval[j](i) = tmp(j);
+             }
+@@ -794,34 +412,34 @@ octcellregexp (const octave_value_list &
+       Cell cellpat = args(1).cell_value ();
+ 
+       for (int j = 0; j < nargout; j++)
+         newretval[j].resize(cellpat.dims ());
+ 
+       for (octave_idx_type i = 0; i < cellpat.numel (); i++)
+         {
+           new_args(1) = cellpat(i);
+-          octave_value_list tmp = octregexp (new_args, nargout, nm,
++          octave_value_list tmp = octregexp (new_args, nargout, who,
+                                              case_insensitive);
+ 
+           if (error_state)
+             break;
+ 
+           for (int j = 0; j < nargout; j++)
+             newretval[j](i) = tmp(j);
+         }
+ 
+       if (!error_state)
+         {
+           for (int j = 0; j < nargout; j++)
+             retval(j) = octave_value (newretval[j]);
+         }
+     }
+   else
+-    retval = octregexp (args, nargout, nm, case_insensitive);
++    retval = octregexp (args, nargout, who, case_insensitive);
+ 
+   return retval;
+ 
+ }
+ 
+ DEFUN_DLD (regexp, args, nargout,
+   "-*- texinfo -*-\n\
+ @deftypefn  {Loadable Function} {[@var{s}, @var{e}, @var{te}, @var{m}, @var{t}, @var{nm}] =} regexp (@var{str}, @var{pat})\n\
+@@ -1017,19 +635,19 @@ Alternatively, use (?x) in the pattern.\
+ {
+   octave_value_list retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargin < 2)
+     print_usage ();
+   else if (args(0).is_cell () || args(1).is_cell ())
+-    retval = octcellregexp (args, nargout, "regexp", false);
++    retval = octcellregexp (args, nargout, "regexp");
+   else
+-    retval = octregexp (args, nargout, "regexp", false);
++    retval = octregexp (args, nargout, "regexp");
+ 
+   return retval;
+ }
+ 
+ /*
+ 
+ ## PCRE_ERROR_MATCHLIMIT test
+ %!test
+@@ -1397,17 +1015,17 @@ syntax of the search pattern.\n\
+ %!assert(regexpi({'asdfg-dfd','-dfd-dfd-','qasfdfdaq'},'-'),{6,[1,5,9],zeros(1,0)})
+ %!assert(regexpi({'asdfg-dfd';'-dfd-dfd-';'qasfdfdaq'},{'-';'f';'q'}),{6;[3,7];[1,9]})
+ %!assert(regexpi('Strings',{'t','s'}),{2,[1,7]})
+ 
+ */
+ 
+ 
+ static octave_value
+-octregexprep (const octave_value_list &args, const std::string &nm)
++octregexprep (const octave_value_list &args, const std::string &who)
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   // Make sure we have string, pattern, replacement
+   const std::string buffer = args(0).string_value ();
+   if (error_state)
+@@ -1418,193 +1036,38 @@ octregexprep (const octave_value_list &a
+     return retval;
+ 
+   const std::string replacement = args(2).string_value ();
+   if (error_state)
+     return retval;
+ 
+   // Pack options excluding 'tokenize' and various output
+   // reordering strings into regexp arg list
+-  octave_value_list regexpargs (nargin-1, octave_value ());
++  octave_value_list regexpargs (nargin-3, octave_value ());
+ 
+-  regexpargs(0) = args (0);
+-  regexpargs(1) = args (1);
+-
+-  int len = 2;
++  int len = 0;
+   for (int i = 3; i < nargin; i++)
+     {
+       const std::string opt = args(i).string_value ();
+       if (opt != "tokenize" && opt != "start" && opt != "end"
+           && opt != "tokenextents" && opt != "match" && opt != "tokens"
+           && opt != "names"  && opt != "split" && opt != "warnings")
+         {
+           regexpargs(len++) = args(i);
+         }
+     }
+   regexpargs.resize (len);
+ 
+-  // Identify replacement tokens; build a vector of group numbers in
+-  // the replacement string so that we can quickly calculate the size
+-  // of the replacement.
+-  int tokens = 0;
+-  for (size_t i=1; i < replacement.size (); i++)
+-    {
+-      if (replacement[i-1]=='$' && isdigit (replacement[i]))
+-        {
+-          tokens++;
+-          i++;
+-        }
+-    }
+-  std::vector<int> token (tokens);
+-
+-  int kk = 0;
+-  for (size_t i = 1; i < replacement.size (); i++)
+-    {
+-      if (replacement[i-1]=='$' && isdigit (replacement[i]))
+-        {
+-          token[kk++] = replacement[i]-'0';
+-          i++;
+-        }
+-    }
+-
+-  // Perform replacement
+-  std::string rep;
+-
+-  if (tokens > 0)
+-    {
+-      std::list<regexp_elem> lst;
+-      string_vector named;
+-      int nopts;
+-      bool once;
+-      int sz = octregexp_list (regexpargs, nm , false, lst, named, nopts, once);
+-
+-      if (error_state)
+-        return retval;
+-      if (sz == 0)
+-        {
+-          retval = args(0);
+-          return retval;
+-        }
+-
+-      // Determine replacement length
+-      const size_t replen = replacement.size () - 2*tokens;
+-      int delta = 0;
+-      const_iterator p = lst.begin ();
+-      for (int i = 0; i < sz; i++)
+-        {
+-          OCTAVE_QUIT;
+-
+-          const Matrix pairs (p->te);
+-          size_t pairlen = 0;
+-          for (int j = 0; j < tokens; j++)
+-            {
+-              if (token[j] == 0)
+-                pairlen += static_cast<size_t> (p->e - p->s) + 1;
+-              else if (token[j] <= pairs.rows ())
+-                pairlen += static_cast<size_t> (pairs(token[j]-1,1)
+-                                                - pairs(token[j]-1,0)) + 1;
+-            }
+-          delta += static_cast<int> (replen + pairlen)
+-            - static_cast<int> (p->e - p->s + 1);
+-          p++;
+-        }
+-
+-      // Build replacement string
+-      rep.reserve (buffer.size () + delta);
+-      size_t from = 0;
+-      p = lst.begin ();
+-      for (int i = 0; i < sz; i++)
+-        {
+-          OCTAVE_QUIT;
++  regexp::opts options;
++  bool extra_args = false;
++  parse_options (options, regexpargs, who, 0, extra_args);
++  if (error_state)
++    return retval;
+ 
+-          const Matrix pairs (p->te);
+-          rep.append (&buffer[from], static_cast<size_t> (p->s - 1) - from);
+-          from = static_cast<size_t> (p->e - 1) + 1;
+-          for (size_t j = 1; j < replacement.size (); j++)
+-            {
+-              if (replacement[j-1]=='$' && isdigit (replacement[j]))
+-                {
+-                  int k = replacement[j]-'0';
+-                  if (k == 0)
+-                    {
+-                      // replace with entire match
+-                      rep.append (&buffer[static_cast<size_t> (p->e - 1)],
+-                                  static_cast<size_t> (p->e - p->s) + 1);
+-                    }
+-                  else if (k <= pairs.rows ())
+-                    {
+-                      // replace with group capture
+-                      rep.append (&buffer[static_cast<size_t> (pairs(k-1,0)-1)],
+-                                  static_cast<size_t> (pairs(k-1,1)
+-                                                       - pairs(k-1,0)) + 1);
+-                    }
+-                  else
+-                    {
+-                      // replace with nothing
+-                    }
+-                  j++;
+-                }
+-              else
+-                {
+-                  rep.append (1, replacement[j-1]);
+-                }
+-              if (j+1 == replacement.size ())
+-                {
+-                  rep.append (1, replacement[j]);
+-                }
+-            }
+-          p++;
+-        }
+-      rep.append (&buffer[from], buffer.size () - from);
+-    }
+-  else
+-    {
+-      std::list<regexp_elem> lst;
+-      string_vector named;
+-      int nopts;
+-      bool once;
+-      int sz = octregexp_list (regexpargs, nm, false, lst, named, nopts, once);
+-
+-      if (error_state)
+-        return retval;
+-      if (sz == 0)
+-        {
+-          retval = args (0);
+-          return retval;
+-        }
+-
+-      // Determine replacement length
+-      const size_t replen = replacement.size ();
+-      int delta = 0;
+-      const_iterator p = lst.begin ();
+-      for (int i = 0; i < sz; i++)
+-        {
+-          OCTAVE_QUIT;
+-          delta += static_cast<int> (replen)
+-            - static_cast<int> (p->e - p->s + 1);
+-          p++;
+-        }
+-
+-      // Build replacement string
+-      rep.reserve (buffer.size () + delta);
+-      size_t from = 0;
+-      p = lst.begin ();
+-      for (int i = 0; i < sz; i++)
+-        {
+-          OCTAVE_QUIT;
+-          rep.append (&buffer[from], static_cast<size_t> (p->s - 1) - from);
+-          from = static_cast<size_t> (p->e - 1) + 1;
+-          rep.append (replacement);
+-          p++;
+-        }
+-      rep.append (&buffer[from], buffer.size () - from);
+-    }
+-
+-  retval = rep;
+-  return retval;
++  return regexp_replace (pattern, buffer, replacement, options, who);
+ }
+ 
+ DEFUN_DLD (regexprep, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn  {Loadable Function} {@var{outstr} =} regexprep (@var{string}, @var{pat}, @var{repstr})\n\
+ @deftypefnx {Loadable Function} {@var{outstr} =} regexprep (@var{string}, @var{pat}, @var{repstr}, \"@var{opt1}\", @dots{})\n\
+ Replace occurrences of pattern @var{pat} in @var{string} with @var{repstr}.\n\
+ \n\
+@@ -1667,17 +1130,17 @@ This option is present for compatibility
+       else
+         rep = Cell (args(2));
+ 
+       dv0 = str.dims ();
+       if (pat.numel () != 1)
+         {
+           dv1 = pat.dims ();
+           if (rep.numel () != 1 && dv1 != rep.dims ())
+-            error ("regexprep: Inconsistent cell array dimensions");
++            error ("regexprep: inconsistent cell array dimensions");
+         }
+       else if (rep.numel () != 1)
+         dv1 = rep.dims ();
+ 
+       if (!error_state)
+         {
+           Cell ret (dv0);
+           octave_value_list new_args = args;
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -26,17 +26,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <deque>
+ #include <list>
+ #include <map>
+ #include <set>
+ #include <string>
+ 
+ #include "glob-match.h"
+-#include "regex-match.h"
++#include "regexp.h"
+ 
+ class tree_argument_list;
+ class octave_user_function;
+ 
+ #include "oct-obj.h"
+ #include "oct-refcount.h"
+ #include "ov.h"
+ 
+@@ -1679,26 +1679,26 @@ public:
+     return retval;
+   }
+ 
+   static std::list<symbol_record>
+   regexp_global_variables (const std::string& pattern)
+   {
+     std::list<symbol_record> retval;
+ 
+-    regex_match pat (pattern);
++    ::regexp pat (pattern);
+ 
+     for (global_table_const_iterator p = global_table.begin ();
+          p != global_table.end (); p++)
+       {
+         // We generate a list of symbol_record objects so that
+         // the results from regexp_variables and regexp_global_variables
+         // may be handled the same way.
+ 
+-        if (pat.match (p->first))
++        if (pat.is_match (p->first))
+           retval.push_back (symbol_record (p->first, p->second,
+                                            symbol_record::global));
+       }
+ 
+     return retval;
+   }
+ 
+   static std::list<symbol_record> glob_variables (const string_vector& patterns)
+@@ -2310,25 +2310,25 @@ private:
+             if (pattern.match (sr.name ()))
+               sr.clear ();
+           }
+       }
+   }
+ 
+   void do_clear_variable_regexp (const std::string& pat)
+   {
+-    regex_match pattern (pat);
++    ::regexp pattern (pat);
+ 
+     for (table_iterator p = table.begin (); p != table.end (); p++)
+       {
+         symbol_record& sr = p->second;
+ 
+         if (sr.is_defined () || sr.is_global ())
+           {
+-            if (pattern.match (sr.name ()))
++            if (pattern.is_match (sr.name ()))
+               sr.clear ();
+           }
+       }
+   }
+ 
+   void do_mark_automatic (const std::string& name)
+   {
+     do_insert (name).mark_automatic ();
+@@ -2385,21 +2385,21 @@ private:
+     return retval;
+   }
+ 
+   std::list<symbol_record> do_regexp (const std::string& pattern,
+                                       bool vars_only = false) const
+   {
+     std::list<symbol_record> retval;
+ 
+-    regex_match pat (pattern);
++    ::regexp pat (pattern);
+ 
+     for (table_const_iterator p = table.begin (); p != table.end (); p++)
+       {
+-        if (pat.match (p->first))
++        if (pat.is_match (p->first))
+           {
+             const symbol_record& sr = p->second;
+ 
+             if (vars_only && ! sr.is_variable ())
+               continue;
+ 
+             retval.push_back (sr);
+           }
+diff --git a/src/variables.cc b/src/variables.cc
+--- a/src/variables.cc
++++ b/src/variables.cc
+@@ -31,17 +31,17 @@ along with Octave; see the file COPYING.
+ #include <iomanip>
+ #include <set>
+ #include <string>
+ 
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "file-ops.h"
+ #include "glob-match.h"
+-#include "regex-match.h"
++#include "regexp.h"
+ #include "str-vec.h"
+ 
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "gripes.h"
+@@ -2045,19 +2045,17 @@ name_matches_any_pattern (const std::str
+ 
+   for (int k = idx; k < argc; k++)
+     {
+       std::string patstr = argv[k];
+       if (! patstr.empty ())
+         {
+           if (have_regexp)
+             {
+-              regex_match pattern (patstr);
+-
+-              if (pattern.match (nm))
++              if (is_regexp_match (patstr, nm))
+                 {
+                   retval = true;
+                   break;
+                 }
+             }
+           else
+             {
+               glob_match pattern (patstr);

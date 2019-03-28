@@ -1,0 +1,233 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1454623992 18000
+#      Thu Feb 04 17:13:12 2016 -0500
+# Node ID 9a5bb6996b164da0cf2db5a0c472e330fdb6edac
+# Parent  bd96c2efd4feca486afa09c4ebc9b9c0bb7d8e17
+write to pipe or file in gl2ps_print
+
+* gl2ps-renderer.cc (safe_fclose): New function.
+(gl2ps_print): Adapt code from F__osmesa_print__ to handle writing to
+pipe or file based on the filename.
+* __osmesa_print__.cc (close_fcn): Delete.
+(F__osmesa_print__): Use gl2ps_print to write image to pipe or file.
+
+diff --git a/libinterp/corefcn/gl2ps-renderer.cc b/libinterp/corefcn/gl2ps-renderer.cc
+--- a/libinterp/corefcn/gl2ps-renderer.cc
++++ b/libinterp/corefcn/gl2ps-renderer.cc
+@@ -621,40 +621,80 @@ gl2ps_renderer::draw_text (const text::p
+ 
+   const Matrix pos = get_transform ().scale (props.get_data_position ());
+   std::string str = props.get_string ().string_vector_value ().join ("\n");
+ 
+   render_text (str, pos(0), pos(1), pos.numel () > 2 ? pos(2) : 0.0,
+                halign, valign, props.get_rotation ());
+ }
+ 
++#endif
++
+ static void
+ safe_pclose (FILE *f)
+ {
+   if (f)
+     octave_pclose (f);
+ }
+ 
+-#endif
++static void
++safe_fclose (FILE *f)
++{
++  if (f)
++    gnulib::fclose (f);
++}
++
++// If the name of the stream begins with '|', open a pipe to the command
++// named by the rest of the string.  Otherwise, write to the named file.
+ 
+ void
+-gl2ps_print (const graphics_object& fig, const std::string& cmd,
++gl2ps_print (const graphics_object& fig, const std::string& stream,
+              const std::string& term)
+ {
+-#ifdef HAVE_GL2PS_H
++#if defined (HAVE_GL2PS_H)
+ 
+-  FILE *fp = octave_popen (cmd.c_str (), "w");
++  // FIXME: should we have a way to create a file that begins with the
++  // character '|'?
+ 
+-  if (! fp)
+-    error ("print: failed to open pipe for gl2ps renderer");
++  bool have_cmd = stream.length () > 1 && stream[0] == '|';
++
++  FILE *fp = 0;
+ 
+   unwind_protect frame;
+ 
+-  frame.add_fcn (safe_pclose, fp);
++  if (have_cmd)
++    {
++      // Create process and pipe gl2ps output to it.
++
++      std::string cmd = stream.substr (1);
++
++      fp = octave_popen (cmd.c_str (), "w");
++
++      if (! fp)
++        error ("print: failed to open pipe \"%s\"", stream.c_str ());
++
++      frame.add_fcn (safe_pclose, fp);
++    }
++  else
++    {
++      // Write gl2ps output directly to file.
++
++      fp = gnulib::fopen (stream.c_str (), "w");
++
++      if (! fp)
++        error ("gl2ps_print: failed to create file \"%s\"", stream.c_str ());
++
++      frame.add_fcn (safe_fclose, fp);
++    }
+ 
+   gl2ps_renderer rend (fp, term);
+ 
+-  rend.draw (fig, cmd);
++  rend.draw (fig, "");
++
++  // Make sure buffered commands are finished!!!
++  glFinish ();
+ 
+ #else
++
+   err_disabled_feature ("gl2ps_print", "gl2ps");
++
+ #endif
+ }
+diff --git a/libinterp/corefcn/gl2ps-renderer.h b/libinterp/corefcn/gl2ps-renderer.h
+--- a/libinterp/corefcn/gl2ps-renderer.h
++++ b/libinterp/corefcn/gl2ps-renderer.h
+@@ -120,12 +120,12 @@ private:
+   double fontsize;
+   std::string fontname;
+   bool buffer_overflow;
+ };
+ 
+ #endif
+ 
+ extern OCTINTERP_API void
+-gl2ps_print (const graphics_object& fig, const std::string& cmd,
++gl2ps_print (const graphics_object& fig, const std::string& stream,
+              const std::string& term);
+ 
+ #endif
+diff --git a/libinterp/dldfcn/__osmesa_print__.cc b/libinterp/dldfcn/__osmesa_print__.cc
+--- a/libinterp/dldfcn/__osmesa_print__.cc
++++ b/libinterp/dldfcn/__osmesa_print__.cc
+@@ -39,27 +39,23 @@ from git://anongit.freedesktop.org/mesa/
+ 
+ #if defined (HAVE_OSMESA_H)
+ #  include "osmesa.h"
+ #elif defined (HAVE_GL_OSMESA_H)
+ #  include "GL/osmesa.h"
+ #endif
+ 
+ #if defined (HAVE_OSMESA) && defined (HAVE_OPENGL)
+-static void
+-close_fcn (FILE *f)
+-{
+-  gnulib::fclose (f);
+-}
+ 
+ static void
+ reset_visibility (figure::properties *fp)
+ {
+   fp->set_visible ("on");
+ }
++
+ #endif
+ 
+ DEFUN_DLD(__osmesa_print__, args, ,
+           "-*- texinfo -*-\n\
+ @deftypefn  {} {} __osmesa_print__ (@var{h}, @var{file}, @var{term})\n\
+ @deftypefnx {} {@var{img} =} __osmesa_print__ (@var{h})\n\
+ Print figure @var{h} using OSMesa and gl2ps for vector formats.\n\
+ \n\
+@@ -95,20 +91,16 @@ instead.\n\
+ 
+   if (nargin != 1 && nargin != 3)
+     print_usage ();
+ 
+   if (nargin == 3)
+     {
+       if (! (args(1).is_string () && args(2).is_string ()))
+         error ("__osmesa_print__: FILE and TERM must be strings");
+-
+-#ifndef HAVE_GL2PS_H
+-      error ("__osmesa_print__: Octave has been compiled without gl2ps");
+-#endif
+     }
+ 
+   octave_value_list retval;
+ 
+   int h = args(0).double_value ();
+   graphics_object fobj = gh_manager::get_object (h);
+   if (! (fobj && fobj.isa ("figure")))
+     error ("__osmesa_print__: H must be a valid figure handle");
+@@ -154,55 +146,20 @@ instead.\n\
+     {
+       outer_frame.add_fcn (reset_visibility, &fp);
+ 
+       fp.set_visible ("off");
+     }
+ 
+   if (nargin == 3)
+     {
+-      // use gl2ps
+-#ifndef HAVE_GL2PS_H
+-      err_disabled_feature ("__osmesa_print__", "gl2ps");
+-#else
+       std::string file = args(1).string_value ();
+       std::string term = args(2).string_value ();
+ 
+-      size_t pos_p = file.find_first_of ("|");
+-      size_t pos_c = file.find_first_not_of ("| ");
+-
+-      if (pos_p == std::string::npos && pos_c == std::string::npos)
+-        error ("__osmesa_print__: empty output ''");
+-      else if (pos_c == std::string::npos)
+-        error ("__osmesa_print__: empty pipe '|'");
+-      else if (pos_p != std::string::npos && pos_p < pos_c)
+-        {
+-          // create process and pipe gl2ps output to it
+-          std::string cmd = file.substr (pos_c);
+-          gl2ps_print (fobj, cmd, term);
+-        }
+-      else
+-        {
+-          // write gl2ps output directly to file
+-          FILE *filep = gnulib::fopen (file.substr (pos_c).c_str (), "w");
+-
+-          if (! filep)
+-            error ("__osmesa_print__: Couldn't create file \"%s\"", file.c_str ());
+-
+-          unwind_protect frame;
+-
+-          frame.add_fcn (close_fcn, filep);
+-
+-          gl2ps_renderer rend (filep, term);
+-          rend.draw (fobj, "");
+-
+-          // Make sure buffered commands are finished!!!
+-          glFinish ();
+-        }
+-#endif
++      gl2ps_print (fobj, file, term);
+     }
+   else
+     {
+       // return RGB image
+       opengl_renderer rend;
+       rend.draw (fobj);
+ 
+       // Make sure buffered commands are finished!!!

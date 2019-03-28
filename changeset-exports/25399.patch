@@ -1,0 +1,431 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1526945577 14400
+#      Mon May 21 19:32:57 2018 -0400
+# Node ID 6ca2c0d76d847f74cfcb85f548da00cc3f726bcd
+# Parent  a78e5b8d5ee7f37ff2d9ecf13a341798e799421e
+store unwind protect frame for function evaluation in call_stack object
+
+* call-stack.h, call-stack.cc (call_stack::m_unwind_protect_frame):
+New data member.
+(call_stack::push): Also handle unwind_protect frame.
+(call_stack::curr_fcn_unwind_protect_frame): New function.
+
+* variables.cc (curr_fcn_unwind_protect_frame): Access current
+unwind_protect frame from call_stack object.
+* pt-eval.cc (tree_evaluator::maybe_push_echo_state_cleanup):
+Likewise.
+
+* ov-usr-fcn.h (octave_user_code::curr_unwind_protect_frame):
+Delete member variable and all uses.
+(octave_user_code::unwind_protect_frame): Delete.
+
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_script::call,
+octave_user_function::call): Push current unwind_protect frame on
+call_stack object instead of saving and restoring
+octave_user_code::curr_unwind_protect_frame.
+
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -87,17 +87,17 @@ namespace octave
+       return true;
+   }
+ 
+   call_stack::call_stack (interpreter& interp)
+     : cs (), curr_frame (0), m_max_stack_depth (1024), m_interpreter (interp)
+   {
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+-    push (nullptr, symtab.top_scope (), 0);
++    push (nullptr, nullptr, symtab.top_scope (), 0);
+   }
+ 
+   int
+   call_stack::current_line (void) const
+   {
+     int retval = -1;
+ 
+     if (! cs.empty ())
+@@ -209,16 +209,34 @@ namespace octave
+                 break;
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
++  unwind_protect *
++  call_stack::curr_fcn_unwind_protect_frame (void) const
++  {
++    auto p = cs.cend ();
++
++    while (p != cs.cbegin ())
++      {
++        const stack_frame& elt = *(--p);
++
++        octave_function *f = elt.m_fcn;
++
++        if (f && f->is_user_code ())
++          return elt.m_unwind_protect_frame;
++      }
++
++    return nullptr;
++  }
++
+   int
+   call_stack::caller_user_code_column (void) const
+   {
+     int retval = -1;
+ 
+     auto p = cs.cend ();
+ 
+     while (p != cs.cbegin ())
+@@ -349,35 +367,36 @@ namespace octave
+             break;
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   void
+-  call_stack::push (octave_function *fcn)
++  call_stack::push (octave_function *fcn, unwind_protect *up_frame)
+   {
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+-    push (fcn, symtab.current_scope (), symtab.current_context ());
++    push (fcn, up_frame, symtab.current_scope (), symtab.current_context ());
+   }
+ 
+   void
+-  call_stack::push (octave_function *fcn, const symbol_scope& scope,
++  call_stack::push (octave_function *fcn, unwind_protect *up_frame,
++                    const symbol_scope& scope,
+                     symbol_record::context_id context)
+   {
+     size_t prev_frame = curr_frame;
+     curr_frame = cs.size ();
+ 
+     // m_max_stack_depth should never be less than zero.
+     if (curr_frame > static_cast<size_t> (m_max_stack_depth))
+       error ("max_stack_depth exceeded");
+ 
+-    cs.push_back (stack_frame (fcn, scope, context, prev_frame));
++    cs.push_back (stack_frame (fcn, up_frame, scope, context, prev_frame));
+ 
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+     symtab.set_scope_and_context (scope, context);
+   }
+ 
+   bool
+   call_stack::goto_frame (size_t n, bool verbose)
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -35,54 +35,61 @@ class octave_user_script;
+ class octave_value;
+ class octave_value_list;
+ 
+ #include "symscope.h"
+ 
+ namespace octave
+ {
+   class interpreter;
++  class unwind_protect;
+ 
+   class
+   OCTINTERP_API
+   call_stack
+   {
+   public:
+ 
+     class stack_frame
+     {
+     public:
+ 
+       friend class call_stack;
+ 
+       stack_frame (octave_function *fcn = nullptr,
++                   unwind_protect *up_frame = nullptr,
+                    const symbol_scope& scope = symbol_scope (),
+                    symbol_record::context_id context = 0, size_t prev = 0)
+-        : m_fcn (fcn), m_line (-1), m_column (-1), m_scope (scope),
++        : m_fcn (fcn), m_unwind_protect_frame (up_frame),
++          m_line (-1), m_column (-1), m_scope (scope),
+           m_context (context), m_prev (prev)
+       { }
+ 
+       stack_frame (const stack_frame& elt)
+-        : m_fcn (elt.m_fcn), m_line (elt.m_line), m_column (elt.m_column),
+-          m_scope (elt.m_scope), m_context (elt.m_context), m_prev (elt.m_prev)
++        : m_fcn (elt.m_fcn),
++          m_unwind_protect_frame (elt.m_unwind_protect_frame),
++          m_line (elt.m_line), m_column (elt.m_column),
++          m_scope (elt.m_scope), m_context (elt.m_context),
++          m_prev (elt.m_prev)
+       { }
+ 
+       int line (void) const { return m_line; }
+ 
+       int column (void) const { return m_column; }
+ 
+       std::string fcn_file_name (void) const;
+ 
+       std::string fcn_name (bool print_subfn = true) const;
+ 
+       bool operator == (const stack_frame& rhs) const;
+ 
+     private:
+ 
+       octave_function *m_fcn;
++      unwind_protect *m_unwind_protect_frame;
+       int m_line;
+       int m_column;
+       symbol_scope m_scope;
+       symbol_record::context_id m_context;
+       size_t m_prev;
+     };
+ 
+     typedef std::deque<stack_frame>::iterator iterator;
+@@ -151,16 +158,18 @@ namespace octave
+         }
+ 
+       return retval;
+     }
+ 
+     // User code caller.
+     octave_user_code * caller_user_code (size_t nskip = 0) const;
+ 
++    unwind_protect *curr_fcn_unwind_protect_frame (void) const;
++
+     // Line in user code caller.
+     int caller_user_code_line (void) const;
+ 
+     // Column in user code caller.
+     int caller_user_code_column (void) const;
+ 
+     // Current function that we are debugging.
+     octave_user_code * debug_user_code (void) const;
+@@ -169,28 +178,25 @@ namespace octave
+     int debug_user_code_line (void) const;
+ 
+     // Column number in current function that we are debugging.
+     int debug_user_code_column (void) const;
+ 
+     // Return TRUE if all elements on the call stack are scripts.
+     bool all_scripts (void) const;
+ 
+-    void push (octave_function *fcn);
+-    void push (octave_function *fcn, const symbol_scope& scope,
+-               symbol_record::context_id context);
++    void push (octave_function *fcn = nullptr,
++               unwind_protect *up_frame = nullptr);
+ 
+-    void push (void)
+-    {
+-      push (nullptr);
+-    }
++    void push (octave_function *fcn, unwind_protect *up_frame,
++               const symbol_scope& scope, symbol_record::context_id context);
+ 
+     void push (const symbol_scope& scope, symbol_record::context_id context)
+     {
+-      push (nullptr, scope, context);
++      push (nullptr, nullptr, scope, context);
+     }
+ 
+     void set_location (int l, int c)
+     {
+       if (! cs.empty ())
+         {
+           stack_frame& elt = cs.back ();
+ 
+diff --git a/libinterp/corefcn/variables.cc b/libinterp/corefcn/variables.cc
+--- a/libinterp/corefcn/variables.cc
++++ b/libinterp/corefcn/variables.cc
+@@ -702,23 +702,17 @@ wants_local_change (const octave_value_l
+ }
+ 
+ static octave::unwind_protect *
+ curr_fcn_unwind_protect_frame (void)
+ {
+   octave::call_stack& cs
+     = octave::__get_call_stack__ ("curr_fcn_unwind_protect_frame");
+ 
+-  octave_user_code *curr_usr_code = cs.caller_user_code ();
+-
+-  octave_user_function *curr_usr_fcn
+-    = (curr_usr_code && curr_usr_code->is_user_function ()
+-       ? dynamic_cast<octave_user_function *> (curr_usr_code) : nullptr);
+-
+-  return curr_usr_fcn ? curr_usr_fcn->unwind_protect_frame () : nullptr;
++  return cs.curr_fcn_unwind_protect_frame ();
+ }
+ 
+ template <typename T>
+ static bool
+ try_local_protect (T& var)
+ {
+   octave::unwind_protect *frame = curr_fcn_unwind_protect_frame ();
+ 
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -178,23 +178,17 @@ octave_user_script::call (octave::tree_e
+       call_depth++;
+ 
+       if (call_depth >= tw.max_recursion_depth ())
+         error ("max_recursion_depth exceeded");
+ 
+       octave::call_stack& cs
+         = octave::__get_call_stack__ ("octave_user_script::call");
+ 
+-      cs.push (this);
+-
+-      // Set pointer to the current unwind_protect frame to allow
+-      // certain builtins register simple cleanup in a very optimized manner.
+-      // This is *not* intended as a general-purpose on-cleanup mechanism,
+-      frame.protect_var (curr_unwind_protect_frame);
+-      curr_unwind_protect_frame = &frame;
++      cs.push (this, &frame);
+ 
+       frame.add_method (cs, &octave::call_stack::pop);
+ 
+       // Update line number even if debugging.
+       frame.protect_var (Vtrack_line_num);
+       Vtrack_line_num = true;
+ 
+       frame.protect_var (octave::tree_evaluator::statement_context);
+@@ -517,23 +511,17 @@ octave_user_function::call (octave::tree
+   // eval_undefined_error().
+ 
+   octave::call_stack& cs
+     = octave::__get_call_stack__ ("octave_user_function::call");
+ 
+   octave::symbol_record::context_id context
+     = anonymous_function ? 0 : call_depth;
+ 
+-  cs.push (this, m_scope, context);
+-
+-  // Set pointer to the current unwind_protect frame to allow
+-  // certain builtins register simple cleanup in a very optimized manner.
+-  // This is *not* intended as a general-purpose on-cleanup mechanism,
+-  frame.protect_var (curr_unwind_protect_frame);
+-  curr_unwind_protect_frame = &frame;
++  cs.push (this, &frame, m_scope, context);
+ 
+   frame.protect_var (Vtrack_line_num);
+   Vtrack_line_num = true;    // update source line numbers, even if debugging
+   frame.add_method (cs, &octave::call_stack::pop);
+ 
+   if (call_depth > 0 && ! is_anonymous_function ())
+     {
+       m_scope.push_context ();
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -63,37 +63,31 @@ protected:
+   octave_user_code (const std::string& fnm = "", const std::string& nm = "",
+                     const octave::symbol_scope& scope = octave::symbol_scope (),
+                     octave::tree_statement_list *cmds = nullptr,
+                     const std::string& ds = "")
+     : octave_function (nm, ds), m_scope (scope), file_name (fnm),
+       t_parsed (static_cast<time_t> (0)),
+       t_checked (static_cast<time_t> (0)),
+       call_depth (-1), m_file_info (nullptr),
+-      curr_unwind_protect_frame (nullptr), cmd_list (cmds)
++      cmd_list (cmds)
+   { }
+ 
+ public:
+ 
+   // No copying!
+ 
+   octave_user_code (const octave_user_code& f) = delete;
+ 
+   octave_user_code& operator = (const octave_user_code& f) = delete;
+ 
+   ~octave_user_code (void);
+ 
+   bool is_user_code (void) const { return true; }
+ 
+-  octave::unwind_protect *
+-  unwind_protect_frame (void)
+-  {
+-    return curr_unwind_protect_frame;
+-  }
+-
+   std::string get_code_line (size_t line);
+ 
+   std::deque<std::string> get_code_lines (size_t line, size_t num_lines);
+ 
+   void cache_function_text (const std::string& text,
+                             const octave::sys::time& timestamp);
+ 
+   octave::symbol_scope scope (void) { return m_scope; }
+@@ -139,19 +133,16 @@ protected:
+ 
+   // Used to keep track of recursion depth.
+   int call_depth;
+ 
+   // Cached text of function or script code with line offsets
+   // calculated.
+   octave::file_info *m_file_info;
+ 
+-  // pointer to the current unwind_protect frame of this function.
+-  octave::unwind_protect *curr_unwind_protect_frame;
+-
+   // The list of commands that make up the body of this function.
+   octave::tree_statement_list *cmd_list;
+ };
+ 
+ // Scripts.
+ 
+ class
+ octave_user_script : public octave_user_code
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -2968,32 +2968,25 @@ namespace octave
+     frame.add_method (*this, &tree_evaluator::set_echo_file_pos,
+                       m_echo_file_pos);
+   }
+ 
+   bool tree_evaluator::maybe_push_echo_state_cleanup (void)
+   {
+     // This function is expected to be called from ECHO, which would be
+     // the top of the call stack.  If the caller of ECHO is a
+-    // user-defined fucntion or script, then set up unwind-protect
++    // user-defined function or script, then set up unwind-protect
+     // elements to restore echo state.
+ 
+-    octave_function *caller = m_call_stack.caller ();
+-
+-    if (caller && caller->is_user_code ())
++    unwind_protect *frame = m_call_stack.curr_fcn_unwind_protect_frame ();
++
++    if (frame)
+       {
+-        octave_user_code *fcn = dynamic_cast<octave_user_code *> (caller);
+-
+-        unwind_protect *frame = fcn->unwind_protect_frame ();
+-
+-        if (frame)
+-          {
+-            push_echo_state_cleanup (*frame);
+-            return true;
+-          }
++        push_echo_state_cleanup (*frame);
++        return true;
+       }
+ 
+     return false;
+   }
+ 
+ 
+   octave_value
+   tree_evaluator::echo (const octave_value_list& args, int)

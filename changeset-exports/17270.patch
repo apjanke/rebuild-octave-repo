@@ -1,0 +1,189 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1376858201 14400
+#      Sun Aug 18 16:36:41 2013 -0400
+# Node ID ba865ea9c7e9ee7a62710491adae92c9d8963122
+# Parent  5b088598df1d6aa65f89393ab03e9574a2aa849c
+Add simple FreeType font cache in class ft_manager.
+
+* libinterp/corefcn/txt-eng-ft.cc (ft_face_destroyed): New static function.
+(ft_manager::font_destroyed): New static method.
+(ft_manager::do_font_destroyed): New method.
+(ft_manager::ft_key, ft_manager::ft_cache): New typedef's.
+(ft_manager::cache): New member, storing weak references to loaded fonts.
+(ft_manager::do_get_font): Look for font into the cache. Use fontconfig and
+freetype if not found. Insert newly loaded fonts into the cache. Install
+finalizer to update the cache on font destruction.
+
+diff --git a/libinterp/corefcn/txt-eng-ft.cc b/libinterp/corefcn/txt-eng-ft.cc
+--- a/libinterp/corefcn/txt-eng-ft.cc
++++ b/libinterp/corefcn/txt-eng-ft.cc
+@@ -26,16 +26,18 @@ along with Octave; see the file COPYING.
+ 
+ #if defined (HAVE_FREETYPE)
+ 
+ #if defined (HAVE_FONTCONFIG)
+ #include <fontconfig/fontconfig.h>
+ #endif
+ 
+ #include <iostream>
++#include <map>
++#include <utility>
+ 
+ #include "singleton-cleanup.h"
+ 
+ #include "error.h"
+ #include "pr-output.h"
+ #include "txt-eng-ft.h"
+ 
+ // FIXME -- maybe issue at most one warning per glyph/font/size/weight
+@@ -60,16 +62,19 @@ gripe_glyph_render (char c)
+ #ifdef _MSC_VER
+ // This is just a trick to avoid multiply symbols definition.
+ // PermMatrix.h contains a dllexport'ed Array<octave_idx_type>
+ // that will make MSVC not to generate new instantiation and
+ // use the imported one.
+ #include "PermMatrix.h"
+ #endif
+ 
++// Forward declaration
++static void ft_face_destroyed (void* object);
++
+ class
+ ft_manager
+ {
+ public:
+   static bool instance_ok (void)
+     {
+       bool retval = true;
+ 
+@@ -94,20 +99,34 @@ public:
+   static void cleanup_instance (void) { delete instance; instance = 0; }
+ 
+   static FT_Face get_font (const std::string& name, const std::string& weight,
+                            const std::string& angle, double size)
+     { return (instance_ok ()
+               ? instance->do_get_font (name, weight, angle, size)
+               : 0); }
+ 
++  static void font_destroyed (FT_Face face)
++    {
++      if (instance_ok ())
++        instance->do_font_destroyed (face);
++    }
++
+ private:
+ 
+   static ft_manager *instance;
+ 
++  typedef std::pair<std::string, double> ft_key;
++  typedef std::map<ft_key, FT_Face> ft_cache;
++
++  // Cache the fonts loaded by freetype. This cache only contains
++  // weak references to the fonts, strong references are only present
++  // in class ft_render.
++  ft_cache cache;
++
+ private:
+ 
+   // No copying!
+ 
+   ft_manager (const ft_manager&);
+ 
+   ft_manager& operator = (const ft_manager&);
+ 
+@@ -144,16 +163,28 @@ private:
+     }
+ 
+ 
+   FT_Face do_get_font (const std::string& name, const std::string& weight,
+                        const std::string& angle, double size)
+     {
+       FT_Face retval = 0;
+ 
++      // Look first into the font cache, then use fontconfig. If the font
++      // is present in the cache, simply add a reference and return it.
++
++      ft_key key (name + ":" + weight + ":" + angle, size);
++      ft_cache::const_iterator it = cache.find (key);
++
++      if (it != cache.end ())
++        {
++          FT_Reference_Face (it->second);
++          return it->second;
++        }
++
+       std::string file;
+ 
+ #if defined (HAVE_FONTCONFIG)
+       if (fontconfig_initialized)
+         {
+           int fc_weight, fc_angle;
+ 
+           if (weight == "bold")
+@@ -216,30 +247,63 @@ private:
+         {
+ #ifdef __WIN32__
+           file = "C:/WINDOWS/Fonts/verdana.ttf";
+ #else
+           // FIXME: find a "standard" font for UNIX platforms
+ #endif
+         }
+ 
+-      if (! file.empty () && FT_New_Face (library, file.c_str (), 0, &retval))
+-        ::warning ("ft_manager: unable to load font: %s", file.c_str ());
++      if (! file.empty ())
++        {
++          if (FT_New_Face (library, file.c_str (), 0, &retval))
++            ::warning ("ft_manager: unable to load font: %s", file.c_str ());
++          else
++            {
++              // Install a finalizer to notify ft_manager that the font is
++              // being destroyed. The class ft_manager only keeps weak
++              // references to font objects.
++
++              retval->generic.data = new ft_key (key);
++              retval->generic.finalizer = ft_face_destroyed;
++
++              // Insert loaded font into the cache.
++
++              cache[key] = retval;
++            }
++        }
+ 
+       return retval;
+     }
+ 
++  void do_font_destroyed (FT_Face face)
++    {
++      if (face->generic.data)
++        {
++          ft_key* pkey =
++            reinterpret_cast<ft_key*> (face->generic.data);
++
++          cache.erase (*pkey);
++          delete pkey;
++          face->generic.data = 0;
++        }
++    }
++
+ private:
+   FT_Library library;
+   bool freetype_initialized;
+   bool fontconfig_initialized;
+ };
+ 
+ ft_manager* ft_manager::instance = 0;
+ 
++static void
++ft_face_destroyed (void* object)
++{ ft_manager::font_destroyed (reinterpret_cast<FT_Face> (object)); }
++
+ // ---------------------------------------------------------------------------
+ 
+ ft_render::ft_render (void)
+     : text_processor (), face (0), bbox (1, 4, 0.0),
+       xoffset (0), yoffset (0), multiline_halign (0),
+       multiline_align_xoffsets (), mode (MODE_BBOX),
+       red (0), green (0), blue (0)
+ {

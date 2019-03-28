@@ -1,0 +1,777 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1315661762 -7200
+#      Sat Sep 10 15:36:02 2011 +0200
+# Node ID 9b74f97919e1ef6b0e2d1f89d7a932c8b6d2fd47
+# Parent  68c50b393f1d944781cbc8f54f128eefd6ca7288
+Fixed KPtyDevice.
+
+diff --git a/gui/src/TerminalHighlighter.cpp b/gui/src/TerminalHighlighter.cpp
+--- a/gui/src/TerminalHighlighter.cpp
++++ b/gui/src/TerminalHighlighter.cpp
+@@ -22,17 +22,17 @@
+ TerminalHighlighter::TerminalHighlighter(QTextDocument *parent)
+   : QSyntaxHighlighter(parent)
+ {
+   HighlightingRule rule;
+ 
+   keywordFormat.setForeground(Qt::darkBlue);
+   QStringList keywordPatterns
+       = QString(ResourceManager::instance ()->octaveKeywords ()).split(" ", QString::SkipEmptyParts);
+-  keywordPatterns << "GNU" << "Octave" << "OctaveGUI";
++   keywordPatterns << "GNU" << "Octave" << "OctaveGUI";
+ 
+   for (int i = 0; i < keywordPatterns.size (); i++)
+     keywordPatterns.replace(i, QString("\\b%1\\b").arg(keywordPatterns.at (i)));
+ 
+   foreach (const QString &pattern, keywordPatterns)
+     {
+       rule.pattern = QRegExp(pattern);
+       rule.format = keywordFormat;
+@@ -66,17 +66,16 @@ TerminalHighlighter::TerminalHighlighter
+   rule.format = subCaptionFormat;
+   highlightingRules.append(rule);
+ 
+   captionFormat.setForeground(Qt::black);
+   captionFormat.setFontWeight(QFont::Bold);
+   rule.pattern = QRegExp("^\\s+\\*\\*.+$");
+   rule.format = captionFormat;
+   highlightingRules.append(rule);
+-
+ }
+ 
+ void TerminalHighlighter::highlightBlock(const QString &text)
+ {
+   foreach (const HighlightingRule &rule, highlightingRules)
+     {
+       QRegExp expression(rule.pattern);
+       int index = expression.indexIn(text);
+diff --git a/gui/src/TerminalView.cpp b/gui/src/TerminalView.cpp
+--- a/gui/src/TerminalView.cpp
++++ b/gui/src/TerminalView.cpp
+@@ -64,8 +64,22 @@ TerminalView::keyPressEvent (QKeyEvent *
+ }
+ 
+ void
+ TerminalView::mousePressEvent (QMouseEvent *mouseEvent)
+ {
+   // TODO: Pass mouse events to the terminal emulation.
+   mouseEvent->accept();
+ }
++
++void
++TerminalView::mouseDoubleClickEvent (QMouseEvent *mouseEvent)
++{
++  // TODO: Pass mouse events to the terminal emulation.
++  mouseEvent->accept();
++}
++
++void
++TerminalView::wheelEvent (QWheelEvent *wheelEvent)
++{
++  // TODO: Pass mouse events to the terminal emulation.
++  wheelEvent->accept();
++}
+diff --git a/gui/src/TerminalView.h b/gui/src/TerminalView.h
+--- a/gui/src/TerminalView.h
++++ b/gui/src/TerminalView.h
+@@ -38,13 +38,15 @@ public:
+   // Terminal Interface
+   QTextCursor textCursor();
+   void setTextCursor (const QTextCursor &cursor);
+   void bell ();
+ 
+ protected:
+   void keyPressEvent (QKeyEvent *keyEvent);
+   void mousePressEvent (QMouseEvent *mouseEvent);
++  void mouseDoubleClickEvent (QMouseEvent *mouseEvent);
++  void wheelEvent (QWheelEvent *wheelEvent);
+ 
+ private:
+   TerminalEmulation *m_terminalEmulation;
+ };
+ #endif // OCTAVETERMINAL_H
+diff --git a/gui/src/terminal/KPtyDevice.cpp b/gui/src/terminal/KPtyDevice.cpp
+--- a/gui/src/terminal/KPtyDevice.cpp
++++ b/gui/src/terminal/KPtyDevice.cpp
+@@ -17,27 +17,43 @@
+ 
+    You should have received a copy of the GNU Library General Public License
+    along with this library; see the file COPYING.LIB.  If not, write to
+    the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+    Boston, MA 02110-1301, USA.
+ */
+ 
+ #include "KPtyDevice.h"
++#define i18n
+ 
+ #include <QtCore/QSocketNotifier>
+ 
+ #include <unistd.h>
+ #include <errno.h>
+ #include <signal.h>
+ #include <termios.h>
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
++#ifdef HAVE_SYS_FILIO_H
++#include <sys/filio.h>
++#endif
++#ifdef HAVE_SYS_TIME_H
++#include <sys/time.h>
++#endif
+ 
++#if defined(Q_OS_FREEBSD) || defined(Q_OS_MAC)
++  // "the other end's output queue size" - kinda braindead, huh?
++#define PTY_BYTES_AVAILABLE TIOCOUTQ
++#elif defined(TIOCINQ)
++  // "our end's input queue size"
+ #define PTY_BYTES_AVAILABLE TIOCINQ
++#else
++  // likewise. more generic ioctl (theoretically)
++#define PTY_BYTES_AVAILABLE FIONREAD
++#endif
+ 
+ //////////////////
+ // private data //
+ //////////////////
+ 
+ // Lifted from Qt. I don't think they would mind. ;)
+ // Re-lift again from Qt whenever a proper replacement for pthread_once appears
+ static void
+@@ -56,66 +72,106 @@ qt_ignore_sigpipe ()
+ #define NO_INTR(ret,func) do { ret = func; } while (ret < 0 && errno == EINTR)
+ 
+ bool
+ KPtyDevicePrivate::_k_canRead ()
+ {
+   Q_Q (KPtyDevice);
+   qint64 readBytes = 0;
+ 
+-
++#ifdef Q_OS_IRIX		// this should use a config define, but how to check it?
++  size_t available;
++#else
+   int available;
++#endif
+   if (!::ioctl (q->masterFd (), PTY_BYTES_AVAILABLE, (char *) &available))
+     {
++#ifdef Q_OS_SOLARIS
++      // A Pty is a STREAMS module, and those can be activated
++      // with 0 bytes available. This happens either when ^C is
++      // pressed, or when an application does an explicit write(a,b,0)
++      // which happens in experiments fairly often. When 0 bytes are
++      // available, you must read those 0 bytes to clear the STREAMS
++      // module, but we don't want to hit the !readBytes case further down.
++      if (!available)
++        {
++          char c;
++          // Read the 0-byte STREAMS message
++          NO_INTR (readBytes, read (q->masterFd (), &c, 0));
++          // Should return 0 bytes read; -1 is error
++          if (readBytes < 0)
++            {
++              readNotifier->setEnabled (false);
++              emit q->readEof ();
++              return false;
++            }
++          return true;
++        }
++#endif
++
+       char *ptr = readBuffer.reserve (available);
+-	// Useless block braces except in Solaris
+-	{
+-	  NO_INTR (readBytes, read (q->masterFd (), ptr, available));
+-	}
++#ifdef Q_OS_SOLARIS
++      // Even if available > 0, it is possible for read()
++      // to return 0 on Solaris, due to 0-byte writes in the stream.
++      // Ignore them and keep reading until we hit *some* data.
++      // In Solaris it is possible to have 15 bytes available
++      // and to (say) get 0, 0, 6, 0 and 9 bytes in subsequent reads.
++      // Because the stream is set to O_NONBLOCK in finishOpen(),
++      // an EOF read will return -1.
++      readBytes = 0;
++      while (!readBytes)
++#endif
++        // Useless block braces except in Solaris
++        {
++          NO_INTR (readBytes, read (q->masterFd (), ptr, available));
++        }
+       if (readBytes < 0)
+-	{
+-	  readBuffer.unreserve (available);
+-	  return false;
+-	}
++        {
++          readBuffer.unreserve (available);
++          q->setErrorString (i18n ("Error reading from PTY"));
++          return false;
++        }
+       readBuffer.unreserve (available - readBytes);	// *should* be a no-op
+     }
+ 
+   if (!readBytes)
+     {
+       readNotifier->setEnabled (false);
++      emit q->readEof ();
+       return false;
+     }
+   else
+     {
+       if (!emittedReadyRead)
+-	{
+-	  emittedReadyRead = true;
+-	  emit q->readyRead ();
+-	  emittedReadyRead = false;
+-	}
++        {
++          emittedReadyRead = true;
++          emit q->readyRead ();
++          emittedReadyRead = false;
++        }
+       return true;
+     }
+ }
+ 
+ bool
+ KPtyDevicePrivate::_k_canWrite ()
+ {
+   Q_Q (KPtyDevice);
+ 
+   writeNotifier->setEnabled (false);
+   if (writeBuffer.isEmpty ())
+     return false;
+ 
+   qt_ignore_sigpipe ();
+   int wroteBytes;
+   NO_INTR (wroteBytes,
+-	   write (q->masterFd (),
+-		  writeBuffer.readPointer (), writeBuffer.readSize ()));
++           write (q->masterFd (),
++                  writeBuffer.readPointer (), writeBuffer.readSize ()));
+   if (wroteBytes < 0)
+     {
++      q->setErrorString (i18n ("Error writing to PTY"));
+       return false;
+     }
+   writeBuffer.free (wroteBytes);
+ 
+   if (!emittedBytesWritten)
+     {
+       emittedBytesWritten = true;
+       emit q->bytesWritten (wroteBytes);
+@@ -148,63 +204,81 @@ KPtyDevicePrivate::_k_canWrite ()
+         } \
+     } while (0)
+ #endif
+ 
+ bool
+ KPtyDevicePrivate::doWait (int msecs, bool reading)
+ {
+   Q_Q (KPtyDevice);
++#ifndef __linux__
++  struct timeval etv;
++#endif
+   struct timeval tv, *tvp;
+ 
+   if (msecs < 0)
+     tvp = 0;
+   else
+     {
+       tv.tv_sec = msecs / 1000;
+       tv.tv_usec = (msecs % 1000) * 1000;
++#ifndef __linux__
++      gettimeofday (&etv, 0);
++      timeradd (&tv, &etv, &etv);
++#endif
+       tvp = &tv;
+     }
+ 
+   while (reading ? readNotifier->isEnabled () : !writeBuffer.isEmpty ())
+     {
+       fd_set rfds;
+       fd_set wfds;
+ 
+       FD_ZERO (&rfds);
+       FD_ZERO (&wfds);
+ 
+       if (readNotifier->isEnabled ())
+-	FD_SET (q->masterFd (), &rfds);
++        FD_SET (q->masterFd (), &rfds);
+       if (!writeBuffer.isEmpty ())
+-	FD_SET (q->masterFd (), &wfds);
++        FD_SET (q->masterFd (), &wfds);
++
++#ifndef __linux__
++      if (tvp)
++        {
++          gettimeofday (&tv, 0);
++          timersub (&etv, &tv, &tv);
++          if (tv.tv_sec < 0)
++            tv.tv_sec = tv.tv_usec = 0;
++        }
++#endif
+ 
+       switch (select (q->masterFd () + 1, &rfds, &wfds, 0, tvp))
+-	{
+-	case -1:
+-	  if (errno == EINTR)
+-	    break;
+-	  return false;
+-	case 0:
+-	  return false;
+-	default:
+-	  if (FD_ISSET (q->masterFd (), &rfds))
+-	    {
+-	      bool canRead = _k_canRead ();
+-	      if (reading && canRead)
+-		return true;
+-	    }
+-	  if (FD_ISSET (q->masterFd (), &wfds))
+-	    {
+-	      bool canWrite = _k_canWrite ();
+-	      if (!reading)
+-		return canWrite;
+-	    }
+-	  break;
+-	}
++        {
++        case -1:
++          if (errno == EINTR)
++            break;
++          return false;
++        case 0:
++          q->setErrorString (i18n ("PTY operation timed out"));
++          return false;
++        default:
++          if (FD_ISSET (q->masterFd (), &rfds))
++            {
++              bool canRead = _k_canRead ();
++              if (reading && canRead)
++                return true;
++            }
++          if (FD_ISSET (q->masterFd (), &wfds))
++            {
++              bool canWrite = _k_canWrite ();
++              if (!reading)
++                return canWrite;
++            }
++          break;
++        }
+     }
+   return false;
+ }
+ 
+ void
+ KPtyDevicePrivate::finishOpen (QIODevice::OpenMode mode)
+ {
+   Q_Q (KPtyDevice);
+@@ -212,22 +286,26 @@ KPtyDevicePrivate::finishOpen (QIODevice
+   q->QIODevice::open (mode);
+   fcntl (q->masterFd (), F_SETFL, O_NONBLOCK);
+   readBuffer.clear ();
+   readNotifier =
+     new QSocketNotifier (q->masterFd (), QSocketNotifier::Read, q);
+   writeNotifier =
+     new QSocketNotifier (q->masterFd (), QSocketNotifier::Write, q);
+   QObject::connect (readNotifier, SIGNAL (activated (int)), q,
+-		    SLOT (_k_canRead ()));
++                    SLOT (_k_canRead ()));
+   QObject::connect (writeNotifier, SIGNAL (activated (int)), q,
+-		    SLOT (_k_canWrite ()));
++                    SLOT (_k_canWrite ()));
+   readNotifier->setEnabled (true);
+ }
+ 
++/////////////////////////////
++// public member functions //
++/////////////////////////////
++
+ KPtyDevice::KPtyDevice (QObject * parent):
+ QIODevice (parent), KPty (new KPtyDevicePrivate (this))
+ {
+ }
+ 
+ KPtyDevice::~KPtyDevice ()
+ {
+   close ();
+@@ -238,31 +316,33 @@ KPtyDevice::open (OpenMode mode)
+ {
+   Q_D (KPtyDevice);
+ 
+   if (masterFd () >= 0)
+     return true;
+ 
+   if (!KPty::open ())
+     {
++      setErrorString (i18n ("Error opening PTY"));
+       return false;
+     }
+ 
+   d->finishOpen (mode);
+ 
+   return true;
+ }
+ 
+ bool
+ KPtyDevice::open (int fd, OpenMode mode)
+ {
+   Q_D (KPtyDevice);
+ 
+   if (!KPty::open (fd))
+     {
++      setErrorString (i18n ("Error opening PTY"));
+       return false;
+     }
+ 
+   d->finishOpen (mode);
+ 
+   return true;
+ }
+ 
+@@ -278,16 +358,22 @@ KPtyDevice::close ()
+   delete d->writeNotifier;
+ 
+   QIODevice::close ();
+ 
+   KPty::close ();
+ }
+ 
+ bool
++KPtyDevice::isSequential () const
++{
++  return true;
++}
++
++bool
+ KPtyDevice::canReadLine () const
+ {
+   Q_D (const KPtyDevice);
+   return QIODevice::canReadLine () || d->readBuffer.canReadLine ();
+ }
+ 
+ bool
+ KPtyDevice::atEnd () const
+@@ -305,31 +391,59 @@ KPtyDevice::bytesAvailable () const
+ 
+ qint64
+ KPtyDevice::bytesToWrite () const
+ {
+   Q_D (const KPtyDevice);
+   return d->writeBuffer.size ();
+ }
+ 
++bool
++KPtyDevice::waitForReadyRead (int msecs)
++{
++  Q_D (KPtyDevice);
++  return d->doWait (msecs, true);
++}
++
++bool
++KPtyDevice::waitForBytesWritten (int msecs)
++{
++  Q_D (KPtyDevice);
++  return d->doWait (msecs, false);
++}
++
++void
++KPtyDevice::setSuspended (bool suspended)
++{
++  Q_D (KPtyDevice);
++  d->readNotifier->setEnabled (!suspended);
++}
++
++bool
++KPtyDevice::isSuspended () const
++{
++  Q_D (const KPtyDevice);
++  return !d->readNotifier->isEnabled ();
++}
++
+ // protected
+ qint64
+ KPtyDevice::readData (char *data, qint64 maxlen)
+ {
+   Q_D (KPtyDevice);
+   return d->readBuffer.read (data, (int) qMin < qint64 > (maxlen, KMAXINT));
+ }
+ 
+ // protected
+ qint64
+ KPtyDevice::readLineData (char *data, qint64 maxlen)
+ {
+   Q_D (KPtyDevice);
+   return d->readBuffer.readLine (data,
+-				 (int) qMin < qint64 > (maxlen, KMAXINT));
++                                 (int) qMin < qint64 > (maxlen, KMAXINT));
+ }
+ 
+ // protected
+ qint64
+ KPtyDevice::writeData (const char *data, qint64 len)
+ {
+   Q_D (KPtyDevice);
+   Q_ASSERT (len <= KMAXINT);
+diff --git a/gui/src/terminal/KPtyDevice.h b/gui/src/terminal/KPtyDevice.h
+--- a/gui/src/terminal/KPtyDevice.h
++++ b/gui/src/terminal/KPtyDevice.h
+@@ -16,32 +16,33 @@
+     along with this library; see the file COPYING.LIB.  If not, write to
+     the Free Software Foundation, Inc., 51 Franklin Street, Fifth Floor,
+     Boston, MA 02110-1301, USA.
+ */
+ 
+ #ifndef kptydev_h
+ #define kptydev_h
+ 
++struct KPtyPrivate;
+ struct KPtyDevicePrivate;
+ 
+ #include "KPty.h"
+ #include <QtCore/QIODevice>
+ #include <QSocketNotifier>
+ 
+ #define Q_DECLARE_PRIVATE_MI(Class, SuperClass) \
+     inline Class##Private* d_func() { return reinterpret_cast<Class##Private *>(SuperClass::d_ptr); } \
+     inline const Class##Private* d_func() const { return reinterpret_cast<const Class##Private *>(SuperClass::d_ptr); } \
+     friend class Class##Private;
+ 
+ /**
+  * Encapsulates KPty into a QIODevice, so it can be used with Q*Stream, etc.
+  */
+ class KPtyDevice:public QIODevice, public KPty
+-{
++{				//krazy:exclude=dpointer (via macro)
+ Q_OBJECT Q_DECLARE_PRIVATE_MI (KPtyDevice, KPty) public:
+ 
+     /**
+      * Constructor
+      */
+   KPtyDevice (QObject * parent = 0);
+ 
+     /**
+@@ -75,16 +76,45 @@ Q_OBJECT Q_DECLARE_PRIVATE_MI (KPtyDevic
+   bool open (int fd, OpenMode mode = ReadWrite | Unbuffered);
+ 
+     /**
+      * Close the pty master/slave pair.
+      */
+   virtual void close ();
+ 
+     /**
++     * Sets whether the KPtyDevice monitors the pty for incoming data.
++     *
++     * When the KPtyDevice is suspended, it will no longer attempt to buffer
++     * data that becomes available from the pty and it will not emit any
++     * signals.
++     *
++     * Do not use on closed ptys.
++     * After a call to open(), the pty is not suspended. If you need to
++     * ensure that no data is read, call this function before the main loop
++     * is entered again (i.e., immediately after opening the pty).
++     */
++  void setSuspended (bool suspended);
++
++    /**
++     * Returns true if the KPtyDevice is not monitoring the pty for incoming
++     * data.
++     *
++     * Do not use on closed ptys.
++     *
++     * See setSuspended()
++     */
++  bool isSuspended () const;
++
++    /**
++     * @return always true
++     */
++  virtual bool isSequential () const;
++
++    /**
+      * @reimp
+      */
+   bool canReadLine () const;
+ 
+     /**
+      * @reimp
+      */
+   bool atEnd () const;
+@@ -94,24 +124,36 @@ Q_OBJECT Q_DECLARE_PRIVATE_MI (KPtyDevic
+      */
+   qint64 bytesAvailable () const;
+ 
+     /**
+      * @reimp
+      */
+   qint64 bytesToWrite () const;
+ 
++  bool waitForBytesWritten (int msecs = -1);
++  bool waitForReadyRead (int msecs = -1);
++
++
++    Q_SIGNALS:
++    /**
++     * Emitted when EOF is read from the PTY.
++     *
++     * Data may still remain in the buffers.
++     */
++  void readEof ();
++
+ protected:
+-  virtual qint64 readData (char *data, qint64 maxSize);
++    virtual qint64 readData (char *data, qint64 maxSize);
+   virtual qint64 readLineData (char *data, qint64 maxSize);
+   virtual qint64 writeData (const char *data, qint64 maxSize);
+ 
+ private:
+   Q_PRIVATE_SLOT (d_func (), bool _k_canRead ())
+-  Q_PRIVATE_SLOT (d_func (), bool _k_canWrite ())};
++    Q_PRIVATE_SLOT (d_func (), bool _k_canWrite ())};
+ 
+ #define KMAXINT ((int)(~0U >> 1))
+ 
+ /////////////////////////////////////////////////////
+ // Helper. Remove when QRingBuffer becomes public. //
+ /////////////////////////////////////////////////////
+ 
+ #include <QtCore/qbytearray.h>
+@@ -163,57 +205,57 @@ public:
+     totalSize -= bytes;
+     Q_ASSERT (totalSize >= 0);
+ 
+     forever
+     {
+       int nbs = readSize ();
+ 
+       if (bytes < nbs)
+-	{
+-	  head += bytes;
+-	  if (head == tail && buffers.count () == 1)
+-	    {
+-	      buffers.first ().resize (CHUNKSIZE);
+-	      head = tail = 0;
+-	    }
+-	  break;
+-	}
++        {
++          head += bytes;
++          if (head == tail && buffers.count () == 1)
++            {
++              buffers.first ().resize (CHUNKSIZE);
++              head = tail = 0;
++            }
++          break;
++        }
+ 
+       bytes -= nbs;
+       if (buffers.count () == 1)
+-	{
+-	  buffers.first ().resize (CHUNKSIZE);
+-	  head = tail = 0;
+-	  break;
+-	}
++        {
++          buffers.first ().resize (CHUNKSIZE);
++          head = tail = 0;
++          break;
++        }
+ 
+       buffers.removeFirst ();
+       head = 0;
+     }
+   }
+ 
+   char *reserve (int bytes)
+   {
+     totalSize += bytes;
+ 
+     char *ptr;
+     if (tail + bytes <= buffers.last ().size ())
+       {
+-	ptr = buffers.last ().data () + tail;
+-	tail += bytes;
++        ptr = buffers.last ().data () + tail;
++        tail += bytes;
+       }
+     else
+       {
+-	buffers.last ().resize (tail);
+-	QByteArray tmp;
+-	tmp.resize (qMax (CHUNKSIZE, bytes));
+-	ptr = tmp.data ();
+-	buffers << tmp;
+-	tail = bytes;
++        buffers.last ().resize (tail);
++        QByteArray tmp;
++        tmp.resize (qMax (CHUNKSIZE, bytes));
++        ptr = tmp.data ();
++        buffers << tmp;
++        tail = bytes;
+       }
+     return ptr;
+   }
+ 
+   // release a trailing part of the last reservation
+   inline void unreserve (int bytes)
+   {
+     totalSize -= bytes;
+@@ -231,26 +273,26 @@ public:
+   int indexAfter (char c, int maxLength = KMAXINT) const
+   {
+     int index = 0;
+     int start = head;
+       QLinkedList < QByteArray >::ConstIterator it = buffers.begin ();
+       forever
+     {
+       if (!maxLength)
+-	return index;
++        return index;
+       if (index == size ())
+-	return -1;
++        return -1;
+       const QByteArray & buf = *it;
+       ++it;
+       int len = qMin ((it == buffers.end ()? tail : buf.size ()) - start,
+-		      maxLength);
++                      maxLength);
+       const char *ptr = buf.data () + start;
+       if (const char *rptr = (const char *)memchr (ptr, c, len))
+-	return index + (rptr - ptr) + 1;
++        return index + (rptr - ptr) + 1;
+         index += len;
+         maxLength -= len;
+         start = 0;
+     }
+   }
+ 
+   inline int lineSize (int maxLength = KMAXINT) const
+   {
+@@ -263,21 +305,21 @@ public:
+   }
+ 
+   int read (char *data, int maxLength)
+   {
+     int bytesToRead = qMin (size (), maxLength);
+     int readSoFar = 0;
+     while (readSoFar < bytesToRead)
+       {
+-	const char *ptr = readPointer ();
+-	int bs = qMin (bytesToRead - readSoFar, readSize ());
+-	memcpy (data + readSoFar, ptr, bs);
+-	readSoFar += bs;
+-	free (bs);
++        const char *ptr = readPointer ();
++        int bs = qMin (bytesToRead - readSoFar, readSize ());
++        memcpy (data + readSoFar, ptr, bs);
++        readSoFar += bs;
++        free (bs);
+       }
+     return readSoFar;
+   }
+ 
+   int readLine (char *data, int maxLength)
+   {
+     return read (data, lineSize (qMin (maxLength, size ())));
+   }

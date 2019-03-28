@@ -1,0 +1,370 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1347146405 21600
+#      Sat Sep 08 17:20:05 2012 -0600
+# Node ID 8125773322d4b4f35fd6e3ed2034b7ece89c4f56
+# Parent  7d2eb4a017982598d66ef328241961131ff6d937
+Error on undefined an unused variables in JIT
+
+* jit-typeinfo.cc (jit_typeinfo::jit_typeinfo): Support grab_fn for all types
+except any and remove copy_fn initialization.
+* jit-typeinfo.h (jit_typeinfo::copy): Removed function.
+
+* pt-jit.cc (jit_convert::visit_identifier): Grab identifier on visit.
+(jit_convert::visit_index_expression): Update resolve signature.
+(jit_convert::resolve): Change parameters.
+(jit_convert::do_assign): Update resolve call.
+(jit_convert_llvm::visit): Remove now dead case.
+* pt-jit.h (jit_convert::resolve): Change resolve signature.
+
+diff --git a/libinterp/interp-core/jit-typeinfo.cc b/libinterp/interp-core/jit-typeinfo.cc
+--- a/libinterp/interp-core/jit-typeinfo.cc
++++ b/libinterp/interp-core/jit-typeinfo.cc
+@@ -1118,46 +1118,42 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+       llvm::Value *op_as_llvm = llvm::ConstantInt::get (llvm_bo_type, op_int);
+       llvm::Value *ret = any_binary.call (builder, op_as_llvm,
+                                           fn.argument (builder, 0),
+                                           fn.argument (builder, 1));
+       fn.do_return (builder, ret);
+       binary_ops[op].add_overload (fn);
+     }
+ 
+-  // grab any
+-  fn = create_function (jit_convention::external, "octave_jit_grab_any", any,
+-                        any);
+-  fn.add_mapping (engine, &octave_jit_grab_any);
+-  grab_fn.add_overload (fn);
+-  grab_fn.stash_name ("grab");
+-
+   // grab matrix
+   fn = create_function (jit_convention::external, "octave_jit_grab_matrix",
+                         matrix, matrix);
+   fn.add_mapping (engine, &octave_jit_grab_matrix);
+   grab_fn.add_overload (fn);
+ 
++  grab_fn.add_overload (create_identity (scalar));
++  grab_fn.add_overload (create_identity (scalar_ptr));
++  grab_fn.add_overload (create_identity (any_ptr));
++  grab_fn.add_overload (create_identity (boolean));
++  grab_fn.add_overload (create_identity (complex));
++  grab_fn.add_overload (create_identity (index));
++
+   // release any
+   fn = create_function (jit_convention::external, "octave_jit_release_any", 0,
+                         any);
+   fn.add_mapping (engine, &octave_jit_release_any);
+   release_fn.add_overload (fn);
+   release_fn.stash_name ("release");
+ 
+   // release matrix
+   fn = create_function (jit_convention::external, "octave_jit_release_matrix",
+                         0, matrix);
+   fn.add_mapping (engine, &octave_jit_release_matrix);
+   release_fn.add_overload (fn);
+ 
+-  // copy
+-  copy_fn.stash_name ("copy");
+-  copy_fn.add_overload (create_identity (scalar));
+-
+   // now for binary scalar operations
+   add_binary_op (scalar, octave_value::op_add, llvm::Instruction::FAdd);
+   add_binary_op (scalar, octave_value::op_sub, llvm::Instruction::FSub);
+   add_binary_op (scalar, octave_value::op_mul, llvm::Instruction::FMul);
+   add_binary_op (scalar, octave_value::op_el_mul, llvm::Instruction::FMul);
+ 
+   add_binary_fcmp (scalar, octave_value::op_lt, llvm::CmpInst::FCMP_ULT);
+   add_binary_fcmp (scalar, octave_value::op_le, llvm::CmpInst::FCMP_ULE);
+@@ -1831,26 +1827,30 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   register_generic ("eye", matrix, scalar);
+   register_generic ("eye", matrix, std::vector<jit_type *> (2, scalar));
+ 
+   add_builtin ("mod");
+   register_generic ("mod", scalar, std::vector<jit_type *> (2, scalar));
+ 
+   casts.resize (next_id + 1);
+   jit_function any_id = create_identity (any);
++  jit_function grab_any = create_function (jit_convention::external,
++                                           "octave_jit_grab_any", any, any);
++  grab_any.add_mapping (engine, &octave_jit_grab_any);
+   jit_function release_any = get_release (any);
+   std::vector<jit_type *> args;
+   args.resize (1);
+ 
+   for (std::map<std::string, jit_type *>::iterator iter = builtins.begin ();
+        iter != builtins.end (); ++iter)
+     {
+       jit_type *btype = iter->second;
+       args[0] = btype;
+ 
++      grab_fn.add_overload (jit_function (grab_any, btype, args));
+       release_fn.add_overload (jit_function (release_any, 0, args));
+       casts[any->type_id ()].add_overload (jit_function (any_id, any, args));
+ 
+       args[0] = any;
+       casts[btype->type_id ()].add_overload (jit_function (any_id, btype,
+                                                            args));
+     }
+ }
+diff --git a/libinterp/interp-core/jit-typeinfo.h b/libinterp/interp-core/jit-typeinfo.h
+--- a/libinterp/interp-core/jit-typeinfo.h
++++ b/libinterp/interp-core/jit-typeinfo.h
+@@ -493,21 +493,16 @@ public:
+     return instance->release_fn;
+   }
+ 
+   static const jit_function& get_release (jit_type *type)
+   {
+     return instance->release_fn.overload (type);
+   }
+ 
+-  static const jit_operation& copy (void)
+-  {
+-    return instance->copy_fn;
+-  }
+-
+   static const jit_operation& print_value (void)
+   {
+     return instance->print_fn;
+   }
+ 
+   static const jit_operation& for_init (void)
+   {
+     return instance->for_init_fn;
+@@ -751,17 +746,16 @@ private:
+   std::map<std::string, jit_type *> builtins;
+ 
+   llvm::StructType *complex_ret;
+ 
+   std::vector<jit_operation> binary_ops;
+   std::vector<jit_operation> unary_ops;
+   jit_operation grab_fn;
+   jit_operation release_fn;
+-  jit_operation copy_fn;
+   jit_operation print_fn;
+   jit_operation for_init_fn;
+   jit_operation for_check_fn;
+   jit_operation for_index_fn;
+   jit_operation logically_true_fn;
+   jit_operation make_range_fn;
+   jit_paren_subsref paren_subsref_fn;
+   jit_paren_subsasgn paren_subsasgn_fn;
+diff --git a/libinterp/interp-core/pt-jit.cc b/libinterp/interp-core/pt-jit.cc
+--- a/libinterp/interp-core/pt-jit.cc
++++ b/libinterp/interp-core/pt-jit.cc
+@@ -354,17 +354,22 @@ jit_convert::visit_identifier (tree_iden
+ {
+   if (ti.has_magic_end ())
+     {
+       if (!end_context.size ())
+         throw jit_fail_exception ("Illegal end");
+       result = block->append (factory.create<jit_magic_end> (end_context));
+     }
+   else
+-    result = get_variable (ti.name ());
++    {
++      jit_variable *var = get_variable (ti.name ());
++      jit_instruction *instr;
++      instr = factory.create<jit_call> (&jit_typeinfo::grab, var);
++      result = block->append (instr);
++    }
+ }
+ 
+ void
+ jit_convert::visit_if_clause (tree_if_clause&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+@@ -453,17 +458,17 @@ jit_convert::visit_if_command_list (tree
+   else
+     // every branch broke, so we don't have a tail
+     breaking = true;
+ }
+ 
+ void
+ jit_convert::visit_index_expression (tree_index_expression& exp)
+ {
+-  result = resolve (jit_typeinfo::paren_subsref (), exp);
++  result = resolve (exp);
+ }
+ 
+ void
+ jit_convert::visit_matrix (tree_matrix&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+@@ -527,17 +532,17 @@ jit_convert::visit_postfix_expression (t
+   tree_expression *operand = tpe.operand ();
+   jit_value *operandv = visit (operand);
+ 
+   const jit_operation& fn = jit_typeinfo::unary_op (etype);
+   result = create_checked (fn, operandv);
+ 
+   if (etype == octave_value::op_incr || etype == octave_value::op_decr)
+     {
+-      jit_value *ret = create_checked (&jit_typeinfo::copy, operandv);
++      jit_value *ret = create_checked (&jit_typeinfo::grab, operandv);
+       do_assign (operand, result);
+       result = ret;
+     }
+ }
+ 
+ void
+ jit_convert::visit_prefix_expression (tree_prefix_expression& tpe)
+ {
+@@ -767,36 +772,46 @@ jit_convert::next_name (const char *pref
+   std::stringstream ss;
+   ss << prefix << count;
+   if (inc)
+     ++count;
+   return ss.str ();
+ }
+ 
+ jit_instruction *
+-jit_convert::resolve (const jit_operation& fres, tree_index_expression& exp,
+-                      jit_value *extra_arg)
++jit_convert::resolve (tree_index_expression& exp, jit_value *extra_arg,
++                      bool lhs)
+ {
+   std::string type = exp.type_tags ();
+   if (! (type.size () == 1 && type[0] == '('))
+     throw jit_fail_exception ("Unsupported index operation");
+ 
+   std::list<tree_argument_list *> args = exp.arg_lists ();
+   if (args.size () != 1)
+-    throw jit_fail_exception ("Bad number of arguments in tree_index_expression");
++    throw jit_fail_exception ("Bad number of arguments in "
++                              "tree_index_expression");
+ 
+   tree_argument_list *arg_list = args.front ();
+   if (! arg_list)
+     throw jit_fail_exception ("null argument list");
+ 
+   if (arg_list->size () < 1)
+     throw jit_fail_exception ("Empty arg_list");
+ 
+   tree_expression *tree_object = exp.expression ();
+-  jit_value *object = visit (tree_object);
++  jit_value *object;
++  if (lhs)
++    {
++      tree_identifier *id = dynamic_cast<tree_identifier *> (tree_object);
++      if (! id)
++        throw jit_fail_exception ("expected identifier");
++      object = get_variable (id->name ());
++    }
++  else
++    object = visit (tree_object);
+ 
+   size_t narg = arg_list->size ();
+   tree_argument_list::iterator iter = arg_list->begin ();
+   bool have_extra = extra_arg;
+   std::vector<jit_value *> call_args (narg + 1 + have_extra);
+   call_args[0] = object;
+ 
+   for (size_t idx = 0; iter != arg_list->end (); ++idx, ++iter)
+@@ -808,32 +823,34 @@ jit_convert::resolve (const jit_operatio
+       jit_magic_end::context ctx (factory, object, idx, narg);
+       end_context.push_back (ctx);
+       call_args[idx + 1] = visit (*iter);
+     }
+ 
+   if (extra_arg)
+     call_args[call_args.size () - 1] = extra_arg;
+ 
++  const jit_operation& fres = lhs ? jit_typeinfo::paren_subsasgn ()
++    : jit_typeinfo::paren_subsref ();
++
+   return create_checked (fres, call_args);
+ }
+ 
+ jit_value *
+ jit_convert::do_assign (tree_expression *exp, jit_value *rhs, bool artificial)
+ {
+   if (! exp)
+     throw jit_fail_exception ("NULL lhs in assign");
+ 
+   if (isa<tree_identifier> (exp))
+     return do_assign (exp->name (), rhs, exp->print_result (), artificial);
+   else if (tree_index_expression *idx
+            = dynamic_cast<tree_index_expression *> (exp))
+     {
+-      jit_value *new_object = resolve (jit_typeinfo::paren_subsasgn (), *idx,
+-                                       rhs);
++      jit_value *new_object = resolve (*idx, rhs, true);
+       do_assign (idx->expression (), new_object, true);
+ 
+       // FIXME: Will not work for values that must be release/grabed
+       return rhs;
+     }
+   else
+     throw jit_fail_exception ("Unsupported assignment");
+ }
+@@ -1117,23 +1134,16 @@ void
+ jit_convert_llvm::visit (jit_assign& assign)
+ {
+   jit_value *new_value = assign.src ();
+   assign.stash_llvm (new_value->to_llvm ());
+ 
+   if (assign.artificial ())
+     return;
+ 
+-  if (isa<jit_assign_base> (new_value))
+-    {
+-      const jit_function& ol =  jit_typeinfo::get_grab (new_value->type ());
+-      if (ol.valid ())
+-        assign.stash_llvm (ol.call (builder, new_value));
+-    }
+-
+   jit_value *overwrite = assign.overwrite ();
+   if (isa<jit_assign_base> (overwrite))
+     {
+       const jit_function& ol = jit_typeinfo::get_release (overwrite->type ());
+       if (ol.valid ())
+         ol.call (builder, overwrite);
+     }
+ }
+@@ -2103,9 +2113,17 @@ Test some simple cases that compile.
+ %! a = [1+1i 1+2i];
+ %! b = 0;
+ %! while 1
+ %!   b = a(1);
+ %!   break;
+ %! endwhile
+ %! assert (b, a(1));
+ 
++%!function test_undef ()
++%!  for i=1:1e7
++%!    XXX;
++%!  endfor
++%!endfunction
++
++%!error <undefined near> (test_undef);
++
+ */
+diff --git a/libinterp/interp-core/pt-jit.h b/libinterp/interp-core/pt-jit.h
+--- a/libinterp/interp-core/pt-jit.h
++++ b/libinterp/interp-core/pt-jit.h
+@@ -201,19 +201,18 @@ private:
+   std::string next_for_bounds (bool inc = true)
+   { return next_name ("#for_bounds", for_bounds_count, inc); }
+ 
+   std::string next_shortcircut_result (bool inc = true)
+   { return next_name ("#shortcircut_result", short_count, inc); }
+ 
+   std::string next_name (const char *prefix, size_t& count, bool inc);
+ 
+-  jit_instruction *resolve (const jit_operation& fres,
+-                            tree_index_expression& exp,
+-                            jit_value *extra_arg = 0);
++  jit_instruction *resolve (tree_index_expression& exp,
++                            jit_value *extra_arg = 0, bool lhs = false);
+ 
+   jit_value *do_assign (tree_expression *exp, jit_value *rhs,
+                         bool artificial = false);
+ 
+   jit_value *do_assign (const std::string& lhs, jit_value *rhs, bool print,
+                         bool artificial = false);
+ 
+   jit_value *visit (tree *tee) { return visit (*tee); }

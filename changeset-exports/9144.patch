@@ -1,0 +1,734 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1240342797 14400
+#      Tue Apr 21 15:39:57 2009 -0400
+# Node ID c6463412aebb86f4f7320fed8b7ebe5dc833d4d2
+# Parent  74d5c1a4ca969772d3fb94b015369a0995f7f754
+eliminate symbol_table::scope_stack; fix scoping issue with evalin
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,35 @@
++2009-04-21  John W. Eaton  <jwe@octave.org>
++
++	* parse.y (Fassignin): Add missing unwind_protect frame.
++
++	* toplev.h (push (symbol_table::scope_id, symbol_table::context_id)):
++	New function.
++
++	* toplev.cc (main_loop): Don't call symbol_table::reset_scope.
++
++	* mex.cc (mexGetVariable, mexPutVariable): Use unwind_protect to
++	restore call stack and scope.
++
++	* ov-usr-fcn.cc (octave_user_function::do_multi_index_op):
++	Don't use symbol_table::push_scope.
++	* variablees.cc (do_who): Likewise.  Use octave_call_stack and
++	unwind_protect to manage change in scope.
++	* ov-fcn-handle.cc (octave_fcn_handle::load_ascii,
++	octave_fcn_handle::load_binary, octave_fcn_handle::load_hdf5):
++	Likewise.
++	* ls-mat5.cc (read_mat5_binary_element): Likewise.
++
++	* symtab.h (erase_scope (void*)): New function, for unwind_protect.
++	(symbol_table::push_scope, symbol_table::pop_scope,
++	symbol_table::reset_scope): Delete.
++	(symbol_table::scope_stack): Delete static member.
++	* symtab.cc (symbol_table::scope_stack): Delete definition.
++
+ 2009-04-17  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* oct-map.h (Octave_map::contents (const_iterator) const,
+ 	Octave_map::contents (iterator)): Simplify.
+ 
+ 2009-04-17  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* oct-map.cc (Octave_map::assign (const octave_value_list&, const
+diff --git a/src/ls-mat5.cc b/src/ls-mat5.cc
+--- a/src/ls-mat5.cc
++++ b/src/ls-mat5.cc
+@@ -60,16 +60,17 @@ along with Octave; see the file COPYING.
+ #include "oct-obj.h"
+ #include "oct-map.h"
+ #include "ov-cell.h"
+ #include "ov-class.h"
+ #include "ov-fcn-inline.h"
+ #include "pager.h"
+ #include "pt-exp.h"
+ #include "sysdep.h"
++#include "toplev.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ #include "version.h"
+ #include "dMatrix.h"
+ 
+ #include "ls-utils.h"
+ #include "ls-mat5.h"
+@@ -863,38 +864,43 @@ read_mat5_binary_element (std::istream& 
+ 	    Octave_map m2 = m1.contents("workspace")(0).map_value();
+ 	    uint32NDArray MCOS = m2.contents("MCOS")(0).uint32_array_value();
+ 	    octave_idx_type off = static_cast<octave_idx_type>(MCOS(4).double_value ());
+ 	    m2 = subsys_ov.map_value();
+ 	    m2 = m2.contents("MCOS")(0).map_value();
+ 	    tc2 = m2.contents("MCOS")(0).cell_value()(1 + off).cell_value()(1);
+ 	    m2 = tc2.map_value();
+ 
++	    unwind_protect::begin_frame ("anon_mat5_load");
++
++	    // Set up temporary scope to use for evaluating the text
++	    // that defines the anonymous function.
++
+ 	    symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
++	    unwind_protect::add (symbol_table::erase_scope, &local_scope);
++
++	    symbol_table::set_scope (local_scope);
++
++	    octave_call_stack::push (local_scope, 0);
++	    unwind_protect::add (octave_call_stack::unwind_pop, 0);
+ 
+ 	    if (m2.nfields() > 0)
+ 	      {
+ 		octave_value tmp;
+       
+ 		for (Octave_map::iterator p0 = m2.begin() ; 
+ 		     p0 != m2.end(); p0++)
+ 		  {
+ 		    std::string key = m2.key(p0);
+ 		    octave_value val = m2.contents(p0)(0);
+ 
+ 		    symbol_table::varref (key, local_scope, 0) = val;
+                   }
+ 	      }
+ 	    
+-	    unwind_protect::begin_frame ("anon_mat5_load");
+-	    
+-	    symbol_table::push_scope (local_scope);
+-
+-	    unwind_protect::add (symbol_table::pop_scope);
+-
+ 	    int parse_status;
+ 	    octave_value anon_fcn_handle = 
+ 	      eval_string (fname.substr (4), true, parse_status);
+ 
+ 	    if (parse_status == 0)
+ 	      {
+ 		octave_fcn_handle *fh = 
+ 		  anon_fcn_handle.fcn_handle_value ();
+@@ -909,18 +915,16 @@ read_mat5_binary_element (std::istream& 
+ 	      }
+ 	    else
+ 	      {
+ 		error ("load: failed to load anonymous function handle");
+ 		goto skip_ahead;
+ 	      }
+ 
+ 	    unwind_protect::run_frame ("anon_mat5_load");
+-
+-	    symbol_table::erase_scope (local_scope);
+ 	  }
+ 	else
+ 	  {
+ 	    error ("load: invalid function handle type");
+ 	    goto skip_ahead;
+ 	  }
+       }
+       break;
+diff --git a/src/mex.cc b/src/mex.cc
+--- a/src/mex.cc
++++ b/src/mex.cc
+@@ -3258,40 +3258,45 @@ mexPrintf (const char *fmt, ...)
+   va_end (args);
+ }
+ 
+ mxArray *
+ mexGetVariable (const char *space, const char *name)
+ {
+   mxArray *retval = 0;
+ 
+-  // FIXME -- should this be in variables.cc?
+-
+   octave_value val;
+ 
+   if (! strcmp (space, "global"))
+     val = get_global_value (name);
+   else
+     {
++      // FIXME -- should this be in variables.cc?
++
++      unwind_protect::begin_frame ("mexGetVariable");
++
+       bool caller = ! strcmp (space, "caller");
+       bool base = ! strcmp (space, "base");
+ 
+       if (caller || base)
+ 	{
+ 	  if (caller)
+ 	    octave_call_stack::goto_caller_frame ();
+ 	  else
+ 	    octave_call_stack::goto_base_frame ();
+ 
++	  if (! error_state)
++	    unwind_protect::add (octave_call_stack::unwind_pop);
++
+ 	  val = symbol_table::varval (name);
+-
+-	  octave_call_stack::pop ();
+ 	}
+       else
+ 	mexErrMsgTxt ("mexGetVariable: symbol table does not exist");
++
++      unwind_protect::run_frame ("mexGetVariable");
+     }
+ 
+   if (val.is_defined ())
+     {
+       retval = mex_context->make_value (val);
+ 
+       retval->set_name (name);
+     }
+@@ -3321,32 +3326,37 @@ mexPutVariable (const char *space, const
+     return 1;
+ 
+   if (! strcmp (space, "global"))
+     set_global_value (name, mxArray::as_octave_value (ptr));
+   else
+     {
+       // FIXME -- should this be in variables.cc?
+ 
++      unwind_protect::begin_frame ("mexPutVariable");
++
+       bool caller = ! strcmp (space, "caller");
+       bool base = ! strcmp (space, "base");
+ 
+       if (caller || base)
+ 	{
+ 	  if (caller)
+ 	    octave_call_stack::goto_caller_frame ();
+ 	  else
+ 	    octave_call_stack::goto_base_frame ();
+ 
++	  if (! error_state)
++	    unwind_protect::add (octave_call_stack::unwind_pop);
++
+ 	  symbol_table::varref (name) = mxArray::as_octave_value (ptr);
+-
+-	  octave_call_stack::pop ();
+ 	}
+       else
+ 	mexErrMsgTxt ("mexPutVariable: symbol table does not exist");
++
++      unwind_protect::run_frame ("mexPutVariable");
+     }
+ 
+   return 0;
+ }
+ 
+ void
+ mexMakeArrayPersistent (mxArray *ptr)
+ {
+diff --git a/src/ov-fcn-handle.cc b/src/ov-fcn-handle.cc
+--- a/src/ov-fcn-handle.cc
++++ b/src/ov-fcn-handle.cc
+@@ -308,17 +308,28 @@ octave_fcn_handle::load_ascii (std::istr
+ 	  // Get a line of text whitespace characters included, leaving
+ 	  // newline in the stream.
+ 	  buf = read_until_newline (is, true);
+ 
+ 	}
+ 
+       pos = is.tellg ();
+ 
++      unwind_protect::begin_frame ("anon_ascii_load");
++
++      // Set up temporary scope to use for evaluating the text that
++      // defines the anonymous function.
++
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
++      unwind_protect::add (symbol_table::erase_scope, &local_scope);
++
++      symbol_table::set_scope (local_scope);
++
++      octave_call_stack::push (local_scope, 0);
++      unwind_protect::add (octave_call_stack::unwind_pop, 0);
+ 
+       octave_idx_type len = 0;
+ 
+       if (extract_keyword (is, "length", len, true) && len >= 0)
+ 	{
+ 	  if (len > 0)
+ 	    {
+ 	      for (octave_idx_type i = 0; i < len; i++)
+@@ -342,22 +353,16 @@ octave_fcn_handle::load_ascii (std::istr
+       else
+ 	{
+ 	  is.seekg (pos);
+ 	  is.clear ();
+ 	}
+ 
+       if (is && success)
+ 	{
+-	  unwind_protect::begin_frame ("anon_ascii_load");
+-
+-	  symbol_table::push_scope (local_scope);
+-
+-	  unwind_protect::add (symbol_table::pop_scope);
+-
+ 	  int parse_status;
+ 	  octave_value anon_fcn_handle = 
+ 	    eval_string (buf, true, parse_status);
+ 
+ 	  if (parse_status == 0)
+ 	    {
+ 	      octave_fcn_handle *fh = 
+ 		anon_fcn_handle.fcn_handle_value ();
+@@ -371,23 +376,21 @@ octave_fcn_handle::load_ascii (std::istr
+ 		  if (uf)
+ 		    symbol_table::cache_name (uf->scope (), nm);
+ 		}
+ 	      else
+ 		success = false;
+ 	    }
+ 	  else
+ 	    success = false;
+-
+-	  unwind_protect::run_frame ("anon_ascii_load");
+ 	}
+       else
+ 	success = false;
+ 
+-      symbol_table::erase_scope (local_scope);
++      unwind_protect::run_frame ("anon_ascii_load");
+     }
+   else
+     success = set_fcn (octaveroot, fpath);
+ 
+   return success;
+ }
+ 
+ bool
+@@ -486,18 +489,29 @@ octave_fcn_handle::load_binary (std::ist
+       if (! is.read (reinterpret_cast<char *> (&tmp), 4))
+ 	return false;
+       if (swap)
+ 	swap_bytes<4> (&tmp);
+ 
+       OCTAVE_LOCAL_BUFFER (char, ctmp2, tmp+1);
+       is.get (ctmp2, tmp+1, 0);
+ 
++      unwind_protect::begin_frame ("anon_binary_load");
++
++      // Set up temporary scope to use for evaluating the text that
++      // defines the anonymous function.
++
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
+-	      
++      unwind_protect::add (symbol_table::erase_scope, &local_scope);	      
++
++      symbol_table::set_scope (local_scope);
++
++      octave_call_stack::push (local_scope, 0);
++      unwind_protect::add (octave_call_stack::unwind_pop, 0);
++
+       if (len > 0)
+ 	{
+ 	  for (octave_idx_type i = 0; i < len; i++)
+ 	    {
+ 	      octave_value t2;
+ 	      bool dummy;
+ 	      std::string doc;
+ 
+@@ -512,22 +526,16 @@ octave_fcn_handle::load_binary (std::ist
+ 		}
+ 
+ 	      symbol_table::varref (name, local_scope) = t2;
+ 	    }
+ 	}
+ 
+       if (is && success)
+ 	{
+-	  unwind_protect::begin_frame ("anon_binary_load");
+-
+-	  symbol_table::push_scope (local_scope);
+-
+-	  unwind_protect::add (symbol_table::pop_scope);
+-
+ 	  int parse_status;
+ 	  octave_value anon_fcn_handle = 
+ 	    eval_string (ctmp2, true, parse_status);
+ 
+ 	  if (parse_status == 0)
+ 	    {
+ 	      octave_fcn_handle *fh = anon_fcn_handle.fcn_handle_value ();
+ 
+@@ -540,21 +548,19 @@ octave_fcn_handle::load_binary (std::ist
+ 		  if (uf)
+ 		    symbol_table::cache_name (uf->scope (), nm);
+ 		}
+ 	      else
+ 		success = false;
+ 	    }
+ 	  else
+ 	    success = false;
+-
+-	  unwind_protect::run_frame ("anon_binary_load");
+ 	}
+ 
+-      symbol_table::erase_scope (local_scope);
++      unwind_protect::run_frame ("anon_binary_load");
+     }
+   else
+     {
+       std::string octaveroot;
+       std::string fpath;
+ 
+       if (nm.find_first_of ("\n") != std::string::npos)
+ 	{
+@@ -928,17 +934,28 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+ 	    success = false;
+ 
+ 	  H5Aclose (attr_id);
+ 	}
+ 
+       // restore error reporting:
+       H5Eset_auto (err_func, err_func_data);
+ 
++      unwind_protect::begin_frame ("anon_hdf5_load");
++
++      // Set up temporary scope to use for evaluating the text that
++      // defines the anonymous function.
++
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
++      unwind_protect::add (symbol_table::erase_scope, &local_scope);
++
++      symbol_table::set_scope (local_scope);
++
++      octave_call_stack::push (local_scope, 0);
++      unwind_protect::add (octave_call_stack::unwind_pop, 0);
+ 
+       if (len > 0 && success)
+ 	{
+ #ifdef HAVE_H5GGET_NUM_OBJS
+ 	  hsize_t num_obj = 0;
+ 	  data_hid = H5Gopen (group_hid, "symbol table"); 
+ 	  H5Gget_num_objs (data_hid, &num_obj);
+ 	  H5Gclose (data_hid);
+@@ -969,22 +986,16 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+ 
+ 		  symbol_table::varref (dsub.name, local_scope) = dsub.tc;
+ 		}
+ 	    }
+ 	}
+ 
+       if (success)
+ 	{
+-	  unwind_protect::begin_frame ("anon_hdf5_load");
+-
+-	  symbol_table::push_scope (local_scope);
+-
+-	  unwind_protect::add (symbol_table::pop_scope);
+-
+ 	  int parse_status;
+ 	  octave_value anon_fcn_handle = 
+ 	    eval_string (fcn_tmp, true, parse_status);
+ 
+ 	  if (parse_status == 0)
+ 	    {
+ 	      octave_fcn_handle *fh = anon_fcn_handle.fcn_handle_value ();
+ 
+@@ -997,21 +1008,19 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+ 		  if (uf)
+ 		    symbol_table::cache_name (uf->scope (), nm);
+ 		}
+ 	      else
+ 		success = false;
+ 	    }
+ 	  else
+ 	    success = false;
+-
+-	  unwind_protect::run_frame ("anon_hdf5_load");
+ 	}
+ 
+-      symbol_table::erase_scope (local_scope);
++      unwind_protect::run_frame ("anon_hdf5_load");
+     }
+   else
+     {
+       std::string octaveroot;
+       std::string fpath;
+ 
+       // we have to pull some shenanigans here to make sure
+       // HDF5 doesn't print out all sorts of error messages if we
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -356,19 +356,16 @@ octave_user_function::do_multi_index_op 
+       ::error ("max_recursion_limit exceeded");
+       unwind_protect::run_frame ("user_func_eval");
+       return retval;
+     }
+ 
+   // Save old and set current symbol table context, for
+   // eval_undefined_error().
+ 
+-  symbol_table::push_scope (local_scope);
+-  unwind_protect::add (symbol_table::pop_scope);
+-
+   octave_call_stack::push (this, local_scope, call_depth);
+   unwind_protect::add (octave_call_stack::unwind_pop, 0);
+ 
+   if (call_depth > 0)
+     {
+       symbol_table::push_context ();
+ 
+       unwind_protect::add (symbol_table::pop_context);
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -4166,16 +4166,18 @@ may be either @code{\"base\"} or @code{\
+   int nargin = args.length ();
+ 
+   if (nargin == 3)
+     {
+       std::string context = args(0).string_value ();
+ 
+       if (! error_state)
+         {
++	  unwind_protect::begin_frame ("Fassignin");
++
+ 	  if (context == "caller")
+ 	    octave_call_stack::goto_caller_frame ();
+ 	  else if (context == "base")
+ 	    octave_call_stack::goto_base_frame ();
+ 	  else
+ 	    error ("assignin: context must be \"caller\" or \"base\"");
+ 
+ 	  if (! error_state)
+@@ -4189,16 +4191,18 @@ may be either @code{\"base\"} or @code{\
+ 		  if (valid_identifier (nm))
+ 		    symbol_table::varref (nm) = args(2);
+ 		  else
+ 		    error ("assignin: invalid variable name");
+ 		}
+ 	      else
+ 		error ("assignin: expecting variable name as second argument");
+ 	    }
++
++	  unwind_protect::run_frame ("Fassignin");
+ 	}
+       else
+         error ("assignin: expecting string as first argument");
+     }
+   else
+     print_usage ();
+ 
+   return retval;
+diff --git a/src/symtab.cc b/src/symtab.cc
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -59,18 +59,16 @@ std::map<std::string, std::set<std::stri
+ 
+ const symbol_table::scope_id symbol_table::xglobal_scope = 0;
+ const symbol_table::scope_id symbol_table::xtop_scope = 1;
+ 
+ symbol_table::scope_id symbol_table::xcurrent_scope = 1;
+ 
+ symbol_table::scope_id symbol_table::xparent_scope = -1;
+ 
+-std::deque<symbol_table::scope_id> symbol_table::scope_stack;
+-
+ symbol_table::context_id symbol_table::xcurrent_context = 0;
+ 
+ // Should Octave always check to see if function files have changed
+ // since they were last compiled?
+ static int Vignore_function_time_stamp = 1;
+ 
+ void
+ symbol_table::symbol_record::symbol_record_rep::dump
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -942,54 +942,33 @@ public:
+ 	      }
+ 	  }
+ 
+ 	if (! error_state)
+ 	  xcurrent_context = context;
+       }
+   }
+ 
+-  static void push_scope (scope_id scope)
+-  {
+-    if (scope_stack.empty ())
+-      scope_stack.push_front (xtop_scope);
+-
+-    set_scope (scope);
+-
+-    scope_stack.push_front (scope);
+-  }
+-
+-  static void pop_scope (void)
+-  {
+-    scope_stack.pop_front ();
+-
+-    set_scope (scope_stack[0]);
+-  }
+-
+-  static void pop_scope (void *) { pop_scope (); }
+-
+-  static void reset_scope (void)
+-  {
+-    scope_stack.clear ();
+-
+-    scope_stack.push_front (xtop_scope);
+-
+-    set_scope (xtop_scope);
+-  }
+-
+   static void set_parent_scope (scope_id scope)
+   {
+     xparent_scope = scope;
+   }
+ 
+   static void reset_parent_scope (void)
+   {
+     set_parent_scope (-1);
+   }
+ 
++  static void erase_scope (void *ptr)
++  {
++    scope_id *pscope = static_cast<scope_id *> (ptr);
++
++    erase_scope (*pscope);
++  }
++
+   static void erase_scope (scope_id scope)
+   {
+     assert (scope != xglobal_scope);
+ 
+     all_instances_iterator p = all_instances.find (scope);
+ 
+     if (p != all_instances.end ())
+       {
+@@ -1891,18 +1870,16 @@ private:
+ 
+   static scope_id xcurrent_scope;
+ 
+   // We use parent_scope to handle parsing subfunctions.
+   static scope_id xparent_scope;
+ 
+   static context_id xcurrent_context;
+ 
+-  static std::deque<scope_id> scope_stack;
+-
+   symbol_table (void)
+     : table_name (), table () { }
+ 
+   ~symbol_table (void) { }
+ 
+   static symbol_table *get_instance (scope_id scope, bool create = true)
+   {
+     symbol_table *retval = 0;
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -538,18 +538,16 @@ main_loop (void)
+ 
+   // The big loop.
+ 
+   int retval = 0;
+   do
+     {
+       try
+ 	{
+-	  symbol_table::reset_scope ();
+-
+ 	  reset_error_handler ();
+ 
+ 	  reset_parser ();
+ 
+ 	  // This is the same as yyparse in parse.y.
+ 	  retval = octave_parse ();
+ 
+ 	  if (retval == 0)
+diff --git a/src/toplev.h b/src/toplev.h
+--- a/src/toplev.h
++++ b/src/toplev.h
+@@ -200,16 +200,24 @@ public:
+   push (octave_function *f,
+ 	symbol_table::scope_id scope = symbol_table::current_scope (),
+ 	symbol_table::context_id context = symbol_table::current_context ())
+   {
+     if (instance_ok ())
+       instance->do_push (f, scope, context);
+   }
+ 
++  static void
++  push (symbol_table::scope_id scope = symbol_table::current_scope (),
++	symbol_table::context_id context = symbol_table::current_context ())
++  {
++    if (instance_ok ())
++      instance->do_push (0, scope, context);
++  }
++
+   static octave_function *top (void)
+   {
+     return instance_ok () ? instance->do_top (): 0;
+   }
+ 
+   static tree_statement *top_statement (void)
+   {
+     return instance_ok () ? instance->do_top_statement (): 0;
+diff --git a/src/variables.cc b/src/variables.cc
+--- a/src/variables.cc
++++ b/src/variables.cc
+@@ -1376,41 +1376,41 @@ do_who (int argc, const string_vector& a
+ 	  // implement this option there so that the variables are never 
+ 	  // stored at all.
+ 	  if (i == argc - 1)
+ 	    error ("whos: -file argument must be followed by a file name");
+ 	  else
+ 	    {
+ 	      std::string nm = argv [i + 1];
+ 
+-	      symbol_table::scope_id tmp_scope = symbol_table::alloc_scope ();
+-
+ 	      unwind_protect::begin_frame ("do_who_file");
+ 
+-	      symbol_table::push_scope (tmp_scope);
+-	      symbol_table::push_context ();
+-	      octave_call_stack::push (0);
++	      // Set up temporary scope.
+ 
++	      symbol_table::scope_id tmp_scope = symbol_table::alloc_scope ();
++	      unwind_protect::add (symbol_table::erase_scope, &tmp_scope);
++
++	      symbol_table::set_scope (tmp_scope);
++
++	      octave_call_stack::push (tmp_scope, 0);
+ 	      unwind_protect::add (octave_call_stack::unwind_pop, 0);
+ 
+ 	      unwind_protect::add (symbol_table::clear_variables);
+ 
+ 	      feval ("load", octave_value (nm), 0);
+ 
+ 	      if (! error_state)
+ 		{
+ 		  std::string newmsg = std::string ("Variables in the file ") + 
+ 		    nm + ":\n\n";
+ 
+ 		  retval =  do_who (i, argv, return_list, verbose, newmsg);
+ 		}
+ 
+ 	      unwind_protect::run_frame ("do_who_file");
+-
+-	      symbol_table::erase_scope (tmp_scope);
+ 	    }
+ 
+ 	  return retval;
+ 	}
+       else if (argv[i] == "-regexp")
+ 	have_regexp = true;
+       else if (argv[i] == "global")
+ 	global_only = true;

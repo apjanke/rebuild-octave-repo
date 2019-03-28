@@ -1,0 +1,1548 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1541028761 14400
+#      Wed Oct 31 19:32:41 2018 -0400
+# Node ID f881d3e271d2af15109c4caa6a3614c3e4587a9d
+# Parent  f75bb9d659e0bd28f91e4ab5d64798715a3fd99d
+eliminate global and file-scope static variables in oct-hist.cc
+
+* interpreter.h, interpreter.cc (interpreter::m_history_system,
+interpreter::get_history_system): New member variable and access
+function.
+
+* interpreter-private.h, interpreter-private.cc
+(__get_history_system__): New function.
+
+* oct-hist.h, oct-hist.cc: Rewrite to use class for
+command history configuration variables and functions.  Change all uses.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -2477,17 +2477,20 @@ namespace octave
+     if (scope)
+           octave_link::set_workspace (true, scope);
+   }
+ 
+   void main_window::clear_history_callback (void)
+   {
+     // INTERPRETER THREAD
+ 
+-    Fhistory (ovl ("-c"));
++    history_system& history_sys
++      = __get_history_system__ ("main_window::clear_history_callback");
++
++    history_sys.do_history (ovl ("-c"));
+   }
+ 
+   void main_window::refresh_workspace_callback (void)
+   {
+     // INTERPRETER THREAD
+ 
+     symbol_scope scope
+       = __get_current_scope__ ("main_window::force_refresh_workspace");
+diff --git a/libinterp/corefcn/interpreter-private.cc b/libinterp/corefcn/interpreter-private.cc
+--- a/libinterp/corefcn/interpreter-private.cc
++++ b/libinterp/corefcn/interpreter-private.cc
+@@ -32,16 +32,17 @@ along with Octave; see the file COPYING.
+ #include "error.h"
+ #include "gtk-manager.h"
+ #include "help.h"
+ #include "input.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "load-path.h"
+ #include "load-save.h"
++#include "oct-hist.h"
+ #include "ov-classdef.h"
+ #include "pager.h"
+ #include "symtab.h"
+ 
+ namespace octave
+ {
+   interpreter& __get_interpreter__ (const std::string& who)
+   {
+@@ -65,16 +66,23 @@ namespace octave
+ 
+   help_system& __get_help_system__ (const std::string& who)
+   {
+     interpreter& interp = __get_interpreter__ (who);
+ 
+     return interp.get_help_system ();
+   }
+ 
++  history_system& __get_history_system__ (const std::string& who)
++  {
++    interpreter& interp = __get_interpreter__ (who);
++
++    return interp.get_history_system ();
++  }
++
+   input_system& __get_input_system__ (const std::string& who)
+   {
+     interpreter& interp = __get_interpreter__ (who);
+ 
+     return interp.get_input_system ();
+   }
+ 
+   output_system& __get_output_system__ (const std::string& who)
+diff --git a/libinterp/corefcn/interpreter-private.h b/libinterp/corefcn/interpreter-private.h
+--- a/libinterp/corefcn/interpreter-private.h
++++ b/libinterp/corefcn/interpreter-private.h
+@@ -34,30 +34,33 @@ class cdef_manager;
+ namespace octave
+ {
+   class bp_table;
+   class call_stack;
+   class child_list;
+   class dynamic_loader;
+   class gtk_manager;
+   class help_system;
++  class history_system;
+   class input_system;
+   class interpreter;
+   class load_path;
+   class load_save_system;
+   class output_system;
+   class tree_evaluator;
+   class type_info;
+ 
+   extern interpreter& __get_interpreter__ (const std::string& who);
+ 
+   extern dynamic_loader& __get_dynamic_loader__ (const std::string& who);
+ 
+   extern help_system& __get_help_system__ (const std::string& who);
+ 
++  extern history_system& __get_history_system__ (const std::string& who);
++
+   extern input_system& __get_input_system__ (const std::string& who);
+ 
+   extern load_path& __get_load_path__ (const std::string& who);
+ 
+   extern load_save_system& __get_load_save_system__ (const std::string& who);
+ 
+   extern output_system& __get_output_system__ (const std::string& who);
+ 
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -357,16 +357,17 @@ namespace octave
+ 
+   interpreter::interpreter (application *app_context)
+     : m_app_context (app_context),
+       m_environment (),
+       m_settings (),
+       m_help_system (*this),
+       m_input_system (*this),
+       m_output_system (*this),
++      m_history_system (*this),
+       m_dynamic_loader (*this),
+       m_load_path (),
+       m_load_save_system (*this),
+       m_type_info (),
+       m_symbol_table (),
+       m_evaluator (*this),
+       m_stream_list (*this),
+       m_child_list (),
+@@ -558,17 +559,17 @@ namespace octave
+             const cmdline_options& options = m_app_context->options ();
+ 
+             read_history_file = options.read_history_file ();
+ 
+             if (! read_history_file)
+               command_history::ignore_entries ();
+           }
+ 
+-        ::initialize_history (read_history_file);
++        m_history_system.initialize (read_history_file);
+ 
+         if (! m_app_context)
+           command_history::ignore_entries ();
+ 
+         m_history_initialized = true;
+       }
+   }
+ 
+@@ -1007,17 +1008,17 @@ namespace octave
+ 
+     // Do this explicitly so that destructors for mex file objects
+     // are called, so that functions registered with mexAtExit are
+     // called.
+     OCTAVE_SAFE_CALL (m_symbol_table.clear_mex_functions, ());
+ 
+     OCTAVE_SAFE_CALL (command_editor::restore_terminal_state, ());
+ 
+-    OCTAVE_SAFE_CALL (octave_history_write_timestamp, ());
++    OCTAVE_SAFE_CALL (m_history_system.write_timestamp, ());
+ 
+     if (! command_history::ignoring_entries ())
+       OCTAVE_SAFE_CALL (command_history::clean_up_and_save, ());
+ 
+     OCTAVE_SAFE_CALL (gh_manager::close_all_figures, ());
+ 
+     m_gtk_manager.unload_all_toolkits ();
+ 
+@@ -1173,24 +1174,25 @@ namespace octave
+     m_input_system.PS1 (">> ");
+     m_input_system.PS2 ("");
+ 
+     m_evaluator.PS4 ("");
+ 
+     m_load_save_system.crash_dumps_octave_core (false);
+     m_load_save_system.save_default_options ("-mat-binary");
+ 
++    m_history_system.timestamp_format_string ("%%-- %D %I:%M %p --%%");
++
+     Fbeep_on_error (octave_value (true));
+     Fconfirm_recursive_rmdir (octave_value (false));
+ 
+     Fdisable_diagonal_matrix (octave_value (true));
+     Fdisable_permutation_matrix (octave_value (true));
+     Fdisable_range (octave_value (true));
+     Ffixed_point_format (octave_value (true));
+-    Fhistory_timestamp_format_string (octave_value ("%%-- %D %I:%M %p --%%"));
+     Fprint_empty_dimensions (octave_value (false));
+     Fstruct_levels_to_print (octave_value (0));
+ 
+     disable_warning ("Octave:abbreviated-property-match");
+     disable_warning ("Octave:data-file-in-path");
+     disable_warning ("Octave:function-name-clash");
+     disable_warning ("Octave:possible-matlab-short-circuit-operator");
+   }
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -33,16 +33,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "dynamic-ld.h"
+ #include "environment.h"
+ #include "gtk-manager.h"
+ #include "help.h"
+ #include "input.h"
+ #include "load-path.h"
+ #include "load-save.h"
++#include "oct-hist.h"
+ #include "oct-stream.h"
+ #include "ov-classdef.h"
+ #include "ov-typeinfo.h"
+ #include "pager.h"
+ #include "pt-eval.h"
+ #include "settings.h"
+ #include "symtab.h"
+ #include "url-handle-manager.h"
+@@ -168,16 +169,21 @@ namespace octave
+       return m_input_system;
+     }
+ 
+     output_system& get_output_system (void)
+     {
+       return m_output_system;
+     }
+ 
++    history_system& get_history_system (void)
++    {
++      return m_history_system;
++    }
++
+     dynamic_loader& get_dynamic_loader (void)
+     {
+       return m_dynamic_loader;
+     }
+ 
+     load_path& get_load_path (void)
+     {
+       return m_load_path;
+@@ -273,16 +279,18 @@ namespace octave
+     settings m_settings;
+ 
+     help_system m_help_system;
+ 
+     input_system m_input_system;
+ 
+     output_system m_output_system;
+ 
++    history_system m_history_system;
++
+     dynamic_loader m_dynamic_loader;
+ 
+     load_path m_load_path;
+ 
+     load_save_system m_load_save_system;
+ 
+     type_info m_type_info;
+ 
+diff --git a/libinterp/corefcn/oct-hist.cc b/libinterp/corefcn/oct-hist.cc
+--- a/libinterp/corefcn/oct-hist.cc
++++ b/libinterp/corefcn/oct-hist.cc
+@@ -60,499 +60,506 @@ Software Foundation, Inc.
+ #include "parse.h"
+ #include "sighandlers.h"
+ #include "sysdep.h"
+ #include "interpreter.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+-// TRUE means input is coming from temporary history file.
+-bool input_from_tmp_history_file = false;
+-
+-static std::string
+-default_history_file (void)
+-{
+-  std::string file;
+-
+-  std::string env_file = octave::sys::env::getenv ("OCTAVE_HISTFILE");
+-
+-  if (! env_file.empty ())
+-    file = env_file;
+-
+-  if (file.empty ())
+-    file = octave::sys::file_ops::concat (octave::sys::env::get_home_directory (),
+-                                          ".octave_hist");
+-
+-  return file;
+-}
+-
+-static int
+-default_history_size (void)
+-{
+-  int size = 1000;
+-
+-  std::string env_size = octave::sys::env::getenv ("OCTAVE_HISTSIZE");
+-
+-  if (! env_size.empty ())
+-    {
+-      int val;
+-
+-      if (sscanf (env_size.c_str (), "%d", &val) == 1)
+-        size = (val > 0 ? val : 0);
+-    }
+-
+-  return size;
+-}
+-
+-static std::string
+-default_history_timestamp_format (void)
+-{
+-  return
+-    "# Octave " OCTAVE_VERSION ", %a %b %d %H:%M:%S %Y %Z <"
+-    + octave::sys::env::get_user_name ()
+-    + '@'
+-    + octave::sys::env::get_host_name ()
+-    + '>';
+-}
+-
+-// The format of the timestamp marker written to the history file when
+-// Octave exits.
+-static std::string Vhistory_timestamp_format_string
+-  = default_history_timestamp_format ();
+-
+-// Display, save, or load history.  Stolen and modified from bash.
+-//
+-// Arg of -w FILENAME means write file, arg of -r FILENAME
+-// means read file, arg of -q means don't number lines.  Arg of N
+-// means only display that many items.
+-
+-static string_vector
+-do_history (const octave_value_list& args, int nargout)
+-{
+-  bool numbered_output = nargout == 0;
+-
+-  octave::unwind_protect frame;
+-
+-  string_vector hlist;
+-
+-  frame.add_fcn (octave::command_history::set_file,
+-                 octave::command_history::file ());
+-
+-  int nargin = args.length ();
+-
+-  // Number of history lines to show (-1 = all)
+-  int limit = -1;
+-
+-  for (octave_idx_type i = 0; i < nargin; i++)
+-    {
+-      octave_value arg = args(i);
+-
+-      std::string option;
+-
+-      if (arg.is_string ())
+-        option = arg.string_value ();
+-      else if (arg.isnumeric ())
+-        {
+-          limit = arg.int_value ();
+-          if (limit < 0)
+-            limit = -limit;
+-          continue;
+-        }
+-      else
+-        err_wrong_type_arg ("history", arg);
+-
+-      if (option == "-r" || option == "-w" || option == "-a"
+-          || option == "-n")
+-        {
+-          if (i < nargin - 1)
+-            {
+-              std::string fname
+-                = args(++i).xstring_value ("history: filename must be a string for %s option",
+-                                           option.c_str ());
+-
+-              octave::command_history::set_file (fname);
+-            }
+-          else
+-            octave::command_history::set_file (default_history_file ());
+-
+-          if (option == "-a")
+-            // Append 'new' lines to file.
+-            octave::command_history::append ();
+-
+-          else if (option == "-w")
+-            // Write entire history.
+-            octave::command_history::write ();
+-
+-          else if (option == "-r")
+-            {
+-              // Read entire file.
+-              octave::command_history::read ();
+-              octave_link::set_history (octave::command_history::list ());
+-            }
+-
+-          else if (option == "-n")
+-            {
+-              // Read 'new' history from file.
+-              octave::command_history::read_range ();
+-              octave_link::set_history (octave::command_history::list ());
+-            }
+-
+-          else
+-            panic_impossible ();
+-
+-          return hlist;
+-        }
+-      else if (option == "-c")
+-        {
+-          octave::command_history::clear ();
+-          octave_link::clear_history ();
+-        }
+-      else if (option == "-q")
+-        numbered_output = false;
+-      else if (option == "--")
+-        {
+-          i++;
+-          break;
+-        }
+-      else
+-        {
+-          // The last argument found in the command list that looks like
+-          // an integer will be used
+-          int tmp;
+-
+-          if (sscanf (option.c_str (), "%d", &tmp) == 1)
+-            {
+-              if (tmp > 0)
+-                limit = tmp;
+-              else
+-                limit = -tmp;
+-            }
+-
+-          else
+-            {
+-              if (option.length () > 0 && option[0] == '-')
+-                error ("history: unrecognized option '%s'", option.c_str ());
+-              else
+-                error ("history: bad non-numeric arg '%s'", option.c_str ());
+-            }
+-        }
+-    }
+-
+-  hlist = octave::command_history::list (limit, numbered_output);
+-
+-  int len = hlist.numel ();
+-
+-  if (nargout == 0)
+-    {
+-      for (octave_idx_type i = 0; i < len; i++)
+-        octave_stdout << hlist[i] << "\n";
+-    }
+-
+-  return hlist;
+-}
+-
+-// Read the edited history lines from STREAM and return them
+-// one at a time.  This can read unlimited length lines.  The
+-// caller should free the storage.
+-
+-static char *
+-edit_history_readline (std::fstream& stream)
+-{
+-  char c;
+-  int line_len = 128;
+-  int lindex = 0;
+-  char *line = new char [line_len];
+-  line[0] = '\0';
+-
+-  while (stream.get (c))
+-    {
+-      if (lindex + 2 >= line_len)
+-        {
+-          char *tmp_line = new char [line_len += 128];
+-          strcpy (tmp_line, line);
+-          delete [] line;
+-          line = tmp_line;
+-        }
+-
+-      if (c == '\n')
+-        {
+-          line[lindex++] = '\n';
+-          line[lindex++] = '\0';
+-          return line;
+-        }
+-      else
+-        line[lindex++] = c;
+-    }
+-
+-  if (! lindex)
+-    {
+-      delete [] line;
+-      return nullptr;
+-    }
+-
+-  if (lindex + 2 >= line_len)
+-    {
+-      char *tmp_line = new char [lindex+3];
+-      strcpy (tmp_line, line);
+-      delete [] line;
+-      line = tmp_line;
+-    }
+-
+-  // Finish with newline if none in file.
+-
+-  line[lindex++] = '\n';
+-  line[lindex++] = '\0';
+-  return line;
+-}
+-
+-static void
+-edit_history_add_hist (const std::string& line)
++namespace octave
+ {
+-  if (! line.empty ())
+-    {
+-      std::string tmp = line;
++  // Read the edited history lines from STREAM and return them
++  // one at a time.  This can read unlimited length lines.  The
++  // caller should free the storage.
+ 
+-      int len = tmp.length ();
++  static char *
++  edit_history_readline (std::fstream& stream)
++  {
++    char c;
++    int line_len = 128;
++    int lindex = 0;
++    char *line = new char [line_len];
++    line[0] = '\0';
+ 
+-      if (len > 0 && tmp[len-1] == '\n')
+-        tmp.resize (len - 1);
++    while (stream.get (c))
++      {
++        if (lindex + 2 >= line_len)
++          {
++            char *tmp_line = new char [line_len += 128];
++            strcpy (tmp_line, line);
++            delete [] line;
++            line = tmp_line;
++          }
+ 
+-      if (! tmp.empty ())
+-        if (octave::command_history::add (tmp))
+-          octave_link::append_history (tmp);
+-    }
+-}
++        if (c == '\n')
++          {
++            line[lindex++] = '\n';
++            line[lindex++] = '\0';
++            return line;
++          }
++        else
++          line[lindex++] = c;
++      }
+ 
+-static bool
+-get_int_arg (const octave_value& arg, int& val)
+-{
+-  bool ok = true;
++    if (! lindex)
++      {
++        delete [] line;
++        return nullptr;
++      }
+ 
+-  if (arg.is_string ())
+-    {
+-      std::string tmp = arg.string_value ();
++    if (lindex + 2 >= line_len)
++      {
++        char *tmp_line = new char [lindex+3];
++        strcpy (tmp_line, line);
++        delete [] line;
++        line = tmp_line;
++      }
++
++    // Finish with newline if none in file.
++
++    line[lindex++] = '\n';
++    line[lindex++] = '\0';
++    return line;
++  }
+ 
+-      ok = sscanf (tmp.c_str (), "%d", &val) == 1;
+-    }
+-  else if (arg.isnumeric ())
+-    val = arg.int_value ();
+-  else
+-    ok = false;
++  static void
++  edit_history_add_hist (const std::string& line)
++  {
++    if (! line.empty ())
++      {
++        std::string tmp = line;
++
++        int len = tmp.length ();
++
++        if (len > 0 && tmp[len-1] == '\n')
++          tmp.resize (len - 1);
+ 
+-  return ok;
+-}
++        if (! tmp.empty ())
++          if (octave::command_history::add (tmp))
++            octave_link::append_history (tmp);
++      }
++  }
+ 
+-static std::string
+-mk_tmp_hist_file (const octave_value_list& args,
+-                  bool insert_curr, const char *warn_for)
+-{
+-  string_vector hlist = octave::command_history::list ();
++  static bool
++  get_int_arg (const octave_value& arg, int& val)
++  {
++    bool ok = true;
+ 
+-  int hist_count = hlist.numel () - 1;  // switch to zero-based indexing
++    if (arg.is_string ())
++      {
++        std::string tmp = arg.string_value ();
+ 
+-  // The current command line is already part of the history list by
+-  // the time we get to this point.  Delete the cmd from the list when
+-  // executing 'edit_history' so that it doesn't show up in the history
+-  // but the actual commands performed will.
++        ok = sscanf (tmp.c_str (), "%d", &val) == 1;
++      }
++    else if (arg.isnumeric ())
++      val = arg.int_value ();
++    else
++      ok = false;
+ 
+-  if (! insert_curr)
+-    octave::command_history::remove (hist_count);
++    return ok;
++  }
++
++  static std::string
++  mk_tmp_hist_file (const octave_value_list& args,
++                    bool insert_curr, const char *warn_for)
++  {
++    string_vector hlist = octave::command_history::list ();
++
++    int hist_count = hlist.numel () - 1;  // switch to zero-based indexing
+ 
+-  hist_count--;  // skip last entry in history list
++    // The current command line is already part of the history list by
++    // the time we get to this point.  Delete the cmd from the list when
++    // executing 'edit_history' so that it doesn't show up in the history
++    // but the actual commands performed will.
+ 
+-  // If no numbers have been specified, the default is to edit the
+-  // last command in the history list.
++    if (! insert_curr)
++      octave::command_history::remove (hist_count);
++
++    hist_count--;  // skip last entry in history list
+ 
+-  int hist_beg = hist_count;
+-  int hist_end = hist_count;
++    // If no numbers have been specified, the default is to edit the
++    // last command in the history list.
++
++    int hist_beg = hist_count;
++    int hist_end = hist_count;
+ 
+-  bool reverse = false;
++    bool reverse = false;
++
++    // Process options.
++
++    int nargin = args.length ();
+ 
+-  // Process options.
+-
+-  int nargin = args.length ();
++    if (nargin == 2)
++      {
++        if (! get_int_arg (args(0), hist_beg)
++            || ! get_int_arg (args(1), hist_end))
++          error ("%s: arguments must be integers", warn_for);
+ 
+-  if (nargin == 2)
+-    {
+-      if (! get_int_arg (args(0), hist_beg)
+-          || ! get_int_arg (args(1), hist_end))
+-        error ("%s: arguments must be integers", warn_for);
++        if (hist_beg < 0)
++          hist_beg += (hist_count + 1);
++        else
++          hist_beg--;
++        if (hist_end < 0)
++          hist_end += (hist_count + 1);
++        else
++          hist_end--;
++      }
++    else if (nargin == 1)
++      {
++        if (! get_int_arg (args(0), hist_beg))
++          error ("%s: argument must be an integer", warn_for);
++
++        if (hist_beg < 0)
++          hist_beg += (hist_count + 1);
++        else
++          hist_beg--;
++
++        hist_end = hist_beg;
++      }
+ 
+-      if (hist_beg < 0)
+-        hist_beg += (hist_count + 1);
+-      else
+-        hist_beg--;
+-      if (hist_end < 0)
+-        hist_end += (hist_count + 1);
+-      else
+-        hist_end--;
+-    }
+-  else if (nargin == 1)
+-    {
+-      if (! get_int_arg (args(0), hist_beg))
+-        error ("%s: argument must be an integer", warn_for);
++    if (hist_beg > hist_count || hist_end > hist_count)
++      error ("%s: history specification out of range", warn_for);
++
++    if (hist_end < hist_beg)
++      {
++        std::swap (hist_end, hist_beg);
++        reverse = true;
++      }
++
++    std::string name = octave::sys::tempnam ("", "oct-");
++
++    std::fstream file (name.c_str (), std::ios::out);
+ 
+-      if (hist_beg < 0)
+-        hist_beg += (hist_count + 1);
+-      else
+-        hist_beg--;
++    if (! file)
++      error ("%s: couldn't open temporary file '%s'", warn_for,
++             name.c_str ());
++
++    if (reverse)
++      {
++        for (int i = hist_end; i >= hist_beg; i--)
++          file << hlist[i] << "\n";
++      }
++    else
++      {
++        for (int i = hist_beg; i <= hist_end; i++)
++          file << hlist[i] << "\n";
++      }
++
++    file.close ();
++
++    return name;
++  }
+ 
+-      hist_end = hist_beg;
+-    }
++  static void
++  unlink_cleanup (const char *file)
++  {
++    octave_unlink_wrapper (file);
++  }
+ 
+-  if (hist_beg > hist_count || hist_end > hist_count)
+-    error ("%s: history specification out of range", warn_for);
++  history_system::history_system (interpreter& interp)
++    : m_interpreter (interp), m_input_from_tmp_file (false),
++      m_timestamp_format_string ()
++  { }
+ 
+-  if (hist_end < hist_beg)
+-    {
+-      std::swap (hist_end, hist_beg);
+-      reverse = true;
+-    }
++  void history_system::initialize (bool read_history_file)
++  {
++    command_history::initialize (read_history_file, default_file (),
++                                 default_size (),
++                                 sys::env::getenv ("OCTAVE_HISTCONTROL"));
++
++    octave_link::set_history (command_history::list ());
++  }
+ 
+-  std::string name = octave::sys::tempnam ("", "oct-");
++  void history_system::write_timestamp (void)
++  {
++    sys::localtime now;
++
++    std::string timestamp = now.strftime (m_timestamp_format_string);
++
++    if (! timestamp.empty ())
++      if (command_history::add (timestamp))
++        octave_link::append_history (timestamp);
++  }
+ 
+-  std::fstream file (name.c_str (), std::ios::out);
+-
+-  if (! file)
+-    error ("%s: couldn't open temporary file '%s'", warn_for,
+-           name.c_str ());
++  octave_value
++  history_system::input_from_tmp_file (const octave_value_list& args,
++                                       int nargout)
++  {
++    return set_internal_variable (m_input_from_tmp_file, args, nargout,
++                                  "input_from_tmp_file");
++  }
+ 
+-  if (reverse)
+-    {
+-      for (int i = hist_end; i >= hist_beg; i--)
+-        file << hlist[i] << "\n";
+-    }
+-  else
+-    {
+-      for (int i = hist_beg; i <= hist_end; i++)
+-        file << hlist[i] << "\n";
+-    }
++  octave_value
++  history_system::timestamp_format_string (const octave_value_list& args,
++                                           int nargout)
++  {
++    return set_internal_variable (m_timestamp_format_string, args, nargout,
++                                  "timestamp_format_string", false);
++  }
++
++  // Display, save, or load history.  Stolen and modified from bash.
++  //
++  // Arg of -w FILENAME means write file, arg of -r FILENAME
++  // means read file, arg of -q means don't number lines.  Arg of N
++  // means only display that many items.
++
++  string_vector history_system::do_history (const octave_value_list& args,
++                                            int nargout)
++  {
++    bool numbered_output = nargout == 0;
++
++    unwind_protect frame;
++
++    string_vector hlist;
+ 
+-  file.close ();
++    frame.add_fcn (command_history::set_file, command_history::file ());
++
++    int nargin = args.length ();
+ 
+-  return name;
+-}
++    // Number of history lines to show (-1 = all)
++    int limit = -1;
++
++    for (octave_idx_type i = 0; i < nargin; i++)
++      {
++        octave_value arg = args(i);
+ 
+-static void
+-unlink_cleanup (const char *file)
+-{
+-  octave_unlink_wrapper (file);
+-}
++        std::string option;
++
++        if (arg.is_string ())
++          option = arg.string_value ();
++        else if (arg.isnumeric ())
++          {
++            limit = arg.int_value ();
++            if (limit < 0)
++              limit = -limit;
++            continue;
++          }
++        else
++          err_wrong_type_arg ("history", arg);
+ 
+-static void
+-do_edit_history (octave::interpreter& interp, const octave_value_list& args)
+-{
+-  std::string name = mk_tmp_hist_file (args, false, "edit_history");
++        if (option == "-r" || option == "-w" || option == "-a"
++            || option == "-n")
++          {
++            if (i < nargin - 1)
++              {
++                std::string fname
++                  = args(++i).xstring_value ("history: filename must be a string for %s option",
++                                             option.c_str ());
+ 
+-  if (name.empty ())
+-    return;
++                command_history::set_file (fname);
++              }
++            else
++              command_history::set_file (default_file ());
++
++            if (option == "-a")
++              // Append 'new' lines to file.
++              command_history::append ();
+ 
+-  // Call up our favorite editor on the file of commands.
++            else if (option == "-w")
++              // Write entire history.
++              command_history::write ();
+ 
+-  octave::environment& env = interp.get_environment ();
+-  std::string cmd = env.editor ();
+-  cmd.append (R"( ")" + name + '"');
++            else if (option == "-r")
++              {
++                // Read entire file.
++                command_history::read ();
++                octave_link::set_history (command_history::list ());
++              }
+ 
+-  // Ignore interrupts while we are off editing commands.  Should we
+-  // maybe avoid using system()?
++            else if (option == "-n")
++              {
++                // Read 'new' history from file.
++                command_history::read_range ();
++                octave_link::set_history (command_history::list ());
++              }
+ 
+-  volatile octave::interrupt_handler old_interrupt_handler
+-    = octave::ignore_interrupts ();
+-
+-  int status = system (cmd.c_str ());
+-
+-  octave::set_interrupt_handler (old_interrupt_handler);
++            else
++              panic_impossible ();
+ 
+-  // Check if text edition was successfull.  Abort the operation
+-  // in case of failure.
+-  if (status != EXIT_SUCCESS)
+-    error ("edit_history: text editor command failed");
+-
+-  // Write the commands to the history file since source_file
+-  // disables command line history while it executes.
++            return hlist;
++          }
++        else if (option == "-c")
++          {
++            command_history::clear ();
++            octave_link::clear_history ();
++          }
++        else if (option == "-q")
++          numbered_output = false;
++        else if (option == "--")
++          {
++            i++;
++            break;
++          }
++        else
++          {
++            // The last argument found in the command list that looks like
++            // an integer will be used
++            int tmp;
+ 
+-  std::fstream file (name.c_str (), std::ios::in);
++            if (sscanf (option.c_str (), "%d", &tmp) == 1)
++              {
++                if (tmp > 0)
++                  limit = tmp;
++                else
++                  limit = -tmp;
++              }
+ 
+-  char *line;
+-  //int first = 1;
+-  while ((line = edit_history_readline (file)) != nullptr)
+-    {
+-      // Skip blank lines.
++            else
++              {
++                if (option.length () > 0 && option[0] == '-')
++                  error ("history: unrecognized option '%s'", option.c_str ());
++                else
++                  error ("history: bad non-numeric arg '%s'", option.c_str ());
++              }
++          }
++      }
+ 
+-      if (line[0] == '\n')
+-        {
+-          delete [] line;
+-          continue;
+-        }
++    hlist = command_history::list (limit, numbered_output);
++
++    int len = hlist.numel ();
++
++    if (nargout == 0)
++      {
++        for (octave_idx_type i = 0; i < len; i++)
++          octave_stdout << hlist[i] << "\n";
++      }
+ 
+-      edit_history_add_hist (line);
++    return hlist;
++  }
++
++  void history_system::do_edit_history (const octave_value_list& args)
++  {
++    std::string name = mk_tmp_hist_file (args, false, "edit_history");
++
++    if (name.empty ())
++      return;
+ 
+-      delete [] line;
+-    }
++    // Call up our favorite editor on the file of commands.
++
++    environment& env = m_interpreter.get_environment ();
++    std::string cmd = env.editor ();
++    cmd.append (R"( ")" + name + '"');
+ 
+-  file.close ();
++    // Ignore interrupts while we are off editing commands.  Should we
++    // maybe avoid using system()?
++
++    volatile interrupt_handler old_interrupt_handler
++      = ignore_interrupts ();
+ 
+-  octave::unwind_protect frame;
++    int status = system (cmd.c_str ());
++
++    set_interrupt_handler (old_interrupt_handler);
+ 
+-  frame.add_fcn (unlink_cleanup, name.c_str ());
+-  frame.protect_var (input_from_tmp_history_file);
++    // Check if text edition was successfull.  Abort the operation
++    // in case of failure.
++    if (status != EXIT_SUCCESS)
++      error ("edit_history: text editor command failed");
+ 
+-  input_from_tmp_history_file = true;
++    // Write the commands to the history file since source_file
++    // disables command line history while it executes.
++
++    std::fstream file (name.c_str (), std::ios::in);
+ 
+-  // FIXME: instead of sourcing a file, we should just iterate through
+-  // the list of commands, parsing and executing them one at a time as
+-  // if they were entered interactively.
++    char *line;
++    //int first = 1;
++    while ((line = edit_history_readline (file)) != nullptr)
++      {
++        // Skip blank lines.
+ 
+-  octave::source_file (name);
+-}
++        if (line[0] == '\n')
++          {
++            delete [] line;
++            continue;
++          }
++
++        edit_history_add_hist (line);
+ 
+-static void
+-do_run_history (const octave_value_list& args)
+-{
+-  std::string name = mk_tmp_hist_file (args, false, "run_history");
++        delete [] line;
++      }
++
++    file.close ();
++
++    unwind_protect frame;
+ 
+-  if (name.empty ())
+-    return;
++    frame.add_fcn (unlink_cleanup, name.c_str ());
++    frame.protect_var (m_input_from_tmp_file);
++
++    m_input_from_tmp_file = true;
+ 
+-  octave::unwind_protect frame;
++    // FIXME: instead of sourcing a file, we should just iterate through
++    // the list of commands, parsing and executing them one at a time as
++    // if they were entered interactively.
++
++    source_file (name);
++  }
+ 
+-  frame.add_fcn (unlink_cleanup, name.c_str ());
+-  frame.protect_var (input_from_tmp_history_file);
++  void history_system::do_run_history (const octave_value_list& args)
++  {
++    std::string name = mk_tmp_hist_file (args, false, "run_history");
++
++    if (name.empty ())
++      return;
+ 
+-  input_from_tmp_history_file = true;
++    unwind_protect frame;
++
++    frame.add_fcn (unlink_cleanup, name.c_str ());
++    frame.protect_var (m_input_from_tmp_file);
++
++    m_input_from_tmp_file = true;
+ 
+-  // FIXME: instead of sourcing a file, we should just iterate through
+-  // the list of commands, parsing and executing them one at a time as
+-  // if they were entered interactively.
++    // FIXME: instead of sourcing a file, we should just iterate through
++    // the list of commands, parsing and executing them one at a time as
++    // if they were entered interactively.
++
++    source_file (name);
++  }
+ 
+-  octave::source_file (name);
+-}
++  std::string history_system::default_file (void)
++  {
++    std::string file;
++
++    std::string env_file = sys::env::getenv ("OCTAVE_HISTFILE");
++
++    if (! env_file.empty ())
++      file = env_file;
+ 
+-void
+-initialize_history (bool read_history_file)
+-{
+-  octave::command_history::initialize (read_history_file,
+-                                       default_history_file (),
+-                                       default_history_size (),
+-                                       octave::sys::env::getenv ("OCTAVE_HISTCONTROL"));
++    if (file.empty ())
++      file = sys::file_ops::concat (sys::env::get_home_directory (),
++                                            ".octave_hist");
++
++    return file;
++  }
+ 
+-  octave_link::set_history (octave::command_history::list ());
+-}
++  int history_system::default_size (void)
++  {
++    int size = 1000;
++
++    std::string env_size = sys::env::getenv ("OCTAVE_HISTSIZE");
++
++    if (! env_size.empty ())
++      {
++        int val;
+ 
+-void
+-octave_history_write_timestamp (void)
+-{
+-  octave::sys::localtime now;
++        if (sscanf (env_size.c_str (), "%d", &val) == 1)
++          size = (val > 0 ? val : 0);
++      }
++
++    return size;
++  }
+ 
+-  std::string timestamp = now.strftime (Vhistory_timestamp_format_string);
+-
+-  if (! timestamp.empty ())
+-    if (octave::command_history::add (timestamp))
+-      octave_link::append_history (timestamp);
++  std::string history_system::default_timestamp_format (void)
++  {
++    return
++      "# Octave " OCTAVE_VERSION ", %a %b %d %H:%M:%S %Y %Z <"
++      + sys::env::get_user_name ()
++      + '@'
++      + sys::env::get_host_name ()
++      + '>';
++  }
+ }
+ 
+ DEFMETHOD (edit_history, interp, args, ,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {} edit_history
+ @deftypefnx {} {} edit_history @var{cmd_number}
+ @deftypefnx {} {} edit_history @var{first} @var{last}
+ Edit the history list using the editor named by the variable @env{EDITOR}.
+@@ -585,23 +592,25 @@ buffer to be edited.
+ @seealso{run_history, history}
+ @end deftypefn */)
+ {
+   // FIXME: should this be limited to the top-level context?
+ 
+   if (args.length () > 2)
+     print_usage ();
+ 
+-  do_edit_history (interp, args);
++  octave::history_system& history_sys = interp.get_history_system ();
++
++  history_sys.do_edit_history (args);
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (history, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (history, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} history
+ @deftypefnx {} {} history @var{opt1} @dots{}
+ @deftypefnx {} {@var{h} =} history ()
+ @deftypefnx {} {@var{h} =} history (@var{opt1}, @dots{})
+ If invoked with no arguments, @code{history} displays a list of commands
+ that you have executed.
+ 
+ Valid options are:
+@@ -634,25 +643,27 @@ typed without displaying line numbers, u
+ 
+ If invoked with a single output argument, the history will be saved to that
+ argument as a cell string and will not be output to screen.
+ @seealso{edit_history, run_history}
+ @end deftypefn */)
+ {
+   // FIXME: should this be limited to the top-level context?
+ 
++  octave::history_system& history_sys = interp.get_history_system ();
++
+   // Call do_history even if nargout is zero to display history list.
+ 
+-  string_vector hlist = do_history (args, nargout);
++  string_vector hlist = history_sys.do_history (args, nargout);
+ 
+   return nargout > 0 ? ovl (Cell (hlist)) : ovl ();
+ }
+ 
+-DEFUN (run_history, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (run_history, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} run_history
+ @deftypefnx {} {} run_history @var{cmd_number}
+ @deftypefnx {} {} run_history @var{first} @var{last}
+ Run commands from the history list.
+ 
+ When invoked with no arguments, run the previously executed command;
+ 
+ With one argument, run the specified command @var{cmd_number};
+@@ -695,20 +706,22 @@ run_history -1 -2
+ @end group
+ @end example
+ 
+ @seealso{edit_history, history}
+ @end deftypefn */)
+ {
+   // FIXME: should this be limited to the top-level context?
+ 
++  octave::history_system& history_sys = interp.get_history_system ();
++
+   if (args.length () > 2)
+     print_usage ();
+ 
+-  do_run_history (args);
++  history_sys.do_run_history (args);
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (history_control, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} history_control ()
+ @deftypefnx {} {@var{old_val} =} history_control (@var{new_val})
+@@ -795,18 +808,18 @@ environment variable @w{@env{OCTAVE_HIST
+   retval = set_internal_variable (tmp, args, nargout, "history_file");
+ 
+   if (tmp != old_history_file)
+     octave::command_history::set_file (tmp);
+ 
+   return retval;
+ }
+ 
+-DEFUN (history_timestamp_format_string, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (history_timestamp_format_string, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} history_timestamp_format_string ()
+ @deftypefnx {} {@var{old_val} =} history_timestamp_format_string (@var{new_val})
+ @deftypefnx {} {} history_timestamp_format_string (@var{new_val}, "local")
+ Query or set the internal variable that specifies the format string
+ for the comment line that is written to the history file when Octave
+ exits.
+ 
+ The format string is passed to @code{strftime}.  The default value is
+@@ -816,17 +829,19 @@ The format string is passed to @code{str
+ @end example
+ 
+ When called from inside a function with the @qcode{"local"} option, the
+ variable is changed locally for the function and any subroutines it calls.
+ The original variable value is restored when exiting the function.
+ @seealso{strftime, history_file, history_size, history_save}
+ @end deftypefn */)
+ {
+-  return SET_INTERNAL_VARIABLE (history_timestamp_format_string);
++  octave::history_system& history_sys = interp.get_history_system ();
++
++  return history_sys.timestamp_format_string (args, nargout);
+ }
+ 
+ DEFUN (history_save, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} history_save ()
+ @deftypefnx {} {@var{old_val} =} history_save (@var{new_val})
+ @deftypefnx {} {} history_save (@var{new_val}, "local")
+ Query or set the internal variable that controls whether commands entered
+diff --git a/libinterp/corefcn/oct-hist.h b/libinterp/corefcn/oct-hist.h
+--- a/libinterp/corefcn/oct-hist.h
++++ b/libinterp/corefcn/oct-hist.h
+@@ -24,17 +24,88 @@ along with Octave; see the file COPYING.
+ #define octave_oct_hist_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <string>
+ 
+ #include "cmd-hist.h"
+ 
+-extern void initialize_history (bool read_history_file = false);
++namespace octave
++{
++  class history_system
++  {
++  public:
++
++    history_system (interpreter& interp);
++
++    history_system (const history_system&) = delete;
++
++    history_system& operator = (const history_system&) = delete;
++
++    ~history_system (void) = default;
++
++    void initialize (bool read_history_file = false);
++
++    void write_timestamp (void);
++
++    octave_value input_from_tmp_file (const octave_value_list& args,
++                                      int nargout);
++
++    bool input_from_tmp_file (void) const
++    {
++      return m_input_from_tmp_file;
++    }
++
++    bool input_from_tmp_file (bool flag)
++    {
++      return set (m_input_from_tmp_file, flag);
++    }
++
++    octave_value timestamp_format_string (const octave_value_list& args,
++                                          int nargout);
++
++    std::string timestamp_format_string (void) const
++    {
++      return m_timestamp_format_string;
++    }
+ 
+-// Write timestamp to history file.
+-extern void octave_history_write_timestamp (void);
++    std::string timestamp_format_string (const std::string& file)
++    {
++      return set (m_timestamp_format_string, file);
++    }
++
++    string_vector
++    do_history (const octave_value_list& args = octave_value_list (),
++                int nargout = 0);
++
++    void do_edit_history (const octave_value_list& args = octave_value_list ());
++
++    void do_run_history (const octave_value_list& args = octave_value_list ());
++
++  private:
++
++    interpreter& m_interpreter;
++
++    // TRUE means input is coming from temporary history file.
++    bool m_input_from_tmp_file;
+ 
+-// TRUE means input is coming from temporary history file.
+-extern bool input_from_tmp_history_file;
++    // The format of the timestamp marker written to the history file when
++    // Octave exits.
++    std::string m_timestamp_format_string;
++
++    static std::string default_file (void);
++
++    static int default_size (void);
++
++    static std::string default_timestamp_format (void);
++
++    template <typename T>
++    T set (T& var, const T& new_val)
++    {
++      T old_val = var;
++      var = new_val;
++      return old_val;
++    }
++  };
++}
+ 
+ #endif
+diff --git a/libinterp/corefcn/syscalls.cc b/libinterp/corefcn/syscalls.cc
+--- a/libinterp/corefcn/syscalls.cc
++++ b/libinterp/corefcn/syscalls.cc
+@@ -136,18 +136,18 @@ error message.
+       int status = octave::sys::dup2 (i_old, i_new, msg);
+ 
+       return ovl (status, msg);
+     }
+   else
+     return ovl (-1, "");
+ }
+ 
+-DEFUNX ("exec", Fexec, args, ,
+-        doc: /* -*- texinfo -*-
++DEFMETHODX ("exec", Fexec, interp, args, ,
++            doc: /* -*- texinfo -*-
+ @deftypefn {} {[@var{err}, @var{msg}] =} exec (@var{file}, @var{args})
+ Replace current process with a new process.
+ 
+ Calling @code{exec} without first calling @code{fork} will terminate your
+ current Octave process and replace it with the program named by @var{file}.
+ For example,
+ 
+ @example
+@@ -186,17 +186,19 @@ error message.
+     }
+   else
+     {
+       exec_args.resize (1);
+ 
+       exec_args[0] = exec_file;
+     }
+ 
+-  octave_history_write_timestamp ();
++  octave::history_system& history_sys = interp.get_history_system ();
++
++  history_sys.write_timestamp ();
+ 
+   if (! octave::command_history::ignoring_entries ())
+     octave::command_history::clean_up_and_save ();
+ 
+   std::string msg;
+ 
+   int status = octave::sys::execvp (exec_file, exec_args, msg);
+ 
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -706,16 +706,18 @@ namespace octave
+     virtual std::string input_source (void) const { return "unknown"; }
+ 
+     virtual bool input_from_terminal (void) const { return false; }
+ 
+     virtual bool input_from_file (void) const { return false; }
+ 
+     virtual bool input_from_eval_string (void) const { return false; }
+ 
++    bool input_from_tmp_history_file (void);
++
+     void push_start_state (int state);
+ 
+     void pop_start_state (void);
+ 
+     void clear_start_state (void);
+ 
+     int start_state (void) const { return start_state_stack.top (); }
+ 
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -3399,16 +3399,24 @@ namespace octave
+ 
+         display_start_state ();
+ 
+         std::cerr << "P: " << pattern << std::endl;
+         std::cerr << "T: " << flex_yytext () << std::endl;
+       }
+   }
+ 
++  bool
++  base_lexer::input_from_tmp_history_file (void)
++  {
++    history_system& history_sys = m_interpreter.get_history_system ();
++
++    return history_sys.input_from_tmp_file ();
++  }
++
+   void
+   base_lexer::push_start_state (int state)
+   {
+     OCTAVE_YYG;
+ 
+     start_state_stack.push (state);
+ 
+     BEGIN (start_state ());
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -3409,17 +3409,17 @@ namespace octave
+         std::string nm = fcn->fcn_file_name ();
+ 
+         sys::file_stat fs (nm);
+ 
+         if (fs && fs.is_newer (now))
+           warning_with_id ("Octave:future-time-stamp",
+                            "time stamp for '%s' is in the future", nm.c_str ());
+       }
+-    else if (! input_from_tmp_history_file
++    else if (! m_lexer.input_from_tmp_history_file ()
+              && ! m_lexer.m_force_script
+              && m_lexer.m_reading_script_file
+              && m_lexer.m_fcn_file_name == id_name)
+       {
+         warning ("function '%s' defined within script file '%s'",
+                  id_name.c_str (), m_lexer.m_fcn_file_full_name.c_str ());
+       }
+ 

@@ -1,0 +1,799 @@
+# HG changeset patch
+# User dbateman
+# Date 1181251840 0
+#      Thu Jun 07 21:30:40 2007 +0000
+# Node ID c45431c845f3e2fa700a5a7141c21e49b37de923
+# Parent  3d913ba36b759e6e5ae2c1425849e5c339ab120b
+[project @ 2007-06-07 21:30:39 by dbateman]
+
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,8 +1,26 @@
++2007-06-07  David Bateman  <dbateman@free.fr>
++
++	* pkg/pkg.m (pkg): For rebuild target, force package order in
++	saved file so that dependent packages are loaded first, and if
++	nargout==0 don't return any arguments.
++	(pkg:install): Only load packages that are marked autoload after
++	install. Various fixes. Save in order.
++	(pkg:uninstall): Save in order
++	(pkg:load_packages): Use load_package_and_dependencies to load
++	packages.
++	(pkg:save_order): New function to sort package list with dependent
++	packages first.
++	(pkg:load_packages_and_dependencies): New function to load both a
++	list of packages and their dependencies.
++	(pkg:load_package_dirs): New function that returns a vector of the
++	indexes into the installed package list indicating the packages to
++	load and the order to load them in to respect the dependencies.
++
+ 2007-06-03  Søren Hauberg  <soren@hauberg.org>
+ 
+ 	* plot/axes.m: Eliminate redundant else clause.
+ 
+ 2007-06-03  David Bateman  <dbateman@free.fr>
+ 
+ 	* polynomial/spline.m: Add a small tolerance to spline tests.
+ 	* pkg/pkg.m: Protect against multiple actions being define.
+diff --git a/scripts/pkg/pkg.m b/scripts/pkg/pkg.m
+--- a/scripts/pkg/pkg.m
++++ b/scripts/pkg/pkg.m
+@@ -311,21 +311,28 @@ function [local_packages, global_package
+ 	global_list = absolute_pathname (files{1});
+       else
+ 	error ("you must specify a global_list file, or request an output argument");
+       endif
+ 
+     case "rebuild"
+       if (global_install)
+ 	global_packages = rebuild (prefix, global_list, files, auto, verbose);
++	global_packages = save_order (global_packages);
+ 	save (global_list, "global_packages");
+-	local_packages = global_packages;
++	if (nargout > 0)
++	  local_packages = global_packages;
++	endif
+       else
+ 	local_packages = rebuild (prefix, local_list, files, auto, verbose);
++	local_packages = save_order (local_packages);
+ 	save (local_list, "local_packages");
++	if (nargout == 0)
++	  clear ("local_packages");
++	endif
+       endif
+ 
+     case "build"
+       if (length (files) < 2)
+ 	error ("you must specify at least the build directory and one filename\nwhen calling 'pkg build'");
+       endif
+       build (files, deps, auto, verbose);
+ 
+@@ -443,17 +450,16 @@ function build (files, handle_deps, auto
+     if (exist (buildlist, "file"))
+       unlink (buildlist);
+     endif
+   end_unwind_protect
+ endfunction
+ 
+ function install (files, handle_deps, autoload, prefix, verbose, local_list, global_list, global_install)
+ 
+-
+   # Check that the directory in prefix exist. If it doesn't: create it!
+   if (! exist (prefix, "dir"))
+     warning ("creating installation directory %s", prefix);
+     [status, msg] = mkdir (prefix);
+     if (status != 1)
+       error ("could not create installation directory: %s", msg);
+     endif
+   endif
+@@ -559,19 +565,31 @@ function install (files, handle_deps, au
+   end_try_catch
+ 
+   ## Check dependencies
+   if (handle_deps)
+     ok = true;
+     error_text = "";
+     for i = 1:length (descriptions)
+       desc = descriptions{i};
+-      idx1 = complement (packages_to_uninstall, 1:length(installed_packages));
+       idx2 = complement (i, 1:length(descriptions));
+-      pseudo_installed_packages = {installed_packages{idx1}, descriptions{idx2}};
++      if (global_install)
++	## Global installation is not allowed to have dependencies on locally
++	## installed packages
++	idx1 = complement (packages_to_uninstall, 
++			   1:length(global_packages));
++	pseudo_installed_packages = {global_packages{idx1}, ...
++				     descriptions{idx2}};
++      else
++	idx1 = complement (packages_to_uninstall, 
++			   1:length(local_packages));
++	pseudo_installed_packages = {local_packages{idx1}, ... 
++				     global_packages{:}, ...
++				     descriptions{idx2}};
++      endif
+       bad_deps = get_unsatisfied_deps (desc, pseudo_installed_packages);
+       ## Are there any unsatisfied dependencies?
+       if (! isempty (bad_deps))
+ 	ok = false;
+ 	for i = 1:length (bad_deps)
+ 	  dep = bad_deps{i};
+ 	  error_text = strcat (error_text, " ", desc.name, " needs ",
+ 			       dep.package, " ", dep.operator, " ",
+@@ -600,18 +618,23 @@ function install (files, handle_deps, au
+       rm_rf (tmpdirs{i});
+     endfor
+     rethrow (lasterror ());
+   end_try_catch
+ 
+   ## Uninstall the packages that will be replaced
+   try
+     for i = packages_to_uninstall
+-      uninstall ({installed_packages{i}.name}, false, verbose, local_list, 
+-		 global_list, global_install);
++      if (global_install)
++	uninstall ({global_packages{i}.name}, false, verbose, local_list, 
++		   global_list, global_install);
++      else
++	uninstall ({local_packages{i}.name}, false, verbose, local_list, 
++		   global_list, global_install);
++      endif
+     endfor
+   catch
+     ## Something went wrong, delete tmpdirs
+     for i = 1:length (tmpdirs)
+       rm_rf (tmpdirs{i});
+     endfor
+     rethrow (lasterror ());
+   end_try_catch
+@@ -648,65 +671,67 @@ function install (files, handle_deps, au
+   endfor
+ 
+   ## If the package requested that it is autoloaded, or the installer
+   ## requested that it is, then mark the package as autoloaded.
+   for i = length (descriptions):-1:1
+     if (autoload > 0 || (autoload == 0 && isautoload (descriptions(i))))
+       fclose (fopen (fullfile (descriptions{i}.dir, "packinfo", 
+ 			       ".autoload"), "wt"));
++      descriptions{i}.autoload = 1;
+     endif
+   endfor
+ 
+   ## Add the packages to the package list
+   try
+     if (global_install)
+       idx = complement (packages_to_uninstall, 1:length(global_packages));
+-      global_packages = {global_packages{idx}, descriptions{:}};
++      global_packages = save_order ({global_packages{idx}, descriptions{:}});
+       save (global_list, "global_packages");
++      installed_packages = {local_packages{:}, global_packages{:}};
+     else
+       idx = complement (packages_to_uninstall, 1:length(local_packages));
+-      local_packages = {local_packages{idx}, descriptions{:}};
++      local_packages = save_order ({local_packages{idx}, descriptions{:}});
+       save (local_list, "local_packages");
++      installed_packages = {local_packages{:}, global_packages{:}};
+     endif
+   catch
+     ## Something went wrong, delete tmpdirs
+     for i = 1:length (tmpdirs)
+       rm_rf (tmpdirs{i});
+     endfor
+     for i = 1:length (descriptions)
+       rm_rf (descriptions{i}.dir);
+     endfor
+     if (global_install)
+-      error ("couldn't append to %s: %s", global_list, lasterr()(8:end));
++      printf ("error: couldn't append to %s\n", global_list);
+     else
+-      error ("couldn't append to %s: %s", local_list, lasterr()(8:end));
++      printf ("error: couldn't append to %s\n", local_list);
+     endif
++    rethrow (lasterror ());
+   end_try_catch
+ 
+   ## All is well, let's clean up
+   for i = 1:length (tmpdirs)
+     [status, msg] = rm_rf (tmpdirs{i});
+     if (status != 1)
+       warning ("couldn't clean up after my self: %s\n", msg);
+     endif
+   endfor
+ 
+   ## Add the newly installed packages to the path, so the user
+-  ## can begin usings them.
+-  arch = getarch();
++  ## can begin usings them. Only load them if they are marked autoload
+   if (length (descriptions) > 0)
+-    dirs = {};
++    idx = [];
+     for i = 1:length (descriptions)
+-      dirs{end + 1} = descriptions{i}.dir;
+-      if (exist (fullfile (descriptions{i}.dir, arch), "dir"))
+-	dirs{end + 1} = fullfile (descriptions{i}.dir, arch);
++      if (isautoload (descriptions(i)))
++	idx (end + 1) = i;
+       endif
+     endfor
+-    addpath (dirs{:});
++    load_packages_and_dependencies (idx, handle_deps, installed_packages);
+   endif
+ endfunction
+ 
+ function uninstall (pkgnames, handle_deps, verbose, local_list, 
+ 		    global_list, global_install)
+   ## Get the list of installed packages
+   [local_packages, global_packages] = installed_packages(local_list, 
+ 							 global_list);
+@@ -803,24 +828,24 @@ function uninstall (pkgnames, handle_dep
+     endif
+   endfor
+ 
+   ## Write a new ~/.octave_packages
+   if (global_install)
+     if (length (remaining_packages) == 0)
+       unlink (global_list);
+     else
+-      global_packages = remaining_packages;
++      global_packages = save_order (remaining_packages);
+       save (global_list, "global_packages");
+     endif
+   else
+     if (length (remaining_packages) == 0)
+       unlink (local_list);
+     else
+-      local_packages = remaining_packages;
++      local_packages = save_order (remaining_packages);
+       save (local_list, "local_packages");
+     endif
+   endif
+ 
+ endfunction
+ 
+ ##########################################################
+ ##        A U X I L I A R Y    F U N C T I O N S        ##
+@@ -887,41 +912,40 @@ function repackage (builddir, buildlist)
+ 	rm_rf (pack.name);
+       endif
+       cd (wd);
+     end_unwind_protect
+   endfor
+ endfunction
+ 
+ function auto = isautoload (desc)
+-auto = false;
+-if (isfield (desc{1}, "autoload"))
+-  a = desc{1}.autoload;
+-  if ((isnumeric (a) && a > 0)
+-      || (ischar (a) && (strcmpi (a, "true")
++  auto = false;
++  if (isfield (desc{1}, "autoload"))
++    a = desc{1}.autoload;
++    if ((isnumeric (a) && a > 0)
++        || (ischar (a) && (strcmpi (a, "true")
+ 			 || strcmpi (a, "on")
+ 			 || strcmpi (a, "yes")
+ 			 || strcmpi (a, "1"))))
+-    auto = true;
++      auto = true;
++    endif
+   endif
+-endif
+ endfunction
+ 
+ function prepare_installation (desc, packdir)
+   ## Is there a pre_install to call?
+   if (exist (fullfile (packdir, "pre_install.m"), "file"))
+     wd = pwd ();
+     try
+       cd (packdir);
+       pre_install (desc); 
+       cd (wd);
+     catch
+       cd (wd);
+-      error ("the pre-install function returned the following error: %s",
+-	     lasterr ());
++      rethrow (lasterror ());
+     end_try_catch
+   endif
+ 
+   ## If the directory "inst" doesn't exist, we create it
+   inst_dir = fullfile (packdir, "inst");
+   if (! exist (inst_dir, "dir"))
+     [status, msg] = mkdir (inst_dir);
+     if (status != 1)
+@@ -1207,17 +1231,17 @@ function copy_files (desc, packdir, bind
+       error ("couldn't copy INDEX file: %s", output);
+     endif
+   else
+     try
+       write_INDEX (desc, fullfile (packdir, "inst"),
+ 		   fullfile (packinfo, "INDEX"));
+     catch
+       rm_rf (desc.dir);
+-      error (lasterr ());
++      rethrow (lasterror ());
+     end_try_catch
+   endif
+ 
+   ## Is there an 'on_uninstall.m' to install?
+   fon_uninstall = fullfile(packdir, "on_uninstall.m");
+   if (exist (fon_uninstall, "file"))
+     [status, output] = copyfile (fon_uninstall, packinfo);
+     if (status != 1)
+@@ -1245,18 +1269,17 @@ function finish_installation (desc, pack
+     wd = pwd ();
+     try
+       cd (packdir);
+       post_install (desc);
+       cd (wd);
+     catch
+       cd (wd);
+       rm_rf (desc.dir);
+-      error ("the post_install function returned the following error: %s",
+-	     lasterr ());
++      rethrow (lasterror ());
+     end_try_catch
+   endif
+ endfunction
+ 
+ ## This function makes sure the package contains the
+ ## essential files.
+ function verify_directory (dir)
+   needed_files = {"COPYING", "DESCRIPTION"};
+@@ -1632,82 +1655,43 @@ function load_packages (files, handle_de
+   installed_packages = installed_packages (local_list, global_list);
+   num_packages = length (installed_packages);
+ 
+   ## Read package names and installdirs into a more convenient format
+   pnames = pdirs = cell (1, num_packages);
+   for i = 1:num_packages
+     pnames{i} = installed_packages{i}.name;
+     pdirs{i} = installed_packages{i}.dir;
+-    pdeps{i} = installed_packages{i}.depends;
+   endfor
+ 
+   ## load all
+-  dirs = {};
+   if (length (files) == 1 && strcmp (files{1}, "all"))
+-    dirs = pdirs;
++    idx = [1:length(installed_packages)];
+   ## load auto
+-  elseif (length (files) == 1 && strcmp (files{1}, "auto"))
++  elseif (length (files) == 1 && strcmp (files{1}, "auto")) 
++    idx = [];
+     for i = 1:length (installed_packages)
+       if (exist (fullfile (pdirs{i}, "packinfo", ".autoload"), "file"))
+-	dirs{end+1} = pdirs{i};
++	idx (end + 1) = i;
+       endif
+     endfor
+   ## load package_name1 ...
+   else
++    idx = [];
+     for i = 1:length (files)
+-      idx = strcmp (pnames, files{i});
+-      if (! any (idx))
++      idx2 = find (strcmp (pnames, files{i}));
++      if (! any (idx2))
+ 	  error ("package %s is not installed", files{i});
+       endif
+-      dirs{end+1} = pdirs{idx};
+-      if (handle_deps)
+-	pdep = pdeps{idx};
+-	for j = 1:length (pdep)
+-	  depname = pdep{j}.package;
+-	  if (strcmp (depname, "octave"))
+-            continue;
+-	  endif
+-	  idx = strcmp (pnames, depname);
+-	  if (! any (idx))
+-	    error ("package %s could not be loaded since it depends on %s",
+-		   files{i}, depname);
+-	  endif
+-	  dirs{end+1} = pdirs{idx};
+-	endfor
+-      endif
++      idx (end + 1) = idx2;
+     endfor
+-    dirs = unique(dirs);
+   endif
+ 
+-  ## Check for architecture dependent directories
+-  arch = getarch();
+-  archdirs = {};
+-  for i = 1:length (dirs)
+-    tmpdir = fullfile (dirs{i}, arch);
+-    archdirs{end + 1} = dirs{i};
+-    if (exist (tmpdir, "dir"))
+-      archdirs{end + 1} = tmpdir;
+-    endif
+-  endfor
+-  if (length (archdirs) > 0)
+-    dirs = archdirs;
+-  endif
+-
+-  ## Load the packages
+-  if (length (dirs) > 0)
+-    addpath (dirs{:});
+-  endif
+-
+-  ## Add local binaries, if any, to the EXEC_PATH
+-  for i = 1:length (dirs)
+-   if (exist (fullfile (dirs{i}, "bin"), "dir"))
+-     EXEC_PATH (strcat (fullfile(dirs{i}, "bin"), ":", EXEC_PATH ()));
+-   endif
+-  endfor
++  ## Load the packages, but take care of the ordering of dependencies
++  load_packages_and_dependencies (idx, handle_deps, installed_packages);
+ endfunction
+ 
+ function unload_packages (files, handle_deps, local_list, global_list)
+   installed_packages = installed_packages (local_list, global_list);
+   num_packages = length (installed_packages);
+ 
+   ## Read package names and installdirs into a more convenient format
+   pnames = pdirs = cell (1, num_packages);
+@@ -1821,8 +1805,101 @@ function [status, output] = shell (cmd)
+       [status, output] = system (strcat ("sh.exe -c \"", cmd, "\""));
+     else
+       error ("Can not find the command shell")
+     endif
+   else
+     [status, output] = system (cmd);
+   endif
+ endfunction
++
++function newdesc = save_order (desc)
++  newdesc = {};
++  for i = 1 : length(desc)
++    deps = desc{i}.depends;
++    if (isempty (deps) || (length (deps) == 1 && 
++			  strcmp(deps{1}.package, "octave")))
++      newdesc {end + 1} = desc{i};
++    else
++      tmpdesc = {};
++      for k = 1 : length (deps)
++        for j = 1 : length (desc)
++          if (strcmp (desc{j}.name, deps{k}.package))
++            tmpdesc {end + 1} = desc{j};
++	    break;
++          endif
++        endfor
++      endfor
++      if (! isempty (tmpdesc))					     
++        newdesc = {newdesc{:}, save_order(tmpdesc){:}, desc{i}};
++      else
++        newdesc {end + 1} = desc{i};
++      endif
++    endif
++  endfor
++  ## Eliminate the duplicates
++  idx = [];
++  for i = 1 : length (newdesc)
++    for j = (i + 1) : length (newdesc)
++      if (strcmp (newdesc{i}.name, newdesc{j}.name))
++        idx (end + 1) = j;
++      endif
++    endfor
++  endfor
++  newdesc(idx) = [];
++endfunction
++
++function load_packages_and_dependencies (idx, handle_deps, installed_packages)
++  idx = load_package_dirs (idx, [], handle_deps, installed_packages);
++  arch = getarch ();
++  dirs = {};
++  execpath = EXEC_PATH ();
++  for i = idx;
++    ndir = installed_packages{i}.dir;
++    dirs {end + 1} = ndir;
++    if (exist (fullfile (dirs{end}, "bin"), "dir"))
++      execpath = strcat (fullfile(dirs{end}, "bin"), ":", execpath);
++    endif
++    tmpdir = fullfile (ndir, arch);
++    if (exist (tmpdir, "dir"))
++      dirs{end + 1} = tmpdir;
++    endif
++  endfor
++
++  ## Load the packages
++  if (length (dirs) > 0)
++    addpath (dirs{:});
++  endif
++
++  ## Add the binaries to exec_path
++  if (! strcmp (EXEC_PATH, execpath))
++    EXEC_PATH (execpath);
++  endif
++endfunction
++
++function idx = load_package_dirs (lidx, idx, handle_deps, installed_packages)
++  for i = lidx
++    if (installed_packages{i}.loaded)
++      continue;
++    else
++      if (handle_deps)
++        deps = installed_packages{i}.depends;
++        if ((length (deps) > 1) || (length (deps) == 1 && 
++	  		  ! strcmp(deps{1}.package, "octave")))
++          tmplidx = [];
++          for k = 1 : length (deps)
++            for j = 1 : length (installed_packages)
++              if (strcmp (installed_packages{j}.name, deps{k}.package))
++                tmplidx (end + 1) = j;
++	        break;
++              endif
++            endfor
++          endfor
++          idx = load_package_dirs (tmplidx, idx, handle_deps, 
++				 installed_packages);
++        endif
++      endif
++      if (isempty (find(idx == i)))
++        idx (end + 1) = i;
++      endif
++    endif
++  endfor
++endfunction
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,14 @@
++2007-06-07  David Bateman  <dbateman@free.fr>
++
++	* ov-fcn-handles.cc (octave_fcn_handle::save_hdf5): More care that
++	all open HDF5 descriptors are closed.
++	(octave_fcn_handle::load_hdf5): Ditto.
++
+ 2007-06-06  Benjamin Lindner  <lindnerben@gmx.net>
+ 
+ 	* utils.cc [__MINGW32__]: Don't define HAVE_C99_VSNPRINTF.
+ 
+ 2007-06-06  Michael Goffioul  <michael.goffioul@swing.be>
+ 
+ 	* defaults.h.in, ls-hdf5.h, ov-complex.h, ov-cx-mat.h, ov-intx.h,
+ 	sysdep.h: Sprinkle with OCTINTERP_API as needed.
+diff --git a/src/ov-fcn-handle.cc b/src/ov-fcn-handle.cc
+--- a/src/ov-fcn-handle.cc
++++ b/src/ov-fcn-handle.cc
+@@ -732,16 +732,17 @@ octave_fcn_handle::save_hdf5 (hid_t loc_
+       std::ostringstream buf;
+       print_raw (buf, true);
+       std::string stmp = buf.str ();
+ 
+       // attach the type of the variable
+       H5Tset_size (type_hid, stmp.length () + 1);
+       if (type_hid < 0)
+ 	{
++	  H5Sclose (space_hid);
+ 	  H5Gclose (group_hid);
+ 	  return false;
+ 	}
+ 
+       data_hid = H5Dcreate (group_hid, "fcn",  type_hid, space_hid,
+ 			    H5P_DEFAULT);
+       if (data_hid < 0 || H5Dwrite (data_hid, type_hid, H5S_ALL, H5S_ALL,
+ 				    H5P_DEFAULT, stmp.c_str ()) < 0)
+@@ -832,17 +833,22 @@ octave_fcn_handle::save_hdf5 (hid_t loc_
+ 
+       if (a_id >= 0)
+ 	{
+ 	  retval = (H5Awrite (a_id, type_hid, octaveroot.c_str ()) >= 0);
+ 
+ 	  H5Aclose (a_id);
+ 	}
+       else
+-	retval = false;
++	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
++	  H5Gclose (group_hid);
++	  return false;
++	}
+ 
+       H5Sclose (space_hid);
+       hdims[0] = 1;
+       hdims[1] = fpath.length ();
+       space_hid = H5Screate_simple (0 , hdims, 0);
+       if (space_hid < 0)
+ 	{
+ 	  H5Tclose (type_hid);
+@@ -929,46 +935,53 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+   OCTAVE_LOCAL_BUFFER (char, nm_tmp, slen);
+ 
+   // create datatype for (null-terminated) string to read into:
+   st_id = H5Tcopy (H5T_C_S1);
+   H5Tset_size (st_id, slen);
+ 
+   if (H5Dread (data_hid, st_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, nm_tmp) < 0)
+     {
++      H5Tclose (st_id);
+       H5Sclose (space_hid);
+       H5Tclose (type_hid);
++      H5Dclose (data_hid);
+       H5Gclose (group_hid);
+       return false;
+     }
+   H5Tclose (st_id);
+   H5Dclose (data_hid);
+   nm = nm_tmp;
+ 
+   if (nm == "@<anonymous>")
+     {
+       data_hid = H5Dopen (group_hid, "fcn");
+ 
+       if (data_hid < 0)
+ 	{
++	  H5Sclose (space_hid);
++	  H5Tclose (type_hid);
+ 	  H5Gclose (group_hid);
+ 	  return false;
+ 	}
+ 
++      H5Tclose (type_hid);
+       type_hid = H5Dget_type (data_hid);
+       type_class_hid = H5Tget_class (type_hid);
+ 
+       if (type_class_hid != H5T_STRING)
+ 	{
++	  H5Sclose (space_hid);
+ 	  H5Tclose (type_hid);
+ 	  H5Dclose (data_hid);
+ 	  H5Gclose (group_hid);
+ 	  return false;
+ 	}
+ 
++      H5Sclose (space_hid);
+       space_hid = H5Dget_space (data_hid);
+       rank = H5Sget_simple_extent_ndims (space_hid);
+ 
+       if (rank != 0)
+ 	{
+ 	  H5Sclose (space_hid);
+ 	  H5Tclose (type_hid);
+ 	  H5Dclose (data_hid);
+@@ -989,21 +1002,24 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+       OCTAVE_LOCAL_BUFFER (char, fcn_tmp, slen);
+ 
+       // create datatype for (null-terminated) string to read into:
+       st_id = H5Tcopy (H5T_C_S1);
+       H5Tset_size (st_id, slen);
+ 
+       if (H5Dread (data_hid, st_id, H5S_ALL, H5S_ALL, H5P_DEFAULT, fcn_tmp) < 0)
+ 	{
++	  H5Tclose (st_id);
+ 	  H5Sclose (space_hid);
+ 	  H5Tclose (type_hid);
++	  H5Dclose (data_hid);
+ 	  H5Gclose (group_hid);
+ 	  return false;
+ 	}
++      H5Tclose (st_id);
+       H5Dclose (data_hid);
+ 
+       symbol_table *local_sym_tab = 0;
+       octave_idx_type len = 0;
+ 
+       // we have to pull some shenanigans here to make sure
+       // HDF5 doesn't print out all sorts of error messages if we
+       // call H5Aopen for a non-existing attribute
+@@ -1076,19 +1092,16 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+ 		      error ("load: failed to load anonymous function handle");
+ 		      success = false;
+ 		      break;
+ 		    }
+ 		}
+ 	    }
+ 	}
+ 
+-      H5Tclose (st_id);
+-      H5Gclose (group_hid);
+-
+       if (success)
+ 	{
+ 	  unwind_protect::begin_frame ("anon_hdf5_load");
+ 	  unwind_protect_ptr (curr_sym_tab);
+ 
+ 	  if (local_sym_tab)
+ 	    curr_sym_tab = local_sym_tab;
+ 
+@@ -1128,67 +1141,80 @@ octave_fcn_handle::load_hdf5 (hid_t loc_
+       // turn off error reporting temporarily, but save the error
+       // reporting function:
+       H5Eget_auto (&err_func, &err_func_data);
+       H5Eset_auto (0, 0);
+ 
+       hid_t attr_id = H5Aopen_name (group_hid, "OCTAVEROOT");
+       if (attr_id >= 0)
+ 	{
++	  H5Tclose (type_hid);
+ 	  type_hid = H5Aget_type (attr_id);
+ 	  type_class_hid = H5Tget_class (type_hid);
+ 
+ 	  if (type_class_hid != H5T_STRING)
+ 	    success = false;
+ 	  else
+ 	    {
+ 	      slen = H5Tget_size (type_hid);
+ 	      st_id = H5Tcopy (H5T_C_S1);
+ 	      H5Tset_size (st_id, slen);
+ 	      OCTAVE_LOCAL_BUFFER (char, root_tmp, slen);
+ 
+ 	      if (H5Aread (attr_id, st_id, root_tmp) < 0)
+ 		success = false;
+ 	      else
+ 		octaveroot = root_tmp;
++
++	      H5Tclose (st_id);
+ 	    }
+ 
+ 	  H5Aclose (attr_id);
+ 	}
+ 
+-      attr_id = H5Aopen_name (group_hid, "FILE");
+-      if (attr_id >= 0)
++      if (success)
+ 	{
+-	  type_hid = H5Aget_type (attr_id);
+-	  type_class_hid = H5Tget_class (type_hid);
++	  attr_id = H5Aopen_name (group_hid, "FILE");
++	  if (attr_id >= 0)
++	    {
++	      H5Tclose (type_hid);
++	      type_hid = H5Aget_type (attr_id);
++	      type_class_hid = H5Tget_class (type_hid);
+ 
+-	  if (type_class_hid != H5T_STRING)
+-	    success = false;
+-	  else
+-	    {
+-	      slen = H5Tget_size (type_hid);
+-	      st_id = H5Tcopy (H5T_C_S1);
+-	      H5Tset_size (st_id, slen);
+-	      OCTAVE_LOCAL_BUFFER (char, path_tmp, slen);
+-
+-	      if (H5Aread (attr_id, st_id, path_tmp) < 0)
++	      if (type_class_hid != H5T_STRING)
+ 		success = false;
+ 	      else
+-		fpath = path_tmp;
++		{
++		  slen = H5Tget_size (type_hid);
++		  st_id = H5Tcopy (H5T_C_S1);
++		  H5Tset_size (st_id, slen);
++		  OCTAVE_LOCAL_BUFFER (char, path_tmp, slen);
++
++		  if (H5Aread (attr_id, st_id, path_tmp) < 0)
++		    success = false;
++		  else
++		    fpath = path_tmp;
++
++		  H5Tclose (st_id);
++		}
++
++	      H5Aclose (attr_id);
+ 	    }
+-
+-	  H5Aclose (attr_id);
+ 	}
+ 
+       // restore error reporting:
+       H5Eset_auto (err_func, err_func_data);
+ 
+       success = (success ? set_fcn (octaveroot, fpath) : success);
+     }
+ 
++  H5Tclose (type_hid);
++  H5Sclose (space_hid);
++  H5Gclose (group_hid);
++
+   return success;
+ }
+ 
+ /* 
+ 
+ %!test
+ %! if (!isempty(findstr(octave_config_info ("DEFS"),"HAVE_HDF5")))
+ %!   a = 2;

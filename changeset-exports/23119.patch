@@ -1,0 +1,751 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1485815892 18000
+#      Mon Jan 30 17:38:12 2017 -0500
+# Node ID 3107d3717cc2d6d6949d2e68eaefb671a08ae1ed
+# Parent  17a3567a7b01447756ccd7a495b82dfb746ce575
+refactor and simplify interpreter startup in GUI
+
+* octave-interpreter.h, octave-interpreter.cc: Delete files.
+Move classes from here to main-window.h, main-window.cc.
+* libgui/src/module.mk: Update.
+
+* main-window.h, main-window.cc (main_window::m_interpreter,
+main_window::m_main_thread): New data members.
+(main_window::main_window): Connect
+octave_interpreter::octave_ready_singal to
+main_window::handle_octave_ready slot.  Create interpreter and main
+thread objects.
+(main_window::~main_window): Delete interpreter and main_thread objects.
+(main_window::interrupt_interpreter): New function.
+(main_window::construct_octave_qt_link): Connect singleShot timer to
+octave_interpreter::execute instead of
+main_window::execute_octave_interpreter.
+Don't connect command_window::interrupt_signal to
+_octave_qt_link::terminal_interrupt.
+Don't connect _workspace_model::rename_variable to
+main_window::handle_rename_variable_request.
+(main_window::construct): Connect command_window::interrupt signal to
+main_window::interrupt_interpreter.
+Connect _workspace_model::rename_variable to
+main_window::handle_rename_variable_request.
+(main_window::execute_octave_interpreter): Delete.
+
+* octave-qt-link.h, octave-qt-link.cc (octave_qt_link::main_thread,
+octave_qt_link::command_interpreter): Delete data members and all uses.
+(octave_qt_link::octave_qt_link): Don't create thread or command
+interpreter objects or connect signals to/from the command interpreter.
+(octave_qt_link::execute_interpreter): Delete.
+(octave_qt_link::terminal_interrupt): Delete.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -72,22 +72,81 @@ create_default_editor (QWidget *p)
+   return new file_editor (p);
+ #else
+   octave_unused_parameter (p);
+ 
+   return 0;
+ #endif
+ }
+ 
++octave_interpreter::octave_interpreter (octave::application *app_context)
++  : QObject (), thread_manager (), m_app_context (app_context)
++{ }
++
++void
++octave_interpreter::execute (void)
++{
++  thread_manager.register_current_thread ();
++
++  octave_thread_manager::unblock_interrupt_signal ();
++
++  // The application context owns the interpreter.
++
++  m_app_context->create_interpreter ();
++
++  int exit_status = 0;
++
++  try
++    {
++      // Final initialization including executing startup files.  If
++      // initialization fails, return the last available status from
++      // that process.
++
++      exit_status = m_app_context->initialize_interpreter ();
++
++      if (m_app_context->interpreter_initialized ())
++        {
++          // The interpreter should be completely ready at this point so let
++          // the GUI know.
++
++          emit octave_ready_signal ();
++
++          // Start executing commands in the command window.
++
++          exit_status = m_app_context->execute_interpreter ();
++        }
++    }
++  catch (const octave::exit_exception& ex)
++    {
++      exit_status = ex.exit_status ();
++    }
++
++  // Whether or not initialization succeeds we need to clean up the
++  // interpreter once we are done with it.
++
++  m_app_context->delete_interpreter ();
++
++  qApp->exit (exit_status);
++}
++
++void
++octave_interpreter::interrupt (void)
++{
++  thread_manager.interrupt ();
++}
++
++
+ main_window::main_window (QWidget *p, octave::gui_application *app_context)
+-  : QMainWindow (p), m_app_context (app_context), _workspace_model (0),
+-    status_bar (0), command_window (0), history_window (0),
+-    file_browser_window (0), doc_browser_window (0), editor_window (0),
+-    workspace_window (0), _settings_dlg (0), find_files_dlg (0),
+-    release_notes_window (0), community_news_window (0), _octave_qt_link (0),
++  : QMainWindow (p), m_app_context (app_context),
++    m_interpreter (new octave_interpreter (app_context)),
++    m_main_thread (new QThread ()), _workspace_model (0), status_bar (0),
++    command_window (0), history_window (0), file_browser_window (0),
++    doc_browser_window (0), editor_window (0), workspace_window (0),
++    _settings_dlg (0), find_files_dlg (0), release_notes_window (0),
++    community_news_window (0), _octave_qt_link (0),
+     _clipboard (QApplication::clipboard ()),
+     _prevent_readline_conflicts (true),
+     _suppress_dbg_location (true),
+     _start_gui (app_context && app_context->start_gui_p ())
+ {
+   if (_start_gui)
+     {
+       _workspace_model = new workspace_model ();
+@@ -122,31 +181,40 @@ main_window::main_window (QWidget *p, oc
+   QDateTime one_day_ago = current.addDays (-1);
+ 
+   if (_start_gui && connect_to_web
+       && (! last_checked.isValid () || one_day_ago > last_checked))
+     load_and_display_community_news (serial);
+ 
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
++
++  connect (m_interpreter, SIGNAL (octave_ready_signal ()),
++           this, SLOT (handle_octave_ready ()));
++
++  m_interpreter->moveToThread (m_main_thread);
++
++  m_main_thread->start ();
+ }
+ 
+ main_window::~main_window (void)
+ {
+   // Destroy the terminal first so that STDERR stream is redirected back
+   // to its original pipe to capture error messages at exit.
+ 
+   delete editor_window;     // first one for dialogs of modified editor-tabs
+   delete command_window;
+   delete workspace_window;
+   delete doc_browser_window;
+   delete file_browser_window;
+   delete history_window;
+   delete status_bar;
+   delete _workspace_model;
++  delete m_interpreter;
++  delete m_main_thread;
+   if (find_files_dlg)
+     {
+       delete find_files_dlg;
+       find_files_dlg = 0;
+     }
+   if (release_notes_window)
+     {
+       delete release_notes_window;
+@@ -1343,19 +1411,29 @@ main_window::construct (void)
+ 
+   construct_octave_qt_link ();
+ 
+   if (_start_gui)
+     {
+       setWindowIcon (QIcon (":/actions/icons/logo.png"));
+ 
+       workspace_window->setModel (_workspace_model);
++
+       connect (_workspace_model, SIGNAL (model_changed (void)),
+                workspace_window, SLOT (handle_model_changed (void)));
+ 
++      connect (_workspace_model,
++               SIGNAL (rename_variable (const QString&, const QString&)),
++               this,
++               SLOT (handle_rename_variable_request (const QString&,
++                                                     const QString&)));
++
++      connect (command_window, SIGNAL (interrupt_signal (void)),
++               this, SLOT (interrupt_interpreter (void)));
++
+       construct_menu_bar ();
+ 
+       construct_tool_bar ();
+ 
+       // Order is important.  Deleting QSettings must be last.
+       connect (qApp, SIGNAL (aboutToQuit ()),
+                command_window, SLOT (save_settings ()));
+       connect (qApp, SIGNAL (aboutToQuit ()),
+@@ -1592,36 +1670,21 @@ main_window::construct_octave_qt_link (v
+                SLOT (handle_update_breakpoint_marker_request (bool,
+                                                                     const QString&,
+                                                               int,
+                                                                                                         const QString&)));
+ 
+       connect (_octave_qt_link,
+                SIGNAL (show_doc_signal (const QString &)),
+                this, SLOT (handle_show_doc (const QString &)));
+-
+-      connect (_workspace_model,
+-               SIGNAL (rename_variable (const QString&, const QString&)),
+-               this,
+-               SLOT (handle_rename_variable_request (const QString&,
+-                                                     const QString&)));
+-
+-      connect (command_window, SIGNAL (interrupt_signal (void)),
+-               _octave_qt_link, SLOT (terminal_interrupt (void)));
+     }
+ 
+   // Defer initializing and executing the interpreter until after the main
+   // window and QApplication are running to prevent race conditions
+-  QTimer::singleShot (0, this, SLOT (execute_octave_interpreter ()));
+-}
+-
+-void
+-main_window::execute_octave_interpreter (void)
+-{
+-  _octave_qt_link->execute_interpreter ();
++  QTimer::singleShot (0, m_interpreter, SLOT (execute ()));
+ }
+ 
+ void
+ main_window::construct_menu_bar (void)
+ {
+   QMenuBar *menu_bar = menuBar ();
+ 
+   construct_file_menu (menu_bar);
+@@ -2374,8 +2437,14 @@ main_window::clipboard_has_changed (QCli
+     }
+ }
+ 
+ void
+ main_window::clear_clipboard ()
+ {
+   _clipboard->clear (QClipboard::Clipboard);
+ }
++
++void
++main_window::interrupt_interpreter (void)
++{
++  m_interpreter->interrupt ();
++}
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -51,21 +51,53 @@ along with Octave; see the file COPYING.
+ #include "find-files-dialog.h"
+ #include "history-dock-widget.h"
+ #include "octave-cmd.h"
+ #include "octave-dock-widget.h"
+ #include "octave-gui.h"
+ #include "octave-qt-link.h"
+ #include "resource-manager.h"
+ #include "terminal-dock-widget.h"
++#include "thread-manager.h"
+ #include "workspace-model.h"
+ #include "workspace-view.h"
+ 
+ class settings_dialog;
+ 
++class octave_interpreter : public QObject
++{
++  Q_OBJECT
++
++public:
++
++  // An object to manage the Octave interpreter.
++
++  octave_interpreter (octave::application *app_context);
++
++  ~octave_interpreter (void) = default;
++
++  void interrupt (void);
++
++signals:
++
++  void octave_ready_signal ();
++
++public slots:
++
++  // Initialize and execute the octave interpreter.
++
++  void execute (void);
++
++private:
++
++  octave_thread_manager thread_manager;
++
++  octave::application *m_app_context;
++};
++
+ /**
+  * @class MainWindow
+  *
+  * Represents the main window.
+  */
+ class main_window : public QMainWindow
+ {
+   Q_OBJECT
+@@ -200,37 +232,39 @@ public slots:
+ 
+   void handle_create_filedialog (const QStringList &filters,
+                                  const QString& title, const QString& filename,
+                                  const QString &dirname,
+                                  const QString& multimode);
+ 
+   void handle_show_doc (const QString &file);
+ 
+-  void execute_octave_interpreter (void);
+   void handle_octave_ready ();
+ 
+   // find files dialog
+   void find_files (const QString &startdir=QDir::currentPath ());
+   void find_files_finished (int);
+ 
+   // setting global shortcuts
+   void set_global_shortcuts (bool enable);
+ 
+   void set_screen_size (int ht, int wd);
+ 
+   // handling the clipboard
+   void clipboard_has_changed (QClipboard::Mode);
+   void clear_clipboard ();
+ 
++  void interrupt_interpreter (void);
++
+   // get the dockwidgets
+   QList<octave_dock_widget *> get_dock_widget_list ()
+   { return dock_widget_list (); }
+ 
+ private slots:
++
+   void disable_menu_shortcuts (bool disable);
+ 
+ protected:
+   void closeEvent (QCloseEvent * closeEvent);
+ 
+ private:
+ 
+   void construct (void);
+@@ -287,16 +321,20 @@ private:
+   void change_directory_callback (const std::string& directory);
+ 
+   void queue_command (octave_cmd *cmd);
+ 
+   void configure_shortcuts ();
+ 
+   octave::gui_application *m_app_context;
+ 
++  octave_interpreter *m_interpreter;
++
++  QThread *m_main_thread;
++
+   workspace_model *_workspace_model;
+ 
+   QHash<QMenu*, QStringList> _hash_menu_text;
+ 
+   // Toolbars.
+   QStatusBar *status_bar;
+ 
+   // Subwindows.
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -99,17 +99,16 @@ endif
+ 
+ OCTAVE_GUI_SRC_MOC = \
+   libgui/src/moc-dialog.cc \
+   libgui/src/moc-documentation-dock-widget.cc \
+   libgui/src/moc-files-dock-widget.cc \
+   libgui/src/moc-history-dock-widget.cc \
+   libgui/src/moc-main-window.cc \
+   libgui/src/moc-octave-cmd.cc \
+-  libgui/src/moc-octave-interpreter.cc \
+   libgui/src/moc-octave-qt-link.cc \
+   libgui/src/moc-settings-dialog.cc \
+   libgui/src/moc-terminal-dock-widget.cc \
+   libgui/src/moc-color-picker.cc \
+   libgui/src/moc-resource-manager.cc \
+   libgui/src/moc-shortcut-manager.cc \
+   libgui/src/moc-welcome-wizard.cc \
+   libgui/src/moc-workspace-model.cc \
+@@ -152,17 +151,16 @@ noinst_HEADERS += \
+   libgui/src/m-editor/file-editor.h \
+   libgui/src/m-editor/find-dialog.h \
+   libgui/src/m-editor/octave-qscintilla.h \
+   libgui/src/m-editor/octave-txt-lexer.h \
+   libgui/src/m-editor/marker.h \
+   libgui/src/main-window.h \
+   libgui/src/octave-gui.h \
+   libgui/src/octave-cmd.h \
+-  libgui/src/octave-interpreter.h \
+   libgui/src/octave-qt-link.h \
+   libgui/src/qtinfo/parser.h \
+   libgui/src/qtinfo/webinfo.h \
+   libgui/src/resource-manager.h \
+   libgui/src/settings-dialog.h \
+   libgui/src/shortcut-manager.h \
+   libgui/src/thread-manager.h \
+   libgui/src/terminal-dock-widget.h \
+@@ -183,17 +181,16 @@ libgui_src_libgui_src_la_SOURCES = \
+   libgui/src/m-editor/find-dialog.cc \
+   libgui/src/m-editor/octave-qscintilla.cc \
+   libgui/src/m-editor/octave-txt-lexer.cc \
+   libgui/src/m-editor/marker.cc \
+   libgui/src/main-window.cc \
+   libgui/src/octave-cmd.cc \
+   libgui/src/octave-dock-widget.cc \
+   libgui/src/octave-gui.cc \
+-  libgui/src/octave-interpreter.cc \
+   libgui/src/octave-qt-link.cc \
+   libgui/src/qtinfo/parser.cc \
+   libgui/src/qtinfo/webinfo.cc \
+   libgui/src/resource-manager.cc \
+   libgui/src/settings-dialog.cc \
+   libgui/src/shortcut-manager.cc \
+   libgui/src/thread-manager.cc \
+   libgui/src/terminal-dock-widget.cc \
+diff --git a/libgui/src/octave-interpreter.cc b/libgui/src/octave-interpreter.cc
+deleted file mode 100644
+--- a/libgui/src/octave-interpreter.cc
++++ /dev/null
+@@ -1,88 +0,0 @@
+-/*
+-
+-Copyright (C) 2013-2016 John W. Eaton
+-Copyright (C) 2011-2016 Jacob Dawid
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
+-(at your option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but
+-WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if defined (HAVE_CONFIG_H)
+-#  include "config.h"
+-#endif
+-
+-#include <QApplication>
+-
+-#include "octave.h"
+-
+-#include "octave-interpreter.h"
+-
+-octave_interpreter::octave_interpreter (octave::application *app_context)
+-  : QObject (), thread_manager (), m_app_context (app_context)
+-{ }
+-
+-void
+-octave_interpreter::execute (void)
+-{
+-  thread_manager.register_current_thread ();
+-
+-  octave_thread_manager::unblock_interrupt_signal ();
+-
+-  // The application context owns the interpreter.
+-
+-  m_app_context->create_interpreter ();
+-
+-  int exit_status = 0;
+-
+-  try
+-    {
+-      // Final initialization including executing startup files.  If
+-      // initialization fails, return the last available status from
+-      // that process.
+-
+-      exit_status = m_app_context->initialize_interpreter ();
+-
+-      if (m_app_context->interpreter_initialized ())
+-        {
+-          // The interpreter should be completely ready at this point so let
+-          // the GUI know.
+-
+-          emit octave_ready_signal ();
+-
+-          // Start executing commands in the command window.
+-
+-          exit_status = m_app_context->execute_interpreter ();
+-        }
+-    }
+-  catch (const octave::exit_exception& ex)
+-    {
+-      exit_status = ex.exit_status ();
+-    }
+-
+-  // Whether or not initialization succeeds we need to clean up the
+-  // interpreter once we are done with it.
+-
+-  m_app_context->delete_interpreter ();
+-
+-  qApp->exit (exit_status);
+-}
+-
+-void
+-octave_interpreter::interrupt (void)
+-{
+-  thread_manager.interrupt ();
+-}
+diff --git a/libgui/src/octave-interpreter.h b/libgui/src/octave-interpreter.h
+deleted file mode 100644
+--- a/libgui/src/octave-interpreter.h
++++ /dev/null
+@@ -1,64 +0,0 @@
+-/*
+-
+-Copyright (C) 2013-2016 John W. Eaton
+-Copyright (C) 2011-2016 Jacob Dawid
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
+-(at your option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but
+-WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if ! defined (octave_octave_interpreter_h)
+-#define octave_octave_interpreter_h 1
+-
+-#include <QObject>
+-
+-#include "octave.h"
+-
+-#include "thread-manager.h"
+-
+-class octave_interpreter : public QObject
+-{
+-  Q_OBJECT
+-
+-public:
+-
+-  // An object to manage the Octave interpreter.
+-
+-  octave_interpreter (octave::application *app_context);
+-
+-  ~octave_interpreter (void) = default;
+-
+-signals:
+-
+-  void octave_ready_signal ();
+-
+-public slots:
+-
+-  // Initialize and execute the octave interpreter.
+-
+-  void execute (void);
+-
+-  void interrupt (void);
+-
+-private:
+-
+-  octave_thread_manager thread_manager;
+-
+-  octave::application *m_app_context;
+-};
+-
+-#endif
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -42,44 +42,20 @@ along with Octave; see the file COPYING.
+ 
+ #include "octave-gui.h"
+ #include "octave-qt-link.h"
+ #include "resource-manager.h"
+ #include "workspace-element.h"
+ 
+ octave_qt_link::octave_qt_link (QWidget *p,
+                                 octave::gui_application *app_context)
+-  : octave_link (), main_thread (new QThread ()),
+-    m_app_context (app_context),
+-    command_interpreter (new octave_interpreter (app_context))
++  : octave_link (), m_app_context (app_context)
+ {
+   _current_directory = "";
+   _new_dir = true;
+-
+-  connect (this, SIGNAL (execute_interpreter_signal (void)),
+-           command_interpreter, SLOT (execute (void)));
+-
+-  connect (command_interpreter, SIGNAL (octave_ready_signal ()),
+-           p, SLOT (handle_octave_ready ()));
+-
+-  command_interpreter->moveToThread (main_thread);
+-
+-  main_thread->start ();
+-}
+-
+-octave_qt_link::~octave_qt_link (void)
+-{
+-  delete command_interpreter;
+-  delete main_thread;
+-}
+-
+-void
+-octave_qt_link::execute_interpreter (void)
+-{
+-  emit execute_interpreter_signal ();
+ }
+ 
+ bool
+ octave_qt_link::do_confirm_shutdown (void)
+ {
+   // Lock the mutex before emitting signal.
+   mutex.lock ();
+ 
+@@ -648,14 +624,8 @@ octave_qt_link::do_show_preferences ()
+   emit show_preferences_signal ();
+ }
+ 
+ void
+ octave_qt_link::do_show_doc (const std::string& file)
+ {
+   emit show_doc_signal (QString::fromStdString (file));
+ }
+-
+-void
+-octave_qt_link::terminal_interrupt (void)
+-{
+-  command_interpreter->interrupt ();
+-}
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -26,23 +26,21 @@ along with Octave; see the file COPYING.
+ #define octave_octave_qt_link_h 1
+ 
+ #include <list>
+ #include <string>
+ 
+ #include <QList>
+ #include <QObject>
+ #include <QString>
+-#include <QThread>
+ #include <QMutex>
+ #include <QWaitCondition>
+ 
+ #include "octave-gui.h"
+ #include "octave-link.h"
+-#include "octave-interpreter.h"
+ 
+ // Defined for purposes of sending QList<int> as part of signal.
+ typedef QList<int> QIntList;
+ 
+ // @class OctaveLink
+ // @brief Provides threadsafe access to octave.
+ // @author Jacob Dawid
+ //
+@@ -53,19 +51,17 @@ typedef QList<int> QIntList;
+ class octave_qt_link : public QObject, public octave_link
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   octave_qt_link (QWidget *p, octave::gui_application *app_context);
+ 
+-  ~octave_qt_link (void);
+-
+-  void execute_interpreter (void);
++  ~octave_qt_link (void) { }
+ 
+   bool do_confirm_shutdown (void);
+ 
+   bool do_copy_image_to_clipboard (const std::string& file);
+ 
+   bool do_edit_file (const std::string& file);
+   bool do_prompt_new_edit_file (const std::string& file);
+ 
+@@ -148,30 +144,23 @@ private:
+ 
+   octave_qt_link (const octave_qt_link&);
+ 
+   octave_qt_link& operator = (const octave_qt_link&);
+ 
+   void do_insert_debugger_pointer (const std::string& file, int line);
+   void do_delete_debugger_pointer (const std::string& file, int line);
+ 
+-  // Thread running octave_main.
+-  QThread *main_thread;
+-
+   octave::gui_application *m_app_context;
+ 
+-  octave_interpreter *command_interpreter;
+-
+   QString _current_directory;
+   bool    _new_dir;
+ 
+ signals:
+ 
+-  void execute_interpreter_signal (void);
+-
+   void copy_image_to_clipboard_signal (const QString& file, bool remove_file);
+ 
+   void edit_file_signal (const QString& file);
+ 
+   void change_directory_signal (const QString& dir);
+ 
+   void execute_command_in_terminal_signal (const QString& command);
+ 
+@@ -199,15 +188,11 @@ signals:
+   void insert_debugger_pointer_signal (const QString&, int);
+   void delete_debugger_pointer_signal (const QString&, int);
+ 
+   void show_preferences_signal (void);
+ 
+   void show_doc_signal (const QString &file);
+ 
+   void confirm_shutdown_signal (void);
+-
+-public slots:
+-
+-  void terminal_interrupt (void);
+ };
+ 
+ #endif

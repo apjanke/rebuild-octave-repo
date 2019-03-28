@@ -1,0 +1,260 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1553108243 0
+#      Wed Mar 20 18:57:23 2019 +0000
+# Node ID 6e50f1fedeb5585c4e542e953f3e7237df3a600a
+# Parent  6e01e5be8de335cd96f9a12521a4ffe1c9b3a78d
+dbstop: accept "at CLASS in METHOD" syntax (partial fix for bug #45404)
+
+* bp-table.h, bp-table.cc (bp_table::parse_dbfunction_params): New
+parameter CLASS_NAME.  Attempt to accept "at CLASS in METHOD" syntax.
+Change all uses.
+
+* debug.cc (Fdbstop): Update docstring.
+
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -85,20 +85,23 @@ DEFMETHOD (dbstop, interp, args, ,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbstop @var{func}
+ @deftypefnx {} {} dbstop @var{func} @var{line}
+ @deftypefnx {} {} dbstop @var{func} @var{line1} @var{line2} @dots{}
+ @deftypefnx {} {} dbstop @var{line1} @dots{}
+ @deftypefnx {} {} dbstop in @var{func}
+ @deftypefnx {} {} dbstop in @var{func} at @var{line}
+ @deftypefnx {} {} dbstop in @var{func} at @var{line} if "@var{condition}"
++@deftypefnx {} {} dbstop in @var{class} at @var{method}
+ @deftypefnx {} {} dbstop if @var{event}
+ @deftypefnx {} {} dbstop if @var{event} @var{ID}
+ @deftypefnx {} {} dbstop (@var{bp_struct})
+ @deftypefnx {} {@var{rline} =} dbstop @dots{}
++dbstop in waveClass at waveClass.plotEta
++dbstop waveClass at waveClass.plotEta
+ 
+ Set breakpoints for the built-in debugger.
+ 
+ @var{func} is the name of a function on the current @code{path}.  When
+ already in debug mode the @var{func} argument can be omitted and the current
+ function will be used.  Breakpoints at subfunctions are set with the scope
+ operator @samp{>}.  For example, If @file{file.m} has a subfunction
+ @code{func2}, then a breakpoint in @code{func2} can be specified by
+@@ -168,29 +171,30 @@ Octave will set the real breakpoint at t
+ When a file is re-parsed, such as when it is modified outside the GUI,
+ all breakpoints within the file are cleared.
+ 
+ @seealso{dbclear, dbstatus, dbstep, debug_on_error, debug_on_warning, debug_on_interrupt}
+ @end deftypefn */)
+ {
+   octave::bp_table::intmap retmap;
+   std::string symbol_name = "";  // stays empty for "dbstop if error" etc
++  std::string class_name = "";
+   octave::bp_table::intmap lines;
+   std::string condition = "";
+   octave_value retval;
+ 
+   octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+   octave::bp_table& bptab = tw.get_bp_table ();
+ 
+   if (args.length() >= 1 && ! args(0).isstruct ())
+     {
+       // explicit function / line / condition
+       bptab.parse_dbfunction_params ("dbstop", args, symbol_name,
+-                                     lines, condition);
++                                     class_name, lines, condition);
+ 
+       if (lines.size () == 0)
+         lines[0] = 1;
+ 
+       if (symbol_name != "")
+         {
+           retmap = bptab.add_breakpoint (symbol_name, lines, condition);
+           retval = intmap_to_ov (retmap);
+@@ -295,26 +299,27 @@ function are cleared.
+ If the requested line is not a breakpoint no action is performed.
+ 
+ The special keyword @qcode{"all"} will clear all breakpoints from all
+ files.
+ @seealso{dbstop, dbstatus, dbwhere}
+ @end deftypefn */)
+ {
+   std::string symbol_name = "";  // stays empty for "dbclear if error" etc
++  std::string class_name = "";
+   octave::bp_table::intmap lines;
+   std::string dummy;             // "if" condition -- only used for dbstop
+ 
+   int nargin = args.length ();
+ 
+   octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+   octave::bp_table& bptab = tw.get_bp_table ();
+ 
+-  bptab.parse_dbfunction_params ("dbclear", args, symbol_name, lines, dummy);
++  bptab.parse_dbfunction_params ("dbclear", args, symbol_name, class_name, lines, dummy);
+ 
+   if (nargin == 1 && symbol_name == "all")
+     {
+       bptab.remove_all_breakpoints ();
+       bptab.dbclear_all_signals ();
+     }
+   else
+     {
+diff --git a/libinterp/parse-tree/bp-table.cc b/libinterp/parse-tree/bp-table.cc
+--- a/libinterp/parse-tree/bp-table.cc
++++ b/libinterp/parse-tree/bp-table.cc
+@@ -247,32 +247,39 @@ namespace octave
+   enum dbstop_args
+   {
+     dbstop_in,
+     dbstop_at,
+     dbstop_if,
+     dbstop_none
+   };
+ 
++  // FIXME: This function probalby needs to be completely overhauled to
++  // correctly parse the full syntax of the dbstop command and properly
++  // reject incorrect forms.
++
+   // Parse parameters (args) of dbstop and dbclear commands.
+   // For dbstop, who=="dbstop"; for dbclear, who=="dbclear".
+-  // The syntax is: dbstop [[in] symbol] [[at] line [line [...]]] [if condition]
++  // The syntax is: dbstop [[in] symbol] [[at] [method | line [line [...]]]] [if condition]
+   // where the form of condition depends on whether or not a file or line has
+-  // been seen.
++  // been seen.  IF symbol and method are specified, then symbol should
++  // be a class name.  Otherwise it should be a function name.
+   // Also execute "if [error|warning|interrupt|naninf]" clauses.
+ 
+   void bp_table::parse_dbfunction_params (const char *who,
+                                           const octave_value_list& args,
+-                                          std::string& symbol_name,
++                                          std::string& func_name,
++                                          std::string& class_name,
+                                           bp_table::intmap& lines,
+                                           std::string& cond)
+   {
+     int nargin = args.length ();
+     int list_idx = 0;
+-    symbol_name = "";
++    func_name = "";
++    class_name = "";
+     lines = bp_table::intmap ();
+ 
+     if (nargin == 0 || ! args(0).is_string ())
+       print_usage (who);
+ 
+     // elements already processed
+     bool seen_in = false;
+     bool seen_at = false;
+@@ -312,59 +319,77 @@ namespace octave
+           error ("%s: '%s' missing argument", who,
+                  (tok == dbstop_in
+                   ? "in" : (tok == dbstop_at ? "at" : "if")));
+ 
+         // process the actual arguments
+         switch (tok)
+           {
+           case dbstop_in:
+-            symbol_name = args(pos).string_value ();
++            func_name = args(pos).string_value ();
+             if (seen_in)
+               error ("%s: Too many function names specified -- %s",
+-                     who, symbol_name.c_str ());
++                     who, func_name.c_str ());
+             else if (seen_at || seen_if)
+               error ("%s: function name must come before line number and 'if'",
+                      who);
+             seen_in = true;
+             pos++;
+             break;
+ 
+           case dbstop_at:
+             if (seen_at)
+               error ("%s: Only one 'at' clause is allowed -- %s",
+                      who, args(pos).string_value ().c_str ());
+             else if (seen_if)
+               error ("%s: line number must come before 'if' clause\n", who);
+             seen_at = true;
+ 
+-            if (! seen_in)
++            if (seen_if)
++              error ("%s: line number must come before 'if' clause\n", who);
++            else if (seen_in)
++              {
++                std::string arg = args(pos).string_value ();
++
++                // FIXME: we really want to distinguish number
++                // vs. method name here.
++
++                if (atoi (arg.c_str ()) == 0)
++                  {
++                    // We have class and function names but already
++                    // stored the class name in func_name.
++                    class_name = func_name;
++                    func_name = arg;
++                    pos++;
++                    break;
++                  }
++
++              }
++            else
+               {
+                 // It was a line number.  Get function name from debugger.
+                 if (Vdebugging)
+-                  symbol_name = m_evaluator.get_user_code ()->profiler_name ();
++                  func_name = m_evaluator.get_user_code ()->profiler_name ();
+                 else
+                   error ("%s: function name must come before line number "
+                          "and 'if'", who);
+                 seen_in = true;
+               }
+-            else if (seen_if)
+-              error ("%s: line number must come before 'if' clause\n", who);
+ 
+             // Read a list of line numbers (or arrays thereof)
+             for ( ; pos < nargin; pos++)
+               {
+                 if (args(pos).is_string ())
+                   {
+                     int line = atoi (args(pos).string_value ().c_str ());
+ 
+                     if (line > 0)
+                       lines[list_idx++] = line;
+                     else
+-                      break;        // may be "if"
++                      break;        // may be "if" or a method name
+                   }
+                 else if (args(pos).isnumeric ())
+                   {
+                     const NDArray arg = args(pos).array_value ();
+ 
+                     for (octave_idx_type j = 0; j < arg.numel (); j++)
+                       lines[list_idx++] = static_cast<int> (arg.elem (j));
+                   }
+diff --git a/libinterp/parse-tree/bp-table.h b/libinterp/parse-tree/bp-table.h
+--- a/libinterp/parse-tree/bp-table.h
++++ b/libinterp/parse-tree/bp-table.h
+@@ -116,19 +116,19 @@ namespace octave
+     octave_map stop_on_err_warn_status (bool to_screen);
+ 
+     void dbstop_process_map_args (const octave_map& mv);
+ 
+     void dbclear_all_signals (void);
+ 
+     bool condition_valid (const std::string& cond);
+ 
+-    void parse_dbfunction_params (const char *, const octave_value_list&,
+-                                  std::string&, bp_table::intmap&,
+-                                  std::string&);
++    void parse_dbfunction_params (const char *who, const octave_value_list& args,
++                                  std::string& func_name, std::string& class_name,
++                                  bp_table::intmap& lines, std::string& cond);
+ 
+   private:
+ 
+     typedef std::set<std::string>::const_iterator const_bp_set_iterator;
+     typedef std::set<std::string>::iterator bp_set_iterator;
+ 
+     tree_evaluator& m_evaluator;
+ 

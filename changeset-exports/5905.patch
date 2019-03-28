@@ -1,0 +1,405 @@
+# HG changeset patch
+# User jwe
+# Date 1153942068 0
+#      Wed Jul 26 19:27:48 2006 +0000
+# Node ID e5c0831a48bdc68e4cddf53b627bbde565a76a42
+# Parent  80d3933fb8b63aa4cd670e4cb95ecf0e96fc1032
+[project @ 2006-07-26 19:27:48 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,20 @@
+ 2006-07-26  John W. Eaton  <jwe@octave.org>
+ 
++	* mex.cc (xfree): New function.
++	(mex::free): Use it.
++	(mxArray_struct::~mxArray_struct, mxArray_cell::~mxArray_cell):
++	Delete elements with delete, not mxDestroyArray.
++	(mex::cleanup): Don't call mex::free or mex::free_value.
++	(mex::free_value): Add debug warning.
++	(mex::mark, mex::unmark): Fix debug warning.
++	(call_mex): Use unwind_protect frame.
++	(mexUnlock): Use iterator to remove item from mex_lock_count.
++
+ 	* octave.cc (maximum_braindamage): Use disable_warning instead of
+ 	bind_internal_variable to disable function-name-clash warning.
+ 	* error.cc (disable_warning): No longer static.
+ 	* error.h: Provide decl.
+ 
+ 2006-07-25  David Bateman  <dbateman@free.fr>
+ 
+ 	* mex.cc (mxArray_octave_value::get_class_id): Handle sparse.
+diff --git a/src/mex.cc b/src/mex.cc
+--- a/src/mex.cc
++++ b/src/mex.cc
+@@ -24,16 +24,26 @@ class mxArray;
+ #include "parse.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // #define DEBUG 1
+ 
++static void
++xfree (void *ptr)
++{
++#ifdef DEBUG
++  std::cerr << "free: " << ptr << std::endl;
++#endif
++
++  ::free (ptr);
++}
++
+ static int
+ max_str_len (int m, const char **str)
+ {
+   int max_len = 0;
+ 
+   for (int i = 0; i < m; i++)
+     {
+       int tmp = strlen (str[i]);
+@@ -1513,17 +1523,17 @@ public:
+     for (int i = 0; i < nfields; i++)
+       mxFree (fields[i]);
+ 
+     mxFree (fields);
+ 
+     int ntot = nfields * get_number_of_elements ();
+ 
+     for  (int i = 0; i < ntot; i++)
+-      mxDestroyArray (data[i]);
++      delete data[i];
+ 
+     mxFree (data);
+   }
+ 
+   octave_value as_octave_value (void) const
+   {
+     dim_vector dv = dims_to_dim_vector ();
+ 
+@@ -1733,17 +1743,17 @@ public:
+ 
+   mxArray_cell *clone (void) const { return new mxArray_cell (*this); }
+ 
+   ~mxArray_cell (void)
+   {
+     int nel = get_number_of_elements ();
+ 
+     for  (int i = 0; i < nel; i++)
+-      mxDestroyArray (data[i]);
++      delete data[i];
+ 
+     mxFree (data);
+   }
+ 
+   octave_value as_octave_value (void) const
+   {
+     dim_vector dv = dims_to_dim_vector ();
+ 
+@@ -1882,17 +1892,17 @@ class mex
+ {
+ public:
+ 
+   mex (void) : memlist (), arraylist (), fname (0) { }
+ 
+   ~mex (void)
+   {
+     if (! memlist.empty ())
+-      error ("mex: cleanup failed");
++      error ("mex: %s: cleanup failed", function_name ());
+ 
+     mxFree (fname);
+   }
+ 
+   const char *function_name (void) const
+   {
+     if (! fname)
+       {
+@@ -1910,40 +1920,53 @@ public:
+     return fname;
+   }
+ 
+   // Free all unmarked pointers obtained from malloc and calloc.
+   static void cleanup (void *ptr)
+   {
+     mex *context = static_cast<mex *> (ptr);
+ 
++    // We can't use mex::free here because it modifies memlist.
+     for (std::set<void *>::iterator p = context->memlist.begin ();
+ 	 p != context->memlist.end (); p++)
+-      context->free (*p);
+-
++      {
++	if (*p)
++	  {
++	    context->unmark (*p);
++
++	    xfree (*p);
++	  }
++      }
++
++    context->memlist.clear ();
++
++    // We can't use mex::free_value here because it modifies arraylist.
+     for (std::set<mxArray *>::iterator p = context->arraylist.begin ();
+ 	 p != context->arraylist.end (); p++)
+-      context->free_value (*p);
++      delete *p;
++
++    context->arraylist.clear ();
+   }
+ 
+   // allocate a pointer, and mark it to be freed on exit
+   void *malloc_unmarked (size_t n)
+   {
+     void *ptr = ::malloc (n);
+ 
+ #ifdef DEBUG
+     std::cerr << "malloc " << n << " bytes: " << ptr << std::endl;
+ #endif
+ 
+     if (! ptr)
+       {
+ 	// FIXME -- could use "octave_new_handler();" instead
+ 
+ 	error ("%s: failed to allocate %d bytes of memory",
+-	       mexFunctionName (), n);
++	       function_name (), n);
+ 
+ 	abort ();
+       }
+ 
+     global_mark (ptr);
+ 
+     return ptr;
+   }
+@@ -2013,20 +2036,17 @@ public:
+ 	unmark (ptr);
+ 
+ 	std::set<void *>::iterator p = global_memlist.find (ptr);
+ 
+ 	if (p != global_memlist.end ())
+ 	  {
+ 	    global_memlist.erase (p);
+ 
+-#ifdef DEBUG
+-	    std::cerr << "free: " << ptr << std::endl;
+-#endif
+-	    ::free (ptr);
++	    xfree (ptr);
+ 	  }
+ 	else
+ 	  warning ("mxFree: skipping memory not allocated by mxMalloc, mxCalloc, or mxRealloc");
+       }
+   }
+ 
+   // Mark a pointer so that it will not be freed on exit.
+   void persistent (void *ptr) { unmark (ptr); }
+@@ -2038,18 +2058,27 @@ public:
+     mxArray *ptr = new mxArray (ov);
+     arraylist.insert (ptr);
+     return ptr;
+   }
+ 
+   // Free an array and its contents.
+   void free_value (mxArray *ptr)
+   {
+-    arraylist.erase (ptr);
+-    delete ptr;
++    std::set<mxArray *>::iterator p = arraylist.find (ptr);
++
++    if (p != arraylist.end ())
++      {
++	arraylist.erase (p);
++	delete ptr;
++      }
++#ifdef DEBUG
++    else
++      warning ("mex::free_value: skipping memory not allocated by mex::make_value");
++#endif
+   }
+ 
+   // Mark an array and its contents so it will not be freed on exit.
+   void persistent (mxArray *ptr)
+   {
+     ptr->mark_persistent ();
+   }
+ 
+@@ -2072,57 +2101,62 @@ private:
+   // The name of the currently executing function.
+   mutable char *fname;
+ 
+   // Mark a pointer to be freed on exit.
+   void mark (void *p)
+   {
+ #ifdef DEBUG
+     if (memlist.find (p) != memlist.end ())
+-      warning ("%s: double registration ignored", mexFunctionName ());
++      warning ("%s: double registration ignored", function_name ());
+ #endif
+ 
+     memlist.insert (p);
+   }
+ 
+   // Unmark a pointer to be freed on exit, either because it was
+   // made persistent, or because it was already freed.
+-  void unmark (void *p)
++  void unmark (void *ptr)
+   {
++    std::set<void *>::iterator p = memlist.find (ptr);
++
++    if (p != memlist.end ())
++      memlist.erase (p);
+ #ifdef DEBUG
+-    if (memlist.find (p) != memlist.end ())
+-      warning ("%s: value not marked", mexFunctionName ());
++    else
++      warning ("%s: value not marked", function_name ());
+ #endif
+-
+-    memlist.erase (p);
+   }
+ 
+   // List of memory resources we allocated.
+   static std::set<void *> global_memlist;
+ 
+   // Mark a pointer as one we allocated.
+-  void global_mark (void *p)
++  void global_mark (void *ptr)
+   {
+ #ifdef DEBUG
+-    if (global_memlist.find (p) != global_memlist.end ())
+-      warning ("%s: double registration ignored", mexFunctionName ());
++    if (global_memlist.find (ptr) != global_memlist.end ())
++      warning ("%s: double registration ignored", function_name ());
+ #endif
+ 
+-    global_memlist.insert (p);
++    global_memlist.insert (ptr);
+   }
+ 
+   // Unmark a pointer as one we allocated.
+-  void global_unmark (void *p)
++  void global_unmark (void *ptr)
+   {
++    std::set<void *>::iterator p = global_memlist.find (ptr);
++
++    if (p != global_memlist.end ())
++      global_memlist.erase (p);
+ #ifdef DEBUG
+-    if (global_memlist.find (p) != global_memlist.end ())
+-      warning ("%s: value not marked", mexFunctionName ());
++    else
++      warning ("%s: value not marked", function_name ());
+ #endif
+ 
+-    global_memlist.erase (p);
+   }
+ };
+ 
+ // List of memory resources we allocated.
+ std::set<void *> mex::global_memlist;
+ 
+ // Current context.
+ mex *mex_context = 0;
+@@ -2768,26 +2802,28 @@ call_mex (callstyle cs, void *f, const o
+   for (int i = 0; i < nargin; i++)
+     argin[i] = 0;
+ 
+   int nout = nargout == 0 ? 1 : nargout;
+   OCTAVE_LOCAL_BUFFER (mxArray *, argout, nout);
+   for (int i = 0; i < nout; i++)
+     argout[i] = 0;
+ 
++  unwind_protect::begin_frame ("call_mex");
++
++  // Save old mex pointer.
++  unwind_protect_ptr (mex_context);
++
+   mex context;
+ 
+   unwind_protect::add (mex::cleanup, static_cast<void *> (&context));
+ 
+   for (int i = 0; i < nargin; i++)
+     argin[i] = context.make_value (args(i));
+ 
+-  // Save old mex pointer.
+-  unwind_protect_ptr (mex_context);
+-
+   if (setjmp (context.jump) == 0)
+     {
+       mex_context = &context;
+ 
+       if (cs == use_fortran)
+ 	{
+ 	  fmex_fptr fcn = FCN_PTR_CAST (fmex_fptr, f);
+ 
+@@ -2799,19 +2835,16 @@ call_mex (callstyle cs, void *f, const o
+       else
+ 	{
+ 	  cmex_fptr fcn = FCN_PTR_CAST (cmex_fptr, f);
+ 
+ 	  fcn (nargout, argout, nargin, argin);
+ 	}
+     }
+ 
+-  // Restore old mex pointer.
+-  unwind_protect::run ();
+-
+   // Convert returned array entries back into octave values.
+ 
+   octave_value_list retval;
+ 
+   if (! error_state)
+     {
+       if (nargout == 0 && argout[0])
+ 	{
+@@ -2827,17 +2860,17 @@ call_mex (callstyle cs, void *f, const o
+ 	    {
+ 	      mxArray *t = argout[i];
+ 	      retval(i) = t ? t->as_octave_value () : octave_value (Matrix ());
+ 	    }
+ 	}
+     }
+ 
+   // Clean up mex resources.
+-  unwind_protect::run ();
++  unwind_protect::run_frame ("call_mex");
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ Fortran_mex (void *f, const octave_value_list& args, int nargout)
+ {
+   return call_mex (use_fortran, f, args, nargout);
+@@ -3151,23 +3184,25 @@ mexSet (double /*handle*/, const char */
+ 
+ void
+ mexUnlock (void)
+ {
+   if (mex_context)
+     {
+       const char *fname = mexFunctionName ();
+ 
+-      if (mex_lock_count.find (fname) == mex_lock_count.end ())
++      std::map<std::string,int>::iterator p = mex_lock_count.find (fname);
++
++      if (p == mex_lock_count.end ())
+ 	warning ("mexUnlock: funtion `%s' is not locked", fname);
+       else
+ 	{
+ 	  int count = --mex_lock_count[fname];
+ 
+ 	  if (count == 0)
+ 	    {
+ 	      munlock (fname);
+ 
+-	      mex_lock_count.erase (fname);
++	      mex_lock_count.erase (p);
+ 	    }
+ 	}
+     }
+ }

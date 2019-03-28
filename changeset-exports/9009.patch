@@ -1,0 +1,271 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1237850941 14400
+#      Mon Mar 23 19:29:01 2009 -0400
+# Node ID da58ec8f62e8e9da22698efd87abfe69f2c5c5c8
+# Parent  7a7cf569528db1231020ccb258c0b85204a081c7
+tag bug don't define forced variables
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,27 @@
++2009-03-23  John W. Eaton  <jwe@octave.org>
++
++	* symtab.h
++	(symbol_table::symbol_record::symobl_recoord_rep::is_variable):
++	Also return true if symbol is tagged as a variable.
++	(symbol_table::symbol_record::symobl_recoord_rep::force_variable):
++	Don't set variable value.
++	(symbol_table::symbol_record::symobl_recoord_rep::clear_forced,
++	symbol_table::symbol_record::clear_forced): Delete.
++	(symbol_table::unmark_forced_variables): Rename from
++	symbol_table::clear_forced_variables.
++	(symbol_table::do_unmark_forced_variables): Rename from
++	symbol_table::do_clear_forced_variables.
++	* parse.y (make_script, finish_function): Call
++	symbol_table::unmark_forced_variables instead of
++	symbol_table::clear_forced_variables.
++	* octave.cc (unmark_forced_vars): New function.
++	(execute_eval_option_code): Add it to the unwind-protect stack.
++
+ 2009-03-22  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* pt-eval.cc (tree_evaluator::visit_simple_for_command):
+ 	Remove struct branch, handle structs by the generic code.
+ 	(tree_evaluator::visit_complex_for_command):
+ 	Add missing const qualifiers.
+ 
+ 2009-03-21  Jaroslav Hajek  <highegg@gmail.com>
+diff --git a/src/octave.cc b/src/octave.cc
+--- a/src/octave.cc
++++ b/src/octave.cc
+@@ -362,16 +362,28 @@ execute_startup_files (void)
+ 
+ 	  source_file (local_rc, context, verbose, require_file);
+ 	}
+     }
+ 
+   unwind_protect::run_frame ("execute_startup_files");
+ }
+ 
++static void
++unmark_forced_vars (void *arg)
++{
++  // Unmark any symbols that may have been tagged as local variables
++  // while parsing (for example, by force_local_variable in lex.l).
++
++  symbol_table::scope_id *pscope = static_cast <symbol_table::scope_id *> (arg);
++
++  if (pscope)
++    symbol_table::unmark_forced_variables (*pscope);
++}
++
+ static int
+ execute_eval_option_code (const std::string& code)
+ {
+   unwind_protect::begin_frame ("execute_eval_option_code");
+ 
+   octave_save_signal_mask ();
+ 
+   can_interrupt = true;
+@@ -381,16 +393,21 @@ execute_eval_option_code (const std::str
+   octave_bad_alloc_hook = unwind_protect::run_all;
+ 
+   octave_catch_interrupts ();
+ 
+   octave_initialized = true;
+ 
+   unwind_protect_bool (interactive);
+ 
++  // Do this with an unwind-protect cleanup function so that the
++  // forced variables will be unmarked in the event of an interrupt.
++  symbol_table::scope_id scope = symbol_table::top_scope ();
++  unwind_protect::add (unmark_forced_vars, &scope);
++
+   interactive = false;
+ 
+   int parse_status = 0;
+ 
+   try
+     {
+       eval_string (code, false, parse_status, 0);
+     }
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -2523,17 +2523,20 @@ make_script (tree_statement_list *cmds, 
+ 			      cmds, doc_string);
+ 
+   octave_time now;
+ 
+   script->stash_fcn_file_time (now);
+ 
+   curr_fcn_ptr = script;
+ 
+-  symbol_table::clear_forced_variables ();
++  // Unmark any symbols that may have been tagged as local variables
++  // while parsing (for example, by force_local_variable in lex.l).
++
++  symbol_table::unmark_forced_variables ();
+ }
+ 
+ // Begin defining a function.
+ 
+ static octave_user_function *
+ start_function (tree_parameter_list *param_list, tree_statement_list *body,
+ 		tree_statement *end_fcn_stmt)
+ {
+@@ -2703,20 +2706,21 @@ finish_function (tree_parameter_list *re
+ 	{
+ 	  // FIXME -- there should be a better way to indicate that we
+ 	  // should create a tree_function_def object other than
+ 	  // looking at curr_fcn_ptr...
+ 
+ 	  retval = new tree_function_def (fcn);
+ 	}
+ 
+-      // Clear any local variables that may have been added while
+-      // parsing (for example, by force_local_variable in lex.l). 
+-
+-      symbol_table::clear_forced_variables (fcn->scope ());
++      // Unmark any symbols that may have been tagged as local
++      // variables while parsing (for example, by force_local_variable
++      // in lex.l).
++
++      symbol_table::unmark_forced_variables (fcn->scope ());
+     }
+ 
+   return retval;
+ }
+ 
+ static void
+ recover_from_parsing_function (void)
+ {
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -199,20 +199,17 @@ public:
+ 	value_stack.push_back (v);
+       }
+ 
+       void force_variable (context_id context)
+       {
+ 	octave_value& val = varref (context);
+ 
+ 	if (! val.is_defined ())
+-	  {
+-	    val = Matrix ();
+-	    mark_forced ();
+-	  }
++	  mark_forced ();
+       }
+ 
+       octave_value& varref (context_id context)
+       {
+ 	if (is_global ())
+ 	  return symbol_table::global_varref (name);
+ 	else if (is_persistent ())
+ 	  return symbol_table::persistent_varref (name);
+@@ -288,33 +285,24 @@ public:
+ 
+ 		unmark_persistent ();
+ 	      }
+ 
+ 	    varref (xcurrent_context) = octave_value ();
+ 	  }
+       }
+ 
+-      void clear_forced (void)
+-      {
+-	if (is_forced ())
+-	  {
+-	    varref (xcurrent_context) = octave_value ();
+-	    unmark_forced ();
+-	  }
+-      }
+-
+       bool is_defined (context_id context) const
+       {
+ 	return varval (context).is_defined ();
+       }
+ 
+       bool is_variable (context_id context) const
+       {
+-	return (storage_class != local || is_defined (context));
++	return (storage_class != local || is_defined (context) || is_forced ());
+       }
+ 
+       bool is_local (void) const { return storage_class & local; }
+       bool is_automatic (void) const { return storage_class & automatic; }
+       bool is_formal (void) const { return storage_class & formal; }
+       bool is_hidden (void) const { return storage_class & hidden; }
+       bool is_inherited (void) const { return storage_class & inherited; }
+       bool is_global (void) const { return storage_class & global; }
+@@ -452,18 +440,16 @@ public:
+     }
+ 
+     void push_context (void) { rep->push_context (); }
+ 
+     size_t pop_context (void) { return rep->pop_context (); }
+ 
+     void clear (void) { rep->clear (); }
+ 
+-    void clear_forced (void) { rep->clear_forced (); }
+-    
+     bool is_defined (context_id context = xcurrent_context) const
+     {
+       return rep->is_defined (context);
+     }
+ 
+     bool is_variable (context_id context = xcurrent_context) const
+     {
+       return rep->is_variable (context);
+@@ -1348,22 +1334,22 @@ public:
+   static void clear_variables (scope_id scope = xcurrent_scope)
+   {
+     symbol_table *inst = get_instance (scope);
+ 
+     if (inst)
+       inst->do_clear_variables ();
+   }
+ 
+-  static void clear_forced_variables (scope_id scope = xcurrent_scope)
++  static void unmark_forced_variables (scope_id scope = xcurrent_scope)
+   {
+     symbol_table *inst = get_instance (scope);
+ 
+     if (inst)
+-      inst->do_clear_forced_variables ();
++      inst->do_unmark_forced_variables ();
+   }
+ 
+   // For unwind_protect.
+   static void clear_variables (void *) { clear_variables (); }
+ 
+   static void clear_functions (void)
+   {
+     for (fcn_table_iterator p = fcn_table.begin (); p != fcn_table.end (); p++)
+@@ -2128,20 +2114,20 @@ private:
+   }
+ 
+   void do_clear_variables (void)
+   {
+     for (table_iterator p = table.begin (); p != table.end (); p++)
+       p->second.clear ();
+   }
+ 
+-  void do_clear_forced_variables (void)
++  void do_unmark_forced_variables (void)
+   {
+     for (table_iterator p = table.begin (); p != table.end (); p++)
+-      p->second.clear_forced ();
++      p->second.unmark_forced ();
+   }
+ 
+   void do_clear_global (const std::string& name)
+   {
+     table_iterator p = table.find (name);
+ 
+     if (p != table.end ())
+       {

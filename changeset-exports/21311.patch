@@ -1,0 +1,277 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1455181172 -39600
+#      Thu Feb 11 19:59:32 2016 +1100
+# Node ID 718332a58d353a6eea482fe810befbeab07c4cfc
+# Parent  fc6a9bd59094b9fb5554668ef0a0b224d6e418da
+Fix left mouse button in editor margin bug from cset 65827e9cccb8
+
+* octave-qt-link.cc (do_debug_cd_or_addpath_error): Back out 65827e9cccb8
+  to use uiwidget_creator instead of QMessageBox.
+
+* file_editor_tab.cc (handle_context_menu_break_condition):
+  Validate condition using  bp_table::condition_valid, to allow
+  file_in_path to be called from a callback.jo
+
+* debug.{cc,h} (condition_valid): make member method, not static function.
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -322,25 +322,24 @@ file_editor_tab::handle_context_menu_edi
+ }
+ 
+ // If "dbstop if ..." selected from context menu, create a conditional
+ // breakpoint.  The default condition is (a) the existing condition if there
+ // is already a breakpoint (b) any selected text, or (c) empty
+ void
+ file_editor_tab::handle_context_menu_break_condition (int linenr)
+ {
+-  QString cond;
+-  bp_info info (_file_name, linenr);  // Get function name & dir from filename.
+-
+   // Ensure editor line numbers match Octave core's line numbers.
+   // Give users the option to save modifications if necessary.
+-  if (! unchanged_or_saved ()
+-     || !(octave_qt_link::file_in_path (info.file, info.dir)))
++  if (! unchanged_or_saved ())
+     return;
+ 
++  QString cond;
++  bp_info info (_file_name, linenr+1); // Get function name & dir from filename.
++
+   // Search for previous condition.  FIXME -- is there a more direct way?
+   if (_edit_area->markersAtLine (linenr) & (1 << marker::cond_break))
+     {
+       emit report_marker_linenr (_bp_lines, _bp_conditions);
+       for (int i = 0; i < _bp_lines.length (); i++)
+         if (_bp_lines.value (i) == linenr)
+           {
+             cond = _bp_conditions.value (i);
+@@ -358,50 +357,58 @@ file_editor_tab::handle_context_menu_bre
+       if (cond == "")
+         cond = _edit_area->selectedText ();
+       else
+         cond = "(" + cond + ") || (" + _edit_area->selectedText () + ")";
+     }
+ 
+   bool valid = false;
+   std::string prompt = "dbstop if";
++  bool ok;
+   while (!valid)
+     {
+-      bool ok;
+       QString new_condition
+         = QInputDialog::getText (this, tr ("Breakpoint condition"),
+                                  tr (prompt.c_str ()), QLineEdit::Normal, cond,
+                                  &ok);
+       if (ok)     // If cancel, don't change breakpoint condition.
+         {
+-          bp_table::intmap line;
+-          line[0] = linenr + 1;
+-
+           try
+             {
+               // Suppress error messages on the console.
+               unwind_protect frame;
+               frame.protect_var (buffer_error_messages);
+               buffer_error_messages++;
+ 
+-              bp_table::add_breakpoint (info.function_name, line,
+-                                        new_condition.toStdString ());
++              bp_table::condition_valid (new_condition.toStdString ());
+               valid = true;
+             }
+-          catch (const octave_interrupt_exception&) { valid = true; }
+           catch (const index_exception& e) { }
+           catch (const octave_execution_exception& e) { }
++          catch (const octave_interrupt_exception&)
++            {
++              ok = false;
++              valid = true;
++            }
+ 
+           // In case we repeat, set new prompt.
+           prompt = "ERROR: " + last_error_message () + "\n\ndbstop if";
+           cond = new_condition;
+         }
+       else
+         valid = true;
+     }
++
++  if (ok)       // If the user didn't cancel, actually set the breakpoint.
++    {
++      info.condition = cond.toStdString ();
++
++      octave_link::post_event
++        (this, &file_editor_tab::add_breakpoint_callback, info);
++    }
+ }
+ 
+ void
+ file_editor_tab::set_file_name (const QString& fileName)
+ {
+   // update tracked file if we really have a file on disk
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (! trackedFiles.isEmpty ())
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -39,16 +39,17 @@ along with Octave; see the file COPYING.
+ #include "load-path.h"
+ #include "oct-env.h"
+ #include "utils.h"
+ 
+ #include "octave-qt-link.h"
+ 
+ #include "resource-manager.h"
+ 
++#include <unistd.h>
+ octave_qt_link::octave_qt_link (QWidget *p)
+   : octave_link (), main_thread (new QThread ()),
+     command_interpreter (new octave_interpreter ())
+ {
+   _current_directory = "";
+   _new_dir = true;
+ 
+   connect (this, SIGNAL (execute_interpreter_signal (void)),
+@@ -382,41 +383,56 @@ int
+ octave_qt_link::do_debug_cd_or_addpath_error (const std::string& file,
+                                               const std::string& dir,
+                                               bool addpath_option)
+ {
+   int retval = -1;
+ 
+   QString qdir = QString::fromStdString (dir);
+   QString qfile = QString::fromStdString (file);
++  QString msg
++    = (addpath_option
++       ? tr ("The file %1 does not exist in the load path.  To run or debug the function you are editing, you must either change to the directory %2 or add that directory to the load path.").arg (qfile).arg (qdir)
++       : tr ("The file %1 is shadowed by a file with the same name in the load path. To run or debug the function you are editing, change to the directory %2.").arg (qfile).arg (qdir));
+ 
+-  QMessageBox msgBox;
++  QString title = tr ("Change Directory or Add Directory to Load Path");
+ 
+-  msgBox.setText ("File not in load path");
+-  QPushButton *cd_btn = msgBox.addButton (tr ("Change Directory"),
+-                                          QMessageBox::YesRole);
++  QString cd_txt = tr ("Change Directory");
++  QString addpath_txt = tr ("Add Directory to Load Path");
++  QString cancel_txt = tr ("Cancel");
+ 
+-  QPushButton *addpath_btn = 0;
++  QStringList btn;
++  QStringList role;
++  btn << cd_txt;
++  role << "YesRole";
+   if (addpath_option)
+     {
+-      msgBox.setInformativeText (tr ("The file %1 does not exist in the load path.  To run or debug the function you are editing, you must either change to the directory %2 or add that directory to the load path.").arg (qfile).arg (qdir));
+-      addpath_btn = msgBox.addButton (tr ("Add Directory to Load Path"),
+-                                     QMessageBox::AcceptRole);
+-    }
+-    else
+-    {
+-      msgBox.setInformativeText (tr ("The file %1 is shadowed by a file with the same name in the load path. To run or debug the function you are editing, change to the directory %2.").arg (qfile).arg (qdir));
+-    }
+-  msgBox.setStandardButtons (QMessageBox::Cancel);
++      btn << addpath_txt;
++      role << "AcceptRole";
++     }
++  btn << cancel_txt;
++  role << "RejectRole";
++
++  // Lock mutex before signaling.
++  uiwidget_creator.mutex.lock ();
++
++  uiwidget_creator.signal_dialog (msg, title, "quest", btn, cancel_txt, role);
+ 
+-  msgBox.exec ();
++  // Wait while the user is responding to message box.
++  uiwidget_creator.waitcondition.wait (&uiwidget_creator.mutex);
++
++  // The GUI has sent a signal and the thread has been awakened.
+ 
+-  if (msgBox.clickedButton () == cd_btn)
+-    retval = 1;
+-  else if (msgBox.clickedButton () == addpath_btn)
++  QString result = uiwidget_creator.get_dialog_button ();
++
++  uiwidget_creator.mutex.unlock ();
++
++  if (result == cd_txt)
++     retval = 1;
++  else if (result == addpath_txt)
+     retval = 2;
+ 
+   return retval;
+ }
+ 
+ void
+ octave_qt_link::do_change_directory (const std::string& dir)
+ {
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -595,18 +595,18 @@ bp_table::do_add_breakpoint_1 (octave_us
+ 
+   return found;
+ }
+ 
+ // Cursory check that  cond  is a valid condition to use for a breakpoint
+ // Currently allows conditions with side-effects, like 'y+=10' and 'y++';
+ // it is odd that the former is not flagged by "is_assignment_expression".
+ // Throws an exception if not valid.
+-static bool
+-condition_valid (const std::string& cond)
++bool
++bp_table::condition_valid (const std::string& cond)
+ {
+   if (cond.length () > 0)
+     {
+       octave_parser parser (cond + " ;"); // ; to reject partial expr like "y=="
+       parser.reset ();
+       int parse_status = parser.run ();
+       if (parse_status)
+         error ("dbstop: Cannot parse condition '%s'", cond.c_str ());
+@@ -644,17 +644,17 @@ bp_table::do_add_breakpoint (const std::
+                              const bp_table::intmap& line,
+                              const std::string& condition)
+ {
+   octave_user_code *dbg_fcn = get_user_code (fname);
+ 
+   if (! dbg_fcn)
+     error ("add_breakpoint: unable to find function '%s'\n", fname.c_str ());
+ 
+-  condition_valid (condition);  // throws error if condition not valid
++  condition_valid (condition); // Throw error if condition not valid.
+ 
+   intmap retval;
+ 
+   if (! do_add_breakpoint_1 (dbg_fcn, fname, line, condition, retval))
+     {
+       // Search subfunctions in the order they appear in the file.
+ 
+       const std::list<std::string> subfcn_names
+diff --git a/libinterp/corefcn/debug.h b/libinterp/corefcn/debug.h
+--- a/libinterp/corefcn/debug.h
++++ b/libinterp/corefcn/debug.h
+@@ -143,16 +143,18 @@ public:
+   }
+ 
+   static octave_map stop_on_err_warn_status (bool toScreen);
+ 
+   static void dbstop_process_map_args (const octave_map& mv);
+ 
+   static void dbclear_all_signals (void);
+ 
++  static bool condition_valid (const std::string& cond);
++
+   friend void parse_dbfunction_params (const char *, const octave_value_list&,
+                                        std::string&, bp_table::intmap&,
+                                        std::string&);
+ 
+ private:
+ 
+   typedef std::set<std::string>::const_iterator const_bp_set_iterator;
+   typedef std::set<std::string>::iterator bp_set_iterator;

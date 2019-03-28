@@ -1,0 +1,289 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1531940045 -7200
+#      Wed Jul 18 20:54:05 2018 +0200
+# Node ID 7644e7f1721f4e613ba13c0475fb47984bfed533
+# Parent  9d3dc0cd7fea0e3d0e80ef32380a509f4b5297f3
+change gui preferences from within the worker thread (bug #49119)
+
+* main-window.cc (construct_octave_qt_link): connect the slot accessing the
+  preferences with the related octave-qt-link signal;
+  (gui_preference): slot for reading the desired preference and for setting
+  a new value if the given value is not empty, finally resuming the worker
+  thread by unlocking a mutex
+
+* main-window.h: new slot gui_preference
+
+* octave-qt-link.cc	(do_gui_preference): new method signaling a request
+  for accessing the preferences to the gui, waiting for the result by
+  a mutex and returning the old value of the preference as a string
+
+* octave-qt-link.h: implementation of purely virtual method
+  octave_link::do_gui_preference, new signal gui_preference_signal
+
+* octave-link.cc (__octave_link_gui_preference__) new octave internal function
+  for accessing the gui preferences by calling octave_link::gui_preference
+
+* octave-link.h: (gui_preference): new static method calling purely virtual
+  method do_gui_preference, which is implemented in octave_qt_link
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1978,16 +1978,23 @@ namespace octave
+         connect (m_octave_qt_link, SIGNAL (exit_debugger_signal (void)),
+                  this, SLOT (handle_exit_debugger (void)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (show_preferences_signal (void)),
+                  this, SLOT (process_settings_dialog_request (void)));
+ 
+         connect (m_octave_qt_link,
++                 SIGNAL (gui_preference_signal (const QString&, const QString&,
++                                                QMutex*, QString*)),
++                 this,
++                 SLOT (gui_preference (const QString&, const QString&,
++                                       QMutex*, QString*)));
++
++        connect (m_octave_qt_link,
+                  SIGNAL (edit_file_signal (const QString&)),
+                  m_active_editor,
+                  SLOT (handle_edit_file_request (const QString&)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (insert_debugger_pointer_signal (const QString&, int)),
+                  this,
+                  SLOT (handle_insert_debugger_pointer_request (const QString&,
+@@ -2481,16 +2488,32 @@ namespace octave
+ 
+     connect (current_dir_up, SIGNAL (triggered (void)),
+              this, SLOT (change_directory_up (void)));
+ 
+     connect (m_undo_action, SIGNAL (triggered (void)),
+              this, SLOT (handle_undo_request (void)));
+   }
+ 
++  void main_window::gui_preference (const QString& key, const QString& value,
++                                    QMutex* wait_for_gui, QString* read_value)
++  {
++    QSettings *settings = resource_manager::get_settings ();
++
++    *read_value = settings->value (key).toString ();
++
++    if (! value.isEmpty ())
++      {
++        settings->setValue (key, QVariant (value));
++        emit settings_changed (settings);
++      }
++
++    wait_for_gui->unlock ();    // data is ready, resume worker threat
++  }
++
+   void main_window::save_workspace_callback (const std::string& file)
+   {
+     // INTERPRETER THREAD
+ 
+     Fsave (ovl (file));
+   }
+ 
+   void main_window::load_workspace_callback (const std::string& file)
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -235,16 +235,18 @@ namespace octave
+                                     const QStringList&);
+ 
+     void handle_create_filedialog (const QStringList& filters,
+                                    const QString& title,
+                                    const QString& filename,
+                                    const QString& dirname,
+                                    const QString& multimode);
+ 
++    void gui_preference (const QString& key, const QString& value,
++                         QMutex* wait_for_gui, QString* read_value);
+     void handle_show_doc (const QString& file);
+     void handle_register_doc (const QString& file);
+     void handle_unregister_doc (const QString& file);
+ 
+     void handle_octave_ready ();
+     void handle_octave_finished (int);
+ 
+     //! Find files dialog.
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -568,16 +568,39 @@ namespace octave
+     return ok;
+   }
+ 
+   void octave_qt_link::do_show_preferences (void)
+   {
+     emit show_preferences_signal ();
+   }
+ 
++  std::string octave_qt_link::do_gui_preference (const std::string& key,
++                                                 const std::string& value)
++  {
++    QMutex wait_for_gui;
++    QString pref_value;
++
++    // Emit the signal for changing or getting a preference
++    emit gui_preference_signal (QString::fromStdString (key),
++                                QString::fromStdString (value),
++                                &wait_for_gui, &pref_value);
++
++    // Unlock and lock the mutex (make sure it is locked without being blocked)
++    wait_for_gui.unlock ();
++    wait_for_gui.lock ();
++
++    // Try to lock it again, thus waiting for the unlock of the gui after
++    // reading/changing desired preference. A timeout of 3 s for not being
++    // blocked forever if something goes wrong
++    wait_for_gui.tryLock (3000);
++
++    return pref_value.toStdString ();
++  }
++
+   void octave_qt_link::do_show_doc (const std::string& file)
+   {
+     emit show_doc_signal (QString::fromStdString (file));
+   }
+ 
+   void octave_qt_link::do_register_doc (const std::string& file)
+   {
+     emit register_doc_signal (QString::fromStdString (file));
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -133,16 +133,18 @@ namespace octave
+ 
+     void do_update_breakpoint (bool insert, const std::string& file, int line,
+                                const std::string& cond);
+ 
+     static bool file_in_path (const std::string& file, const std::string& dir);
+ 
+     void do_show_preferences (void);
+ 
++    std::string do_gui_preference (const std::string& key,
++                                   const std::string& value);
+     void do_show_doc (const std::string& file);
+     void do_register_doc (const std::string& file);
+     void do_unregister_doc (const std::string& file);
+ 
+     void do_edit_variable (const std::string& name, const octave_value& val);
+ 
+     void shutdown_confirmation (bool sd) { m_shutdown_confirm_result = sd; }
+ 
+@@ -188,16 +190,19 @@ namespace octave
+     void update_breakpoint_marker_signal (bool insert, const QString& file,
+                                           int line, const QString& cond);
+ 
+     void insert_debugger_pointer_signal (const QString&, int);
+     void delete_debugger_pointer_signal (const QString&, int);
+ 
+     void show_preferences_signal (void);
+ 
++    void gui_preference_signal (const QString&, const QString&,
++                                QMutex*, QString*);
++
+     void show_doc_signal (const QString& file);
+ 
+     void register_doc_signal (const QString& file);
+ 
+     void unregister_doc_signal (const QString& file);
+ 
+     void edit_variable_signal (const QString& name, const octave_value& val);
+ 
+diff --git a/libinterp/corefcn/octave-link.cc b/libinterp/corefcn/octave-link.cc
+--- a/libinterp/corefcn/octave-link.cc
++++ b/libinterp/corefcn/octave-link.cc
+@@ -377,16 +377,37 @@ DEFUN (__octave_link_show_preferences__,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} __octave_link_show_preferences__ ()
+ Undocumented internal function.
+ @end deftypefn */)
+ {
+   return ovl (octave_link::show_preferences ());
+ }
+ 
++DEFUN (__octave_link_gui_preference__, args, ,
++       doc: /* -*- texinfo -*-
++@deftypefn {} {} __octave_link_gui_preference__ ()
++Undocumented internal function.
++@end deftypefn */)
++{
++  std::string key;
++  std::string value = "";
++
++  if (args.length () >= 1)
++    key = args(0).string_value();
++  else
++    error ("__octave_link_gui_preference__: "
++           "first argument must be the preference key");
++
++  if (args.length () >= 2)
++    value = args(1).string_value();
++
++  return ovl (octave_link::gui_preference (key, value));
++}
++
+ DEFMETHOD (openvar, interp, args, ,
+            doc: /* -*- texinfo -*-
+ @deftypefn {} {} openvar (@var{name})
+ Open the variable @var{name} in the graphical Variable Editor.
+ @end deftypefn */)
+ {
+   if (args.length () != 1)
+     print_usage ();
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -404,16 +404,28 @@ public:
+       {
+         instance->do_show_preferences ();
+         return true;
+       }
+     else
+       return false;
+   }
+ 
++  static std::string
++  gui_preference (const std::string& key,
++                  const std::string& value)
++  {
++    if (enabled ())
++      {
++        return instance->do_gui_preference (key, value);
++      }
++    else
++      return "";
++  }
++
+   static bool
+   show_doc (const std::string & file)
+   {
+     if (enabled ())
+       {
+         instance->do_show_doc (file);
+         return true;
+       }
+@@ -609,16 +621,19 @@ protected:
+   virtual void do_exit_debugger_event (void) = 0;
+ 
+   virtual void do_update_breakpoint (bool insert,
+                                      const std::string& file, int line,
+                                      const std::string& cond) = 0;
+ 
+   virtual void do_show_preferences (void) = 0;
+ 
++  virtual std::string do_gui_preference (const std::string& key,
++                                         const std::string& value) = 0;
++
+   virtual void do_show_doc (const std::string& file) = 0;
+ 
+   virtual void do_register_doc (const std::string& file) = 0;
+ 
+   virtual void do_unregister_doc (const std::string& file) = 0;
+ 
+   virtual void
+   do_edit_variable (const std::string& name, const octave_value& val) = 0;

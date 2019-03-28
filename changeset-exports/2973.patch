@@ -1,0 +1,1444 @@
+# HG changeset patch
+# User jwe
+# Date 863724657 0
+#      Thu May 15 19:30:57 1997 +0000
+# Node ID ef3379196bcfeb4b5f830792f33cfb63a2b96391
+# Parent  ae2471c4e5c0b580d8291c98307a685961e36927
+[project @ 1997-05-15 19:27:38 by jwe]
+
+diff --git a/src/pt-cmd.cc b/src/pt-cmd.cc
+--- a/src/pt-cmd.cc
++++ b/src/pt-cmd.cc
+@@ -46,31 +46,30 @@ int returning = 0;
+ #include "oct-var-ref.h"
+ #include "pt-cmd.h"
+ #include "symtab.h"
+ #include "ov.h"
+ #include "pt-exp.h"
+ #include "pt-id.h"
+ #include "pt-indir.h"
+ #include "pt-misc.h"
+-#include "pt-mvr.h"
+ #include "pt-walk.h"
+ #include "unwind-prot.h"
+ #include "variables.h"
+ 
+ // Decide if it's time to quit a for or while loop.
+ static inline bool
+ quit_loop_now (void)
+ {
+   // Maybe handle `continue N' someday...
+ 
+   if (continuing)
+     continuing--;
+ 
+-  bool quit = (returning || breaking || continuing);
++  bool quit = (error_state || returning || breaking || continuing);
+ 
+   if (breaking)
+     breaking--;
+ 
+   return quit;
+ }
+ 
+ // Base class for declaration commands (global, static).
+@@ -89,33 +88,28 @@ tree_decl_command::accept (tree_walker& 
+ // Global.
+ 
+ static void
+ do_global_init (tree_decl_elt& elt, bool skip_initializer)
+ {
+   tree_identifier *id = elt.ident ();
+ 
+   if (id)
+-    id->link_to_global ();
+-  else
+     {
+-      tree_simple_assignment_expression *expr = elt.assign_expr ();
++      id->link_to_global ();
++
++      tree_expression *expr = elt.expression ();
+ 
+       if (expr)
+ 	{
+-	  if (expr->left_hand_side_is_identifier_only ()
+-	      && (id = expr->left_hand_side_id ()))
+-	    {
+-	      id->link_to_global ();
++	  octave_value init_val = expr->rvalue ();
+ 
+-	      if (! (skip_initializer || error_state))
+-		expr->eval ();
+-	    }
+-	  else
+-	    error ("global: unable to make structure elements global");
++	  octave_variable_reference ult = id->lvalue ();
++
++	  ult.assign (octave_value::asn_eq, init_val);
+ 	}
+     }
+ }
+ 
+ void
+ tree_global_command::eval (void)
+ {
+   if (init_list)
+@@ -133,33 +127,28 @@ tree_global_command::eval (void)
+ // Static.
+ 
+ static void
+ do_static_init (tree_decl_elt& elt, bool)
+ {
+   tree_identifier *id = elt.ident ();
+ 
+   if (id)
+-    id->mark_as_static ();
+-  else
+     {
+-      tree_simple_assignment_expression *expr = elt.assign_expr ();
++      id->mark_as_static ();
++
++      tree_expression *expr = elt.expression ();
+ 
+       if (expr)
+ 	{
+-	  if (expr->left_hand_side_is_identifier_only ()
+-	      && (id = expr->left_hand_side_id ()))
+-	    {
+-	      id->mark_as_static ();
++	  octave_value init_val = expr->rvalue ();
+ 
+-	      if (! error_state)
+-		expr->eval ();
+-	    }
+-	  else
+-	    error ("global: unable to make structure elements global");
++	  octave_variable_reference ult = id->lvalue ();
++
++	  ult.assign (octave_value::asn_eq, init_val);
+ 	}
+     }
+ }
+ 
+ void
+ tree_static_command::eval (void)
+ {
+   // Static variables only need to be marked and initialized once.
+@@ -227,356 +216,284 @@ tree_while_command::eval_error (void)
+ void
+ tree_while_command::accept (tree_walker& tw)
+ {
+   tw.visit_while_command (*this);
+ }
+ 
+ // For.
+ 
+-tree_for_command::~tree_for_command (void)
++tree_simple_for_command::~tree_simple_for_command (void)
+ {
+-  delete id;
+-  delete id_list;
+   delete expr;
+   delete list;
+ }
+ 
+ inline void
+-tree_for_command::do_for_loop_once (tree_return_list *lst,
+-				    const octave_value_list& rhs, bool& quit)
++tree_simple_for_command::do_for_loop_once (octave_variable_reference& ult,
++					   const octave_value& rhs,
++					   bool& quit)
+ {
+   quit = false;
+ 
+-  tree_oct_obj *tmp = new tree_oct_obj (rhs);
+-  tree_multi_assignment_expression tmp_ass (lst, tmp, 1);
+-  tmp_ass.eval ();
++  ult.assign (octave_value::asn_eq, rhs);
++
++  if (! error_state)
++    {
++      if (list)
++	{
++	  list->eval ();
++
++	  if (error_state)
++	    eval_error ();
++	}
++    }
++  else
++    eval_error ();
++
++  quit = quit_loop_now ();
++}
+ 
++#define DO_LOOP(arg) \
++  do \
++    { \
++      for (int i = 0; i < steps; i++) \
++	{ \
++	  octave_value val (arg); \
++ \
++	  bool quit = false; \
++ \
++	  do_for_loop_once (ult, val, quit); \
++ \
++	  if (quit) \
++	    break; \
++	} \
++    } \
++  while (0)
++
++void
++tree_simple_for_command::eval (void)
++{
+   if (error_state)
++    return;
++
++  octave_value rhs = expr->rvalue ();
++
++  if (error_state || rhs.is_undefined ())
+     {
+       eval_error ();
+       return;
+     }
+ 
+-  if (list)
+-    {
+-      list->eval ();
+-
+-      if (error_state)
+-	{
+-	  eval_error ();
+-	  quit = true;
+-	  return;
+-	}
+-    }
+-
+-  quit = quit_loop_now ();
+-}
+-
+-inline void
+-tree_for_command::do_for_loop_once (tree_index_expression *idx_expr,
+-				    const octave_value& rhs, bool& quit)
+-{
+-  quit = false;
+-
+-  octave_value *tmp = new octave_value (rhs);
+-  tree_simple_assignment_expression tmp_ass (idx_expr, tmp, true);
+-  tmp_ass.eval ();
++  octave_variable_reference ult = lhs->lvalue ();
+ 
+   if (error_state)
+     {
+       eval_error ();
+       return;
+     }
+ 
+-  if (list)
+-    {
+-      list->eval ();
+-
+-      if (error_state)
+-	{
+-	  eval_error ();
+-	  quit = true;
+-	  return;
+-	}
+-    }
+-
+-  quit = quit_loop_now ();
+-}
+-
+-inline void
+-tree_for_command::do_for_loop_once (tree_identifier *ident,
+-				    octave_value& rhs, bool& quit)
+-{
+-  quit = false;
+-
+-  ident->reference () . assign (octave_value::asn_eq, rhs);
+-
+-  if (! error_state)
+-    {
+-      if (list)
+-	list->eval ();
+-
+-      if (error_state)
+-	{
+-	  eval_error ();
+-	  quit = true;
+-	}
+-      else
+-	quit = quit_loop_now ();
+-    }
+-  else
+-    eval_error ();
+-
+-  return;
+-}
+-
+-#define DO_LOOP(val) \
+-  do \
+-    { \
+-      if (ident) \
+-	for (int i = 0; i < steps; i++) \
+-	  { \
+-	    octave_value rhs (val); \
+-	    bool quit = false; \
+-	    do_for_loop_once (ident, rhs, quit); \
+-	    if (quit) \
+-	      break; \
+-	  } \
+-      else if (id_list) \
+-	for (int i = 0; i < steps; i++) \
+-	  { \
+-	    octave_value_list rhs (val); \
+-	    bool quit = false; \
+-	    do_for_loop_once (id_list, rhs, quit); \
+-	    if (quit) \
+-	      break; \
+-	  } \
+-      else \
+-	for (int i = 0; i < steps; i++) \
+-	  { \
+-	    octave_value rhs (val); \
+-	    bool quit = false; \
+-	    do_for_loop_once (tmp_id, rhs, quit); \
+-	    if (quit) \
+-	      break; \
+-	  } \
+-    } \
+-  while (0)
+-
+-void
+-tree_for_command::eval (void)
+-{
+-  if (error_state || ! expr)
+-    return;
+-
+-  octave_value tmp_expr = expr->eval ();
+-
+-  if (error_state || tmp_expr.is_undefined ())
+-    {
+-      eval_error ();
+-      return;
+-    }
+-
+-  tree_index_expression *tmp_id = id;
+-  if (id_list && id_list->length () == 1)
+-    tmp_id = id_list->front ();
+-
+-  tree_identifier *ident = 0;
+-  if (tmp_id && ! tmp_id->arg_list ())
+-    {
+-      tree_indirect_ref *idr = tmp_id->ident ();
+-      if (idr->is_identifier_only ())
+-	ident = idr->ident ();
+-    }
+-
+-  if (id_list && ! ident && ! tmp_expr.is_map ())
+-    {
+-      error ("in statement `for [X, Y] = VAL', VAL must be a structure");
+-      return;
+-    }
+-
+-  if (tmp_expr.is_scalar_type ())
++  if (rhs.is_scalar_type ())
+     {
+       bool quit = false;
+-      if (ident)
+-	do_for_loop_once (ident, tmp_expr, quit);
+-      else if (id_list)
+-	{
+-	  octave_value_list rhs (tmp_expr);
+-	  do_for_loop_once (id_list, rhs, quit);
+-	}
+-      else
+-	do_for_loop_once (tmp_id, tmp_expr, quit);
++
++      do_for_loop_once (ult, rhs, quit);
+     }
+-  else if (tmp_expr.is_matrix_type ())
++  else if (rhs.is_matrix_type ())
+     {
+       Matrix m_tmp;
+       ComplexMatrix cm_tmp;
++
+       int nr;
+       int steps;
+-      if (tmp_expr.is_real_matrix ())
++
++      if (rhs.is_real_matrix ())
+ 	{
+-	  m_tmp = tmp_expr.matrix_value ();
++	  m_tmp = rhs.matrix_value ();
+ 	  nr = m_tmp.rows ();
+ 	  steps = m_tmp.columns ();
+ 	}
+       else
+ 	{
+-	  cm_tmp = tmp_expr.complex_matrix_value ();
++	  cm_tmp = rhs.complex_matrix_value ();
+ 	  nr = cm_tmp.rows ();
+ 	  steps = cm_tmp.columns ();
+ 	}
+ 
+-      if (tmp_expr.is_real_matrix ())
++      if (rhs.is_real_matrix ())
+ 	{
+ 	  if (nr == 1)
+-	    DO_LOOP(m_tmp (0, i));
++	    DO_LOOP (m_tmp (0, i));
+ 	  else
+-	    DO_LOOP(m_tmp.extract (0, i, nr-1, i));
++	    DO_LOOP (m_tmp.extract (0, i, nr-1, i));
+ 	}
+       else
+ 	{
+ 	  if (nr == 1)
+-	    DO_LOOP(cm_tmp (0, i));
++	    DO_LOOP (cm_tmp (0, i));
+ 	  else
+-	    DO_LOOP(cm_tmp.extract (0, i, nr-1, i));
++	    DO_LOOP (cm_tmp.extract (0, i, nr-1, i));
+ 	}
+     }
+-  else if (tmp_expr.is_string ())
++  else if (rhs.is_string ())
+     {
+       gripe_string_invalid ();
+     }
+-  else if (tmp_expr.is_range ())
++  else if (rhs.is_range ())
+     {
+-      Range rng = tmp_expr.range_value ();
++      Range rng = rhs.range_value ();
+ 
+       int steps = rng.nelem ();
+       double b = rng.base ();
+       double increment = rng.inc ();
+ 
+-      if (ident)
++      for (int i = 0; i < steps; i++)
+ 	{
+-	  for (int i = 0; i < steps; i++)
+-	    {
+-	      double tmp_val = b + i * increment;
+-
+-	      octave_value rhs (tmp_val);
++	  double tmp_val = b + i * increment;
+ 
+-	      bool quit = false;
+-	      do_for_loop_once (ident, rhs, quit);
+-
+-	      if (quit)
+-		break;
+-	    }
+-	}
+-      else if (id_list)
+-	{
+-	  for (int i = 0; i < steps; i++)
+-	    {
+-	      double tmp_val = b + i * increment;
++	  octave_value val (tmp_val);
+ 
+-	      octave_value_list rhs (tmp_val);
+-
+-	      bool quit = false;
+-	      do_for_loop_once (id_list, rhs, quit);
++	  bool quit = false;
+ 
+-	      if (quit)
+-		break;
+-	    }
+-	}
+-      else
+-	{
+-	  for (int i = 0; i < steps; i++)
+-	    {
+-	      double tmp_val = b + i * increment;
++	  do_for_loop_once (ult, val, quit);
+ 
+-	      octave_value rhs (tmp_val);
+-
+-	      bool quit = false;
+-	      do_for_loop_once (tmp_id, rhs, quit);
+-
+-	      if (quit)
+-		break;
+-	    }
++	  if (quit)
++	    break;
+ 	}
+     }
+-  else if (tmp_expr.is_map ())
++  else if (rhs.is_map ())
+     {
+-      if (ident)
+-	{
+-	  Octave_map tmp_val (tmp_expr.map_value ());
+-
+-	  for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
+-	    {
+-	      octave_value rhs (tmp_val.contents (p));
+-
+-	      bool quit = false;
+-	      do_for_loop_once (ident, rhs, quit);
+-
+-	      if (quit)
+-		break;
+-	    }
+-	}
+-      else if (id_list)
+-	{
+-	  // Cycle through structure elements.  First element of
+-	  // id_list is set to value and the second is set to the name
+-	  // of the structure element.
+-
+-	  Octave_map tmp_val (tmp_expr.map_value ());
++      Octave_map tmp_val (rhs.map_value ());
+ 
+-	  for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
+-	    {
+-	      octave_value_list tmp;
+-	      tmp (1) = tmp_val.key (p);
+-	      tmp (0) = tmp_val.contents (p);
+-
+-	      bool quit = false;
+-	      do_for_loop_once (id_list, tmp, quit);
++      for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
++	{
++	  octave_value val = tmp_val.contents (p);
+ 
+-	      if (quit)
+-		break;
+-	    }
+-	}
+-      else
+-	{
+-	  Octave_map tmp_val (tmp_expr.map_value ());
++	  bool quit = false;
+ 
+-	  for (Pix p = tmp_val.first (); p != 0; tmp_val.next (p))
+-	    {
+-	      octave_value rhs = tmp_val.contents (p);
++	  do_for_loop_once (ult, val, quit);
+ 
+-	      bool quit = false;
+-	      do_for_loop_once (tmp_id, rhs, quit);
+-
+-	      if (quit)
+-		break;
+-	    }
++	  if (quit)
++	    break;
+ 	}
+     }
+   else
+     {
+       ::error ("invalid type in for loop expression near line %d, column %d",
+ 	       line (), column ());
+     }
+ }
+ 
+ void
+-tree_for_command::eval_error (void)
++tree_simple_for_command::eval_error (void)
+ {
+   if (error_state > 0)
+     ::error ("evaluating for command near line %d, column %d",
+ 	     line (), column ());
+ }
+ 
+ void
+-tree_for_command::accept (tree_walker& tw)
++tree_simple_for_command::accept (tree_walker& tw)
++{
++  tw.visit_simple_for_command (*this);
++}
++
++tree_complex_for_command::~tree_complex_for_command (void)
++{
++  delete expr;
++  delete list;
++}
++
++void
++tree_complex_for_command::do_for_loop_once (octave_variable_reference &val_ref,
++					    octave_variable_reference &key_ref,
++					    const octave_value& val,
++					    const octave_value& key,
++					    bool& quit)
++{
++  quit = false;
++
++  val_ref.assign (octave_value::asn_eq, val);
++  key_ref.assign (octave_value::asn_eq, key);
++
++  if (! error_state)
++    {
++      if (list)
++	{
++	  list->eval ();
++
++	  if (error_state)
++	    eval_error ();
++	}
++    }
++  else
++    eval_error ();
++
++  quit = quit_loop_now ();
++}
++
++void
++tree_complex_for_command::eval (void)
+ {
+-  tw.visit_for_command (*this);
++  if (error_state)
++    return;
++
++  octave_value rhs = expr->rvalue ();
++
++  if (error_state || rhs.is_undefined ())
++    {
++      eval_error ();
++      return;
++    }
++
++  if (rhs.is_map ())
++    {
++      // Cycle through structure elements.  First element of id_list
++      // is set to value and the second is set to the name of the
++      // structure element.
++
++      Pix p = lhs->first ();
++      tree_expression *elt = lhs->operator () (p);
++      octave_variable_reference val_ref = elt->lvalue ();
++
++      lhs->next (p);
++      elt = lhs->operator () (p);
++      octave_variable_reference key_ref = elt->lvalue ();
++
++      Octave_map tmp_val (rhs.map_value ());
++
++      for (p = tmp_val.first (); p != 0; tmp_val.next (p))
++	{
++	  octave_value key = tmp_val.key (p);
++	  octave_value val = tmp_val.contents (p);
++
++	  bool quit = false;
++
++	  do_for_loop_once (key_ref, val_ref, key, val, quit);
++
++	  if (quit)
++	    break;
++	}
++    }
++  else
++    error ("in statement `for [X, Y] = VAL', VAL must be a structure");
++}
++
++void
++tree_complex_for_command::eval_error (void)
++{
++  if (error_state > 0)
++    ::error ("evaluating for command near line %d, column %d",
++	     line (), column ());
++}
++
++void
++tree_complex_for_command::accept (tree_walker& tw)
++{
++  tw.visit_complex_for_command (*this);
+ }
+ 
+ // If.
+ 
+ tree_if_command::~tree_if_command (void)
+ {
+   delete list;
+ }
+@@ -606,17 +523,17 @@ tree_switch_command::~tree_switch_comman
+   delete list;
+ }
+ 
+ void
+ tree_switch_command::eval (void)
+ {
+   if (expr)
+     {
+-      octave_value val = expr->eval ();
++      octave_value val = expr->rvalue ();
+ 
+       if (! error_state)
+ 	{
+ 	  if (list)
+ 	    list->eval (val);
+ 
+ 	  if (error_state)
+ 	    eval_error ();
+diff --git a/src/pt-cmd.h b/src/pt-cmd.h
+--- a/src/pt-cmd.h
++++ b/src/pt-cmd.h
+@@ -26,32 +26,34 @@ Software Foundation, 59 Temple Place - S
+ #if defined (__GNUG__)
+ #pragma interface
+ #endif
+ 
+ class ostream;
+ 
+ class octave_value_list;
+ 
++class tree_argument_list;
+ class tree_statement_list;
+ class tree_decl_init_list;
+ class tree_if_command_list;
+ class tree_switch_case_list;
+ class tree_expression;
+ class tree_index_expression;
+ class tree_identifier;
+ class tree_return_list;
+ class octave_value;
+ 
+ class tree_command;
+ class tree_decl_command;
+ class tree_global_command;
+ class tree_static_command;
+ class tree_while_command;
+-class tree_for_command;
++class tree_simple_for_command;
++class tree_complex_for_command;
+ class tree_if_command;
+ class tree_switch_command;
+ class tree_try_catch_command;
+ class tree_unwind_protect_command;
+ class tree_no_op_command;
+ class tree_break_command;
+ class tree_continue_command;
+ class tree_return_command;
+@@ -182,69 +184,98 @@ private:
+ 
+   // List of commands to execute.
+   tree_statement_list *list;
+ };
+ 
+ // For.
+ 
+ class
+-tree_for_command : public tree_command
++tree_simple_for_command : public tree_command
+ {
+ public:
+ 
+-  tree_for_command (int l = -1, int c = -1)
+-    : tree_command (l, c), id (0), id_list (0), expr (0), list (0) { }
++  tree_simple_for_command (int l = -1, int c = -1)
++    : tree_command (l, c), lhs (0), expr (0), list (0) { }
+ 
+-  tree_for_command (tree_index_expression *ident, tree_expression *e,
+-		    tree_statement_list *lst, int l = -1, int c = -1)
+-    : tree_command (l, c), id (ident), id_list (0), expr (e),
+-      list (lst) { }
++  tree_simple_for_command (tree_expression *le, tree_expression *re,
++			   tree_statement_list *lst, int l = -1, int c = -1)
++    : tree_command (l, c), lhs (le), expr (re), list (lst) { }
+ 
+-  tree_for_command (tree_return_list *ident, tree_expression *e,
+-		    tree_statement_list *lst, int l = -1, int c = -1)
+-    : tree_command (l, c), id (0), id_list (ident), expr (e),
+-      list (lst) { }
+-
+-  ~tree_for_command (void);
++  ~tree_simple_for_command (void);
+ 
+   void eval (void);
+ 
+   void eval_error (void);
+ 
+-  tree_index_expression *ident (void) { return id; }
++  tree_expression *left_hand_side (void) { return lhs; }
+ 
+   tree_expression *control_expr (void) { return expr; }
+ 
+   tree_statement_list *body (void) { return list; }
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
+-  // Identifier to modify.
+-  tree_index_expression *id;
+-
+-  // List of identifiers to modify.
+-  tree_return_list *id_list;
++  // Expression to modify.
++  tree_expression *lhs;
+ 
+   // Expression to evaluate.
+   tree_expression *expr;
+ 
+   // List of commands to execute.
+   tree_statement_list *list;
+ 
+-  void do_for_loop_once (tree_return_list *lst,
+-			 const octave_value_list& rhs, bool& quit);
++  void do_for_loop_once (octave_variable_reference &ult,
++			 const octave_value& rhs, bool& quit);
++};
++
++class
++tree_complex_for_command : public tree_command
++{
++public:
++
++  tree_complex_for_command (int l = -1, int c = -1)
++    : tree_command (l, c), lhs (0), expr (0), list (0) { }
++
++  tree_complex_for_command (tree_argument_list *le, tree_expression *re,
++			    tree_statement_list *lst, int l = -1, int c = -1)
++    : tree_command (l, c), lhs (le), expr (re), list (lst) { }
++
++  ~tree_complex_for_command (void);
++
++  void eval (void);
++
++  void eval_error (void);
+ 
+-  void do_for_loop_once (tree_index_expression *idx_expr,
+-			 const octave_value& rhs, bool& quit);
++  tree_argument_list *left_hand_side (void) { return lhs; }
++
++  tree_expression *control_expr (void) { return expr; }
++
++  tree_statement_list *body (void) { return list; }
++
++  void accept (tree_walker& tw);
++
++private:
+ 
+-  void do_for_loop_once (tree_identifier *ident,
+-			 octave_value& rhs, bool& quit);
++  // Expression to modify.
++  tree_argument_list *lhs;
++
++  // Expression to evaluate.
++  tree_expression *expr;
++
++  // List of commands to execute.
++  tree_statement_list *list;
++
++  void do_for_loop_once (octave_variable_reference &val_ref,
++			 octave_variable_reference &key_ref,
++			 const octave_value& val,
++			 const octave_value& key,
++			 bool& quit);
+ };
+ 
+ // If.
+ 
+ class
+ tree_if_command : public tree_command
+ {
+ public:
+diff --git a/src/pt-indir.cc b/src/pt-indir.cc
+--- a/src/pt-indir.cc
++++ b/src/pt-indir.cc
+@@ -112,16 +112,16 @@ tree_indirect_ref::accept (tree_walker& 
+   tw.visit_indirect_ref (*this);
+ }
+ 
+ void
+ tree_indirect_ref::eval_error (void) const
+ {
+   if (error_state > 0)
+     ::error ("evaluating structure reference operator near line %d, column %d",
+-	     oper () . c_str (), line (), column ());
++	     line (), column ());
+ }
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/pt-misc.cc b/src/pt-misc.cc
+--- a/src/pt-misc.cc
++++ b/src/pt-misc.cc
+@@ -39,27 +39,26 @@ Software Foundation, 59 Temple Place - S
+ #endif
+ 
+ #include "str-vec.h"
+ 
+ #include "defun.h"
+ #include "error.h"
+ #include "input.h"
+ #include "oct-obj.h"
+-#include "oct-usr-fcn.h"
+ #include "oct-var-ref.h"
++#include "ov-usr-fcn.h"
+ #include "ov.h"
+ #include "pager.h"
+ #include "pt-cmd.h"
+ #include "pt-const.h"
+ #include "pt-exp.h"
+ #include "pt-id.h"
+ #include "pt-indir.h"
+ #include "pt-misc.h"
+-#include "pt-mvr.h"
+ #include "pt-pr-code.h"
+ #include "pt-walk.h"
+ #include "toplev.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // Nonzero means we're breaking out of a loop or function body.
+ extern int breaking;
+@@ -101,131 +100,101 @@ tree_statement::maybe_echo_code (bool in
+       && (Vecho_executing_commands & ECHO_FUNCTIONS))
+     {
+       tree_print_code tpc (octave_stdout, Vps4);
+ 
+       accept (tpc);
+     }
+ }
+ 
+-octave_value
+-tree_statement::eval (bool silent, bool in_function_body)
++octave_value_list
++tree_statement::eval (bool silent, int nargout, bool in_function_body)
+ {
+-  octave_value retval;
++  octave_value_list retval;
+ 
+   bool pf = silent ? false : print_flag;
+ 
+   if (cmd || expr)
+     {
+       maybe_echo_code (in_function_body);
+ 
+       if (cmd)
+ 	cmd->eval ();
+       else
+-	retval = expr->eval (pf);
+-    }
+-
+-  return retval;
+-}
++	{
++	  expr->set_print_flag (pf);
+ 
+-octave_value_list
+-tree_statement::eval (bool silent, int nargout, bool in_function_body)
+-{
+-  bool pf = silent ? false : print_flag;
++	  // XXX FIXME XXX -- maybe all of this should be packaged in
++	  // one virtual function that returns a flag saying whether
++	  // or not the expression will take care of binding ans and
++	  // printing the result.
+ 
+-  octave_value_list retval;
++	  bool do_bind_ans = false;
+ 
+-  if (cmd || expr)
+-    {
+-      maybe_echo_code (in_function_body);
++	  if (expr->is_identifier ())
++	    {
++	      bool script_file_executed = false;
+ 
+-      if (cmd)
+-	cmd->eval ();
+-      else
+-	{
+-	  if (expr->is_multi_val_ret_expression ())
+-	    {
+-	      octave_value_list args;
++	      tree_identifier *id = static_cast<tree_identifier *> (expr);
+ 
+-	      tree_multi_val_ret *t = static_cast<tree_multi_val_ret *> (expr);
++	      id->do_lookup (script_file_executed, false);
+ 
+-	      retval = t->eval (pf, nargout, args);
++	      do_bind_ans = id->is_function ();
+ 	    }
+ 	  else
+-	    retval = expr->eval (pf);
++	    do_bind_ans = (! (expr->is_indirect_ref ()
++			      || expr->is_assignment_expression ()));
++
++	  retval = expr->rvalue (nargout);
++
++	  if (do_bind_ans && ! (error_state || retval.empty ()))
++	    bind_ans (retval(0), pf);
+ 	}
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ tree_statement::accept (tree_walker& tw)
+ {
+   tw.visit_statement (*this);
+ }
+ 
+-octave_value
+-tree_statement_list::eval (bool silent)
++octave_value_list
++tree_statement_list::eval (bool silent, int nargout)
+ {
+-  octave_value retval;
++  octave_value_list retval;
+ 
+   if (error_state)
+     return retval;
+ 
+   for (Pix p = first (); p != 0; next (p))
+     {
+       tree_statement *elt = this->operator () (p);
+ 
+-      bool silent_flag =
+-	silent ? true : (function_body ? Vsilent_functions : false);
+-
+-      retval = elt->eval (silent_flag, function_body);
+-
+-      if (error_state)
+-	break;
+-
+-      if (breaking || continuing)
+-	break;
+-
+-      if (returning)
+-	break;
+-    }
++      if (elt)
++	{
++	  bool silent_flag =
++	    silent ? true : (function_body ? Vsilent_functions : false);
+ 
+-  return retval;
+-}
+-
+-octave_value_list
+-tree_statement_list::eval (bool no_print, int nargout)
+-{
+-  octave_value_list retval;
+-
+-  if (error_state)
+-    return retval;
+-
+-  if (nargout > 1)
+-    {
+-      for (Pix p = first (); p != 0; next (p))
+-	{
+-	  tree_statement *elt = this->operator () (p);
+-
+-	  retval = elt->eval (no_print, nargout, function_body);
++	  retval = elt->eval (silent_flag, nargout, function_body);
+ 
+ 	  if (error_state)
+ 	    break;
+ 
+ 	  if (breaking || continuing)
+ 	    break;
+ 
+ 	  if (returning)
+ 	    break;
+ 	}
++      else
++	error ("invalid statement found in statement list!");
+     }
+-  else
+-    retval = eval (no_print);
+ 
+   return retval;
+ }
+ 
+ void
+ tree_statement_list::accept (tree_walker& tw)
+ {
+   tw.visit_statement_list (*this);
+@@ -235,16 +204,30 @@ tree_argument_list::~tree_argument_list 
+ {
+   while (! empty ())
+     {
+       tree_expression *t = remove_front ();
+       delete t;
+     }
+ }
+ 
++bool
++tree_argument_list::all_elements_are_constant (void) const
++{
++  for (Pix p = first (); p != 0; next (p))
++    {
++      tree_expression *elt = this->operator () (p);
++
++      if (! elt->is_constant ())
++	return false;
++    }
++
++  return true;
++}
++
+ octave_value_list
+ tree_argument_list::convert_to_const_vector (void)
+ {
+   int len = length ();
+ 
+   // XXX FIXME XXX -- would be nice to know in advance how largs args
+   // needs to be even when we have a list containing an all_va_args
+   // token.
+@@ -252,19 +235,21 @@ tree_argument_list::convert_to_const_vec
+   octave_value_list args;
+   args.resize (len);
+ 
+   Pix p = first ();
+   int j = 0;
+   for (int k = 0; k < len; k++)
+     {
+       tree_expression *elt = this->operator () (p);
++
+       if (elt)
+ 	{
+-	  octave_value tmp = elt->eval ();
++	  octave_value tmp = elt->rvalue ();
++
+ 	  if (error_state)
+ 	    {
+ 	      ::error ("evaluating argument list element number %d", k);
+ 	      args = octave_value_list ();
+ 	      break;
+ 	    }
+ 	  else
+ 	    {
+@@ -363,17 +348,21 @@ tree_parameter_list::mark_as_formal_para
+ void
+ tree_parameter_list::initialize_undefined_elements (octave_value& val)
+ {
+   for (Pix p = first (); p != 0; next (p))
+     {
+       tree_identifier *elt = this->operator () (p);
+ 
+       if (! elt->is_defined ())
+-	elt->reference () . assign (octave_value::asn_eq, val);
++	{
++	  octave_variable_reference tmp = elt->lvalue ();
++
++	  tmp.assign (octave_value::asn_eq, val);
++	}
+     }
+ }
+ 
+ void
+ tree_parameter_list::define_from_arg_vector (const octave_value_list& args)
+ {
+   int nargin = args.length ();
+ 
+@@ -383,17 +372,17 @@ tree_parameter_list::define_from_arg_vec
+   int expected_nargin = length ();
+ 
+   Pix p = first ();
+ 
+   for (int i = 0; i < expected_nargin; i++)
+     {
+       tree_identifier *elt = this->operator () (p);
+ 
+-      octave_variable_reference ref = elt->reference ();
++      octave_variable_reference ref = elt->lvalue ();
+ 
+       if (i < nargin)
+ 	{
+ 	  if (args(i).is_defined () && args(i).is_magic_colon ())
+ 	    {
+ 	      ::error ("invalid use of colon in function argument list");
+ 	      return;
+ 	    }
+@@ -420,17 +409,17 @@ tree_parameter_list::convert_to_const_ve
+ 
+   int i = 0;
+ 
+   for (Pix p = first (); p != 0; next (p))
+     {
+       tree_identifier *elt = this->operator () (p);
+ 
+       if (elt->is_defined ())
+-	retval(i) = elt->eval ();
++	retval(i) = elt->rvalue ();
+ 
+       i++;
+     }
+ 
+   if (vr_list)
+     {
+       for (Pix p = vr_list->first (); p != 0; vr_list->next (p))
+ 	{
+@@ -484,17 +473,17 @@ tree_return_list::accept (tree_walker& t
+   tw.visit_return_list (*this);
+ }
+ 
+ // Declarations (global, static, etc.).
+ 
+ tree_decl_elt::~tree_decl_elt (void)
+ {
+   delete id;
+-  delete ass_expr;
++  delete expr;
+ }
+ 
+ void
+ tree_decl_elt::accept (tree_walker& tw)
+ {
+   tw.visit_decl_elt (*this);
+ }
+ 
+@@ -574,17 +563,17 @@ tree_switch_case::~tree_switch_case (voi
+   delete list;
+ }
+ 
+ bool
+ tree_switch_case::label_matches (const octave_value& val)
+ {
+   bool retval = false;
+ 
+-  octave_value label_value = label->eval ();
++  octave_value label_value = label->rvalue ();
+ 
+   if (! error_state)
+     {
+       if (label_value.is_defined ())
+ 	{
+ 	  octave_value tmp = do_binary_op (octave_value::eq,
+ 					   val, label_value);
+ 
+diff --git a/src/pt-misc.h b/src/pt-misc.h
+--- a/src/pt-misc.h
++++ b/src/pt-misc.h
+@@ -30,17 +30,17 @@ Software Foundation, 59 Temple Place - S
+ class ostream;
+ 
+ class string_vector;
+ 
+ class octave_value_list;
+ class octave_value;
+ class tree_command;
+ class tree_expression;
+-class tree_simple_assignment_expression;
++class tree_simple_assignment;
+ class tree_index_expression;
+ class tree_identifier;
+ class symbol_record;
+ class symbol_table;
+ 
+ class tree_statement;
+ class tree_statement_list;
+ class tree_argument_list;
+@@ -90,18 +90,16 @@ public:
+   int column (void);
+ 
+   void maybe_echo_code (bool in_function_body);
+ 
+   bool print_result (void) { return print_flag; }
+ 
+   tree_command *command (void) { return cmd; }
+ 
+-  octave_value eval (bool silent, bool in_function_body);
+-
+   octave_value_list eval (bool silent, int nargout, bool in_function_body);
+ 
+   tree_expression *expression (void) { return expr; }
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
+@@ -136,19 +134,17 @@ public:
+ 	{
+ 	  tree_statement *t = remove_front ();
+ 	  delete t;
+ 	}
+     }
+ 
+   void mark_as_function_body (void) { function_body = true; }
+ 
+-  octave_value eval (bool silent = false);
+-
+-  octave_value_list eval (bool silent, int nargout);
++  octave_value_list eval (bool silent = false, int nargout = 0);
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
+   // Does this list of statements make up the body of a function?
+   bool function_body;
+ };
+@@ -164,16 +160,18 @@ public:
+   tree_argument_list (void)
+     : SLList<tree_expression *> () { }
+ 
+   tree_argument_list (tree_expression *t)
+     : SLList<tree_expression *> () { append (t); }
+ 
+   ~tree_argument_list (void);
+ 
++  bool all_elements_are_constant (void) const;
++
+   octave_value_list convert_to_const_vector (void);
+ 
+   string_vector get_arg_names (void) const;
+ 
+   void accept (tree_walker& tw);
+ };
+ 
+ // Parameter lists.  Used to hold the list of input and output
+@@ -255,45 +253,36 @@ public:
+ 
+ class
+ tree_decl_elt
+ {
+ public:
+ 
+   typedef void (*eval_fcn) (tree_decl_elt &, bool);
+ 
+-  tree_decl_elt (void)
+-    : id (0), ass_expr (0) { }
+-
+-  tree_decl_elt (tree_identifier *i)
+-    : id (i), ass_expr (0) { }
+-
+-  tree_decl_elt (tree_simple_assignment_expression *ass)
+-    : id (0), ass_expr (ass) { }
++  tree_decl_elt (tree_identifier *i = 0, tree_expression *e = 0)
++    : id (i), expr (e) { }
+ 
+   ~tree_decl_elt (void);
+ 
+   void eval (void);
+ 
+   tree_identifier *ident (void) { return id; }
+ 
+-  tree_simple_assignment_expression *assign_expr (void) { return ass_expr; }
++  tree_expression *expression (void) { return expr; }
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
+-  // Only one of id or ass_expr can be valid at once.
+-
+   // An identifier to tag with the declared property.
+   tree_identifier *id;
+ 
+-  // An assignemnt expression.  Valid only if the left hand side of
+-  // the assignment is a simple identifier.
+-  tree_simple_assignment_expression *ass_expr;
++  // An initializer expression (may be zero);
++  tree_expression *expr;
+ };
+ 
+ class
+ tree_decl_init_list : public SLList<tree_decl_elt *>
+ {
+ public:
+ 
+   tree_decl_init_list (void)
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -57,17 +57,16 @@ Software Foundation, 59 Temple Place - S
+ #include "file-io.h"
+ #include "help.h"
+ #include "input.h"
+ #include "lex.h"
+ #include <oct-conf.h>
+ #include "oct-hist.h"
+ #include "oct-map.h"
+ #include "oct-obj.h"
+-#include "oct-sym.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pathsearch.h"
+ #include "procstream.h"
+ #include "ov.h"
+ #include "pt-misc.h"
+ #include "pt-plot.h"
+ #include "sighandlers.h"
+@@ -90,19 +89,16 @@ extern int returning;
+ 
+ // Nonzero means we are using readline.
+ // (--no-line-editing)
+ int line_editing = 1;
+ 
+ // Nonzero means we printed messages about reading startup files.
+ int reading_startup_message_printed = 0;
+ 
+-// Command number, counting from the beginning of this session.
+-int current_command_number = 1;
+-
+ // Nonzero means we are exiting via the builtin exit or quit functions.
+ int quitting_gracefully = 0;
+ 
+ // Current command to execute.
+ tree_statement_list *global_command = 0;
+ 
+ // Pointer to function that is currently being evaluated.
+ octave_user_function *curr_function = 0;
+@@ -284,17 +280,17 @@ main_loop (void)
+ 	      if (! (interactive || forced_interactive))
+ 		break;
+ 	    }
+ 	  else
+ 	    {
+ 	      if (octave_completion_matches_called)
+ 		octave_completion_matches_called = false;	    
+ 	      else
+-		current_command_number++;
++		command_editor::increment_current_command_number ();
+ 	    }
+ 	}
+     }
+   while (retval == 0);
+ 
+   return retval;
+ }
+ 
+@@ -467,17 +463,17 @@ Foundation, 59 Temple Place - Suite 330,
+ 
+ // XXX FIXME XXX -- this may not be the best place for these...
+ 
+ static octave_value_list
+ feval (const octave_value_list& args, int nargout)
+ {
+   octave_value_list retval;
+ 
+-  octave_symbol *fcn = is_valid_function (args(0), "feval", 1);
++  octave_function *fcn = is_valid_function (args(0), "feval", 1);
+ 
+   if (fcn)
+     {
+       string_vector arg_names = args.name_tags ();
+ 
+       int tmp_nargin = args.length () - 1;
+ 
+       octave_value_list tmp_args (tmp_nargin, octave_value ());
+@@ -487,17 +483,17 @@ feval (const octave_value_list& args, in
+       for (int i = 0; i < tmp_nargin; i++)
+ 	{
+ 	  tmp_args(i) = args(i+1);
+ 	  tmp_arg_names(i) = arg_names(i+1);
+ 	}
+ 
+       tmp_args.stash_name_tags (tmp_arg_names);
+ 
+-      retval = fcn->eval (nargout, tmp_args);
++      retval = fcn->do_index_op (nargout, tmp_args);
+     }
+ 
+   return retval;
+ }
+ 
+ DEFUN (feval, args, nargout,
+   "feval (NAME, ARGS, ...)\n\
+ \n\

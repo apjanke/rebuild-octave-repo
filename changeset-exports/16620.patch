@@ -1,0 +1,972 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1367834444 14400
+#      Mon May 06 06:00:44 2013 -0400
+# Node ID 818eef7b2618c99826f32944083ce988afba6137
+# Parent  db31d1e77d7bd352ed3fc8a4ef3b94b852f6c325
+allow terminal colors to be set from preferences dialog
+
+* QTerminalInterface.h (QTerminalInterface::setBackgroundColor,
+QTerminalInterface::setForeroundColor,
+QTerminalInterface::setSelectionColor,
+QTerminalInterface::setCursorColor): New functions.
+
+* QUnixTerminalImpl.h, QUnixTerminalImpl.cpp
+QUnixTerminalImpl::setBackgroundColor,
+QUnixTerminalImpl::setForeroundColor,
+QUnixTerminalImpl::setSelectionColor,
+QUnixTerminalImpl::setCursorColor): New functions.
+
+* QWinTerminalImpl.h, QWinTerminalImpl.cpp
+(QConsolePrivate::setCursorColor): New argument, useForegroundColor.
+(QConsolePrivate::m_selectionColor, QConsolePrivate::m_cursorColor):
+New member variablebs.
+(QConsolePrivate::selectionColor, QConsolePrivate::cursorColor,
+QConsolePrivate::setSelectionColor, QConsolePrivate::setCursorColor):
+Use member variables instead of Windows console color map.
+(QConsolePrivate::cursorColor): Return foreground color if stored
+color is invalid.
+(QConsolePrivate::setCursorColor): Store invalid color if
+useForegroundcolor.
+(QConsolePrivate::QConsolePrivate): Set default selection and cursor
+colors.
+
+* QTerminal.cc (QTerminal::notice_settings): Handle terminal color
+settings.
+
+* resource-manager.h, resource-manager.cc
+(resource_manager::terminal_color_names,
+resource_manager::terminal_default_colors,
+resource_manager::terminal_color_chars): New functions.
+
+* settings-dialog.h, settings-dialog.cc
+(settings_dialog::read_terminal_colors): New function.
+(settings_dialog::settings_dialog): Call read_terminal_colors.  Read
+valud for using foreground color for cursor color.
+(settings_dialog::write_terminal_colors): New function.
+(settings_dialog::write_changed_settings): Call
+write_terminal_colors.  Handle setting for using foreground color for
+cursor color.
+
+* settings-dialog.ui: Add color selection to terminal settings
+dialog.
+
+diff --git a/libgui/qterminal/libqterminal/QTerminal.cc b/libgui/qterminal/libqterminal/QTerminal.cc
+--- a/libgui/qterminal/libqterminal/QTerminal.cc
++++ b/libgui/qterminal/libqterminal/QTerminal.cc
+@@ -36,9 +36,38 @@ QTerminal::notice_settings (const QSetti
+   QString cursorType = settings->value ("terminal/cursorType","ibeam").toString ();
+   bool cursorBlinking = settings->value ("terminal/cursorBlinking",true).toBool ();
+   if (cursorType == "ibeam")
+     setCursorType(QTerminalInterface::IBeamCursor, cursorBlinking);
+   else if (cursorType == "block")
+     setCursorType(QTerminalInterface::BlockCursor, cursorBlinking);
+   else if (cursorType == "underline")
+     setCursorType(QTerminalInterface::UnderlineCursor, cursorBlinking);
++
++  bool cursorUseForegroundColor
++    = settings->value ("terminal/cursorUseForegroundColor",true).toBool ();
++
++  // FIXME -- we shouldn't duplicate this information here and in the
++  // resource manager.
++  QList<QColor> default_colors;
++
++  default_colors << QColor(0,0,0)
++                 << QColor(255,255,255)
++                 << QColor(192,192,192)
++                 << QColor(128,128,128);
++
++  setForegroundColor
++    (settings->value ("terminal/color_f",
++                      QVariant (default_colors.at (0))).value<QColor> ());
++
++  setBackgroundColor
++    (settings->value ("terminal/color_b",
++                      QVariant (default_colors.at (1))).value<QColor> ());
++
++  setSelectionColor
++    (settings->value ("terminal/color_s",
++                      QVariant (default_colors.at (2))).value<QColor> ());
++
++  setCursorColor
++    (cursorUseForegroundColor,
++     settings->value ("terminal/color_c",
++                      QVariant (default_colors.at (3))).value<QColor> ());
+ }
+diff --git a/libgui/qterminal/libqterminal/QTerminalInterface.h b/libgui/qterminal/libqterminal/QTerminalInterface.h
+--- a/libgui/qterminal/libqterminal/QTerminalInterface.h
++++ b/libgui/qterminal/libqterminal/QTerminalInterface.h
+@@ -19,16 +19,17 @@ You should have received a copy of the G
+ along with Foobar.  If not, see <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifndef QTERMINALINTERFACE_H
+ #define QTERMINALINTERFACE_H
+ 
+ #include <QWidget>
++#include <QColor>
+ #include <QMenu>
+ 
+ class QTerminalInterface : public QWidget
+ {
+     Q_OBJECT
+ public:
+     QTerminalInterface(QWidget *xparent = 0) : QWidget(xparent) {
+       connect (this, SIGNAL(customContextMenuRequested(QPoint)),
+@@ -56,17 +57,23 @@ public:
+     };
+ 
+     virtual void setCursorType(CursorType type, bool blinking) {
+         // Provide empty default impl in order to avoid conflicts with the win impl.
+         Q_UNUSED(type);
+         Q_UNUSED(blinking);
+     }
+ 
+-public slots:
++    virtual void setBackgroundColor (const QColor& color) = 0;
++    virtual void setForegroundColor (const QColor& color) = 0;
++    virtual void setSelectionColor (const QColor& color) = 0;
++    virtual void setCursorColor (bool useForegroundColor,
++                                 const QColor& color) = 0;
++
++ public slots:
+     virtual void copyClipboard() = 0;
+     virtual void pasteClipboard() = 0;
+ 
+     virtual void handleCustomContextMenuRequested(QPoint at) {
+       _contextMenu->move (mapToGlobal(at));
+       _contextMenu->show ();
+     }
+ 
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+@@ -130,16 +130,28 @@ void QUnixTerminalImpl::setCursorType(Cu
+     switch(type) {
+         case UnderlineCursor: m_terminalView->setKeyboardCursorShape(TerminalView::UnderlineCursor); break;
+         case BlockCursor: m_terminalView->setKeyboardCursorShape(TerminalView::BlockCursor); break;
+         case IBeamCursor: m_terminalView->setKeyboardCursorShape(TerminalView::IBeamCursor); break;
+     }
+     m_terminalView->setBlinkingCursor(blinking);
+ }
+ 
++// FIXME -- not sure how to make these work properly given the way the
++// Unix terminal handles colors.
++void QUnixTerminalImpl::setBackgroundColor (const QColor& color) { }
++void QUnixTerminalImpl::setForegroundColor (const QColor& color) { }
++void QUnixTerminalImpl::setSelectionColor (const QColor& color) { }
++
++void QUnixTerminalImpl::setCursorColor (bool useForegroundColor,
++                                        const QColor& color)
++{
++  m_terminalView->setKeyboardCursorColor (useForegroundColor, color);
++}
++
+ void QUnixTerminalImpl::showEvent(QShowEvent *)
+ {
+     m_terminalView->updateImage();
+     m_terminalView->repaint();
+     m_terminalView->update();
+ }
+ 
+ void QUnixTerminalImpl::resizeEvent(QResizeEvent*)
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+@@ -38,16 +38,21 @@ public:
+     virtual ~QUnixTerminalImpl();
+ 
+     void setTerminalFont(const QFont &font); 
+     void setSize(int h, int v);
+     void sendText(const QString& text);
+ 
+     void setCursorType(CursorType type, bool blinking);
+ 
++    void setBackgroundColor (const QColor& color);
++    void setForegroundColor (const QColor& color);
++    void setSelectionColor (const QColor& color);
++    void setCursorColor (bool useForegroundColor, const QColor& color);
++
+ public slots:
+     void copyClipboard();
+     void pasteClipboard();
+ 
+ protected:
+     void showEvent(QShowEvent *);
+     virtual void resizeEvent(QResizeEvent *);   
+ 
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+@@ -132,17 +132,17 @@ public:
+   QColor backgroundColor (void) const;
+   QColor foregroundColor (void) const;
+   QColor selectionColor (void) const;
+   QColor cursorColor (void) const;
+ 
+   void setBackgroundColor (const QColor& color);
+   void setForegroundColor (const QColor& color);
+   void setSelectionColor (const QColor& color);
+-  void setCursorColor (const QColor& color);
++  void setCursorColor (bool useForegroundColor, const QColor& color);
+ 
+   void drawTextBackground (QPainter& p, int cx1, int cy1, int cx2, int cy2,
+                            int cw, int ch);
+ 
+   void drawSelection (QPainter& p, int cx1, int cy1, int cx2, int cy2,
+                       int cw, int ch);
+ 
+   void drawCursor (QPainter& p);
+@@ -167,16 +167,19 @@ private:
+   bool m_cursorBlinking;
+   bool m_hasBlinkingCursor;
+   QTimer *m_blinkCursorTimer;
+   KeyboardCursorType m_cursorType;
+ 
+   QPoint m_beginSelection;
+   QPoint m_endSelection;
+ 
++  QColor m_selectionColor;
++  QColor m_cursorColor;
++
+   HANDLE m_stdOut;
+   HWND m_consoleWindow;
+   CHAR_INFO* m_buffer;
+   CHAR_INFO* m_tmpBuffer;
+   HANDLE m_process;
+ 
+   QConsoleView* m_consoleView;
+   QScrollBar* m_scrollBar;
+@@ -300,18 +303,21 @@ QConsolePrivate::QConsolePrivate (QWinTe
+   // Choose 15 (0xF) as index into the Windows console color map for the
+   // background and 0 (0x0) as the index for the foreground.  This
+   // selection corresponds to the indices used in the foregroundColor,
+   // setForegroundColor, backgroundColor, and SetBackgroundColor
+   // functions.
+ 
+   SetConsoleTextAttribute (m_stdOut, 0xF0);
+ 
++  // Defaults.
+   setBackgroundColor (Qt::white);
+   setForegroundColor (Qt::black);
++  setSelectionColor (Qt::lightGray);
++  setCursorColor (false, Qt::darkGray);
+ 
+   // FIXME -- should we set the palette?
+   QPalette palette (backgroundColor ());
+   m_consoleView->setPalette (palette);
+ 
+   m_consoleView->setAutoFillBackground (true);
+ 
+   m_consoleView->setFont (m_font);
+@@ -471,43 +477,55 @@ void QConsolePrivate::updateSelection (v
+ 
+ void QConsolePrivate::clearSelection (void)
+ {
+   m_beginSelection = m_endSelection = QPoint ();
+ 
+   m_consoleView->update ();
+ }
+ 
+-// FIXME -- maybe we should not be messing with the Windows console
+-// colors for things like the selection and cursor which are entirely up
+-// to us to draw.
++QColor QConsolePrivate::backgroundColor (void) const
++{
++  return m_colors[15];
++}
++
++QColor QConsolePrivate::foregroundColor (void) const
++{
++  return m_colors[0];
++}
+ 
+-QColor QConsolePrivate::backgroundColor (void) const { return m_colors[15]; }
+-QColor QConsolePrivate::foregroundColor (void) const { return m_colors[0]; }
+-QColor QConsolePrivate::selectionColor (void) const { return m_colors[7]; }
+-QColor QConsolePrivate::cursorColor (void) const { return m_colors[8]; }
++QColor QConsolePrivate::selectionColor (void) const
++{
++  return m_selectionColor;
++}
++
++QColor QConsolePrivate::cursorColor (void) const
++{
++  return m_cursorColor.isValid () ? m_cursorColor : foregroundColor ();
++}
+ 
+ void QConsolePrivate::setBackgroundColor (const QColor& color)
+ {
+   m_colors[15] = color;
+ }
+ 
+ void QConsolePrivate::setForegroundColor (const QColor& color)
+ {
+   m_colors[0] = color;
+ }
+ 
+ void QConsolePrivate::setSelectionColor (const QColor& color)
+ {
+-  m_colors[7] = color;
++  m_selectionColor = color;
+ }
+ 
+-void QConsolePrivate::setCursorColor (const QColor& color)
++void QConsolePrivate::setCursorColor (bool useForegroundColor,
++                                      const QColor& color)
+ {
+-  m_colors[8] = color;
++  m_cursorColor = useForegroundColor ? QColor () : color;
+ }
+ 
+ void QConsolePrivate::drawTextBackground (QPainter& p, int cx1, int cy1,
+                                           int cx2, int cy2, int cw, int ch)
+ {
+   p.save ();
+ 
+   int ascent = p.fontMetrics ().ascent ();
+@@ -1359,16 +1377,37 @@ void QWinTerminalImpl::setCursorType (Cu
+     case IBeamCursor:
+       d->m_cursorType = QConsolePrivate::IBeamCursor;
+       break;
+     }
+ 
+   setBlinkingCursor (blinking);
+ }
+ 
++void QWinTerminalImpl::setBackgroundColor (const QColor& color)
++{
++  d->setBackgroundColor (color);
++}
++
++void QWinTerminalImpl::setForegroundColor (const QColor& color)
++{
++  d->setForegroundColor (color);
++}
++
++void QWinTerminalImpl::setSelectionColor (const QColor& color)
++{
++  d->setSelectionColor (color);
++}
++
++void QWinTerminalImpl::setCursorColor (bool useForegroundColor,
++                                       const QColor& color)
++{
++  d->setCursorColor (useForegroundColor, color);
++}
++
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ void QWinTerminalImpl::setTerminalFont (const QFont& f)
+ {
+   d->m_font = f;
+   d->m_consoleView->setFont (f);
+   d->updateConsoleSize (true);
+ }
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+@@ -50,16 +50,21 @@ public:
+   QWinTerminalImpl (const QString& cmd, QWidget* parent = 0);
+   ~QWinTerminalImpl (void);
+ 
+   void setTerminalFont (const QFont& font);
+   void setSize (int columns, int lines);
+   void sendText (const QString& s);
+   void setCursorType (CursorType type, bool blinking);
+ 
++  void setBackgroundColor (const QColor& color);
++  void setForegroundColor (const QColor& color);
++  void setSelectionColor (const QColor& color);
++  void setCursorColor (bool useForegoundColor, const QColor& color);
++
+ public slots:
+   void copyClipboard (void);
+   void pasteClipboard (void);
+   void blinkCursorEvent (void);
+ 
+ signals:
+   void terminated (void);
+   void titleChanged (const QString&);
+diff --git a/libgui/src/resource-manager.cc b/libgui/src/resource-manager.cc
+--- a/libgui/src/resource-manager.cc
++++ b/libgui/src/resource-manager.cc
+@@ -212,16 +212,34 @@ resource_manager::storage_class_default_
+   return QList<QColor> () << QColor(190,255,255)
+                           << QColor(220,255,220)
+                           << QColor(220,220,255)
+                           << QColor(255,255,190)
+                           << QColor(255,220,220)
+                           << QColor(255,190,255);
+ }
+ 
++QStringList 
++resource_manager::terminal_color_names (void)
++{
++  return QStringList () << QObject::tr ("foreground")
++                        << QObject::tr ("background")
++                        << QObject::tr ("selection")
++                        << QObject::tr ("cursor");
++}
++
++QList<QColor>
++resource_manager::terminal_default_colors (void)
++{
++  return QList<QColor> () << QColor(0,0,0)
++                          << QColor(255,255,255)
++                          << QColor(192,192,192)
++                          << QColor(128,128,128);
++}
++
+ const char*
+ resource_manager::octave_keywords (void)
+ {
+   return
+       ".nargin. "
+       "EDITOR "
+       "EXEC_PATH "
+       "F_DUPFD "
+diff --git a/libgui/src/resource-manager.h b/libgui/src/resource-manager.h
+--- a/libgui/src/resource-manager.h
++++ b/libgui/src/resource-manager.h
+@@ -82,16 +82,20 @@ public:
+   }
+ 
+   static const char *octave_keywords (void);
+   
+   static QString storage_class_chars (void) { return "afghip"; }
+   static QStringList storage_class_names (void);
+   static QList<QColor> storage_class_default_colors (void);
+ 
++  static QString terminal_color_chars (void) { return "fbsc"; }
++  static QStringList terminal_color_names (void);
++  static QList<QColor> terminal_default_colors (void);
++
+ private:
+ 
+   static resource_manager *instance;
+ 
+   static void cleanup_instance (void) { delete instance; instance = 0; }
+ 
+   // No copying!
+ 
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -92,16 +92,17 @@ settings_dialog::settings_dialog (QWidge
+   ui->showFileType->setChecked (settings->value ("filesdockwidget/showFileType",false).toBool());
+   ui->showLastModified->setChecked (settings->value ("filesdockwidget/showLastModified",false).toBool());
+   ui->showHiddenFiles->setChecked (settings->value ("filesdockwidget/showHiddenFiles",false).toBool());
+   ui->useAlternatingRowColors->setChecked (settings->value ("filesdockwidget/useAlternatingRowColors",true).toBool());
+   ui->sync_octave_directory->setChecked (settings->value ("filesdockwidget/sync_octave_directory",true).toBool());
+   ui->useProxyServer->setChecked (settings->value ("useProxyServer",false).toBool ());
+   ui->proxyHostName->setText (settings->value ("proxyHostName").toString ());
+   ui->terminal_cursorBlinking->setChecked (settings->value ("terminal/cursorBlinking",true).toBool ());
++  ui->terminal_cursorUseForegroundColor->setChecked (settings->value ("terminal/cursorUseForegroundColor",true).toBool ());
+ 
+   QString cursorType = settings->value ("terminal/cursorType","ibeam").toString ();
+ 
+   QStringList items;
+   items << QString("0") << QString("1") << QString("2");
+   ui->terminal_cursorType->addItems(items);
+   ui->terminal_cursorType->setItemText (0, "IBeam Cursor");
+   ui->terminal_cursorType->setItemText (1, "Block Cursor");
+@@ -124,16 +125,19 @@ settings_dialog::settings_dialog (QWidge
+ 
+   ui->proxyPort->setText (settings->value ("proxyPort").toString ());
+   ui->proxyUserName->setText (settings->value ("proxyUserName").toString ());
+   ui->proxyPassword->setText (settings->value ("proxyPassword").toString ());
+ 
+   // qorkspace colors
+   read_workspace_colors (settings);
+ 
++  // terminal colors
++  read_terminal_colors (settings);
++
+ #ifdef HAVE_QSCINTILLA
+   // editor styles: create lexer, read settings, and create dialog elements
+   QsciLexer *lexer;
+   lexer = new lexer_octave_gui ();
+   read_lexer_settings (lexer,settings);
+   delete lexer;
+   lexer = new QsciLexerCPP ();
+   read_lexer_settings (lexer,settings);
+@@ -280,16 +284,53 @@ settings_dialog::read_workspace_colors (
+           column = 0;
+         }
+     }
+ 
+   // place grid with elements into the tab
+   ui->workspace_colors_box->setLayout (style_grid);
+ }
+ 
++void
++settings_dialog::read_terminal_colors (QSettings *settings)
++{
++
++  QList<QColor> default_colors = resource_manager::terminal_default_colors ();
++  QStringList class_names = resource_manager::terminal_color_names ();
++  QString class_chars = resource_manager::terminal_color_chars ();
++  int nr_of_classes = class_chars.length ();
++
++  QGridLayout *style_grid = new QGridLayout ();
++  QLabel *description[nr_of_classes];
++  color_picker *color[nr_of_classes];
++
++  int column = 0;
++  int row = 0;
++  for (int i = 0; i < nr_of_classes; i++)
++    {
++      description[i] = new QLabel (class_names.at (i));
++      description[i]->setAlignment (Qt::AlignRight);
++      QVariant default_var = default_colors.at (i);
++      QColor setting_color = settings->value ("terminal/color_"+class_chars.mid (i,1),
++                                              default_var).value<QColor> ();
++      color[i] = new color_picker (setting_color);
++      color[i]->setObjectName ("terminal_color_"+class_chars.mid (i,1));
++      color[i]->setMinimumSize (30,10);
++      style_grid->addWidget (description[i], row,2*column);
++      style_grid->addWidget (color[i],       row,2*column+1);
++      if (++column == 2)
++        {
++          row++;
++          column = 0;
++        }
++    }
++
++  // place grid with elements into the tab
++  ui->terminal_colors_box->setLayout (style_grid);
++}
+ 
+ void
+ settings_dialog::write_changed_settings ()
+ {
+   QSettings *settings = resource_manager::get_settings ();
+   // FIXME -- what should happen if settings is 0?
+ 
+   // the icon set
+@@ -325,16 +366,17 @@ settings_dialog::write_changed_settings 
+   settings->setValue ("filesdockwidget/sync_octave_directory", ui->sync_octave_directory->isChecked ());
+   settings->setValue ("useProxyServer", ui->useProxyServer->isChecked ());
+   settings->setValue ("proxyType", ui->proxyType->currentText ());
+   settings->setValue ("proxyHostName", ui->proxyHostName->text ());
+   settings->setValue ("proxyPort", ui->proxyPort->text ());
+   settings->setValue ("proxyUserName", ui->proxyUserName->text ());
+   settings->setValue ("proxyPassword", ui->proxyPassword->text ());
+   settings->setValue ("terminal/cursorBlinking", ui->terminal_cursorBlinking->isChecked ());
++  settings->setValue ("terminal/cursorUseForegroundColor", ui->terminal_cursorUseForegroundColor->isChecked ());
+ 
+   // the cursor
+   QString cursorType;
+   switch (ui->terminal_cursorType->currentIndex ())
+     {
+     case 0: cursorType = "ibeam"; break;
+     case 1: cursorType = "block"; break;
+     case 2: cursorType = "underline";  break;
+@@ -361,16 +403,18 @@ settings_dialog::write_changed_settings 
+   write_lexer_settings (lexer,settings);
+   delete lexer;
+   lexer = new QsciLexerBash ();
+   write_lexer_settings (lexer,settings);
+   delete lexer;
+ #endif
+ 
+   write_workspace_colors (settings);
++
++  write_terminal_colors (settings);
+ }
+ 
+ #ifdef HAVE_QSCINTILLA
+ void
+ settings_dialog::write_lexer_settings (QsciLexer *lexer, QSettings *settings)
+ {
+   QWidget *tab = ui->tabs_editor_styles->
+             findChild <QWidget *>(QString (lexer->language ())+"_styles");
+@@ -439,8 +483,25 @@ settings_dialog::write_workspace_colors 
+       color = ui->workspace_colors_box->findChild <color_picker *>(
+                             "color_"+class_chars.mid (i,1));
+       if (color)
+         settings->setValue ("workspaceview/color_"+class_chars.mid (i,1),
+                             color->color ());
+     }
+   settings->sync ();
+ }
++
++void
++settings_dialog::write_terminal_colors (QSettings *settings)
++{
++  QString class_chars = resource_manager::terminal_color_chars ();
++  color_picker *color;
++
++  for (int i = 0; i < class_chars.length (); i++)
++    {
++      color = ui->terminal_colors_box->findChild <color_picker *>(
++                            "terminal_color_"+class_chars.mid (i,1));
++      if (color)
++        settings->setValue ("terminal/color_"+class_chars.mid (i,1),
++                            color->color ());
++    }
++  settings->sync ();
++}
+diff --git a/libgui/src/settings-dialog.h b/libgui/src/settings-dialog.h
+--- a/libgui/src/settings-dialog.h
++++ b/libgui/src/settings-dialog.h
+@@ -47,11 +47,14 @@ private:
+   void write_lexer_settings (QsciLexer *lexer, QSettings *settings);
+   int  get_valid_lexer_styles (QsciLexer *lexer, int styles[]);
+   enum { MaxLexerStyles = 64,
+          MaxStyleNumber = 128 };
+ #endif
+ 
+   void read_workspace_colors (QSettings *settings);
+   void write_workspace_colors (QSettings *settings);
++
++  void read_terminal_colors (QSettings *settings);
++  void write_terminal_colors (QSettings *settings);
+ };
+ 
+ #endif // SETTINGSDIALOG_H
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -27,17 +27,17 @@
+   </property>
+   <property name="windowTitle">
+    <string>Settings</string>
+   </property>
+   <layout class="QVBoxLayout" name="verticalLayout_2">
+    <item>
+     <widget class="QTabWidget" name="tabWidget">
+      <property name="currentIndex">
+-      <number>0</number>
++      <number>3</number>
+      </property>
+      <widget class="QWidget" name="tab_4">
+       <property name="enabled">
+        <bool>true</bool>
+       </property>
+       <attribute name="title">
+        <string>General</string>
+       </attribute>
+@@ -312,136 +312,177 @@
+         </rect>
+        </property>
+       </widget>
+      </widget>
+      <widget class="QWidget" name="tab_5">
+       <attribute name="title">
+        <string>Terminal</string>
+       </attribute>
+-      <layout class="QVBoxLayout" name="verticalLayout">
+-       <item>
+-        <layout class="QHBoxLayout" name="horizontalLayout_5">
+-         <item>
+-          <widget class="QLabel" name="label_11">
+-           <property name="text">
+-            <string>Font</string>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <widget class="QFontComboBox" name="terminal_fontName">
+-           <property name="editable">
+-            <bool>false</bool>
+-           </property>
+-           <property name="fontFilters">
+-            <set>QFontComboBox::MonospacedFonts</set>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <widget class="QLabel" name="label_12">
+-           <property name="text">
+-            <string>Font Size</string>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <widget class="QSpinBox" name="terminal_fontSize">
+-           <property name="minimum">
+-            <number>2</number>
+-           </property>
+-           <property name="maximum">
+-            <number>96</number>
+-           </property>
+-           <property name="value">
+-            <number>10</number>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <spacer name="horizontalSpacer_5">
+-           <property name="orientation">
+-            <enum>Qt::Horizontal</enum>
+-           </property>
+-           <property name="sizeHint" stdset="0">
+-            <size>
+-             <width>40</width>
+-             <height>20</height>
+-            </size>
+-           </property>
+-          </spacer>
+-         </item>
+-        </layout>
+-       </item>
+-       <item>
+-        <layout class="QHBoxLayout" name="horizontalLayout_3">
+-         <item>
+-          <widget class="QLabel" name="label">
+-           <property name="text">
+-            <string>Cursor type:</string>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <widget class="QComboBox" name="terminal_cursorType"/>
+-         </item>
+-         <item>
+-          <spacer name="horizontalSpacer">
+-           <property name="orientation">
+-            <enum>Qt::Horizontal</enum>
+-           </property>
+-           <property name="sizeHint" stdset="0">
+-            <size>
+-             <width>40</width>
+-             <height>20</height>
+-            </size>
+-           </property>
+-          </spacer>
+-         </item>
+-        </layout>
+-       </item>
+-       <item>
+-        <layout class="QHBoxLayout" name="horizontalLayout_2">
+-         <item>
+-          <widget class="QCheckBox" name="terminal_cursorBlinking">
+-           <property name="text">
+-            <string>Cursor blinking</string>
+-           </property>
+-          </widget>
+-         </item>
+-         <item>
+-          <spacer name="horizontalSpacer_2">
+-           <property name="orientation">
+-            <enum>Qt::Horizontal</enum>
+-           </property>
+-           <property name="sizeHint" stdset="0">
+-            <size>
+-             <width>40</width>
+-             <height>20</height>
+-            </size>
+-           </property>
+-          </spacer>
+-         </item>
+-        </layout>
+-       </item>
+-       <item>
+-        <spacer name="verticalSpacer_3">
+-         <property name="orientation">
+-          <enum>Qt::Vertical</enum>
+-         </property>
+-         <property name="sizeHint" stdset="0">
+-          <size>
+-           <width>20</width>
+-           <height>321</height>
+-          </size>
+-         </property>
+-        </spacer>
+-       </item>
+-      </layout>
++      <widget class="QWidget" name="horizontalLayoutWidget">
++       <property name="geometry">
++        <rect>
++         <x>10</x>
++         <y>50</y>
++         <width>631</width>
++         <height>31</height>
++        </rect>
++       </property>
++       <layout class="QHBoxLayout" name="horizontalLayout_3">
++        <item>
++         <widget class="QLabel" name="label">
++          <property name="text">
++           <string>Cursor type:</string>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <widget class="QComboBox" name="terminal_cursorType"/>
++        </item>
++        <item>
++         <spacer name="horizontalSpacer">
++          <property name="orientation">
++           <enum>Qt::Horizontal</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>40</width>
++            <height>20</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
++        <item>
++         <widget class="QCheckBox" name="terminal_cursorBlinking">
++          <property name="text">
++           <string>Cursor blinking</string>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <widget class="QCheckBox" name="terminal_cursorUseForegroundColor">
++          <property name="text">
++           <string>Use Foreground Color</string>
++          </property>
++         </widget>
++        </item>
++       </layout>
++      </widget>
++      <widget class="QWidget" name="verticalLayoutWidget_2">
++       <property name="geometry">
++        <rect>
++         <x>10</x>
++         <y>90</y>
++         <width>631</width>
++         <height>164</height>
++        </rect>
++       </property>
++       <layout class="QVBoxLayout" name="verticalLayout">
++        <item>
++         <widget class="QGroupBox" name="terminal_colors_box">
++          <property name="minimumSize">
++           <size>
++            <width>0</width>
++            <height>162</height>
++           </size>
++          </property>
++          <property name="title">
++           <string>Terminal Colors</string>
++          </property>
++         </widget>
++        </item>
++       </layout>
++      </widget>
++      <widget class="QWidget" name="verticalLayoutWidget_3">
++       <property name="geometry">
++        <rect>
++         <x>10</x>
++         <y>260</y>
++         <width>631</width>
++         <height>121</height>
++        </rect>
++       </property>
++       <layout class="QVBoxLayout" name="verticalLayout_8">
++        <item>
++         <spacer name="verticalSpacer_3">
++          <property name="orientation">
++           <enum>Qt::Vertical</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>20</width>
++            <height>40</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
++       </layout>
++      </widget>
++      <widget class="QWidget" name="layoutWidget">
++       <property name="geometry">
++        <rect>
++         <x>10</x>
++         <y>10</y>
++         <width>631</width>
++         <height>30</height>
++        </rect>
++       </property>
++       <layout class="QHBoxLayout" name="horizontalLayout_5">
++        <item>
++         <widget class="QLabel" name="label_11">
++          <property name="text">
++           <string>Font</string>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <widget class="QFontComboBox" name="terminal_fontName">
++          <property name="editable">
++           <bool>false</bool>
++          </property>
++          <property name="fontFilters">
++           <set>QFontComboBox::MonospacedFonts</set>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <widget class="QLabel" name="label_12">
++          <property name="text">
++           <string>Font Size</string>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <widget class="QSpinBox" name="terminal_fontSize">
++          <property name="minimum">
++           <number>2</number>
++          </property>
++          <property name="maximum">
++           <number>96</number>
++          </property>
++          <property name="value">
++           <number>10</number>
++          </property>
++         </widget>
++        </item>
++        <item>
++         <spacer name="horizontalSpacer_5">
++          <property name="orientation">
++           <enum>Qt::Horizontal</enum>
++          </property>
++          <property name="sizeHint" stdset="0">
++           <size>
++            <width>40</width>
++            <height>20</height>
++           </size>
++          </property>
++         </spacer>
++        </item>
++       </layout>
++      </widget>
+      </widget>
+      <widget class="QWidget" name="tab_2">
+       <attribute name="title">
+        <string>File Browser</string>
+       </attribute>
+       <layout class="QVBoxLayout" name="verticalLayout_3">
+        <item>
+         <widget class="QCheckBox" name="showFileSize">
+@@ -508,16 +549,22 @@
+        <property name="geometry">
+         <rect>
+          <x>19</x>
+          <y>19</y>
+          <width>631</width>
+          <height>81</height>
+         </rect>
+        </property>
++       <property name="minimumSize">
++        <size>
++         <width>0</width>
++         <height>81</height>
++        </size>
++       </property>
+        <property name="title">
+         <string>Storage Class Colors</string>
+        </property>
+       </widget>
+      </widget>
+      <widget class="QWidget" name="tab_3">
+       <attribute name="title">
+        <string>Network</string>

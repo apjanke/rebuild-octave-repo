@@ -1,0 +1,376 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1423472185 -3600
+#      Mon Feb 09 09:56:25 2015 +0100
+# Node ID bd1369a2a6519264809c928826606dd8e7b9b93f
+# Parent  894b5c5e0b926cc90b05860196e0d758c424f0d8
+add extra action for interrupting with Ctrl-C (bug #44204)
+* QTerminal.cc (notice_settings): check if copy-shortcut is Ctrl-C and set flag
+  for slots and enable/disable new interrupt-action accordingly
+
+* QTerminal.h: new function setting flag (purely virtual);
+  (constructor): new interrupt-action with shortcut Ctrl-C
+
+* QUnixTerminalImpl.cpp (copyClipboard): call internal function with flag;
+  (has_extra_interrupt): new function for setting flag for copy-/interrupt-
+  slots
+
+* QUnixTerminalImpl.h new flag for slots and function setting flag
+
+* TerminalView.cpp (copyClipboard): gets flag as parameter, only interrupts
+  if Ctrl-C is shortcut for copy
+
+* TerminalView.h: copyClipboard with boolean parameter
+
+* QWinTerminalImpl.cpp (copyClipboard): only interrupts if Ctrl-C is shortcut
+  for copy;
+  (has_extra_interrupt): function for setting flag for copy-/interrupts-slots
+
+* QWinTerminalImpl.h: new flag and function setting the flag
+
+diff --git a/libgui/qterminal/libqterminal/QTerminal.cc b/libgui/qterminal/libqterminal/QTerminal.cc
+--- a/libgui/qterminal/libqterminal/QTerminal.cc
++++ b/libgui/qterminal/libqterminal/QTerminal.cc
+@@ -114,9 +114,26 @@ QTerminal::notice_settings (const QSetti
+     (settings->value ("terminal/color_s",
+                       QVariant (colors.at (2))).value<QColor> ());
+ 
+   setCursorColor
+     (cursorUseForegroundColor,
+      settings->value ("terminal/color_c",
+                       QVariant (colors.at (3))).value<QColor> ());
+   setScrollBufferSize (settings->value ("terminal/history_buffer",1000).toInt () );
++
++  // check whether Copy shoretcut is Ctrl-C
++  int set = settings->value ("shortcuts/set",0).toInt ();
++  QKeySequence copy;
++  QString key = QString ("shortcuts/main_edit:copy");
++  if (set)
++    key.append ("_1");  // if second set is active
++  copy = QKeySequence (settings->value (key).toString ()); // the copy shortcut
++
++  //  dis- or enable extra interrupt action
++  QKeySequence ctrl;
++  ctrl = Qt::ControlModifier;
++
++  bool extra_ir_action = (copy != QKeySequence (ctrl + Qt::Key_C));
++
++  _interrupt_action->setEnabled (extra_ir_action);
++  has_extra_interrupt (extra_ir_action);
+ }
+diff --git a/libgui/qterminal/libqterminal/QTerminal.h b/libgui/qterminal/libqterminal/QTerminal.h
+--- a/libgui/qterminal/libqterminal/QTerminal.h
++++ b/libgui/qterminal/libqterminal/QTerminal.h
+@@ -28,16 +28,17 @@ see <http://www.gnu.org/licenses/>.
+ #include <QKeySequence>
+ #include <QWidget>
+ #include <QStringList>
+ #include <QColor>
+ #include <QList>
+ #include <QMenu>
+ #include <QClipboard>
+ #include <QApplication>
++#include <QAction>
+ 
+ class QTerminal : public QWidget
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   static QTerminal *create (QWidget *xparent = 0);
+@@ -51,16 +52,18 @@ public:
+   virtual void setTerminalFont (const QFont& font) = 0;
+ 
+   virtual void setSize (int h, int v) = 0;
+ 
+   virtual void sendText (const QString& text) = 0;
+ 
+   virtual QString selectedText () = 0;
+ 
++  virtual void has_extra_interrupt (bool extra) = 0;
++
+   enum CursorType
+   {
+     UnderlineCursor,
+     BlockCursor,
+     IBeamCursor
+   };
+ 
+   virtual void setCursorType (CursorType type, bool blinking)
+@@ -113,16 +116,17 @@ public slots:
+   virtual void init_terminal_size (void) { }
+ 
+   void terminal_interrupt (void) { emit interrupt_signal (); }
+ 
+ protected:
+ 
+   QTerminal (QWidget *xparent = 0) : QWidget (xparent)
+   {
++    // context menu
+     setContextMenuPolicy (Qt::CustomContextMenu);
+ 
+     _contextMenu = new QMenu (this);
+ 
+     _copy_action = _contextMenu->addAction (
+                      QIcon (":/actions/icons/editcopy.png"),
+                      tr ("Copy"), this, SLOT (copyClipboard ()));
+ 
+@@ -156,19 +160,31 @@ protected:
+     connect (xparent, SIGNAL (copyClipboard_signal ()),
+              this, SLOT (copyClipboard ()));
+ 
+     connect (xparent, SIGNAL (pasteClipboard_signal ()),
+              this, SLOT (pasteClipboard ()));
+ 
+     connect (xparent, SIGNAL (selectAll_signal ()),
+              this, SLOT (selectAll ()));
++
++    // extra interrupt action
++    _interrupt_action = new QAction (this);
++    addAction (_interrupt_action);
++
++    _interrupt_action->setShortcut (
++            QKeySequence (Qt::ControlModifier + Qt::Key_C));
++
++    connect (_interrupt_action, SIGNAL (triggered (bool)),
++            this, SLOT (terminal_interrupt ()));
+   }
+ 
+ private:
+ 
+   QMenu *_contextMenu;
+   QAction * _copy_action;
+   QAction * _paste_action;
+   QAction * _selectall_action;
++
++  QAction *_interrupt_action;
+ };
+ 
+ #endif // QTERMINAL_H
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.cpp
+@@ -202,17 +202,17 @@ void QUnixTerminalImpl::resizeEvent(QRes
+     m_terminalView->resize(this->size());
+     m_terminalView->updateImage();
+     m_terminalView->repaint();
+     m_terminalView->update();
+ }
+ 
+ void QUnixTerminalImpl::copyClipboard()
+ {
+-    m_terminalView->copyClipboard();
++    m_terminalView->copyClipboard (_extra_interrupt);
+ }
+ 
+ void QUnixTerminalImpl::pasteClipboard()
+ {
+     m_terminalView->pasteClipboard();
+ }
+ 
+ void QUnixTerminalImpl::selectAll()
+@@ -220,8 +220,14 @@ void QUnixTerminalImpl::selectAll()
+     m_terminalView->selectAll();
+ }
+ 
+ 
+ QString QUnixTerminalImpl::selectedText ()
+ {
+   return m_terminalView->selectedText ();
+ }
++
++void
++QUnixTerminalImpl::has_extra_interrupt (bool extra)
++{
++  _extra_interrupt = extra;
++}
+diff --git a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/unix/QUnixTerminalImpl.h
+@@ -44,16 +44,17 @@ public:
+     void setCursorType(CursorType type, bool blinking);
+ 
+     void setBackgroundColor (const QColor& color);
+     void setForegroundColor (const QColor& color);
+     void setSelectionColor (const QColor& color);
+     void setCursorColor (bool useForegroundColor, const QColor& color);
+     void setScrollBufferSize(int value);
+     QString selectedText();
++    void has_extra_interrupt (bool extra_interrupt);
+ 
+ public slots:
+     void copyClipboard();
+     void pasteClipboard();
+     void selectAll();
+ 
+ protected:
+     void showEvent(QShowEvent *);
+@@ -61,11 +62,12 @@ protected:
+ 
+ private:
+     void initialize();
+     void connectToPty();
+ 
+     TerminalView *m_terminalView;
+     TerminalModel *m_terminalModel;
+     KPty *m_kpty;
++    bool _extra_interrupt;
+ };
+ 
+ #endif // Q_UNIXTERMINALIMPL
+diff --git a/libgui/qterminal/libqterminal/unix/TerminalView.cpp b/libgui/qterminal/libqterminal/unix/TerminalView.cpp
+--- a/libgui/qterminal/libqterminal/unix/TerminalView.cpp
++++ b/libgui/qterminal/libqterminal/unix/TerminalView.cpp
+@@ -2267,24 +2267,24 @@ void TerminalView::emitSelection(bool us
+     }
+ }
+ 
+ void TerminalView::setSelection(const QString& t)
+ {
+   QApplication::clipboard()->setText(t, QClipboard::Selection);
+ }
+ 
+-void TerminalView::copyClipboard()
++void TerminalView::copyClipboard(bool extra_interrupt)
+ {
+   if ( !_screenWindow || !hasFocus())
+     return;
+ 
+   QString text = _screenWindow->selectedText(_preserveLineBreaks);
+ 
+-  if (text.isEmpty ())
++  if (text.isEmpty () && ! extra_interrupt)
+     emit interrupt_signal ();
+   else
+     QApplication::clipboard()->setText(text);
+ }
+ 
+ void TerminalView::pasteClipboard()
+ {
+   if(hasFocus ())
+@@ -2307,16 +2307,17 @@ void TerminalView::selectAll()
+ }
+ 
+ 
+ void TerminalView::pasteSelection()
+ {
+   emitSelection(true,false);
+ }
+ 
++
+ /* ------------------------------------------------------------------------- */
+ /*                                                                           */
+ /*                                Keyboard                                   */
+ /*                                                                           */
+ /* ------------------------------------------------------------------------- */
+ 
+ void TerminalView::keyPressEvent( QKeyEvent* event )
+ {
+diff --git a/libgui/qterminal/libqterminal/unix/TerminalView.h b/libgui/qterminal/libqterminal/unix/TerminalView.h
+--- a/libgui/qterminal/libqterminal/unix/TerminalView.h
++++ b/libgui/qterminal/libqterminal/unix/TerminalView.h
+@@ -399,17 +399,17 @@ public slots:
+     void updateImage();
+     /**
+      * Causes the terminal display to fetch the latest line status flags from the
+      * associated terminal screen ( see setScreenWindow() ).
+      */
+     void updateLineProperties();
+ 
+     /** Copies the selected text to the clipboard. */
+-    void copyClipboard();
++    void copyClipboard (bool extra_interrupt);
+     /**
+      * Pastes the content of the clipboard into the
+      * display.
+      */
+     void pasteClipboard();
+     /**
+      * Pastes the content of the selection into the
+      * display.
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+@@ -1754,25 +1754,25 @@ void QWinTerminalImpl::setSize (int colu
+ {
+   d->log ("emit set_screen_size_signal (%d, %d)\n", columns, lines);
+ 
+   emit set_screen_size_signal (columns, lines);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////
+ 
+-void QWinTerminalImpl::copyClipboard (void)
++void QWinTerminalImpl::copyClipboard ()
+ {
+   if(!hasFocus()) return;
+ 
+   QClipboard *clipboard = QApplication::clipboard ();
+ 
+   QString selection = d->getSelection ();
+ 
+-  if (selection.isEmpty ())
++  if (selection.isEmpty () && ! _extra_interrupt)
+     terminal_interrupt ();
+   else
+     {
+       clipboard->setText (selection);
+ 
+       emit report_status_message (tr ("copied selection to clipboard"));
+     }
+ }
+@@ -1830,8 +1830,15 @@ void QWinTerminalImpl::dropEvent (QDropE
+         {
+           if(dropText.length () > 0)
+             dropText += "\n";
+           dropText  += url.toLocalFile ();
+         }
+       sendText (dropText);
+     }
+ }
++
++//////////////////////////////////////////////////////////////////////////////
++
++void QWinTerminalImpl::has_extra_interrupt (bool extra)
++{
++  _extra_interrupt = extra;
++}
+\ No newline at end of file
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+@@ -61,16 +61,18 @@ public:
+   void setBackgroundColor (const QColor& color);
+   void setForegroundColor (const QColor& color);
+   void setSelectionColor (const QColor& color);
+   void setCursorColor (bool useForegoundColor, const QColor& color);
+   void setScrollBufferSize(int value);
+ 
+   QString selectedText ();
+ 
++  void has_extra_interrupt (bool);
++
+ public slots:
+   void copyClipboard (void);
+   void pasteClipboard (void);
+   void selectAll (void);
+   void blinkCursorEvent (void);
+   void init_terminal_size (void);
+ 
+ signals:
+@@ -105,13 +107,14 @@ private slots:
+   void verticalScrollValueChanged (int value);
+   void monitorConsole (void);
+   void updateSelection (void);
+   void tripleClickTimeout (void);
+ 
+ private:
+   QConsolePrivate* d;
+   bool allowTripleClick;
++  bool _extra_interrupt;
+ };
+ 
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ #endif // __QConsole_h__

@@ -1,0 +1,325 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1412896856 14400
+#      Thu Oct 09 19:20:56 2014 -0400
+# Node ID efccb2a65b9a27f0cdd01db38aa327bf5ae220de
+# Parent  65554f5847ac45c4bb85ba447e228845a6287fbe
+preserve text on Windows terminal resize (bug #41893; patch #8532)
+
+* QWinTerminalImpl.h, QWinTerminalImpl.cpp
+(QConsolePrivate::updateConsoleSize): Don't shrink the size of the
+console buffer.  Store the terminal size in the environment.  Force
+the command line editor (usually readline) to notice the change in
+screen size as soon as possible.
+(QWinTerminalImpl::QWinTerminalImpl): Connect set_screen_size_signal
+with parent set_screen_size slot.
+(QWinTerminalImpl::set_screen_size_signal): New signal.
+* main-window.h, main-window.cc (main_window::int_pair): New typedef.
+(main_window::set_screen_size_callback): New callback function.
+(main_window::set_screen_size): New slot.
+* sysdep.cc (w32_init): New function. Tell command_editor to prefer
+environment variables for window size.
+(MINGW_init, MSVC_init): Call w32_init.
+(QWinTerminalImpl::setSize): Emit set_screen_size_signal.
+
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.cpp
+@@ -964,19 +964,40 @@ void QConsolePrivate::updateConsoleSize 
+   QSize winSize = m_consoleView->size ();
+ 
+   m_charSize.rwidth () = fm.averageCharWidth ();
+   m_charSize.rheight () = fm.lineSpacing ();
+ 
+   m_consoleRect.setWidth (winSize.width () / fm.averageCharWidth ());
+   m_consoleRect.setHeight (winSize.height () / fm.lineSpacing ());
+ 
+-  m_bufferSize.rwidth () = m_consoleRect.width ();
+-  m_bufferSize.rheight () = qMax (m_bufferSize.height (),
+-                                  m_consoleRect.height ());
++  // Don't shrink the size of the buffer.  That way wide lines won't be
++  // truncated and will reappear if the window is enlarged again later.
++
++  if (m_consoleRect.width () > m_bufferSize.width ())
++    m_bufferSize.rwidth () = m_consoleRect.width ();
++
++  if (qMax (m_bufferSize.height (), m_consoleRect.height ())
++      > m_bufferSize.height ())
++    m_bufferSize.rheight () = qMax (m_bufferSize.height (),
++                                    m_consoleRect.height ());
++
++  // Store the terminal size in the environment.  When Octave is
++  // initialized, we ask the command editor (usually readline) to prefer
++  // using these values rather than querying the terminal so that the
++  // buffer size can be larger than the size of the window that the
++  // command editor will actually use.
++
++  qputenv ("LINES", QByteArray::number (m_consoleRect.height ()));
++  qputenv ("COLUMNS", QByteArray::number (m_consoleRect.width ())); 
++
++  // Force the command line editor (usually readline) to notice the
++  // change in screen size as soon as possible.
++
++  q->setSize (m_consoleRect.height (), m_consoleRect.width ());
+ 
+   m_consoleRect.moveLeft (0);
+   if (m_consoleRect.bottom () >= m_bufferSize.height ())
+     m_consoleRect.moveTop (m_bufferSize.height () - m_consoleRect.height ());
+ 
+   log ("Console resized:\n");
+   log ("  widget size: %d x %d\n", winSize.width (), winSize.height ());
+   log ("  buffer size: %d x %d\n", m_bufferSize.width (),
+@@ -1328,16 +1349,19 @@ QWinTerminalImpl::QWinTerminalImpl (QWid
+     : QTerminal (parent), d (new QConsolePrivate (this)),
+       allowTripleClick (false)
+ {
+     installEventFilter (this);
+ 
+     connect (this, SIGNAL (set_global_shortcuts_signal (bool)),
+            parent, SLOT (set_global_shortcuts (bool)));
+ 
++    connect (this, SIGNAL (set_screen_size_signal (int, int)),
++             parent, SLOT (set_screen_size (int, int)));
++
+     setAcceptDrops (true);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ QWinTerminalImpl::QWinTerminalImpl (const QString& cmd, QWidget* parent)
+     : QTerminal (parent), d (new QConsolePrivate (this, cmd))
+ {
+@@ -1639,18 +1663,19 @@ void QWinTerminalImpl::setTerminalFont (
+   d->m_consoleView->setFont (f);
+   d->updateConsoleSize (true);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ void QWinTerminalImpl::setSize (int columns, int lines)
+ {
+-  Q_UNUSED (columns);
+-  Q_UNUSED (lines);
++  d->log ("emit set_screen_size_signal (%d, %d)\n", columns, lines);
++
++  emit set_screen_size_signal (columns, lines);
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////////
+ 
+ void QWinTerminalImpl::copyClipboard (void)
+ {
+   if(!hasFocus()) return;
+ 
+@@ -1721,9 +1746,8 @@ void QWinTerminalImpl::dropEvent (QDropE
+         {
+           if(dropText.length () > 0) 
+             dropText += "\n";
+           dropText  += url.toLocalFile ();
+         }
+       sendText (dropText);
+     }
+ }
+-
+diff --git a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+--- a/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
++++ b/libgui/qterminal/libqterminal/win32/QWinTerminalImpl.h
+@@ -71,16 +71,17 @@ public slots:
+   void pasteClipboard (void);
+   void selectAll (void);
+   void blinkCursorEvent (void);
+ 
+ signals:
+   void terminated (void);
+   void titleChanged (const QString&);
+   void set_global_shortcuts_signal (bool);
++  void set_screen_size_signal (int, int);
+ 
+ protected:
+   void viewPaintEvent (QConsoleView*, QPaintEvent*);
+   void setBlinkingCursor (bool blink);
+   void setBlinkingCursorState (bool blink);
+   void viewResizeEvent (QConsoleView*, QResizeEvent*);
+   void wheelEvent (QWheelEvent*);
+   void focusInEvent (QFocusEvent*);
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -2098,16 +2098,22 @@ main_window::clear_command_window_callba
+ 
+ void
+ main_window::resize_command_window_callback (void)
+ {
+   command_editor::resize_terminal ();
+ }
+ 
+ void
++main_window::set_screen_size_callback (const int_pair& sz)
++{
++  command_editor::set_screen_size (sz.first, sz.second);
++}
++
++void
+ main_window::clear_history_callback (void)
+ {
+   Fhistory (ovl ("-c"));
+ }
+ 
+ void
+ main_window::execute_command_callback ()
+ {
+@@ -2384,16 +2390,23 @@ main_window::set_global_shortcuts (bool 
+ 
+       // news menu
+       _release_notes_action->setShortcut (no_key);
+       _current_news_action->setShortcut (no_key);
+     }
+ }
+ 
+ void
++main_window::set_screen_size (int ht, int wd)
++{
++  octave_link::post_event (this, &main_window::set_screen_size_callback,
++                           int_pair (ht, wd));
++}
++
++void
+ main_window::handle_show_doc (const QString& file)
+ {
+   doc_browser_window->setVisible (true);
+   emit show_doc_signal (file);
+ }
+ 
+ void
+ main_window::clipboard_has_changed (QClipboard::Mode cp_mode)
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -64,16 +64,17 @@ along with Octave; see the file COPYING.
+  */
+ class main_window : public QMainWindow
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   typedef std::pair <std::string, std::string> name_pair;
++  typedef std::pair <int, int> int_pair;
+ 
+   main_window (QWidget *parent = 0);
+ 
+   ~main_window (void);
+ 
+   bool command_window_has_focus (void) const;
+ 
+   void focus_command_window (void);
+@@ -191,16 +192,18 @@ public slots:
+   // find files dialog
+   void find_files (const QString &startdir=QDir::currentPath ());
+   void find_files_finished (int);
+ 
+   // setting global shortcuts
+   void set_global_shortcuts (bool enable);
+   void set_global_edit_shortcuts (bool enable);
+ 
++  void set_screen_size (int ht, int wd);
++
+   // handling the clipboard
+   void clipboard_has_changed (QClipboard::Mode);
+   void clear_clipboard ();
+ 
+   // get the dockwidgets
+   QList<octave_dock_widget *> get_dock_widget_list ()
+     { return dock_widget_list (); }
+ 
+@@ -247,16 +250,18 @@ private:
+   void rename_variable_callback (const name_pair& names);
+ 
+   void command_window_undo_callback (void);
+ 
+   void clear_command_window_callback (void);
+ 
+   void resize_command_window_callback (void);
+ 
++  void set_screen_size_callback (const int_pair&);
++
+   void clear_workspace_callback (void);
+ 
+   void clear_history_callback (void);
+ 
+   void execute_command_callback ();
+   void run_file_callback (const QFileInfo& info);
+   bool focus_console_after_command ();
+ 
+diff --git a/libinterp/corefcn/sysdep.cc b/libinterp/corefcn/sysdep.cc
+--- a/libinterp/corefcn/sysdep.cc
++++ b/libinterp/corefcn/sysdep.cc
+@@ -164,31 +164,39 @@ w32_set_quiet_shutdown (void)
+   SetProcessShutdownParameters (0x280, SHUTDOWN_NORETRY);
+ }
+ 
+ void
+ MINGW_signal_cleanup (void)
+ {
+   w32_set_quiet_shutdown ();
+ }
++
++static void
++w32_init (void)
++{
++  w32_set_octave_home ();
++
++  command_editor::prefer_env_winsize (true);
++}
+ #endif
+ 
+ #if defined (__MINGW32__)
+ static void
+ MINGW_init (void)
+ {
+-  w32_set_octave_home ();
++  w32_init ();
+ }
+ #endif
+ 
+ #if defined (_MSC_VER)
+ static void
+ MSVC_init (void)
+ {
+-  w32_set_octave_home ();
++  w32_init ();
+ }
+ #endif
+ 
+ 
+ // Return TRUE if FILE1 and FILE2 refer to the same (physical) file.
+ 
+ bool
+ same_file_internal (const std::string& file1, const std::string& file2)
+diff --git a/liboctave/util/cmd-edit.cc b/liboctave/util/cmd-edit.cc
+--- a/liboctave/util/cmd-edit.cc
++++ b/liboctave/util/cmd-edit.cc
+@@ -1465,16 +1465,23 @@ command_editor::filename_completion_desi
+ bool
+ command_editor::filename_quoting_desired (bool arg)
+ {
+   return (instance_ok ())
+          ? instance->do_filename_quoting_desired (arg) : false;
+ }
+ 
+ bool
++command_editor::prefer_env_winsize (bool arg)
++{
++  return (instance_ok ())
++         ? instance->do_prefer_env_winsize (arg) : false;
++}
++
++bool
+ command_editor::interrupt (bool arg)
+ {
+   bool retval;
+ 
+   if (instance_ok ())
+     {
+       // Return the current interrupt state.
+       retval = instance->interrupted;

@@ -1,0 +1,297 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1271163541 -7200
+#      Tue Apr 13 14:59:01 2010 +0200
+# Node ID f0266ee4aabe34de4e309b1499d5aaa91cc72daa
+# Parent  189274f6c7c42dc037d77278ab2ef53579ccd2da
+optimize some special indexing & assignment cases
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,17 @@
++2010-04-13  Jaroslav Hajek  <highegg@gmail.com>
++
++	* Sparse.cc (Sparse<T>::index): If S is a sparse column vector,
++	forward S(I,1) and S(I,:) to 1D indexing. Handle permutation indexing
++	in the 1D case.
++	(Sparse<T>::assign): If S is a sparse column vector,
++	forward S(I,1) = X and S(I,:) =X to 1D indexed assignment.
++	* idx-vector.cc (idx_vector::inverse_permutation): Add missing break.
++
+ 2010-04-13  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* Array-util.cc (gripe_invalid_assignment_size,
+ 	gripe_assignment_dimension_mismatch): Move funcs here from Array.cc
+ 	* Array-util.h: Declare them.
+ 	* Array.cc: Remove them.
+ 
+ 	* Sparse.cc (Sparse<T>::assign): New overloaded method.
+diff --git a/liboctave/MSparse.h b/liboctave/MSparse.h
+--- a/liboctave/MSparse.h
++++ b/liboctave/MSparse.h
+@@ -50,16 +50,19 @@ public:
+     Sparse<T> (dv, nz) { }
+ 
+   MSparse (const MSparse<T>& a) : Sparse<T> (a) { }
+ 
+   MSparse (const MSparse<T>& a, const dim_vector& dv) : Sparse<T> (a, dv) { }
+ 
+   MSparse (const Sparse<T>& a) : Sparse<T> (a) { }
+ 
++  template <class U>
++  MSparse (const Sparse<U>& a) : Sparse<T> (a) { }
++
+   MSparse (const Array<T>& a, const idx_vector& r, const idx_vector& c,
+            octave_idx_type nr = -1, octave_idx_type nc = -1, bool sum_terms = true)
+     : Sparse<T> (a, r, c, nr, nc, sum_terms) { }
+ 
+   explicit MSparse (octave_idx_type r, octave_idx_type c, T val) : Sparse<T> (r, c, val) { }
+ 
+   MSparse (octave_idx_type r, octave_idx_type c, octave_idx_type num_nz) : Sparse<T> (r, c, num_nz) { }
+ 
+diff --git a/liboctave/Sparse.cc b/liboctave/Sparse.cc
+--- a/liboctave/Sparse.cc
++++ b/liboctave/Sparse.cc
+@@ -166,39 +166,16 @@ Sparse<T>::SparseRep::change_length (oct
+ template <class T>
+ bool
+ Sparse<T>::SparseRep::indices_ok (void) const
+ {
+   return sparse_indices_ok (r, c, nrows, ncols, nnz ());
+ }
+ 
+ template <class T>
+-template <class U>
+-Sparse<T>::Sparse (const Sparse<U>& a)
+-  : dimensions (a.dimensions)
+-{
+-  if (a.nnz () == 0)
+-    rep = new typename Sparse<T>::SparseRep (rows (), cols());
+-  else
+-    {
+-      rep = new typename Sparse<T>::SparseRep (rows (), cols (), a.nnz ());
+-      
+-      octave_idx_type nz = a.nnz ();
+-      octave_idx_type nc = cols ();
+-      for (octave_idx_type i = 0; i < nz; i++)
+-        {
+-          xdata (i) = T (a.data (i));
+-          xridx (i) = a.ridx (i);
+-        }
+-      for (octave_idx_type i = 0; i < nc + 1; i++)
+-        xcidx (i) = a.cidx (i);
+-    }
+-}
+-
+-template <class T>
+ Sparse<T>::Sparse (octave_idx_type nr, octave_idx_type nc, T val)
+   : dimensions (dim_vector (nr, nc))
+ { 
+   if (val != T ())
+     {
+       rep = new typename Sparse<T>::SparseRep (nr, nc, nr*nc);
+ 
+       octave_idx_type ii = 0;
+@@ -1390,16 +1367,31 @@ Sparse<T>::index (const idx_vector& idx,
+           octave_idx_type ui = lblookup (ridx (), nz, ub);
+           // Copy data and adjust indices.
+           octave_idx_type nz_new = ui - li;
+           retval = Sparse<T> (ub - lb, 1, nz_new);
+           copy_or_memcpy (nz_new, data () + li, retval.data ());
+           mx_inline_sub (nz_new, retval.xridx (), ridx () + li, lb);
+           retval.xcidx(1) = nz_new;
+         }
++      else if (idx.is_permutation (nel) && idx.is_vector ())
++        {
++          if (idx.is_range () && idx.increment () == -1)
++            {
++              retval = Sparse<T> (nr, 1, nz);
++              std::reverse_copy (ridx (), ridx () + nz, retval.ridx ());
++              std::reverse_copy (data (), data () + nz, retval.data ());
++            }
++          else
++            {
++              Array<T> tmp = array_value ();
++              tmp = tmp.index (idx);
++              retval = Sparse<T> (tmp);
++            }
++        }
+       else
+         {
+           // If indexing a sparse column vector by a vector, the result is a
+           // sparse column vector, otherwise it inherits the shape of index.
+           // Vector transpose is cheap, so do it right here.
+           const Array<octave_idx_type> idxa = (idx_dims(0) == 1 
+                                                ? idx.as_array ().transpose ()
+                                                : idx.as_array ());
+@@ -1552,16 +1544,21 @@ Sparse<T>::index (const idx_vector& idx_
+             {
+               octave_idx_type ljj = cidx(idx_j(j));
+               octave_idx_type lj = retval.xcidx(j), nzj = retval.xcidx(j+1) - lj;
+               copy_or_memcpy (nzj, data () + ljj, retval.data () + lj);
+               copy_or_memcpy (nzj, ridx () + ljj, retval.ridx () + lj);
+             }
+         }
+     }
++  else if (nc == 1 && idx_j.is_colon_equiv (nc) && idx_i.is_vector ())
++    {
++      // It's actually vector indexing. The 1D index is specialized for that.
++      retval = index (idx_i);
++    }
+   else if (idx_i.is_scalar ())
+     {
+       octave_idx_type ii = idx_i(0);
+       retval = Sparse<T> (1, m);
+       OCTAVE_LOCAL_BUFFER (octave_idx_type, ij, m);
+       for (octave_idx_type j = 0; j < m; j++)
+         {
+           octave_quit ();
+@@ -1647,20 +1644,18 @@ Sparse<T>::index (const idx_vector& idx_
+                   retval.xdata(li + i) = data(uj - i); // Copy in reverse order.
+                   retval.xridx(li + i) = nr - 1 - ridx(uj - i); // Ditto with transform.
+                 }
+             }
+         }
+       else
+         {
+           // Get inverse permutation.
+-          OCTAVE_LOCAL_BUFFER (octave_idx_type, iinv, nr);
+-          const Array<octave_idx_type> ia = idx_i.as_array ();
+-          for (octave_idx_type i = 0; i < nr; i++)
+-            iinv[ia(i)] = i;
++          idx_vector idx_iinv = idx_i.inverse_permutation (nr);
++          const octave_idx_type *iinv = idx_iinv.raw ();
+ 
+           // Scatter buffer.
+           OCTAVE_LOCAL_BUFFER (T, scb, nr);
+           octave_idx_type *rri = retval.ridx ();
+ 
+           for (octave_idx_type j = 0; j < m; j++)
+             {
+               octave_quit ();
+@@ -1677,24 +1672,30 @@ Sparse<T>::index (const idx_vector& idx_
+ 
+               // Gather.
+               for (octave_idx_type i = 0; i < nzj; i++)
+                 retval.xdata(li + i) = scb[rri[li + i]];
+             }
+         }
+ 
+     }
++  else if (idx_j.is_colon ())
++    {
++      // This requires  uncompressing columns, which is generally costly,
++      // so we rely on the efficient transpose to handle this.
++      // It may still make sense to optimize some cases here.
++      retval = transpose ();
++      retval = retval.index (idx_vector::colon, idx_i);
++      retval = retval.transpose ();
++    }
+   else
+     {
+-      // This is the most general case, where all optimizations failed.
+-      // I suppose this is a relatively rare case, so it will be done
+-      // as s(i,j) = ((s(:,j).')(:,i)).'
+-      // Note that if j is :, the first indexing expr. is a shallow copy.
+-      retval = index (idx_vector::colon, idx_j).transpose ();
+-      retval = retval.index (idx_vector::colon, idx_i).transpose ();
++      // A(I, J) is decomposed into A(:, J)(I, :).
++      retval = index (idx_vector::colon, idx_j);
++      retval = retval.index (idx_i, idx_vector::colon);
+     }
+ 
+   return retval;
+ }
+ 
+ template <class T>
+ void
+ Sparse<T>::assign (const idx_vector& idx, const Sparse<T>& rhs)
+@@ -1983,16 +1984,21 @@ Sparse<T>::assign (const idx_vector& idx
+                       octave_idx_type k = tmp.cidx(i);
+                       copy_or_memcpy (u - l, tmp.data () + k, xdata () + l);
+                       copy_or_memcpy (u - l, tmp.ridx () + k, xridx () + l);
+                     }
+                 }
+ 
+             }
+         }
++      else if (nc == 1 && idx_j.is_colon_equiv (nc) && idx_i.is_vector ())
++        {
++          // It's actually vector indexing. The 1D assign is specialized for that.
++          assign (idx_i, rhs);
++        }
+       else if (idx_j.is_colon ())
+         {
+           if (idx_i.is_permutation (nr))
+             {
+               *this = rhs.index (idx_i.inverse_permutation (nr), idx_j);
+             }
+           else
+             {
+diff --git a/liboctave/idx-vector.cc b/liboctave/idx-vector.cc
+--- a/liboctave/idx-vector.cc
++++ b/liboctave/idx-vector.cc
+@@ -1173,16 +1173,17 @@ idx_vector::inverse_permutation (octave_
+     case class_vector:
+       {
+         idx_vector_rep *r = dynamic_cast<idx_vector_rep *> (rep);
+         const octave_idx_type *ri = r->get_data ();
+         Array<octave_idx_type> idx (orig_dimensions ());
+         for (octave_idx_type i = 0; i < n; i++)
+           idx.xelem(ri[i]) = i;
+         retval = new idx_vector_rep (idx, r->extent (0), DIRECT);
++        break;
+       }
+     default:
+       retval = *this;
+       break;
+     }
+ 
+   return retval;
+ }
+@@ -1254,16 +1255,22 @@ void idx_vector::unconvert (idx_class_ty
+     }
+ }
+ 
+ Array<octave_idx_type> 
+ idx_vector::as_array (void) const
+ {
+   return rep->as_array ();
+ }
++
++bool
++idx_vector::is_vector (void) const
++{
++  return idx_class () != class_vector || orig_dimensions ().is_vector ();
++}
+     
+ octave_idx_type 
+ idx_vector::freeze (octave_idx_type z_len, const char *, bool resize_ok)
+ {
+   if (! resize_ok && extent (z_len) > z_len)
+     {
+       (*current_liboctave_error_handler)
+         ("invalid matrix index = %d", extent (z_len));
+diff --git a/liboctave/idx-vector.h b/liboctave/idx-vector.h
+--- a/liboctave/idx-vector.h
++++ b/liboctave/idx-vector.h
+@@ -1000,16 +1000,18 @@ public:
+                   double& scalar, Range& range, 
+                   Array<double>& array, Array<bool>& mask) const;
+ 
+   Array<octave_idx_type> as_array (void) const;
+ 
+   // Raw pointer to index array.  This is non-const because it may be
+   // necessary to mutate the index.
+   const octave_idx_type *raw (void);
++
++  bool is_vector (void) const;
+     
+   // FIXME -- these are here for compatibility.  They should be removed
+   // when no longer in use.
+ 
+   octave_idx_type elem (octave_idx_type n) const 
+     { return (*this) (n); }
+ 
+   bool is_colon_equiv (octave_idx_type n, int) const

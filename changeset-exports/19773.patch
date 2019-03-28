@@ -1,0 +1,487 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1424379912 -3600
+#      Thu Feb 19 22:05:12 2015 +0100
+# Node ID 034bcac0b61c34343fcc16017badc6d81583e3c3
+# Parent  32d9c8b904bcf114a6620ccd84cdd7b473d57110
+use of C++ API for running a file (bug #42307)
+
+* octave-cmd.cc: New file providing the new command class octave_cmd;
+  (prepare_command_editor): common action that all derived command classes
+  use for method execute;
+  (octave_cmd_exec::execute): execute method of derived class for executing
+  ordinary commands in the terminal;
+  (octave_cmd_eval::execute): execute method of derived class for running a
+  file (as function if it is a valid identifier or as script)
+
+* octave-cmd.h: providing base and derived classes
+
+* main-window.cc (main_window): _cmd_queue is not a pointer anymore;
+  (~main_window): _cmd_queue is not a pointer anymore;
+  (execute_command_in_terminal): use new command class for queuing a command;
+  (run_file_in_terminal): check for valid identifier moved from here to
+  the execute method of the related command class;
+  (run_file_callback): use new class for queuing command, path check moved
+  from here into the execute method of the command class;
+  (queue_command): gets new command class instead of a string as input;
+  (closeEvent): queue command class instead of string;
+  (execute_command_callback): command queue contains command class instances;
+
+* main-window.h: use new octave-cmd class for queue_command,
+  the command queue is not a pointer anymore
+
+* module.mk: new files octave-cmd.cc and octave-cmd.h
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -86,17 +86,17 @@ main_window::main_window (QWidget *p)
+     editor_window (create_default_editor (this)),
+     workspace_window (new workspace_view (this)),
+     _settings_dlg (0),
+     find_files_dlg (0),
+     release_notes_window (0),
+     community_news_window (0),
+     _octave_qt_link (0),
+     _clipboard (QApplication::clipboard ()),
+-    _cmd_queue (new QStringList ()),  // no command pending
++    _cmd_queue (QList<octave_cmd *> ()),  // no command pending
+     _cmd_processing (1),
+     _cmd_queue_mutex (),
+     _dbg_queue (new QStringList ()),  // no debug pending
+     _dbg_processing (1),
+     _dbg_queue_mutex (),
+     _prevent_readline_conflicts (true)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+@@ -157,17 +157,16 @@ main_window::~main_window (void)
+       _settings_dlg = 0;
+     }
+   if (community_news_window)
+     {
+       delete community_news_window;
+       community_news_window = 0;
+     }
+   delete _octave_qt_link;
+-  delete _cmd_queue;
+ }
+ 
+ // catch focus changes and determine the active dock widget
+ void
+ main_window::focus_changed (QWidget *, QWidget *new_widget)
+ {
+   octave_dock_widget* dock = 0;
+   QWidget *w_new = new_widget;  // get a copy of new focus widget
+@@ -310,68 +309,42 @@ main_window::focus_console_after_command
+ {
+   QSettings *settings = resource_manager::get_settings ();
+   return settings->value ("terminal/focus_after_command",false).toBool ();
+ }
+ 
+ void
+ main_window::execute_command_in_terminal (const QString& command)
+ {
+-  queue_command (command);
++  octave_cmd_exec *cmd = new octave_cmd_exec (command);
++  queue_command (cmd);
+   if (focus_console_after_command ())
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::run_file_in_terminal (const QFileInfo& info)
+ {
+-  QString file_name = info.canonicalFilePath ();
+-  QString command = "run \"" + file_name + "\"";
+-
+-  QString function_name = info.fileName ();
+-  function_name.chop (info.suffix ().length () + 1);
+-
+-  if (! valid_identifier (function_name.toStdString ()))
+-    {
+-      int ans = QMessageBox::question (0, tr ("Octave"),
+-         tr ("The file %1\n"
+-             "can not be executed because its name\n"
+-             "is not a valid identifier.\n\n"
+-             "Do you want to execute\n%2\n"
+-             "instead?").
+-          arg (file_name).arg (command),
+-          QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes);
+-
+-      if (ans == QMessageBox::Yes)
+-        execute_command_in_terminal (command);
+-
+-      return;
+-    }
+-
+   octave_link::post_event (this, &main_window::run_file_callback, info);
+   if (focus_console_after_command ())
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::run_file_callback (const QFileInfo& info)
+ {
+-  QString dir = info.absolutePath ();
+-  QString function_name = info.fileName ();
+-  function_name.chop (info.suffix ().length () + 1);
+-  if (octave_qt_link::file_in_path (info.absoluteFilePath ().toStdString (),
+-                                    dir.toStdString ()))
+-    queue_command (function_name);
++  octave_cmd_eval *cmd = new octave_cmd_eval (info);
++  queue_command (cmd);
+ }
+ 
+ void
+-main_window::queue_command (QString command)
++main_window::queue_command (octave_cmd* cmd)
+ {
+   _cmd_queue_mutex.lock ();
+-  _cmd_queue->append (command);   // queue command
++  _cmd_queue.append (cmd);     // queue command and type
+   _cmd_queue_mutex.unlock ();
+ 
+   if (_cmd_processing.tryAcquire ())  // if callback not processing, post event
+     octave_link::post_event (this, &main_window::execute_command_callback);
+ }
+ 
+ void
+ main_window::handle_new_figure_request (void)
+@@ -1007,17 +980,18 @@ main_window::show_about_octave (void)
+   QMessageBox::about (this, tr ("About Octave"),
+                       QString::fromStdString (message));
+ }
+ 
+ void
+ main_window::closeEvent (QCloseEvent *e)
+ {
+   e->ignore ();
+-  queue_command ("exit");
++  octave_cmd_exec *cmd = new octave_cmd_exec ("exit");
++  queue_command (cmd);
+ }
+ 
+ void
+ main_window::read_settings (void)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   if (!settings)
+@@ -2062,36 +2036,31 @@ main_window::clear_history_callback (voi
+   Fhistory (ovl ("-c"));
+ }
+ 
+ void
+ main_window::execute_command_callback ()
+ {
+   bool repost = false;          // flag for reposting event for this callback
+ 
+-  if (!_cmd_queue->isEmpty ())  // list can not be empty here, just to make sure
++  if (! _cmd_queue.isEmpty ())  // list can not be empty here, just to make sure
+     {
+-      std::string pending_input = command_editor::get_current_line ();
+-      command_editor::set_initial_input (pending_input);
+-
+       _cmd_queue_mutex.lock (); // critical path
+-      std::string command = _cmd_queue->takeFirst ().toStdString ();
+-      if (_cmd_queue->isEmpty ())
+-        _cmd_processing.release ();  // cmd queue empty, processing will stop
++
++      octave_cmd *cmd = _cmd_queue.takeFirst ();
++
++      if (_cmd_queue.isEmpty ())
++          _cmd_processing.release ();  // cmd queue empty, processing will stop
+       else
+         repost = true;          // not empty, repost at end
+       _cmd_queue_mutex.unlock ();
+ 
+-      command_editor::replace_line (command);
+-
+-      command_editor::redisplay ();
+-      // We are executing inside the command editor event loop.  Force
+-      // the current line to be returned for processing.
+-      Fdb_next_breakpoint_quiet (ovl (_suppress_dbg_location));
+-      command_editor::accept_line ();
++      cmd->execute ();
++
++      delete cmd;
+     }
+ 
+   if (repost)  // queue not empty, so repost event for further processing
+     octave_link::post_event (this, &main_window::execute_command_callback);
+ 
+ }
+ 
+ void
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -52,16 +52,17 @@ along with Octave; see the file COPYING.
+ #include "workspace-view.h"
+ #include "history-dock-widget.h"
+ #include "files-dock-widget.h"
+ #include "terminal-dock-widget.h"
+ #include "documentation-dock-widget.h"
+ #include "octave-qt-link.h"
+ #include "octave-dock-widget.h"
+ #include "find-files-dialog.h"
++#include "octave-cmd.h"
+ 
+ class settings_dialog;
+ 
+ /**
+  * @class MainWindow
+  *
+  * Represents the main window.
+  */
+@@ -271,17 +272,17 @@ private:
+   void execute_command_callback ();
+   void run_file_callback (const QFileInfo& info);
+   bool focus_console_after_command ();
+ 
+   void new_figure_callback (void);
+ 
+   void change_directory_callback (const std::string& directory);
+ 
+-  void queue_command (QString command);
++  void queue_command (octave_cmd *cmd);
+ 
+   void queue_debug (QString command);
+ 
+   void execute_debug_callback ();
+ 
+   void configure_shortcuts ();
+ 
+   workspace_model *_workspace_model;
+@@ -391,18 +392,22 @@ private:
+ 
+   octave_qt_link *_octave_qt_link;
+ 
+   QClipboard *_clipboard;
+ 
+   // Flag for closing whole application.
+   bool _closing;
+ 
+-  // semaphore to synchronize execution signals and related callback
+-  QStringList *_cmd_queue;
++  // command queue and semaphore to synchronize execution signals
++  // and related callback
++
++  // the queue for the command structures
++  QList<octave_cmd *> _cmd_queue;
++  // semaphores used for handling the queue
+   QSemaphore   _cmd_processing;
+   QMutex       _cmd_queue_mutex;
+ 
+   // semaphore to synchronize debug signals and related callbacks
+   QStringList *_dbg_queue;
+   QSemaphore   _dbg_processing;
+   QMutex       _dbg_queue_mutex;
+ 
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -125,16 +125,17 @@ noinst_HEADERS += \
+   src/m-editor/file-editor-interface.h \
+   src/m-editor/file-editor-tab.h \
+   src/m-editor/file-editor.h \
+   src/m-editor/find-dialog.h \
+   src/m-editor/octave-qscintilla.h \
+   src/m-editor/octave-txt-lexer.h \
+   src/main-window.h \
+   src/octave-gui.h \
++  src/octave-cmd.h \
+   src/octave-interpreter.h \
+   src/octave-qt-link.h \
+   src/qtinfo/parser.h \
+   src/qtinfo/webinfo.h \
+   src/resource-manager.h \
+   src/settings-dialog.h \
+   src/shortcut-manager.h \
+   src/thread-manager.h \
+@@ -152,16 +153,17 @@ src_libgui_src_la_SOURCES = \
+   src/files-dock-widget.cc \
+   src/history-dock-widget.cc \
+   src/m-editor/file-editor-tab.cc \
+   src/m-editor/file-editor.cc \
+   src/m-editor/find-dialog.cc \
+   src/m-editor/octave-qscintilla.cc \
+   src/m-editor/octave-txt-lexer.cc \
+   src/main-window.cc \
++  src/octave-cmd.cc \
+   src/octave-dock-widget.cc \
+   src/octave-gui.cc \
+   src/octave-interpreter.cc \
+   src/octave-qt-link.cc \
+   src/qtinfo/parser.cc \
+   src/qtinfo/webinfo.cc \
+   src/resource-manager.cc \
+   src/settings-dialog.cc \
+diff --git a/libgui/src/octave-cmd.cc b/libgui/src/octave-cmd.cc
+new file mode 100644
+--- /dev/null
++++ b/libgui/src/octave-cmd.cc
+@@ -0,0 +1,85 @@
++/*
++
++Copyright (C) 2014 Torsten
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++// Author: Torsten <ttl@justmail.de>
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "octave-cmd.h"
++
++#include "octave-qt-link.h"
++#include "cmd-edit.h"
++#include "builtin-defun-decls.h"
++#include "utils.h"
++
++
++void
++octave_cmd::prepare_command_editor (const QString& cmd)
++{
++  std::string pending_input = command_editor::get_current_line ();
++
++  command_editor::set_initial_input (pending_input);
++  command_editor::replace_line (cmd.toStdString ());
++  command_editor::redisplay ();
++  // We are executing inside the command editor event loop.  Force
++  // the current line to be returned for processing.
++}
++
++
++// ---------------------------------------------------------------------
++//  class octave_cmd_exec: executing a command
++
++void
++octave_cmd_exec::execute ()
++{
++  prepare_command_editor (_cmd);
++  command_editor::accept_line ();
++}
++
++
++// ---------------------------------------------------------------------
++//  class octave_cmd_eval: running a file
++
++void
++octave_cmd_eval::execute ()
++{
++  QString function_name = _info.fileName ();
++  function_name.chop (_info.suffix ().length () + 1);
++  std::string file_path = _info.absoluteFilePath ().toStdString ();
++
++  prepare_command_editor ("");
++
++  if (valid_identifier (function_name.toStdString ()))
++    { // valid identifier: call as function with possibility to debug
++      std::string path = _info.absolutePath ().toStdString ();
++      if (octave_qt_link::file_in_path (file_path, path))
++          Feval (ovl (function_name.toStdString ()));
++    }
++  else
++    { // no valid identifier: use Fsource (), no debug possible
++      Fsource (ovl (file_path));
++    }
++
++  command_editor::accept_line ();
++}
+diff --git a/libgui/src/octave-cmd.h b/libgui/src/octave-cmd.h
+new file mode 100644
+--- /dev/null
++++ b/libgui/src/octave-cmd.h
+@@ -0,0 +1,73 @@
++/*
++
++Copyright (C) 2014 Torsten
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++// Author: Torsten <ttl@justmail.de>
++
++#if !defined (octave_cmd_h)
++#define octave_cmd_h 1
++
++#include <QString>
++#include <QFileInfo>
++
++class octave_cmd
++{
++public:
++
++  octave_cmd () { };
++  virtual ~octave_cmd () { };
++
++  virtual void execute () { };
++  void prepare_command_editor (const QString& cmd);
++};
++
++
++// ---------------------------------------------------------------------
++//  class octave_cmd_exec
++
++class octave_cmd_exec : public octave_cmd
++{
++public:
++
++  octave_cmd_exec (const QString& cmd) : octave_cmd () { _cmd = cmd; };
++  void execute ();
++
++private:
++
++  QString _cmd;
++};
++
++
++// ---------------------------------------------------------------------
++//  class octave_cmd_eval
++
++class octave_cmd_eval : public octave_cmd
++{
++public:
++
++  octave_cmd_eval (const QFileInfo& info) : octave_cmd () { _info = info; };
++  void execute ();
++
++private:
++
++  QFileInfo _info;
++};
++#endif

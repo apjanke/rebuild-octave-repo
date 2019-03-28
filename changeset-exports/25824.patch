@@ -1,0 +1,949 @@
+# HG changeset patch
+# User Olaf Till <i7tiol@t-online.de>
+# Date 1534626341 -7200
+#      Sat Aug 18 23:05:41 2018 +0200
+# Node ID 91e1ca0e3a9d45b4d2e229e1af20e996b1269b16
+# Parent  6784059127f5c44767d2b894fa852c64fa479fbc
+Save all scopes of nested anonymous functions (bug #45969).
+
+* libinterp/parse-tree/pt-anon-scopes.[h,cc]: New files with new class
+tree_anon_scopes derived from class tree_walker.  Collects variables in
+all scopes of nested anonymous function definitions.
+
+* libinterp/octave-value/ov-fcn-handle.cc
+(octave_fcn_handle::save_ascii, ::save_binary, ::save_hdf5): Use
+tree_anon_scopes object to save variables of anonymous functions.
+
+* test/bug-45969/bug-45969.tst, test/bug-45969/module.mk:
+New testfiles.
+
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -49,16 +49,17 @@ along with Octave; see the file COPYING.
+ #include "oct-hdf5.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ #include "parse.h"
+ #include "pr-output.h"
+ #include "pt-arg-list.h"
++#include "pt-anon-scopes.h"
+ #include "pt-assign.h"
+ #include "pt-cmd.h"
+ #include "pt-eval.h"
+ #include "pt-exp.h"
+ #include "pt-idx.h"
+ #include "pt-misc.h"
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
+@@ -339,45 +340,45 @@ octave_fcn_handle::set_fcn (const std::s
+   return true;
+ }
+ 
+ bool
+ octave_fcn_handle::save_ascii (std::ostream& os)
+ {
+   if (nm == anonymous)
+     {
++      if (fcn.is_undefined ())
++        return false;
++
++      octave_user_function *f = fcn.user_function_value ();
++      octave::symbol_scope f_scope = f->scope ();
++
++      if (! f_scope)
++        error ("internal error, invalid scope");
++
++      octave::tree_anon_scopes tas (f);
++
+       os << nm << "\n";
+ 
+       print_raw (os, true);
+       os << "\n";
+ 
+-      if (fcn.is_undefined ())
+-        return false;
+-
+-      std::list<octave::symbol_record> vars;
+-
+-      octave_user_function *f = fcn.user_function_value ();
+-      octave::symbol_record::context_id context = 0;
+-      octave::symbol_scope f_scope = f->scope ();
+-      if (f_scope)
+-        {
+-          vars = f_scope.all_variables ();
+-          context = f_scope.current_context ();
+-        }
+-
+-      size_t varlen = vars.size ();
++      size_t varlen = tas.symrec_map_size ();
+ 
+       if (varlen > 0)
+         {
++          octave::symbol_record::context_id context
++            = f_scope.current_context ();
++
+           os << "# length: " << varlen << "\n";
+ 
+-          for (const auto& symrec : vars)
++          for (const auto& name_symrec : tas)
+             {
+-              if (! save_text_data (os, symrec.varval (context),
+-                                    symrec.name (), false, 0))
++              if (! save_text_data (os, name_symrec.second.varval (context),
++                                    name_symrec.first, false, 0))
+                 return ! os.fail ();
+             }
+         }
+     }
+   else
+     {
+       octave_function *f = function_value ();
+       std::string fnm = (f ? f->fcn_file_name () : "");
+@@ -528,28 +529,25 @@ octave_fcn_handle::save_binary (std::ost
+ {
+   if (nm == anonymous)
+     {
+       std::ostringstream nmbuf;
+ 
+       if (fcn.is_undefined ())
+         return false;
+ 
+-      std::list<octave::symbol_record> vars;
+-
+       octave_user_function *f = fcn.user_function_value ();
+       octave::symbol_scope f_scope = f->scope ();
+-      octave::symbol_record::context_id context = 0;
+-      if (f_scope)
+-        {
+-          vars = f_scope.all_variables ();
+-          context = f_scope.current_context ();
+-        }
++
++      if (! f_scope)
++        error ("internal error, invalid scope");
+ 
+-      size_t varlen = vars.size ();
++      octave::tree_anon_scopes tas (f);
++
++      size_t varlen = tas.symrec_map_size ();
+ 
+       if (varlen > 0)
+         nmbuf << nm << ' ' << varlen;
+       else
+         nmbuf << nm;
+ 
+       std::string buf_str = nmbuf.str ();
+       int32_t tmp = buf_str.length ();
+@@ -560,20 +558,23 @@ octave_fcn_handle::save_binary (std::ost
+       print_raw (buf, true);
+       std::string stmp = buf.str ();
+       tmp = stmp.length ();
+       os.write (reinterpret_cast<char *> (&tmp), 4);
+       os.write (stmp.c_str (), stmp.length ());
+ 
+       if (varlen > 0)
+         {
+-          for (const auto& symrec : vars)
++          octave::symbol_record::context_id context
++            = f_scope.current_context ();
++
++          for (const auto& name_symrec : tas)
+             {
+-              if (! save_binary_data (os, symrec.varval (context),
+-                                      symrec.name (), "", 0, save_as_floats))
++              if (! save_binary_data (os, name_symrec.second.varval (context),
++                                      name_symrec.first, "", 0, save_as_floats))
+                 return ! os.fail ();
+             }
+         }
+     }
+   else
+     {
+       std::ostringstream nmbuf;
+ 
+@@ -788,28 +789,25 @@ octave_fcn_handle::save_hdf5 (octave_hdf
+           H5Sclose (space_hid);
+           H5Tclose (type_hid);
+           H5Gclose (group_hid);
+           return false;
+         }
+ 
+       H5Dclose (data_hid);
+ 
+-      std::list<octave::symbol_record> vars;
+-
+       octave_user_function *f = fcn.user_function_value ();
+       octave::symbol_scope f_scope = f->scope ();
+-      octave::symbol_record::context_id context = 0;
+-      if (f_scope)
+-        {
+-          vars = f_scope.all_variables ();
+-          context = f_scope.current_context ();
+-        }
++
++      if (! f_scope)
++        error ("internal error, invalid scope");
+ 
+-      size_t varlen = vars.size ();
++      octave::tree_anon_scopes tas (f);
++
++      size_t varlen = tas.symrec_map_size ();
+ 
+       if (varlen > 0)
+         {
+           hid_t as_id = H5Screate (H5S_SCALAR);
+ 
+           if (as_id >= 0)
+             {
+ #if defined (HAVE_HDF5_18)
+@@ -844,20 +842,25 @@ octave_fcn_handle::save_hdf5 (octave_hdf
+           if (data_hid < 0)
+             {
+               H5Sclose (space_hid);
+               H5Tclose (type_hid);
+               H5Gclose (group_hid);
+               return false;
+             }
+ 
+-          for (const auto& symrec : vars)
++          octave::symbol_record::context_id context
++            = f_scope.current_context ();
++
++          for (const auto& name_symrec : tas)
+             {
+-              if (! add_hdf5_data (data_hid, symrec.varval (context),
+-                                   symrec.name (), "", false, save_as_floats))
++              if (! add_hdf5_data (data_hid,
++                                   name_symrec.second.varval (context),
++                                   name_symrec.first, "", false,
++                                   save_as_floats))
+                 break;
+             }
+           H5Gclose (data_hid);
+         }
+     }
+   else
+     {
+       std::string octaveroot = octave::config::octave_exec_home ();
+diff --git a/libinterp/parse-tree/module.mk b/libinterp/parse-tree/module.mk
+--- a/libinterp/parse-tree/module.mk
++++ b/libinterp/parse-tree/module.mk
+@@ -4,16 +4,17 @@ PARSE_TREE_INC = \
+   %reldir%/jit-ir.h \
+   %reldir%/jit-typeinfo.h \
+   %reldir%/jit-util.h \
+   %reldir%/lex.h \
+   %reldir%/oct-lvalue.h \
+   %reldir%/parse.h \
+   %reldir%/profiler.h \
+   %reldir%/pt-all.h \
++  %reldir%/pt-anon-scopes.h \
+   %reldir%/pt-arg-list.h \
+   %reldir%/pt-array-list.h \
+   %reldir%/pt-assign.h \
+   %reldir%/pt-binop.h \
+   %reldir%/pt-bp.h \
+   %reldir%/pt-cbinop.h \
+   %reldir%/pt-cell.h \
+   %reldir%/pt-check.h \
+@@ -54,16 +55,17 @@ PARSE_TREE_SRC = \
+   %reldir%/jit-typeinfo.cc \
+   %reldir%/jit-util.cc \
+   %reldir%/lex.ll \
+   %reldir%/oct-gperf.h \
+   %reldir%/oct-lvalue.cc \
+   %reldir%/oct-parse.h \
+   %reldir%/oct-parse.yy \
+   %reldir%/profiler.cc \
++  %reldir%/pt-anon-scopes.cc \
+   %reldir%/pt-arg-list.cc \
+   %reldir%/pt-array-list.cc \
+   %reldir%/pt-assign.cc \
+   %reldir%/pt-binop.cc \
+   %reldir%/pt-bp.cc \
+   %reldir%/pt-cbinop.cc \
+   %reldir%/pt-cell.cc \
+   %reldir%/pt-check.cc \
+diff --git a/libinterp/parse-tree/pt-anon-scopes.cc b/libinterp/parse-tree/pt-anon-scopes.cc
+new file mode 100644
+--- /dev/null
++++ b/libinterp/parse-tree/pt-anon-scopes.cc
+@@ -0,0 +1,433 @@
++/*
++
++Copyright (C) 1996-2018 John W. Eaton
++Copyright (C) 2015-2018 Olaf Till
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "error.h"
++#include "pt-all.h"
++#include "pt-anon-scopes.h"
++
++// TODO: make sure that if(f->scope()) is checked if necessary
++
++namespace octave
++{
++  tree_anon_scopes::tree_anon_scopes (octave_user_function *f)
++    : scopes (), merged_tables ()
++  {
++    if (f)
++      {
++        if (! f->is_anonymous_function ())
++          panic_impossible ();
++
++        // Collect the scope of the outer anonymous function.
++
++        stash_scope_if_valid (f->scope ());
++
++        // Further walk the tree to find nested definitions of further
++        // anonymous functions.
++
++        tree_statement_list *cmd_list = f->body ();
++
++        if (cmd_list)
++          cmd_list->accept (*this);
++
++        // Collect symbol records of all collected scopes.
++
++        merge_tables ();
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_anon_fcn_handle (tree_anon_fcn_handle& afh)
++  {
++    // Collect the scope of this anonymous function.
++
++    stash_scope_if_valid (afh.scope ());
++
++    // Further walk the tree to find nested definitions of further
++    // anonymous functions.
++
++    tree_expression *e = afh.expression ();
++
++    if (e)
++      e->accept (*this);
++  }
++
++  // The rest of visit_... methods is only for walking the tree. Many of
++  // them, in particular all methods for commands, are not applicable to
++  // anonymous functions. Only parts of the tree are walked which could
++  // contain further (nested) anonymous function definitions (so
++  // e.g. identifiers and left hand sides of assignments are ignored).
++
++  void
++  tree_anon_scopes::visit_argument_list (tree_argument_list& lst)
++  {
++    tree_argument_list::iterator p = lst.begin ();
++
++    while (p != lst.end ())
++      {
++        tree_expression *elt = *p++;
++
++        if (elt)
++          {
++            elt->accept (*this);
++          }
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_binary_expression (tree_binary_expression& expr)
++  {
++    tree_expression *op1 = expr.lhs ();
++
++    if (op1)
++      op1->accept (*this);
++
++    tree_expression *op2 = expr.rhs ();
++
++    if (op2)
++      op2->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_break_command (tree_break_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_colon_expression (tree_colon_expression& expr)
++  {
++    tree_expression *op1 = expr.base ();
++
++    if (op1)
++      op1->accept (*this);
++
++    tree_expression *op3 = expr.increment ();
++
++    if (op3)
++      op3->accept (*this);
++
++    tree_expression *op2 = expr.limit ();
++
++    if (op2)
++      op2->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_continue_command (tree_continue_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_decl_command (tree_decl_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_decl_elt (tree_decl_elt&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_decl_init_list (tree_decl_init_list&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_simple_for_command (tree_simple_for_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_complex_for_command (tree_complex_for_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_octave_user_script (octave_user_script&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_octave_user_function (octave_user_function&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_function_def (tree_function_def&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_identifier (tree_identifier& /* id */)
++  {
++  }
++
++  void
++  tree_anon_scopes::visit_if_clause (tree_if_clause&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_if_command (tree_if_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_if_command_list (tree_if_command_list&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_switch_case (tree_switch_case&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_switch_case_list (tree_switch_case_list&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_switch_command (tree_switch_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_index_expression (tree_index_expression& expr)
++  {
++    tree_expression *e = expr.expression ();
++
++    if (e)
++      e->accept (*this);
++
++    std::list<tree_argument_list *> lst = expr.arg_lists ();
++
++    std::list<tree_argument_list *>::iterator p = lst.begin ();
++
++    while (p != lst.end ())
++      {
++        tree_argument_list *elt = *p++;
++
++        if (elt)
++          elt->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_matrix (tree_matrix& lst)
++  {
++    tree_matrix::iterator p = lst.begin ();
++
++    while (p != lst.end ())
++      {
++        tree_argument_list *elt = *p++;
++
++        if (elt)
++          elt->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_cell (tree_cell& lst)
++  {
++    tree_matrix::iterator p = lst.begin ();
++
++    while (p != lst.end ())
++      {
++        tree_argument_list *elt = *p++;
++
++        if (elt)
++          elt->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_multi_assignment (tree_multi_assignment& expr)
++  {
++    tree_expression *rhs = expr.right_hand_side ();
++
++    if (rhs)
++      rhs->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_no_op_command (tree_no_op_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_constant (tree_constant& /* val */)
++  {
++  }
++
++  void
++  tree_anon_scopes::visit_fcn_handle (tree_fcn_handle& /* fh */)
++  {
++  }
++
++  void
++  tree_anon_scopes::visit_funcall (tree_funcall& /* fc */)
++  {
++  }
++
++  void
++  tree_anon_scopes::visit_parameter_list (tree_parameter_list&)
++  {
++    // In visit_anon_fcn_handle we only accept/visit the body of
++    // anonymous function definitions, not the parameter list.
++
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_postfix_expression (tree_postfix_expression& expr)
++  {
++    tree_expression *e = expr.operand ();
++
++    if (e)
++      e->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_prefix_expression (tree_prefix_expression& expr)
++  {
++    tree_expression *e = expr.operand ();
++
++    if (e)
++      e->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_return_command (tree_return_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_return_list (tree_return_list& lst)
++  {
++    tree_return_list::iterator p = lst.begin ();
++
++    while (p != lst.end ())
++      {
++        tree_index_expression *elt = *p++;
++
++        if (elt)
++          elt->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_simple_assignment (tree_simple_assignment& expr)
++  {
++    tree_expression *rhs = expr.right_hand_side ();
++
++    if (rhs)
++      rhs->accept (*this);
++  }
++
++  void
++  tree_anon_scopes::visit_statement (tree_statement& stmt)
++  {
++    tree_command *cmd = stmt.command ();
++
++    if (cmd)
++      panic_impossible ();
++    else
++      {
++        tree_expression *expr = stmt.expression ();
++
++        if (expr)
++          expr->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_statement_list (tree_statement_list& lst)
++  {
++    for (auto& p : lst)
++      {
++        tree_statement *elt = p;
++
++        if (elt)
++          elt->accept (*this);
++      }
++  }
++
++  void
++  tree_anon_scopes::visit_try_catch_command (tree_try_catch_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_unwind_protect_command (tree_unwind_protect_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_while_command (tree_while_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::visit_do_until_command (tree_do_until_command&)
++  {
++    panic_impossible ();
++  }
++
++  void
++  tree_anon_scopes::merge_tables (void)
++  {
++    for (const auto& sc : scopes)
++      {
++        symrec_list vars = sc.all_variables ();
++
++        for (const auto& symrec : vars)
++          merged_tables[symrec.name ()] = symrec;
++      }
++  }
++}
++
+diff --git a/libinterp/parse-tree/pt-anon-scopes.h b/libinterp/parse-tree/pt-anon-scopes.h
+new file mode 100644
+--- /dev/null
++++ b/libinterp/parse-tree/pt-anon-scopes.h
+@@ -0,0 +1,187 @@
++/*
++
++Copyright (C) 1996-2018 John W. Eaton
++Copyright (C) 2015-2018 Olaf Till
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if !defined (octave_pt_anon_scopes_h)
++#define octave_pt_anon_scopes_h 1
++
++#include "pt-walk.h"
++#include "ov-usr-fcn.h"
++
++namespace octave
++{
++  // In possibly nested definitions of anonymous functions, collect
++  // their scopes and the symbol records therein.
++
++  class
++  tree_anon_scopes : public tree_walker
++  {
++  public:
++
++    tree_anon_scopes (void) : scopes (), merged_tables () { }
++
++    tree_anon_scopes (octave_user_function *);
++  
++    tree_anon_scopes& operator = (tree_anon_scopes&& tas)
++    {
++      scopes = std::move (tas.scopes);
++      merged_tables = std::move (tas.merged_tables);
++      return *this;
++    }
++
++    typedef std::map<std::string, symbol_record> symrec_map;
++
++    symrec_map::const_iterator begin (void)
++    {
++      return merged_tables.cbegin ();
++    }
++
++    symrec_map::const_iterator end (void)
++    {
++      return merged_tables.cend ();
++    }
++
++    unsigned int symrec_map_size (void)
++    {
++      return merged_tables.size ();
++    }
++
++    // No copying!
++
++    tree_anon_scopes (const tree_anon_scopes&) = delete;
++
++    tree_anon_scopes& operator = (const tree_anon_scopes&) = delete;
++
++    ~tree_anon_scopes (void) { }
++
++    // The following methods, though public, don't belong to the
++    // intended user interface of this class.
++
++    void visit_anon_fcn_handle (tree_anon_fcn_handle&);
++
++    void visit_argument_list (tree_argument_list&);
++
++    void visit_binary_expression (tree_binary_expression&);
++
++    void visit_break_command (tree_break_command&);
++
++    void visit_colon_expression (tree_colon_expression&);
++
++    void visit_continue_command(tree_continue_command&);
++
++    void visit_decl_command (tree_decl_command&);
++
++    void visit_decl_elt (tree_decl_elt&);
++
++    void visit_decl_init_list (tree_decl_init_list&);
++
++    void visit_simple_for_command (tree_simple_for_command&);
++
++    void visit_complex_for_command (tree_complex_for_command&);
++
++    void visit_octave_user_script (octave_user_script&);
++
++    void visit_octave_user_function (octave_user_function&);
++
++    void visit_function_def (tree_function_def&);
++
++    void visit_identifier (tree_identifier&);
++
++    void visit_if_clause (tree_if_clause&);
++
++    void visit_if_command (tree_if_command&);
++
++    void visit_if_command_list (tree_if_command_list&);
++
++    void visit_switch_case (tree_switch_case&);
++
++    void visit_switch_case_list (tree_switch_case_list&);
++
++    void visit_switch_command (tree_switch_command&);
++
++    void visit_index_expression (tree_index_expression&);
++
++    void visit_matrix (tree_matrix&);
++
++    void visit_cell (tree_cell&);
++
++    void visit_multi_assignment (tree_multi_assignment&);
++
++    void visit_no_op_command (tree_no_op_command&);
++
++    void visit_constant (tree_constant&);
++
++    void visit_fcn_handle (tree_fcn_handle&);
++
++    void visit_funcall (tree_funcall&);
++
++    void visit_parameter_list (tree_parameter_list&);
++
++    void visit_postfix_expression (tree_postfix_expression&);
++
++    void visit_prefix_expression (tree_prefix_expression&);
++
++    void visit_return_command (tree_return_command&);
++
++    void visit_return_list (tree_return_list&);
++
++    void visit_simple_assignment (tree_simple_assignment&);
++
++    void visit_statement (tree_statement&);
++
++    void visit_statement_list (tree_statement_list&);
++
++    void visit_try_catch_command (tree_try_catch_command&);
++
++    void visit_unwind_protect_command (tree_unwind_protect_command&);
++
++    void visit_while_command (tree_while_command&);
++
++    void visit_do_until_command (tree_do_until_command&);
++
++  private:
++
++    void stash_scope_if_valid (const symbol_scope& sc)
++    {
++      if (sc)
++        scopes.push_back (sc);
++      else
++        error ("internal error, invalid scope");
++    }
++
++    // The scope of this anonymous function and the collected scopes
++    // of all anonymous functions whose definitions are nested in the
++    // current anonymous function definition.
++
++    std::vector<symbol_scope> scopes;
++
++    // Symbol records of all collected scopes are merged over variable names.
++
++    typedef std::list<symbol_record> symrec_list;
++
++    void merge_tables (void);
++
++    symrec_map merged_tables;
++  };
++}
++
++#endif
+diff --git a/test/bug-45969/bug-45969.tst b/test/bug-45969/bug-45969.tst
+new file mode 100644
+--- /dev/null
++++ b/test/bug-45969/bug-45969.tst
+@@ -0,0 +1,36 @@
++%!test
++%! ascii_filename = tempname ();
++%! binary_filename = tempname ();
++%! a = 2;
++%! b = 10;
++%! c = 20;
++%! f1 = @ (f, x) f (x) + a;
++%! f2 = @ (y) f1 (@ (z) z^2 + b * y, y) + c;
++%! f2_arg = 5;
++%! unwind_protect
++%!   save (ascii_filename, "f2");
++%!   save ("-binary", binary_filename, "f2");
++%!   ascii = load (ascii_filename);
++%!   binary = load (binary_filename);
++%!   assert (f2 (f2_arg), ascii.f2 (f2_arg));
++%!   assert (f2 (f2_arg), binary.f2 (f2_arg));
++%! unwind_protect_cleanup
++%!   unlink (ascii_filename);
++%!   unlink (binary_filename);
++%! end_unwind_protect
++
++%!testif HAVE_HDF5
++%! hdf5_filename = tempname ();
++%! a = 2;
++%! b = 10;
++%! c = 20;
++%! f1 = @ (f, x) f (x) + a;
++%! f2 = @ (y) f1 (@ (z) z^2 + b * y, y) + c;
++%! f2_arg = 5;
++%! unwind_protect
++%!   save ("-hdf5", hdf5_filename, "f2");
++%!   hdf5 = load (hdf5_filename);
++%!   assert (f2 (f2_arg), hdf5.f2 (f2_arg));
++%! unwind_protect_cleanup
++%!   unlink (hdf5_filename);
++%! end_unwind_protect
+diff --git a/test/bug-45969/module.mk b/test/bug-45969/module.mk
+new file mode 100644
+--- /dev/null
++++ b/test/bug-45969/module.mk
+@@ -0,0 +1,4 @@
++bug_45969_TEST_FILES = \
++  test/bug-45969/bug-45969.tst
++
++TEST_FILES += $(bug_45969_TEST_FILES)

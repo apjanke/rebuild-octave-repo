@@ -1,0 +1,208 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1384889132 18000
+#      Tue Nov 19 14:25:32 2013 -0500
+# Node ID 1329866151be88b670f6759b8ba52a4d3e0dabab
+# Parent  1adf3710bb68b7bd88b58197ebb35686b40f42dc
+[Win32] Use spawn instead of exec for main octave wrapper executable.
+
+* src/main.in.cc (prepare_spawn): New function, copied from libtool.
+(octave_exec): Use it and call spawnv instead of execv (note: execv
+kills the current process, instead of replacing it).
+(main): Make sure argv[0] always points to the executable, required by
+libtool wrappers.
+
+diff --git a/src/main.in.cc b/src/main.in.cc
+--- a/src/main.in.cc
++++ b/src/main.in.cc
+@@ -361,24 +361,146 @@ get_octave_bindir (void)
+   // has been relocated to some installation directory other than the
+   // one originally configured.
+ 
+   std::string obd = octave_getenv ("OCTAVE_BINDIR");
+ 
+   return obd.empty () ? subst_octave_home (std::string (OCTAVE_BINDIR)) : obd;
+ }
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__) // Adapted from libtool wrapper.
++
++/* Prepares an argument vector before calling spawn().
++   Note that spawn() does not by itself call the command interpreter
++     (getenv ("COMSPEC") != NULL ? getenv ("COMSPEC") :
++      ({ OSVERSIONINFO v; v.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
++         GetVersionEx(&v);
++         v.dwPlatformId == VER_PLATFORM_WIN32_NT;
++      }) ? "cmd.exe" : "command.com").
++   Instead it simply concatenates the arguments, separated by ' ', and calls
++   CreateProcess().  We must quote the arguments since Win32 CreateProcess()
++   interprets characters like ' ', '\t', '\\', '"' (but not '<' and '>') in a
++   special way:
++   - Space and tab are interpreted as delimiters. They are not treated as
++     delimiters if they are surrounded by double quotes: "...".
++   - Unescaped double quotes are removed from the input. Their only effect is
++     that within double quotes, space and tab are treated like normal
++     characters.
++   - Backslashes not followed by double quotes are not special.
++   - But 2*n+1 backslashes followed by a double quote become
++     n backslashes followed by a double quote (n >= 0):
++       \" -> "
++       \\\" -> \"
++       \\\\\" -> \\"
++ */
++#define SHELL_SPECIAL_CHARS "\"\\ \001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037"
++#define SHELL_SPACE_CHARS " \001\002\003\004\005\006\007\010\011\012\013\014\015\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037"
++char **
++prepare_spawn (char **argv)
++{
++  size_t argc;
++  char **new_argv;
++  size_t i;
++
++  /* Count number of arguments.  */
++  for (argc = 0; argv[argc] != NULL; argc++)
++    ;
++
++  /* Allocate new argument vector.  */
++  new_argv = new char* [argc + 1];
++
++  /* Put quoted arguments into the new argument vector.  */
++  for (i = 0; i < argc; i++)
++    {
++      const char *string = argv[i];
++
++      if (string[0] == '\0')
++	new_argv[i] = strdup ("\"\"");
++      else if (strpbrk (string, SHELL_SPECIAL_CHARS) != NULL)
++	{
++	  int quote_around = (strpbrk (string, SHELL_SPACE_CHARS) != NULL);
++	  size_t length;
++	  unsigned int backslashes;
++	  const char *s;
++	  char *quoted_string;
++	  char *p;
++
++	  length = 0;
++	  backslashes = 0;
++	  if (quote_around)
++	    length++;
++	  for (s = string; *s != '\0'; s++)
++	    {
++	      char c = *s;
++	      if (c == '"')
++		length += backslashes + 1;
++	      length++;
++	      if (c == '\\')
++		backslashes++;
++	      else
++		backslashes = 0;
++	    }
++	  if (quote_around)
++	    length += backslashes + 1;
++
++	  quoted_string = new char [length + 1];
++
++	  p = quoted_string;
++	  backslashes = 0;
++	  if (quote_around)
++	    *p++ = '"';
++	  for (s = string; *s != '\0'; s++)
++	    {
++	      char c = *s;
++	      if (c == '"')
++		{
++		  unsigned int j;
++		  for (j = backslashes + 1; j > 0; j--)
++		    *p++ = '\\';
++		}
++	      *p++ = c;
++	      if (c == '\\')
++		backslashes++;
++	      else
++		backslashes = 0;
++	    }
++	  if (quote_around)
++	    {
++	      unsigned int j;
++	      for (j = backslashes; j > 0; j--)
++		*p++ = '\\';
++	      *p++ = '"';
++	    }
++	  *p = '\0';
++
++	  new_argv[i] = quoted_string;
++	}
++      else
++	new_argv[i] = (char *) string;
++    }
++  new_argv[argc] = NULL;
++
++  return new_argv;
++}
++
++#endif // __WIN32__ && ! __CYGWIN__
++
+ static int
+ octave_exec (const std::string& file, char **argv)
+ {
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  argv = prepare_spawn (argv);
++  return _spawnv (_P_WAIT, file.c_str (), argv);
++#else
+   execv (file.c_str (), argv);
+ 
+   std::cerr << "octave: failed to exec '" << file << "'" << std::endl;
+ 
+   return 1;
++#endif
+ }
+ 
+ static char *
+ strsave (const char *s)
+ {
+   if (! s)
+     return 0;
+ 
+@@ -406,18 +528,22 @@ main (int argc, char **argv)
+ #if defined (HAVE_OCTAVE_GUI)
+   file += "octave-gui";
+ #else
+   file += "octave-cli";
+ #endif
+ 
+   char **new_argv = new char * [argc + 1];
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  int k = 1;
++#else
+   int k = 0;
+   new_argv[k++] = strsave ("octave");
++#endif
+ 
+   for (int i = 1; i < argc; i++)
+     {
+       if (! strcmp (argv[i], "--no-gui-libs"))
+         {
+           // Run the version of Octave that is not linked with any GUI
+           // libraries.  It may not be possible to do plotting or any
+           // ui* calls, but it will be a little faster to start and
+@@ -511,16 +637,20 @@ main (int argc, char **argv)
+             }
+         }
+     }
+   else
+     retval = octave_exec (file, new_argv);
+ 
+ #else
+ 
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  file += ".exe";
++  new_argv[0] = strsave (file.c_str ());
++#endif
+   retval = octave_exec (file, new_argv);
+ 
+ #endif
+ 
+   return retval;
+ }
+ 
+ /*!

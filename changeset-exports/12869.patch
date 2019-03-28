@@ -1,0 +1,533 @@
+# HG changeset patch
+# User Daniel Kraft <d@domob.eu>
+# Date 1310674584 -7200
+#      Thu Jul 14 22:16:24 2011 +0200
+# Node ID de9a9719e594fc7da21dc2f7fe8dcdb6508e68ca
+# Parent  b00181c65533f00943c22fc1408f41feb2808d0d
+Extend data collection in profiler and add user-interface profile function.
+
+* scripts/general/module.mk: Add profile.m.
+* scripts/general/profile.m: New file.
+* src/profiler.h (stats): New utility class.
+(data): Field to replace old times, can now hold more info.
+* src/profiler.cc (stats): Implementation of routines.
+(profile_data_accumulator): Changes necessary because call_stack was
+changed to be a std::vector now and for the new statistics map.
+(profile_data_accumulator::get_data): Extended to produce much more
+sophisticated output.
+(profile_data_accumulator::enter_function): Collect some more data
+than the timing.
+
+diff --git a/scripts/general/module.mk b/scripts/general/module.mk
+--- a/scripts/general/module.mk
++++ b/scripts/general/module.mk
+@@ -56,16 +56,17 @@ general_FCN_FILES = \
+   general/nargchk.m \
+   general/nargoutchk.m \
+   general/nextpow2.m \
+   general/num2str.m \
+   general/pol2cart.m \
+   general/polyarea.m \
+   general/postpad.m \
+   general/prepad.m \
++  general/profile.m \
+   general/quadgk.m \
+   general/quadl.m \
+   general/quadv.m \
+   general/randi.m \
+   general/rat.m \
+   general/repmat.m \
+   general/rot90.m \
+   general/rotdim.m \
+diff --git a/scripts/general/profile.m b/scripts/general/profile.m
+new file mode 100644
+--- /dev/null
++++ b/scripts/general/profile.m
+@@ -0,0 +1,103 @@
++## Copyright (C) 2011 Daniel Kraft
++##
++## This file is part of Octave.
++##
++## Octave is free software; you can redistribute it and/or modify it
++## under the terms of the GNU General Public License as published by
++## the Free Software Foundation; either version 3 of the License, or (at
++## your option) any later version.
++##
++## Octave is distributed in the hope that it will be useful, but
++## WITHOUT ANY WARRANTY; without even the implied warranty of
++## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++## General Public License for more details.
++##
++## You should have received a copy of the GNU General Public License
++## along with Octave; see the file COPYING.  If not, see
++## <http://www.gnu.org/licenses/>.
++
++## -*- texinfo -*-
++## @deftypefn {Function File} {} profile on
++## @deftypefnx {Function File} {} profile off
++## @deftypefnx {Function File} {} profile resume
++## @deftypefnx {Function File} {} profile clear
++## @deftypefnx {Function File} {@var{S} =} profile ('status')
++## @deftypefnx {Function File} {@var{T} =} profile ('info')
++## Control the built-in profiler.
++##
++## @table @code
++## @item profile on
++## Start the profiler, clearing all previously collected data if there
++## is any.
++##
++## @item profile off
++## Stop profiling.  The collected data can later be retrieved and examined
++## with calls like @code{S = profile ('info')}.
++##
++## @item profile clear
++## Clear all collected profiler data.
++##
++## @item profile resume
++## Restart profiling without cleaning up the old data and instead
++## all newly collected statistics are added to the already existing ones.
++##
++## @item @var{S} = profile ('status')
++## Return a structure filled with certain information about the current status
++## of the profiler.  At the moment, the only field is @code{ProfilerStatus}
++## which is either 'on' or 'off'.
++##
++## @item @var{T} = profile ('info')
++## Return the collected profiling statistics in the structure @var{T}.
++## Currently, the only field is @code{FunctionTable} which is an array
++## of structures, each entry corresponding to a function which was called
++## and for which profiling statistics are present.
++## @end table
++## @end deftypefn
++
++## Built-in profiler.
++## Author: Daniel Kraft <d@domob.eu>
++
++function retval = profile (option)
++
++  switch (option)
++    case 'on'
++      __profiler_reset ();
++      __profiler_enable (true);
++
++    case 'off'
++      __profiler_enable (false);
++
++    case 'clear'
++      __profiler_reset ();
++
++    case 'resume'
++      __profiler_enable (true);
++
++    case 'status'
++      enabled = __profiler_enable ();
++      if (enabled)
++        enabled = 'on';
++      else
++        enabled = 'off';
++      endif
++      retval = struct ('ProfilerStatus', enabled);
++
++    case 'info'
++      data = __profiler_data ();
++      retval = struct ('FunctionTable', data);
++
++    otherwise
++      print_usage ();
++  endswitch
++
++endfunction
++
++%!demo
++%! profile ('on');
++%! A = rand (100);
++%! B = expm (A);
++%! profile ('off');
++%! profile ('resume');
++%! C = sqrtm (A);
++%! profile ('off');
++%! T = profile ('info')
+diff --git a/src/profiler.cc b/src/profiler.cc
+--- a/src/profiler.cc
++++ b/src/profiler.cc
+@@ -21,17 +21,16 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <iostream>
+ 
+-#include "Cell.h"
+ #include "defun.h"
+ #include "oct-time.h"
+ #include "ov-fcn.h"
+ #include "ov-struct.h"
+ #include "pager.h"
+ #include "profiler.h"
+ 
+ profile_data_accumulator::enter::enter (profile_data_accumulator& a,
+@@ -48,99 +47,176 @@ profile_data_accumulator::enter::enter (
+ }
+ 
+ profile_data_accumulator::enter::~enter ()
+ {
+   if (fcn)
+     acc.exit_function (*fcn);
+ }
+ 
++profile_data_accumulator::stats::stats ()
++  : time (0.0), calls (0), recursive (false),
++    parents (), children ()
++{}
++
++// With the help of a mapping name -> index, convert a function_set list
++// to an Octave array of indices.
++octave_value
++profile_data_accumulator::stats::function_set_value (const function_set& list,
++                                                     const fcn_index_map& idx)
++{
++  const octave_idx_type n = list.size ();
++
++  RowVector retval (n);
++  octave_idx_type i = 0;
++  for (function_set::const_iterator p = list.begin (); p != list.end (); ++p)
++    {
++      fcn_index_map::const_iterator q = idx.find (*p);
++      assert (q != idx.end ());
++      retval (i) = q->second;
++      ++i;
++    }
++  assert (i == n);
++
++  return retval;
++}
++
+ profile_data_accumulator::profile_data_accumulator ()
+-  : enabled (false), call_stack (), times (), last_time (-1.0)
++  : enabled (false), call_stack (), data (), last_time (-1.0)
+ {}
+ 
+ void
+ profile_data_accumulator::set_active (bool value)
+ {
+   // If we enable, clear the call-stack.  This ensures we freshly start
+   // with collecting times now.
+   if (value)
+     {
+       while (!call_stack.empty ())
+-        call_stack.pop ();
++        call_stack.pop_back ();
+     }
+ 
+   enabled = value;
+ }
+ 
+ void
+ profile_data_accumulator::enter_function (const octave_function& fcn)
+ {
+   // The enter class will check and only call us if the profiler is active.
+   assert (is_active ());
+ 
+   // If there is already an active function, add to its time before
+   // pushing the new one.
+   if (!call_stack.empty ())
+     add_current_time ();
+ 
+-  call_stack.push (&fcn);
++  // Update non-timing related data for the function entered.
++  const std::string name = fcn.profiler_name ();
++  stats& entry = data[name];
++  ++entry.calls;
++  if (!call_stack.empty ())
++    {
++      const std::string parent_name = call_stack.back ()->profiler_name ();
++      entry.parents.insert (parent_name);
++      data[parent_name].children.insert (name);
++    }
++  if (!entry.recursive)
++    for (call_stack_type::iterator i = call_stack.begin ();
++         i != call_stack.end (); ++i)
++      if (*i == &fcn)
++        {
++          entry.recursive = true;
++          break;
++        }
++
++  call_stack.push_back (&fcn);
+   last_time = query_time ();
+ }
+ 
+ void
+ profile_data_accumulator::exit_function (const octave_function& fcn)
+ {
+   assert (!call_stack.empty ());
+-  assert (&fcn == call_stack.top ());
++  assert (&fcn == call_stack.back ());
+ 
+   // Usually, if we are disabled this function is not even called.  But the
+   // call disabling the profiler is an exception.  So also check here
+   // and only record the time if enabled.
+   if (is_active ())
+     add_current_time ();
+ 
+-  call_stack.pop ();
++  call_stack.pop_back ();
+ 
+   // If this was an "inner call", we resume executing the parent function
+   // up the stack.  So note the start-time for this!
+   last_time = query_time ();
+ }
+ 
+ void
+ profile_data_accumulator::reset (void)
+ {
+   if (is_active ())
+     {
+       error ("Can't reset active profiler.");
+       return;
+     }
+ 
+-  times.clear ();
++  data.clear ();
+   last_time = -1.0;
+ }
+ 
+-Cell
++octave_value
+ profile_data_accumulator::get_data (void) const
+ {
+-  const int n = times.size ();
++  const octave_idx_type n = data.size ();
+ 
+-  Cell retval (1, n);
+-  int i = 0;
+-  for (timing_map::const_iterator p = times.begin (); p != times.end (); ++p)
++  // For the parent/child data, we need to map function key-names
++  // to the indices they correspond to in the output array.  Find them out
++  // in a preparation step.
++  fcn_index_map fcn_indices;
++  octave_idx_type i = 0;
++  for (stats_map::const_iterator p = data.begin (); p != data.end (); ++p)
+     {
+-      octave_scalar_map entry;
+-
+-      entry.contents ("name") = octave_value (p->first);
+-      entry.contents ("time") = octave_value (p->second);
+-
+-      retval (i++) = entry;
++      fcn_indices[p->first] = i + 1;
++      ++i;
+     }
+   assert (i == n);
+ 
++  Cell rv_names (n, 1);
++  Cell rv_times (n, 1);
++  Cell rv_calls (n, 1);
++  Cell rv_recursive (n, 1);
++  Cell rv_parents (n, 1);
++  Cell rv_children (n, 1);
++
++  i = 0;
++  for (stats_map::const_iterator p = data.begin (); p != data.end (); ++p)
++    {
++      const stats& entry = p->second;
++
++      rv_names (i) = octave_value (p->first);
++      rv_times (i) = octave_value (entry.time);
++      rv_calls (i) = octave_value (entry.calls);
++      rv_recursive (i) = octave_value (entry.recursive);
++      rv_parents (i) = stats::function_set_value (entry.parents, fcn_indices);
++      rv_children (i) = stats::function_set_value (entry.children, fcn_indices);
++
++      ++i;
++    }
++  assert (i == n);
++
++  Octave_map retval;
++
++  retval.assign ("FunctionName", rv_names);
++  retval.assign ("TotalTime", rv_times);
++  retval.assign ("NumCalls", rv_calls);
++  retval.assign ("IsRecursive", rv_recursive);
++  retval.assign ("Parents", rv_parents);
++  retval.assign ("Children", rv_children);
++
+   return retval;
+ }
+ 
+ double
+ profile_data_accumulator::query_time (void) const
+ {
+   octave_time now;
+   return now.double_value ();
+@@ -148,29 +224,31 @@ profile_data_accumulator::query_time (vo
+ 
+ void
+ profile_data_accumulator::add_current_time (void)
+ {
+   const double t = query_time ();
+   assert (last_time >= 0.0 && last_time <= t);
+ 
+   assert (!call_stack.empty ());
+-  const std::string name = call_stack.top ()->profiler_name ();
++  const std::string name = call_stack.back ()->profiler_name ();
+ 
+-  // If the key is not yet present in the map, it is constructed
+-  // with default value 0.
+-  times[name] += t - last_time;
++  // The entry for this function should already be created; namely
++  // when entering the function via the non-timing data collection!
++  stats_map::iterator pos = data.find (name);
++  assert (pos != data.end ());
++  pos->second.time += t - last_time;
+ }
+ 
+ profile_data_accumulator profiler;
+ 
+-DEFUN (profiler_enable, args, nargout,
++DEFUN (__profiler_enable, args, ,
+   "-*- texinfo -*-\n\
+-@deftypefn  {Built-in Function} {} profiler_enable (enabled)\n\
+-Enable or disable the profiler data collection.\n\
++@deftypefn {Function File} __profiler_enable ()\n\
++Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   octave_value_list retval;
+ 
+   const int nargin = args.length ();
+   if (nargin > 0)
+     {
+       if (nargin > 1)
+@@ -182,37 +260,37 @@ Enable or disable the profiler data coll
+       profiler.set_active (args(0).bool_value ());
+     }
+ 
+   retval(0) = profiler.is_active ();
+ 
+   return retval;
+ }
+ 
+-DEFUN (profiler_reset, args, nargout,
++DEFUN (__profiler_reset, args, ,
+   "-*- texinfo -*-\n\
+-@deftypefn  {Built-in Function} {} profiler_reset ()\n\
+-Clear all collected profiling data.\n\
++@deftypefn {Function File} __profiler_reset ()\n\
++Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   octave_value_list retval;
+   const int nargin = args.length ();
+ 
+   if (nargin > 0)
+     warning ("profiler_reset: ignoring extra arguments");
+ 
+   profiler.reset ();
+ 
+   return retval;
+ }
+ 
+-DEFUN (profiler_data, args, nargout,
++DEFUN (__profiler_data, args, ,
+   "-*- texinfo -*-\n\
+-@deftypefn  {Built-in Function} {} data = profiler_data ()\n\
+-Query the timings collected by the profiler.\n\
++@deftypefn {Function File} __profiler_data ()\n\
++Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   octave_value_list retval;
+   const int nargin = args.length ();
+ 
+   if (nargin > 0)
+     warning ("profiler_data: ignoring extra arguments");
+ 
+diff --git a/src/profiler.h b/src/profiler.h
+--- a/src/profiler.h
++++ b/src/profiler.h
+@@ -18,21 +18,22 @@ You should have received a copy of the G
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_profiler_h)
+ #define octave_profiler_h 1
+ 
+-#include <stack>
+ #include <map>
++#include <set>
++#include <vector>
+ 
+ class octave_function;
+-class Cell;
++class octave_value;
+ 
+ class
+ OCTAVE_API
+ profile_data_accumulator
+ {
+ public:
+ 
+   // This is a utility class that can be used to call the enter/exit
+@@ -63,26 +64,53 @@ public:
+   profile_data_accumulator (void);
+ 
+   bool is_active (void) const { return enabled; }
+ 
+   void set_active (bool);
+ 
+   void reset (void);
+ 
+-  Cell get_data (void) const;
++  octave_value get_data (void) const;
+ 
+ private:
+ 
++  typedef std::set<std::string> function_set;
++  typedef std::map<std::string, octave_idx_type> fcn_index_map;
++
++  // Store some statistics data collected for a function.
++  class stats
++  {
++    private:
++
++      double time;
++      unsigned calls;
++
++      bool recursive;
++
++      function_set parents;
++      function_set children;
++
++    public:
++
++      stats ();
++
++      static octave_value
++      function_set_value (const function_set&, const fcn_index_map&);
++
++      friend class profile_data_accumulator;
++  };
++
+   bool enabled;
+ 
+-  std::stack<const octave_function*> call_stack;
++  typedef std::vector<const octave_function*> call_stack_type;
++  call_stack_type call_stack;
+ 
+-  typedef std::map<std::string, double> timing_map;
+-  timing_map times;
++  typedef std::map<std::string, stats> stats_map;
++  stats_map data;
+ 
+   // Store last timestamp we had, when the currently active function was called.
+   double last_time;
+ 
+   // These are private as only the unwind-protecting inner class enter
+   // should be allowed to call them.
+   void enter_function (const octave_function&);
+   void exit_function (const octave_function&);

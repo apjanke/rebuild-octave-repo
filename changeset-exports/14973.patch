@@ -1,0 +1,305 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1340745330 18000
+#      Tue Jun 26 16:15:30 2012 -0500
+# Node ID 2960f1b2d6eac851032c0c2256fa75e955327ebd
+# Parent  457eb974310bfbaea14aea128d55d4913015346d
+Add sin to JIT
+
+* src/ov-builtin.cc (octave_builtin::to_jit, octave_builtin::stash_jit):
+    New function.
+* src/ov-builtin.h (octave_builtin::to_jit, octave_builtin::stash_jit):
+    New declaration.
+  (octave_builtin::octave_builtin): Initialize jtype.
+
+* src/pt-jit.cc (jit_typeinfo::jit_typeinfo): Initialize sin type.
+  (jit_typeinfo::do_type_of): Convert builtin functions to their jit type.
+* src/pt-jit.h (jit_typeinfo): Add sin_type
+
+diff --git a/src/ov-builtin.cc b/src/ov-builtin.cc
+--- a/src/ov-builtin.cc
++++ b/src/ov-builtin.cc
+@@ -147,10 +147,21 @@ octave_builtin::do_multi_index_op (int n
+         {
+           gripe_library_execution_error ();
+         }
+     }
+ 
+   return retval;
+ }
+ 
++jit_type *
++octave_builtin::to_jit (void) const
++{
++  return jtype;
++}
++
++void
++octave_builtin::stash_jit (jit_type &type)
++{
++  jtype = &type;
++}
+ 
+ const std::list<octave_lvalue> *octave_builtin::curr_lvalue_list = 0;
+diff --git a/src/ov-builtin.h b/src/ov-builtin.h
+--- a/src/ov-builtin.h
++++ b/src/ov-builtin.h
+@@ -25,32 +25,33 @@ along with Octave; see the file COPYING.
+ 
+ #include <string>
+ 
+ #include "ov-fcn.h"
+ #include "ov-typeinfo.h"
+ 
+ class octave_value;
+ class octave_value_list;
++class jit_type;
+ 
+ // Builtin functions.
+ 
+ class
+ OCTINTERP_API
+ octave_builtin : public octave_function
+ {
+ public:
+ 
+-  octave_builtin (void) : octave_function (), f (0) { }
++  octave_builtin (void) : octave_function (), f (0), jtype (0) { }
+ 
+   typedef octave_value_list (*fcn) (const octave_value_list&, int);
+ 
+   octave_builtin (fcn ff, const std::string& nm = std::string (),
+                   const std::string& ds = std::string ())
+-    : octave_function (nm, ds), f (ff) { }
++    : octave_function (nm, ds), f (ff), jtype (0) { }
+ 
+   ~octave_builtin (void) { }
+ 
+   octave_value subsref (const std::string& type,
+                         const std::list<octave_value_list>& idx)
+     {
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+@@ -70,23 +71,30 @@ public:
+ 
+   octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& args);
+ 
+   octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& args,
+                      const std::list<octave_lvalue>* lvalue_list);
+ 
++  jit_type *to_jit (void) const;
++
++  void stash_jit (jit_type& type);
++
+   static const std::list<octave_lvalue> *curr_lvalue_list;
+ 
+ protected:
+ 
+   // A pointer to the actual function.
+   fcn f;
+ 
++  // A pointer to the jit type that represents the function.
++  jit_type *jtype;
++
+ private:
+ 
+   // No copying!
+ 
+   octave_builtin (const octave_builtin& ob);
+ 
+   octave_builtin& operator = (const octave_builtin& ob);
+ 
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -32,32 +32,34 @@ along with Octave; see the file COPYING.
+ #include "pt-jit.h"
+ 
+ #include <typeinfo>
+ 
+ #include <llvm/LLVMContext.h>
+ #include <llvm/Module.h>
+ #include <llvm/Function.h>
+ #include <llvm/BasicBlock.h>
++#include <llvm/Intrinsics.h>
+ #include <llvm/Support/IRBuilder.h>
+ #include <llvm/ExecutionEngine/ExecutionEngine.h>
+ #include <llvm/ExecutionEngine/JIT.h>
+ #include <llvm/PassManager.h>
+ #include <llvm/Analysis/Verifier.h>
+ #include <llvm/Analysis/CallGraph.h>
+ #include <llvm/Analysis/Passes.h>
+ #include <llvm/Target/TargetData.h>
+ #include <llvm/Transforms/Scalar.h>
+ #include <llvm/Transforms/IPO.h>
+ #include <llvm/Support/TargetSelect.h>
+ #include <llvm/Support/raw_os_ostream.h>
+ 
+ #include "octave.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
++#include "ov-builtin.h"
+ #include "ov-scalar.h"
+ #include "pt-all.h"
+ 
+ static llvm::IRBuilder<> builder (llvm::getGlobalContext ());
+ 
+ static llvm::LLVMContext& context = llvm::getGlobalContext ();
+ 
+ jit_typeinfo *jit_typeinfo::instance;
+@@ -401,16 +403,18 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   any = new_type ("any", 0, any_t);
+   matrix = new_type ("matrix", any, matrix_t);
+   scalar = new_type ("scalar", any, scalar_t);
+   range = new_type ("range", any, range_t);
+   string = new_type ("string", any, string_t);
+   boolean = new_type ("bool", any, bool_t);
+   index = new_type ("index", any, index_t);
+ 
++  sin_type = new_type ("sin", any, any_t);
++
+   casts.resize (next_id + 1);
+   identities.resize (next_id + 1, 0);
+ 
+   // bind global variables
+   lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
+                                            llvm::GlobalValue::ExternalLinkage,
+                                            0, "error_state");
+   engine->addGlobalMapping (lerror_state,
+@@ -469,16 +473,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   fn = create_function ("octave_jit_grab_matrix", void_t,
+                         matrix_t->getPointerTo (), matrix_t->getPointerTo ());
+   engine->addGlobalMapping (fn,
+                             reinterpret_cast<void *> (&octave_jit_grab_matrix));
+   grab_fn.add_overload (fn, false, matrix, matrix);
+ 
+   // release any
+   fn = create_function ("octave_jit_release_any", void_t, any_t);
++  llvm::Function *release_any = fn;
+   engine->addGlobalMapping (fn,
+                             reinterpret_cast<void*>(&octave_jit_release_any));
+   release_fn.add_overload (fn, false, 0, any);
+   release_fn.stash_name ("release");
+ 
+   // release matrix
+   fn = create_function ("octave_jit_release_matrix", void_t,
+                         matrix_t->getPointerTo ());
+@@ -887,16 +892,47 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+ 
+   // cast any <- any
+   fn = create_identity (any);
+   casts[any->type_id ()].add_overload (fn, false, any, any);
+ 
+   // cast scalar <- scalar
+   fn = create_identity (scalar);
+   casts[scalar->type_id ()].add_overload (fn, false, scalar, scalar);
++
++
++  // -------------------- builtin functions --------------------
++
++  // FIXME: Handling this here is messy, but it's the easiest way for now
++  // FIXME: Come up with a nicer way of defining functions
++  octave_value ov_sin = symbol_table::builtin_find ("sin");
++  octave_builtin *bsin
++    = dynamic_cast<octave_builtin *> (ov_sin.internal_rep ());
++  if (bsin)
++    {
++      bsin->stash_jit (*sin_type);
++
++      llvm::Function *isin
++        = llvm::Intrinsic::getDeclaration (module, llvm::Intrinsic::sin,
++                                           llvm::makeArrayRef (scalar_t));
++      fn = create_function ("octave_jit_sin", scalar, any, scalar);
++      body = llvm::BasicBlock::Create (context, "body", fn);
++      builder.SetInsertPoint (body);
++      {
++        llvm::Value *ret = builder.CreateCall (isin, ++fn->arg_begin ());
++        builder.CreateRet (ret);
++      }
++      llvm::verifyFunction (*fn);
++      paren_subsref_fn.add_overload (fn, false, scalar, sin_type, scalar);
++      release_fn.add_overload (release_any, false, 0, sin_type);
++
++      fn = create_identity (any);
++      casts[any->type_id ()].add_overload (fn, false, any, sin_type);
++      casts[sin_type->type_id ()].add_overload (fn, false, sin_type, any);
++    }
+ }
+ 
+ void
+ jit_typeinfo::add_print (jit_type *ty, void *call)
+ {
+   std::stringstream name;
+   name << "octave_jit_print_" << ty->name ();
+ 
+@@ -1014,17 +1050,23 @@ jit_typeinfo::do_insert_error_check (voi
+ {
+   return builder.CreateLoad (lerror_state);
+ }
+ 
+ jit_type *
+ jit_typeinfo::do_type_of (const octave_value &ov) const
+ {
+   if (ov.is_function ())
+-    return 0; // functions are not supported
++    {
++      // FIXME: This is ugly, we need to finalize how we want to to this, then
++      // have octave_value fully support the needed functionality
++      octave_builtin *builtin
++        = dynamic_cast<octave_builtin *> (ov.internal_rep ());
++      return builtin ? builtin->to_jit () : 0;
++    }
+ 
+   if (ov.is_range ())
+     return get_range ();
+ 
+   if (ov.is_double_type ())
+     {
+       if (ov.is_real_scalar ())
+         return get_scalar ();
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -48,19 +48,21 @@ along with Octave; see the file COPYING.
+ // at the start of a simple for loop.
+ //
+ // The octave low level IR is a linear IR, it works by converting everything to
+ // calls to jit_functions. This turns expressions like c = a + b into
+ // c = call binary+ (a, b)
+ // The jit_functions contain information about overloads for different types.
+ // For, example, if we know a and b are scalars, then c must also be a scalar.
+ //
++// Support for function calls is in progress. Currently, calls to sin with a
++// scalar argument will compile.
+ //
+ // TODO:
+-// 1. Function calls
++// 1. Function calls (In progress)
+ // 2. Cleanup/documentation
+ // 3. ...
+ // ---------------------------------------------------------
+ 
+ 
+ // we don't want to include llvm headers here, as they require
+ // __STDC_LIMIT_MACROS and __STDC_CONSTANT_MACROS be defined in the entire
+ // compilation unit
+@@ -676,16 +678,17 @@ private:
+   std::vector<jit_type*> id_to_type;
+   jit_type *any;
+   jit_type *matrix;
+   jit_type *scalar;
+   jit_type *range;
+   jit_type *string;
+   jit_type *boolean;
+   jit_type *index;
++  jit_type *sin_type;
+ 
+   std::vector<jit_function> binary_ops;
+   jit_function grab_fn;
+   jit_function release_fn;
+   jit_function print_fn;
+   jit_function for_init_fn;
+   jit_function for_check_fn;
+   jit_function for_index_fn;

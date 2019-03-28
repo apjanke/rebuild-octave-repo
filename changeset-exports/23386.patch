@@ -1,0 +1,595 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1492005845 14400
+#      Wed Apr 12 10:04:05 2017 -0400
+# Node ID f1ea44e92df8958f4bb7a8a2bd10bf31a4f40945
+# Parent  41639665aa34c9f21d3ccd14fdc35da7c8283cd8
+improve compatibility for single index indexing (bug #50776)
+
+* dim-vector.h (dim_vector::make_nd_vector, dim_vector::is_nd_vector):
+New functions.
+
+* idx-vector.cc: Preserve nd-vector orientation for logical indices.
+* Array.cc (Array<T>::index): Simplify.
+
+* Array.h (Array<T>::is_nd_vector): New function.
+
+* test/single-index.tst: New file.
+* test/module.mk: Update.
+
+diff --git a/liboctave/array/Array.cc b/liboctave/array/Array.cc
+--- a/liboctave/array/Array.cc
++++ b/liboctave/array/Array.cc
+@@ -712,69 +712,72 @@ public:
+   void resize_fill (const T* src, T *dest, const T& rfv) const
+   { do_resize_fill (src, dest, rfv, n-1); }
+ };
+ 
+ template <typename T>
+ Array<T>
+ Array<T>::index (const idx_vector& i) const
+ {
++  // Colon:
++  //
++  //   object   | index    | result orientation
++  //   ---------+----------+-------------------
++  //   anything | colon    | column vector
++  //
++  // Numeric array or logical mask:
++  //
++  //   Note that logical mask indices are always transformed to vectors
++  //   before we see them.
++  //
++  //   object   | index    | result orientation
++  //   ---------+----------+-------------------
++  //   vector   | vector   | indexed object
++  //            | other    | same size as index
++  //   ---------+----------+-------------------
++  //   array    | anything | same size as index
++
+   octave_idx_type n = numel ();
+   Array<T> retval;
+ 
+   if (i.is_colon ())
+     {
+       // A(:) produces a shallow copy as a column vector.
+       retval = Array<T> (*this, dim_vector (n, 1));
+     }
+   else
+     {
+       if (i.extent (n) != n)
+-        octave::err_index_out_of_range (1, 1, i.extent (n), n, dimensions); // throws
+-
+-      // FIXME: this is the only place where orig_dimensions are used.
+-      dim_vector rd = i.orig_dimensions ();
+-      octave_idx_type il = i.length (n);
+-
+-      // FIXME: this is for Matlab compatibility.  Matlab 2007 given
+-      //
+-      //   b = ones (3,1)
+-      //
+-      // yields the following:
+-      //
+-      //   b(zeros (0,0)) gives []
+-      //   b(zeros (1,0)) gives zeros (0,1)
+-      //   b(zeros (0,1)) gives zeros (0,1)
+-      //   b(zeros (0,m)) gives zeros (0,m)
+-      //   b(zeros (m,0)) gives zeros (m,0)
+-      //   b(1:2) gives ones (2,1)
+-      //   b(ones (2)) gives ones (2) etc.
+-      //
+-      // As you can see, the behavior is weird, but the tests end up pretty
+-      // simple.  Nah, I don't want to suggest that this is ad hoc :)
+-
+-      if (ndims () == 2 && n != 1 && rd.is_vector ())
++        octave::err_index_out_of_range (1, 1, i.extent (n), n, dimensions);
++
++      dim_vector result_dims = i.orig_dimensions ();
++      octave_idx_type idx_len = i.length ();
++
++      if (n != 1 && is_nd_vector () && idx_len != 1
++          && result_dims.is_nd_vector ())
+         {
+-          if (columns () == 1)
+-            rd = dim_vector (il, 1);
+-          else if (rows () == 1)
+-            rd = dim_vector (1, il);
++          // Indexed object and index are both vectors.  Set result size
++          // and orientation as above.
++
++          dim_vector dv = dims ();
++
++          result_dims = dv.make_nd_vector (idx_len);
+         }
+ 
+       octave_idx_type l, u;
+-      if (il != 0 && i.is_cont_range (n, l, u))
++      if (idx_len != 0 && i.is_cont_range (n, l, u))
+         // If suitable, produce a shallow slice.
+-        retval = Array<T> (*this, rd, l, u);
++        retval = Array<T> (*this, result_dims, l, u);
+       else
+         {
+           // Don't use resize here to avoid useless initialization for POD
+           // types.
+-          retval = Array<T> (rd);
+-
+-          if (il != 0)
++          retval = Array<T> (result_dims);
++
++          if (idx_len != 0)
+             i.index (data (), n, retval.fortran_vec ());
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ template <typename T>
+diff --git a/liboctave/array/Array.h b/liboctave/array/Array.h
+--- a/liboctave/array/Array.h
++++ b/liboctave/array/Array.h
+@@ -571,16 +571,18 @@ public:
+   { return permute (vec, true); }
+ 
+   bool is_square (void) const { return (dim1 () == dim2 ()); }
+ 
+   bool is_empty (void) const { return numel () == 0; }
+ 
+   bool is_vector (void) const { return dimensions.is_vector (); }
+ 
++  bool is_nd_vector (void) const { return dimensions.is_nd_vector (); }
++
+   Array<T> transpose (void) const;
+   Array<T> hermitian (T (*fcn) (const T&) = 0) const;
+ 
+   const T *data (void) const { return slice_data; }
+ 
+   const T *fortran_vec (void) const { return data (); }
+ 
+   T *fortran_vec (void);
+diff --git a/liboctave/array/dim-vector.h b/liboctave/array/dim-vector.h
+--- a/liboctave/array/dim-vector.h
++++ b/liboctave/array/dim-vector.h
+@@ -454,16 +454,60 @@ public:
+       return dim_vector (1, numel ());
+   }
+ 
+   bool is_vector (void) const
+   {
+     return (ndims () == 2 && (elem (0) == 1 || elem (1) == 1));
+   }
+ 
++  bool is_nd_vector (void) const
++  {
++    int num_non_one = 0;
++
++    for (int i = 0; i < ndims (); i++)
++      {
++        if (elem (i) != 1)
++          {
++            num_non_one++;
++
++            if (num_non_one > 1)
++              break;
++          }
++      }
++
++    return num_non_one == 1;
++  }
++
++  // Create a vector with length N.  If this object is a vector,
++  // preserve the orientation, otherwise, create a column vector.
++
++  dim_vector make_nd_vector (octave_idx_type n) const
++  {
++    dim_vector orig_dims;
++
++    if (is_nd_vector ())
++      {
++        orig_dims = *this;
++
++        for (int i = 0; i < orig_dims.ndims (); i++)
++          {
++            if (orig_dims(i) != 1)
++              {
++                orig_dims(i) = n;
++                break;
++              }
++          }
++      }
++    else
++      orig_dims = dim_vector (n, 1);
++
++    return orig_dims;
++  }
++
+   int first_non_singleton (int def = 0) const
+   {
+     for (int i = 0; i < ndims (); i++)
+       {
+         if (elem (i) != 1)
+           return i;
+       }
+ 
+diff --git a/liboctave/array/idx-vector.cc b/liboctave/array/idx-vector.cc
+--- a/liboctave/array/idx-vector.cc
++++ b/liboctave/array/idx-vector.cc
+@@ -385,19 +385,17 @@ idx_vector::idx_vector_rep::idx_vector_r
+                                             octave_idx_type nnz)
+   : data (0), len (nnz), ext (0), aowner (0), orig_dims ()
+ {
+   if (nnz < 0)
+     len = bnda.nnz ();
+ 
+   const dim_vector dv = bnda.dims ();
+ 
+-  if (! dv.all_zero ())
+-    orig_dims = ((dv.ndims () == 2 && dv(0) == 1)
+-                 ? dim_vector (1, len) : dim_vector (len, 1));
++  orig_dims = dv.make_nd_vector (len);
+ 
+   if (len != 0)
+     {
+       octave_idx_type *d = new octave_idx_type [len];
+ 
+       octave_idx_type ntot = bnda.numel ();
+ 
+       octave_idx_type k = 0;
+@@ -411,19 +409,17 @@ idx_vector::idx_vector_rep::idx_vector_r
+     }
+ }
+ 
+ idx_vector::idx_vector_rep::idx_vector_rep (const Sparse<bool>& bnda)
+   : data (0), len (bnda.nnz ()), ext (0), aowner (0), orig_dims ()
+ {
+   const dim_vector dv = bnda.dims ();
+ 
+-  if (! dv.all_zero ())
+-    orig_dims = ((dv.ndims () == 2 && dv(0) == 1)
+-                 ? dim_vector (1, len) : dim_vector (len, 1));
++  orig_dims = dv.make_nd_vector (len);
+ 
+   if (len != 0)
+     {
+       octave_idx_type *d = new octave_idx_type [len];
+ 
+       octave_idx_type k = 0;
+       octave_idx_type nc = bnda.cols ();
+       octave_idx_type nr = bnda.rows ();
+@@ -656,19 +652,17 @@ idx_vector::idx_mask_rep::idx_mask_rep (
+ 
+   // We truncate the extent as much as possible.  For Matlab
+   // compatibility, but maybe it's not a bad idea anyway.
+   while (ext > 0 && ! bnda(ext-1))
+     ext--;
+ 
+   const dim_vector dv = bnda.dims ();
+ 
+-  if (! dv.all_zero ())
+-    orig_dims = ((dv.ndims () == 2 && dv(0) == 1)
+-                 ? dim_vector (1, len) : dim_vector (len, 1));
++  orig_dims = dv.make_nd_vector (len);
+ 
+   aowner = new Array<bool> (bnda);
+   data = bnda.data ();
+ }
+ 
+ idx_vector::idx_mask_rep::~idx_mask_rep (void)
+ {
+   if (aowner)
+diff --git a/test/module.mk b/test/module.mk
+--- a/test/module.mk
++++ b/test/module.mk
+@@ -28,16 +28,17 @@ TEST_FILES += \
+   test/line-continue.tst \
+   test/logical-index.tst \
+   test/null-assign.tst \
+   test/parser.tst \
+   test/prefer.tst \
+   test/range.tst \
+   test/recursion.tst \
+   test/return.tst \
++  test/single-index.tst \
+   test/slice.tst \
+   test/struct.tst \
+   test/switch.tst \
+   test/system.tst \
+   test/transpose.tst \
+   test/try.tst \
+   test/unwind.tst \
+   test/while.tst
+diff --git a/test/single-index.tst b/test/single-index.tst
+new file mode 100644
+--- /dev/null
++++ b/test/single-index.tst
+@@ -0,0 +1,289 @@
++## Copyright (C) 2017 John W. Eaton
++##
++## This file is part of Octave.
++##
++## Octave is free software; you can redistribute it and/or modify it
++## under the terms of the GNU General Public License as published by
++## the Free Software Foundation; either version 3 of the License, or
++## (at your option) any later version.
++##
++## Octave is distributed in the hope that it will be useful, but
++## WITHOUT ANY WARRANTY; without even the implied warranty of
++## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++## GNU General Public License for more details.
++##
++## You should have received a copy of the GNU General Public License
++## along with Octave; see the file COPYING.  If not, see
++## <http://www.gnu.org/licenses/>.
++
++%!shared rv,cv,ndv,wm,tm,nd,lrv,lcv,lwm,ltm,lndv1,lndv2,lnd1,lnd2,rrv,rcv,rndv1,rndv2
++%! rv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! cv = rv';
++%! ndv = reshape (rv, 1, 1, 12);
++%! wm = reshape (rv, 2, 6);
++%! tm = reshape (rv, 6, 2);
++%! nd = reshape (rv, 2, 2, 3);
++%! lrv = logical ([1,0,0,1,1,0,0,1,1,0,0,1]);
++%! lcv = lrv';
++%! lwm = reshape (lrv, 2, 6);
++%! ltm = reshape (lrv, 6, 2);
++%! lndv1 = reshape (lrv, 1, 1, 12);
++%! lndv2 = reshape (lrv, 1, 1, 1, 12);
++%! lnd1 = reshape (lrv, 2, 2, 3);
++%! lnd2 = reshape (lrv, 2, 3, 2);
++%! rrv = [1,4,5,8,9,12];
++%! rcv = rrv';
++%! rndv1 = reshape (rrv, 1, 1, 6);
++%! rndv2 = reshape (rrv, 1, 1, 1, 6);
++%!assert (rv(lrv), rrv)
++%!assert (rv(lcv), rrv)
++%!assert (rv(lwm), rrv)
++%!assert (rv(ltm), rrv)
++%!assert (rv(lndv1), rrv)
++%!assert (rv(lndv2), rrv)
++%!assert (rv(lnd1), rrv)
++%!assert (rv(lnd2), rrv)
++%!assert (cv(lrv), rcv)
++%!assert (cv(lcv), rcv)
++%!assert (cv(lwm), rcv)
++%!assert (cv(ltm), rcv)
++%!assert (cv(lndv1), rcv)
++%!assert (cv(lndv2), rcv)
++%!assert (cv(lnd1), rcv)
++%!assert (cv(lnd2), rcv)
++%!assert (ndv(lrv), rndv1)
++%!assert (ndv(lcv), rndv1)
++%!assert (ndv(lwm), rndv1)
++%!assert (ndv(ltm), rndv1)
++%!assert (ndv(lndv1), rndv1)
++%!assert (ndv(lndv2), rndv1)
++%!assert (ndv(lnd1), rndv1)
++%!assert (ndv(lnd2), rndv1)
++%!assert (wm(lrv), rrv)
++%!assert (wm(lcv), rcv)
++%!assert (wm(lwm), rcv)
++%!assert (wm(ltm), rcv)
++%!assert (wm(lndv1), rndv1)
++%!assert (wm(lndv2), rndv2)
++%!assert (wm(lnd1), rcv)
++%!assert (wm(lnd2), rcv)
++%!assert (tm(lrv), rrv)
++%!assert (tm(lcv), rcv)
++%!assert (tm(lwm), rcv)
++%!assert (tm(ltm), rcv)
++%!assert (tm(lndv1), rndv1)
++%!assert (tm(lndv2), rndv2)
++%!assert (tm(lnd1), rcv)
++%!assert (tm(lnd2), rcv)
++%!assert (nd(lrv), rrv)
++%!assert (nd(lcv), rcv)
++%!assert (nd(lwm), rcv)
++%!assert (nd(ltm), rcv)
++%!assert (nd(lndv1), rndv1)
++%!assert (nd(lndv2), rndv2)
++%!assert (nd(lnd1), rcv)
++%!assert (nd(lnd2), rcv)
++
++%!shared rv,cv,ndv,wm,tm,nd,lrv,lcv,lwm,ltm,lndv1,lndv2,lnd1,lnd2,rrv,rcv,rndv1,rndv2
++%! rv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! cv = rv';
++%! ndv = reshape (rv, 1, 1, 12);
++%! wm = reshape (rv, 2, 6);
++%! tm = reshape (rv, 6, 2);
++%! nd = reshape (rv, 2, 2, 3);
++%! lrv = logical ([1,1,1,1,1,1,1,1,1,1,1,1]);
++%! lcv = lrv';
++%! lwm = reshape (lrv, 2, 6);
++%! ltm = reshape (lrv, 6, 2);
++%! lndv1 = reshape (lrv, 1, 1, 12);
++%! lndv2 = reshape (lrv, 1, 1, 1, 12);
++%! lnd1 = reshape (lrv, 2, 2, 3);
++%! lnd2 = reshape (lrv, 2, 3, 2);
++%! rrv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! rcv = rrv';
++%! rndv1 = reshape (rrv, 1, 1, 12);
++%! rndv2 = reshape (rrv, 1, 1, 1, 12);
++%!assert (rv(lrv), rrv)
++%!assert (rv(lcv), rrv)
++%!assert (rv(lwm), rrv)
++%!assert (rv(ltm), rrv)
++%!assert (rv(lndv1), rrv)
++%!assert (rv(lndv2), rrv)
++%!assert (rv(lnd1), rrv)
++%!assert (rv(lnd2), rrv)
++%!assert (cv(lrv), rcv)
++%!assert (cv(lcv), rcv)
++%!assert (cv(lwm), rcv)
++%!assert (cv(ltm), rcv)
++%!assert (cv(lndv1), rcv)
++%!assert (cv(lndv2), rcv)
++%!assert (cv(lnd1), rcv)
++%!assert (cv(lnd2), rcv)
++%!assert (ndv(lrv), rndv1)
++%!assert (ndv(lcv), rndv1)
++%!assert (ndv(lwm), rndv1)
++%!assert (ndv(ltm), rndv1)
++%!assert (ndv(lndv1), rndv1)
++%!assert (ndv(lndv2), rndv1)
++%!assert (ndv(lnd1), rndv1)
++%!assert (ndv(lnd2), rndv1)
++%!assert (wm(lrv), rrv)
++%!assert (wm(lcv), rcv)
++%!assert (wm(lwm), rcv)
++%!assert (wm(ltm), rcv)
++%!assert (wm(lndv1), rndv1)
++%!assert (wm(lndv2), rndv2)
++%!assert (wm(lnd1), rcv)
++%!assert (wm(lnd2), rcv)
++%!assert (tm(lrv), rrv)
++%!assert (tm(lcv), rcv)
++%!assert (tm(lwm), rcv)
++%!assert (tm(ltm), rcv)
++%!assert (tm(lndv1), rndv1)
++%!assert (tm(lndv2), rndv2)
++%!assert (tm(lnd1), rcv)
++%!assert (tm(lnd2), rcv)
++%!assert (nd(lrv), rrv)
++%!assert (nd(lcv), rcv)
++%!assert (nd(lwm), rcv)
++%!assert (nd(ltm), rcv)
++%!assert (nd(lndv1), rndv1)
++%!assert (nd(lndv2), rndv2)
++%!assert (nd(lnd1), rcv)
++%!assert (nd(lnd2), rcv)
++
++%!shared rv,cv,ndv,wm,tm,nd,irv,icv,iwm,itm,indv1,indv2,ind1,ind2,rrv,rcv,rndv1,rndv2
++%! rv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! cv = rv';
++%! ndv = reshape (rv, 1, 1, 12);
++%! wm = reshape (rv, 2, 6);
++%! tm = reshape (rv, 6, 2);
++%! nd = reshape (rv, 2, 2, 3);
++%! irv = [1,3,5,7,9,11];
++%! icv = irv';
++%! iwm = reshape (irv, 2, 3);
++%! itm = reshape (irv, 3, 2);
++%! indv1 = reshape (irv, 1, 1, 6);
++%! indv2 = reshape (irv, 1, 1, 1, 6);
++%! ind1 = reshape (irv, 2, 1, 3);
++%! ind2 = reshape (irv, 1, 3, 2);
++%! rrv = [1,3,5,7,9,11];
++%! rcv = rrv';
++%! rndv1 = reshape (rrv, 1, 1, 6);
++%! rndv2 = reshape (rrv, 1, 1, 1, 6);
++%!assert (rv(irv), rrv)
++%!assert (rv(icv), rrv)
++%!assert (rv(iwm), iwm)
++%!assert (rv(itm), itm)
++%!assert (rv(indv1), rrv)
++%!assert (rv(indv2), rrv)
++%!assert (rv(ind1), ind1)
++%!assert (rv(ind2), ind2)
++%!assert (cv(irv), rcv)
++%!assert (cv(icv), rcv)
++%!assert (cv(iwm), iwm)
++%!assert (cv(itm), itm)
++%!assert (cv(indv1), rcv)
++%!assert (cv(indv2), rcv)
++%!assert (cv(ind1), ind1)
++%!assert (cv(ind2), ind2)
++%!assert (ndv(irv), rndv1)
++%!assert (ndv(icv), rndv1)
++%!assert (ndv(iwm), iwm)
++%!assert (ndv(itm), itm)
++%!assert (ndv(indv1), rndv1)
++%!assert (ndv(indv2), rndv1)
++%!assert (ndv(ind1), ind1)
++%!assert (ndv(ind2), ind2)
++%!assert (wm(irv), rrv)
++%!assert (wm(icv), rcv)
++%!assert (wm(iwm), iwm)
++%!assert (wm(itm), itm)
++%!assert (wm(indv1), rndv1)
++%!assert (wm(indv2), rndv2)
++%!assert (wm(ind1), ind1)
++%!assert (wm(ind2), ind2)
++%!assert (tm(irv), rrv)
++%!assert (tm(icv), rcv)
++%!assert (tm(iwm), iwm)
++%!assert (tm(itm), itm)
++%!assert (tm(indv1), rndv1)
++%!assert (tm(indv2), rndv2)
++%!assert (tm(ind1), ind1)
++%!assert (tm(ind2), ind2)
++%!assert (nd(irv), rrv)
++%!assert (nd(icv), rcv)
++%!assert (nd(iwm), iwm)
++%!assert (nd(itm), itm)
++%!assert (nd(indv1), rndv1)
++%!assert (nd(indv2), rndv2)
++%!assert (nd(ind1), ind1)
++%!assert (nd(ind2), ind2)
++
++%!shared rv,cv,ndv,wm,tm,nd,irv,icv,iwm,itm,indv1,indv2,ind1,ind2,rrv,rcv,rndv1,rndv2
++%! rv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! cv = rv';
++%! ndv = reshape (rv, 1, 1, 12);
++%! wm = reshape (rv, 2, 6);
++%! tm = reshape (rv, 6, 2);
++%! nd = reshape (rv, 2, 2, 3);
++%! irv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! icv = irv';
++%! iwm = reshape (irv, 2, 6);
++%! itm = reshape (irv, 6, 2);
++%! indv1 = reshape (irv, 1, 1, 12);
++%! indv2 = reshape (irv, 1, 1, 1, 12);
++%! ind1 = reshape (irv, 2, 2, 3);
++%! ind2 = reshape (irv, 2, 3, 2);
++%! rrv = [1,2,3,4,5,6,7,8,9,10,11,12];
++%! rcv = rrv';
++%! rndv1 = reshape (rrv, 1, 1, 12);
++%! rndv2 = reshape (rrv, 1, 1, 1, 12);
++%!assert (rv(irv), rrv)
++%!assert (rv(icv), rrv)
++%!assert (rv(iwm), iwm)
++%!assert (rv(itm), itm)
++%!assert (rv(indv1), rrv)
++%!assert (rv(indv2), rrv)
++%!assert (rv(ind1), ind1)
++%!assert (rv(ind2), ind2)
++%!assert (cv(irv), rcv)
++%!assert (cv(icv), rcv)
++%!assert (cv(iwm), iwm)
++%!assert (cv(itm), itm)
++%!assert (cv(indv1), rcv)
++%!assert (cv(indv2), rcv)
++%!assert (cv(ind1), ind1)
++%!assert (cv(ind2), ind2)
++%!assert (ndv(irv), rndv1)
++%!assert (ndv(icv), rndv1)
++%!assert (ndv(iwm), iwm)
++%!assert (ndv(itm), itm)
++%!assert (ndv(indv1), rndv1)
++%!assert (ndv(indv2), rndv1)
++%!assert (ndv(ind1), ind1)
++%!assert (ndv(ind2), ind2)
++%!assert (wm(irv), rrv)
++%!assert (wm(icv), rcv)
++%!assert (wm(iwm), iwm)
++%!assert (wm(itm), itm)
++%!assert (wm(indv1), rndv1)
++%!assert (wm(indv2), rndv2)
++%!assert (wm(ind1), ind1)
++%!assert (wm(ind2), ind2)
++%!assert (tm(irv), rrv)
++%!assert (tm(icv), rcv)
++%!assert (tm(iwm), iwm)
++%!assert (tm(itm), itm)
++%!assert (tm(indv1), rndv1)
++%!assert (tm(indv2), rndv2)
++%!assert (tm(ind1), ind1)
++%!assert (tm(ind2), ind2)
++%!assert (nd(irv), rrv)
++%!assert (nd(icv), rcv)
++%!assert (nd(iwm), iwm)
++%!assert (nd(itm), itm)
++%!assert (nd(indv1), rndv1)
++%!assert (nd(indv2), rndv2)
++%!assert (nd(ind1), ind1)
++%!assert (nd(ind2), ind2)

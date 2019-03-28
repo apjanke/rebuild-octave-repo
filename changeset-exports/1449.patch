@@ -1,0 +1,411 @@
+# HG changeset patch
+# User jwe
+# Date 811568991 0
+#      Wed Sep 20 03:49:51 1995 +0000
+# Node ID df589c97e14011a4f967a357630cbc54eed8503b
+# Parent  067f11a467427c247d41a55066988de290d7b1ab
+[project @ 1995-09-20 03:49:51 by jwe]
+
+diff --git a/src/dirfns.cc b/src/dirfns.cc
+--- a/src/dirfns.cc
++++ b/src/dirfns.cc
+@@ -57,16 +57,17 @@ Free Software Foundation, Inc.
+ #include "pager.h"
+ #include "pathlen.h"
+ #include "procstream.h"
+ #include "statdefs.h"
+ #include "sysdep.h"
+ #include "sysdir.h"
+ #include "tree-const.h"
+ #include "tree-plot.h"
++#include "unwind-prot.h"
+ #include "utils.h"
+ 
+ extern "C"
+ {
+ #include <readline/tilde.h>
+ extern char *strerror (int);
+ }
+ 
+@@ -422,31 +423,37 @@ print a directory listing")
+   for (int i = 1; i < argc; i++)
+     {
+       char *tmp = tilde_expand (argv[i]);
+       ls_buf << tmp << " ";
+       free (tmp);
+     }
+ 
+   ls_buf << ends;
++  char *ls_command = ls_buf.str ();
++  delete [] ls_command;
+ 
+-  char *ls_command = ls_buf.str ();
++  iprocstream *cmd = new iprocstream (ls_command);
+ 
+-  iprocstream cmd (ls_command);
++  add_unwind_protect (cleanup_iprocstream, cmd);
+ 
+-  char ch;
+-  ostrstream output_buf;
+-  while (cmd.get (ch))
+-    output_buf.put (ch);
++  if (cmd && *cmd)
++    {
++      int ch;
++      ostrstream output_buf;
++      while ((ch = cmd->get ()) != EOF)
++	output_buf << (char) ch;
++      output_buf << ends;
+ 
+-  output_buf << ends;
++      maybe_page_output (output_buf);
++    }
++  else
++    error ("couldn't start process for ls!");
+ 
+-  maybe_page_output (output_buf);
+-
+-  delete [] ls_command;
++  run_unwind_protect ();
+ 
+   DELETE_ARGV;
+ 
+   return retval;
+ }
+ 
+ DEFALIAS (dir, ls);
+ 
+diff --git a/src/octave.cc b/src/octave.cc
+--- a/src/octave.cc
++++ b/src/octave.cc
+@@ -1019,48 +1019,57 @@ DEFUN ("system", Fsystem, Ssystem, 2, 1,
+   const char *tmp_str = tc_command.string_value ();
+ 
+   if (error_state)
+     {
+       error ("system: expecting string as first argument");
+     }
+   else
+     {
+-      iprocstream cmd (tmp_str);
++      iprocstream *cmd = new iprocstream (tmp_str);
+ 
+-      ostrstream output_buf;
++      add_unwind_protect (cleanup_iprocstream, cmd);
++
++      int status = 127;
+ 
+-      char ch;
+-      while (cmd.get (ch))
+-	output_buf.put (ch);
++      if (cmd && *cmd)
++	{
++	  ostrstream output_buf;
+ 
+-      output_buf << ends;
++	  char ch;
++	  while (cmd->get (ch))
++	    output_buf.put (ch);
+ 
+-      int status = cmd.close ();
++	  output_buf << ends;
++
++	  status = cmd->close ();
+ 
+-      // The value in status is as returned by waitpid.  If the
+-      // process exited normally, extract the actual exit status of
+-      // the command.  Otherwise, return 127 as a failure code.
++	  // The value in status is as returned by waitpid.  If the
++	  // process exited normally, extract the actual exit status of
++	  // the command.  Otherwise, return 127 as a failure code.
+ 
+-      if ((status & 0xff) == 0)
+-	status = (status & 0xff00) >> 8;
+-      else
+-	status = 127;
++	  if ((status & 0xff) == 0)
++	    status = (status & 0xff00) >> 8;
+ 
+-      if (nargout > 0 || nargin > 1)
+-	{
+-	  char *msg = output_buf.str ();
++	  if (nargout > 0 || nargin > 1)
++	    {
++	      char *msg = output_buf.str ();
+ 
+-	  retval(1) = (double) status;
+-	  retval(0) = msg;
++	      retval(1) = (double) status;
++	      retval(0) = msg;
+ 
+-	  delete [] msg;
++	      delete [] msg;
++	    }
++	  else
++	    maybe_page_output (output_buf);
+ 	}
+       else
+-	maybe_page_output (output_buf);
++	error ("unable to start subprocess for `%s'", tmp_str);
++
++      run_unwind_protect ();
+     }
+ 
+   return retval;
+ }
+ 
+ DEFALIAS (shell_cmd, system);
+ 
+ #if defined (__GNUG__) && defined (DEBUG_NEW_DELETE)
+diff --git a/src/pager.cc b/src/pager.cc
+--- a/src/pager.cc
++++ b/src/pager.cc
+@@ -37,16 +37,17 @@ Software Foundation, 59 Temple Place - S
+ #include "defun.h"
+ #include "error.h"
+ #include "help.h"
+ #include "input.h"
+ #include "oct-obj.h"
+ #include "pager.h"
+ #include "sighandlers.h"
+ #include "tree-const.h"
++#include "unwind-prot.h"
+ #include "user-prefs.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // Where we stash output headed for the screen.
+ static ostrstream *pager_buf = 0;
+ 
+ // Nonzero means we write to the diary file.
+@@ -141,31 +142,39 @@ flush_output_to_pager (void)
+ 
+   int nlines = line_count (message);
+ 
+   if (nlines > terminal_rows () - 2)
+     {
+       char *pgr = user_pref.pager_binary;
+       if (pgr)
+ 	{
+-	  oprocstream pager_stream (pgr);
+-	  if (pager_stream)
++	  volatile sig_handler *old_sigint_handler;
++	  old_sigint_handler = octave_set_signal_handler (SIGINT, SIG_IGN);
++
++	  oprocstream *pager_stream = new oprocstream (pgr);
++
++	  add_unwind_protect (cleanup_oprocstream, pager_stream);
++
++	  int output_paged = 0;
++	  if (pager_stream && *pager_stream)
+ 	    {
+-	      volatile sig_handler *old_sigint_handler;
+-	      old_sigint_handler = octave_set_signal_handler (SIGINT, SIG_IGN);
+-
+-	      pager_stream << message;
++	      output_paged = 1;
++	      *pager_stream << message;
+ 	      delete [] message;
+-	      pager_stream.flush ();
+-	      pager_stream.close ();
++	      pager_stream->flush ();
++	      pager_stream->close ();
++	    }
+ 
+-	      octave_set_signal_handler (SIGINT, old_sigint_handler);
++	  run_unwind_protect ();
+ 
+-	      return;
+-	    }
++	  octave_set_signal_handler (SIGINT, old_sigint_handler);
++
++	  if (output_paged)
++	    return;
+ 	}
+     }
+ 
+   cout << message;
+   delete [] message;
+   cout.flush ();
+ }
+ 
+diff --git a/src/pt-plot.cc b/src/pt-plot.cc
+--- a/src/pt-plot.cc
++++ b/src/pt-plot.cc
+@@ -72,17 +72,17 @@ static char *gnuplot_terminal_type = 0;
+ 
+ // Should the graph window be cleared before plotting the next line?
+ static int clear_before_plotting = 1;
+ 
+ // List of files to delete when we exit or crash.
+ static SLStack <char *> tmp_files;
+ 
+ // Pipe to gnuplot.
+-static oprocstream plot_stream;
++static oprocstream *plot_stream = 0;
+ 
+ // Use shortest possible abbreviations to minimize trouble caused by
+ // gnuplot's fixed-length command line buffer.
+ 
+ #ifndef GNUPLOT_COMMAND_PLOT  
+ #define GNUPLOT_COMMAND_PLOT   "pl"
+ #endif
+ 
+@@ -106,68 +106,87 @@ static oprocstream plot_stream;
+ #define GNUPLOT_COMMAND_TITLE  "t"
+ #endif
+ 
+ static void
+ open_plot_stream (void)
+ {
+   static int initialized = 0;
+ 
+-  if (! plot_stream.is_open ())
++  if (plot_stream && ! *plot_stream)
++    {
++      delete plot_stream;
++      plot_stream = 0;
++    }
++
++  if (! plot_stream)
+     {
+       initialized = 0;
+ 
+       plot_line_count = 0;
+ 
+       char *plot_prog = user_pref.gnuplot_binary;
+       if (plot_prog)
+ 	{
+-	  plot_stream.open (plot_prog);
+-	  if (! plot_stream.is_open ())
++	  plot_stream = new oprocstream (plot_prog);
++
++	  if (plot_stream && ! *plot_stream)
++	    {
++	      delete plot_stream;
++	      plot_stream = 0;
++	    }
++
++	  if (! plot_stream)
+ 	    {
+ 	      warning ("plot: unable to open pipe to `%s'",
+ 		       plot_prog);
+ 
+ 	      if (strcmp (plot_prog, "gnuplot") != 0)
+ 		{
+ 		  warning ("having trouble finding plotting program.");
+ 		  warning ("trying again with `gnuplot'");
+ 		  goto last_chance;
+ 		}
+ 	    }
+ 	}
+       else
+ 	{
+ 	last_chance:
+ 
+-	  plot_stream.open ("gnuplot");
++	  plot_stream = new oprocstream ("gnuplot");
+ 
+-	  if (! plot_stream.is_open ())
++	  if (plot_stream && ! *plot_stream)
++	    {
++	      delete plot_stream;
++	      plot_stream = 0;
++	    }
++
++	  if (! plot_stream)
+ 	    error ("plot: unable to open pipe to `%s'", plot_prog);
+ 	}
+     }
+ 
+-  if (! initialized)
++  if (! error_state && plot_stream && *plot_stream && ! initialized)
+     {
+       initialized = 1;
+-      plot_stream << "set data style lines\n";
++      *plot_stream << "set data style lines\n";
+ 
+       if (gnuplot_terminal_type)
+-	plot_stream << "set term " << gnuplot_terminal_type << "\n";
++	*plot_stream << "set term " << gnuplot_terminal_type << "\n";
+     }
+ }
+ 
+ static int
+ send_to_plot_stream (const char *cmd)
+ {
+   // From sighandlers.cc:
+ 
+   extern int pipe_handler_error_count;
+ 
+-  if (! plot_stream.is_open ())
++  if (! (plot_stream && *plot_stream))
+     {
+       open_plot_stream ();
+ 
+       if (error_state)
+ 	return -1;
+     }
+ 
+   int replot_len = strlen (GNUPLOT_COMMAND_REPLOT);
+@@ -177,24 +196,24 @@ send_to_plot_stream (const char *cmd)
+   int is_replot = (strncmp (cmd, GNUPLOT_COMMAND_REPLOT, replot_len) == 0);
+   int is_splot = (strncmp (cmd, GNUPLOT_COMMAND_SPLOT, splot_len) == 0);
+   int is_plot = (strncmp (cmd, GNUPLOT_COMMAND_PLOT, plot_len) == 0);
+ 
+   if (plot_line_count == 0 && is_replot)
+     error ("replot: no previous plot");
+   else
+     {
+-      plot_stream << cmd;
++      *plot_stream << cmd;
+ 
+       if (! (is_replot || is_splot || is_plot)
+ 	  && plot_line_count > 0
+ 	  && user_pref.automatic_replot)
+-	plot_stream << GNUPLOT_COMMAND_REPLOT << "\n";
++	*plot_stream << GNUPLOT_COMMAND_REPLOT << "\n";
+ 
+-      plot_stream.flush ();
++      plot_stream->flush ();
+       pipe_handler_error_count = 0;
+     }
+ 
+   return 0;
+ }
+ 
+ // Plotting, eh?
+ 
+@@ -1066,26 +1085,29 @@ cleanup_tmp_files (void)
+       unlink (filename);
+       delete [] filename;
+     }
+ }
+ 
+ void
+ close_plot_stream (void)
+ {
+-  if (plot_stream.is_open ())
+-    plot_stream.close ();
++  if (plot_stream)
++    {
++      delete plot_stream;
++      plot_stream = 0;
++    }
+ 
+   plot_line_count = 0;
+ }
+ 
+ void
+ do_external_plotter_cd (const char *newdir)
+ {
+-  if (plot_stream.is_open ())
++  if (plot_stream && *plot_stream)
+     {
+       ostrstream plot_buf;
+       plot_buf << "cd \"" << newdir << "\"\n" << ends;
+       char *message = plot_buf.str ();
+       send_to_plot_stream (message);
+       delete [] message;
+     }
+ }

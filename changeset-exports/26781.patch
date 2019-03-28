@@ -1,0 +1,543 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1550872806 0
+#      Fri Feb 22 22:00:06 2019 +0000
+# Node ID 98f1a964ff3385c69c86da9bbfb3dfa53045e632
+# Parent  1218f6fa38569663c940f5eac8f387819ea3dd86
+insert package info in symbol table as loadpath finds +package dirs
+
+* fcn-info.h (fcn_info::fcn_info_rep::install_local_function):
+Delete unused function decl.
+(fcn_info::fcn_info_rep::is_package_defined,
+fcn_info::fcn_info_rep::install_package, fcn_info::is_package_defined,
+fcn_info::install_package): New functions.
+
+* load-path.h, load-path.cc (load_path::dir_info::initialize,
+load_path::dir_info::get_file_list):
+Accept name of parent package as argument.
+(load_path::dir_info::get_file_list): Pass full name of package to
+get_package_dir.
+(load_path::dir_info::get_package_dir): Install package in symbbol
+table.  Pass package name to dir_info constructor.
+
+* symtab.h, symtab.cc (symbol_table::install_package): New function.
+
+* cdef-manager.h, cdef-manager.cc (cdef_manager::make_package_symbol):
+New function.
+(cdef_manager::make_package): Eliminate parent package name argument.
+Split parent name out of full name of package to set containing
+package property.
+(cdef_manager::find_package): Don't split parent package name out from
+full package name here.
+
+diff --git a/libinterp/corefcn/fcn-info.h b/libinterp/corefcn/fcn-info.h
+--- a/libinterp/corefcn/fcn-info.h
++++ b/libinterp/corefcn/fcn-info.h
+@@ -68,18 +68,16 @@ namespace octave
+       // No copying!
+ 
+       fcn_info_rep (const fcn_info_rep&) = delete;
+ 
+       fcn_info_rep& operator = (const fcn_info_rep&) = delete;
+ 
+       ~fcn_info_rep (void) = default;
+ 
+-      octave_value install_local_function (const std::string& file_name);
+-
+       octave_value load_private_function (const std::string& dir_name);
+ 
+       octave_value load_class_constructor (void);
+ 
+       octave_value load_class_method (const std::string& dispatch_type);
+ 
+       octave_value find (const octave_value_list& args);
+ 
+@@ -93,32 +91,42 @@ namespace octave
+ 
+       octave_value find_user_function (void);
+ 
+       bool is_user_function_defined (void) const
+       {
+         return function_on_path.is_defined ();
+       }
+ 
++      bool is_package_defined (void) const
++      {
++        return package.is_defined ();
++      }
++
+       octave_value find_function (const octave_value_list& args)
+       {
+         return find (args);
+       }
+ 
+       void install_cmdline_function (const octave_value& f)
+       {
+         cmdline_function = f;
+       }
+ 
+       void install_local_function (const octave_value& f,
+                                    const std::string& file_name)
+       {
+         local_functions[file_name] = f;
+       }
+ 
++      void install_package (const octave_value& pack)
++      {
++        package = pack;
++      }
++
+       void install_user_function (const octave_value& f)
+       {
+         function_on_path = f;
+       }
+ 
+       void install_built_in_function (const octave_value& f)
+       {
+         built_in_function = f;
+@@ -272,16 +280,21 @@ namespace octave
+       return m_rep->find_user_function ();
+     }
+ 
+     bool is_user_function_defined (void) const
+     {
+       return m_rep->is_user_function_defined ();
+     }
+ 
++    bool is_package_defined (void) const
++    {
++      return m_rep->is_package_defined ();
++    }
++
+     octave_value find_function (const octave_value_list& args
+                                 = octave_value_list ())
+     {
+       return m_rep->find_function (args);
+     }
+ 
+     void install_cmdline_function (const octave_value& f)
+     {
+@@ -289,16 +302,21 @@ namespace octave
+     }
+ 
+     void install_local_function (const octave_value& f,
+                                  const std::string& file_name)
+     {
+       m_rep->install_local_function (f, file_name);
+     }
+ 
++    void install_package (const octave_value& pack)
++    {
++      m_rep->install_package (pack);
++    }
++
+     void install_user_function (const octave_value& f)
+     {
+       m_rep->install_user_function (f);
+     }
+ 
+     void install_built_in_function (const octave_value& f)
+     {
+       m_rep->install_built_in_function (f);
+diff --git a/libinterp/corefcn/load-path.cc b/libinterp/corefcn/load-path.cc
+--- a/libinterp/corefcn/load-path.cc
++++ b/libinterp/corefcn/load-path.cc
+@@ -1220,33 +1220,33 @@ namespace octave
+         if (it != package_dir_map.end ())
+           return it->second.is_package (name_tail);
+         else
+           return false;
+       }
+   }
+ 
+   void
+-  load_path::dir_info::initialize (void)
++  load_path::dir_info::initialize (const std::string& parent_package)
+   {
+     is_relative = ! sys::env::absolute_pathname (dir_name);
+ 
+     dir_time_last_checked = sys::time (static_cast<time_t> (0));
+ 
+     sys::file_stat fs (dir_name);
+ 
+     if (fs)
+       {
+         method_file_map.clear ();
+         package_dir_map.clear ();
+ 
+         dir_mtime = fs.mtime ();
+         dir_time_last_checked = sys::time ();
+ 
+-        get_file_list (dir_name);
++        get_file_list (dir_name, parent_package);
+ 
+         try
+           {
+             std::string abs_name = sys::env::make_absolute (dir_name);
+ 
+             // FIXME: nothing is ever removed from this cache of
+             // directory information, so there could be some resource
+             // problems.  Perhaps it should be pruned from time to time.
+@@ -1264,17 +1264,18 @@ namespace octave
+     else
+       {
+         std::string msg = fs.error ();
+         warning ("load_path: %s: %s", dir_name.c_str (), msg.c_str ());
+       }
+   }
+ 
+   void
+-  load_path::dir_info::get_file_list (const std::string& d)
++  load_path::dir_info::get_file_list (const std::string& d,
++                                      const std::string& parent_package)
+   {
+     sys::dir_entry dir (d);
+ 
+     if (dir)
+       {
+         string_vector flist = dir.read ();
+ 
+         octave_idx_type len = flist.numel ();
+@@ -1297,17 +1298,24 @@ namespace octave
+               {
+                 if (fs.is_dir ())
+                   {
+                     if (fname == "private")
+                       get_private_file_map (full_name);
+                     else if (fname[0] == '@')
+                       get_method_file_map (full_name, fname.substr (1));
+                     else if (fname[0] == '+')
+-                      get_package_dir (full_name, fname.substr (1));
++                      {
++                        std::string pkg_name = fname.substr (1);
++
++                        if (! parent_package.empty ())
++                          pkg_name = parent_package + "." + pkg_name;
++
++                        get_package_dir (full_name, pkg_name);
++                      }
+                   }
+                 else
+                   {
+                     all_files[all_files_count++] = fname;
+ 
+                     size_t pos = fname.rfind ('.');
+ 
+                     if (pos != std::string::npos)
+@@ -1355,17 +1363,22 @@ namespace octave
+     if (fs && fs.is_dir ())
+       method_file_map[class_name].private_file_map = get_fcn_files (pd);
+   }
+ 
+   void
+   load_path::dir_info::get_package_dir (const std::string& d,
+                                         const std::string& package_name)
+   {
+-    package_dir_map[package_name] = dir_info (d);
++    symbol_table& symtab
++      = __get_symbol_table__ ("load_path::dir_info::get_package_dir");
++
++    symtab.install_package (package_name);
++
++    package_dir_map[package_name] = dir_info (d, package_name);
+   }
+ 
+   void
+   load_path::package_info::move (const dir_info& di, bool at_end)
+   {
+     std::string dir_name = di.dir_name;
+ 
+     auto s = std::find (dir_list.begin (), dir_list.end (), dir_name);
+diff --git a/libinterp/corefcn/load-path.h b/libinterp/corefcn/load-path.h
+--- a/libinterp/corefcn/load-path.h
++++ b/libinterp/corefcn/load-path.h
+@@ -257,22 +257,22 @@ namespace octave
+       typedef package_dir_map_type::const_iterator const_package_dir_map_iterator;
+       typedef package_dir_map_type::iterator package_dir_map_iterator;
+ 
+       // This default constructor is only provided so we can create a
+       // std::map of dir_info objects.  You should not use this
+       // constructor for any other purpose.
+       dir_info (void) = default;
+ 
+-      dir_info (const std::string& d)
++      dir_info (const std::string& d, const std::string& parent_package = "")
+         : dir_name (d), abs_dir_name (), is_relative (false),
+           dir_mtime (), dir_time_last_checked (), all_files (), fcn_files (),
+           private_file_map (), method_file_map (), package_dir_map ()
+       {
+-        initialize ();
++        initialize (parent_package);
+       }
+ 
+       dir_info (const dir_info&) = default;
+ 
+       ~dir_info (void) = default;
+ 
+       dir_info& operator = (const dir_info&) = default;
+ 
+@@ -288,19 +288,20 @@ namespace octave
+       fcn_file_map_type private_file_map;
+       method_file_map_type method_file_map;
+       package_dir_map_type package_dir_map;
+ 
+       bool is_package (const std::string& name) const;
+ 
+     private:
+ 
+-      void initialize (void);
++      void initialize (const std::string& parent_package = "");
+ 
+-      void get_file_list (const std::string& d);
++      void get_file_list (const std::string& d,
++                          const std::string& parent_package);
+ 
+       void get_private_file_map (const std::string& d);
+ 
+       void get_method_file_map (const std::string& d,
+                                 const std::string& class_name);
+ 
+       void get_package_dir (const std::string& d,
+                             const std::string& package_name);
+diff --git a/libinterp/corefcn/symtab.cc b/libinterp/corefcn/symtab.cc
+--- a/libinterp/corefcn/symtab.cc
++++ b/libinterp/corefcn/symtab.cc
+@@ -31,16 +31,19 @@ along with Octave; see the file COPYING.
+ 
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "oct-time.h"
+ 
+ #include "bp-table.h"
+ #include "call-stack.h"
++#include "cdef-manager.h"
++#include "cdef-package.h"
++#include "cdef-utils.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "fcn-info.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "load-path.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn.h"
+@@ -483,16 +486,56 @@ namespace octave
+         fcn_info& finfo = p->second;
+ 
+         finfo.install_built_in_dispatch (klass);
+       }
+     else
+       error ("install_built_in_dispatch: '%s' is undefined", name.c_str ());
+   }
+ 
++  // Install a +package directory object in the function table.
++  void symbol_table::install_package (const std::string& name)
++  {
++    auto p = m_fcn_table.find (name);
++
++    bool found_in_fcn_table = (p != m_fcn_table.end ());
++
++    if (found_in_fcn_table)
++      {
++        fcn_info& finfo = p->second;
++
++        if (finfo.is_package_defined ())
++          return;
++      }
++
++    cdef_manager& cdm = m_interpreter.get_cdef_manager ();
++
++    octave_function *tmp = cdm.make_package_symbol (name);
++
++    if (! tmp)
++      return;
++
++    octave_value pack = tmp;
++
++    if (found_in_fcn_table)
++      {
++        fcn_info& finfo = p->second;
++
++        finfo.install_package (pack);
++      }
++    else
++      {
++        fcn_info finfo (name);
++
++        finfo.install_package (pack);
++
++        m_fcn_table[name] = finfo;
++      }
++  }
++
+   std::list<std::string> symbol_table::user_function_names (void)
+   {
+     std::list<std::string> retval;
+ 
+     for (const auto& nm_finfo : m_fcn_table)
+       {
+         if (nm_finfo.second.is_user_function_defined ())
+           retval.push_back (nm_finfo.first);
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -144,16 +144,18 @@ namespace octave
+     bool is_superiorto (const std::string& a, const std::string& b);
+ 
+     void alias_built_in_function (const std::string& alias,
+                                   const std::string& name);
+ 
+     void install_built_in_dispatch (const std::string& name,
+                                     const std::string& klass);
+ 
++    void install_package (const std::string& name);
++
+     std::list<std::string> user_function_names (void);
+ 
+     std::list<std::string> built_in_function_names (void);
+ 
+     std::list<std::string> cmdline_function_names (void);
+ 
+     octave_value dump (void) const;
+ 
+diff --git a/libinterp/octave-value/cdef-manager.cc b/libinterp/octave-value/cdef-manager.cc
+--- a/libinterp/octave-value/cdef-manager.cc
++++ b/libinterp/octave-value/cdef-manager.cc
+@@ -714,28 +714,17 @@ namespace octave
+         if (! retval.ok ())
+           error ("invalid package `%s'", name.c_str ());
+       }
+     else
+       {
+         load_path& lp = m_interpreter.get_load_path ();
+ 
+         if (load_if_not_found && lp.find_package (name))
+-          {
+-            size_t pos = name.rfind ('.');
+-
+-            if (pos == std::string::npos)
+-              retval = make_package (name, "");
+-            else
+-              {
+-                std::string parent_name = name.substr (0, pos);
+-
+-                retval = make_package (name, parent_name);
+-              }
+-          }
++          retval = make_package (name);
+         else if (error_if_not_found)
+           error ("unknown package `%s'", name.c_str ());
+       }
+ 
+     return retval;
+   }
+ 
+   octave_function *
+@@ -746,16 +735,29 @@ namespace octave
+     cdef_package pack = find_package (pack_name, false);
+ 
+     if (pack.ok ())
+       retval = new octave_classdef_meta (pack);
+ 
+     return retval;
+   }
+ 
++  octave_function *
++  cdef_manager::make_package_symbol (const std::string& pack_name)
++  {
++    octave_function *retval = nullptr;
++
++    cdef_package pack = make_package (pack_name);
++
++    if (pack.ok ())
++      retval = new octave_classdef_meta (pack);
++
++    return retval;
++  }
++
+   cdef_class
+   cdef_manager::make_class (const std::string& name,
+                             const std::list<octave::cdef_class>& super_list)
+   {
+     cdef_class cls (name, super_list);
+ 
+     cls.set_class (meta_class ());
+ 
+@@ -915,25 +917,32 @@ namespace octave
+                              const std::string& m_access, bool is_static)
+   {
+     octave_value fcn (new octave_builtin (mm, name));
+ 
+     return make_method (cls, name, fcn, m_access, is_static);
+   }
+ 
+   cdef_package
+-  cdef_manager::make_package (const std::string& nm, const std::string& parent)
++  cdef_manager::make_package (const std::string& package_name)
+   {
+-    cdef_package pack (nm);
++    cdef_package pack (package_name);
++
++    std::string parent;
++
++    size_t pos = package_name.rfind ('.');
++
++    if (pos != std::string::npos)
++      parent = package_name.substr (0, pos);
+ 
+     pack.set_class (meta_package ());
+ 
+     if (parent.empty ())
+       pack.put ("ContainingPackage", Matrix ());
+     else
+       pack.put ("ContainingPackage", to_ov (find_package (parent)));
+ 
+-    if (! nm.empty ())
++    if (! package_name.empty ())
+       register_package (pack);
+ 
+     return pack;
+   }
+ }
+diff --git a/libinterp/octave-value/cdef-manager.h b/libinterp/octave-value/cdef-manager.h
+--- a/libinterp/octave-value/cdef-manager.h
++++ b/libinterp/octave-value/cdef-manager.h
+@@ -57,16 +57,18 @@ namespace octave
+                                           const std::string& class_name);
+ 
+     cdef_package find_package (const std::string& name,
+                                bool error_if_not_found = true,
+                                bool load_if_not_found = true);
+ 
+     octave_function * find_package_symbol (const std::string& pack_name);
+ 
++    octave_function * make_package_symbol (const std::string& pack_name);
++
+     void register_class (const cdef_class& cls)
+     {
+       m_all_classes[cls.get_name ()] = cls;
+     }
+ 
+     void unregister_class (const cdef_class& cls)
+     {
+       m_all_classes.erase(cls.get_name ());
+@@ -123,17 +125,17 @@ namespace octave
+ 
+     cdef_method
+       make_method (const cdef_class& cls, const std::string& name,
+                    octave_builtin::meth mm,
+                    const std::string& m_access = "public",
+                    bool is_static = false);
+ 
+     cdef_package
+-      make_package (const std::string& nm, const std::string& parent = "");
++      make_package (const std::string& package_name);
+ 
+   private:
+ 
+     interpreter& m_interpreter;
+ 
+     // All registered/loaded classes
+     std::map<std::string, cdef_class> m_all_classes;
+ 

@@ -1,0 +1,263 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1457459965 18000
+#      Tue Mar 08 12:59:25 2016 -0500
+# Node ID 7ce76114b32164594f3f1c847945c4190d6c2005
+# Parent  fdeb0d731512b974704f24e2ab7ec7a2c84bbf51
+catch exceptions in PKG_ADD files at startup (bug #47346)
+
+* load-path.h, load-path.cc (execute_pkg_add, execute_pkg_del):
+Make static functions in load_path class.  Change uses.
+(load_path::get_add_hook, load_path::get_add_hook): New functions.
+
+* octave.cc (execute_pkg_add, initialize_load_path):
+New static functions.
+(safe_source_file): Improve error messages.
+(gripe_safe_source_exception): Delete.
+(octave_initialize_interpreter): Call initialize_load_path instead of
+load_path::initialize.
+
+diff --git a/libinterp/corefcn/load-path.cc b/libinterp/corefcn/load-path.cc
+--- a/libinterp/corefcn/load-path.cc
++++ b/libinterp/corefcn/load-path.cc
+@@ -41,18 +41,18 @@ along with Octave; see the file COPYING.
+ #include "ov-usr-fcn.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ 
+ load_path *load_path::instance = 0;
+-load_path::hook_fcn_ptr load_path::add_hook = execute_pkg_add;
+-load_path::hook_fcn_ptr load_path::remove_hook = execute_pkg_del;
++load_path::hook_fcn_ptr load_path::add_hook = load_path::execute_pkg_add;
++load_path::hook_fcn_ptr load_path::remove_hook = load_path::execute_pkg_del;
+ std::string load_path::command_line_path;
+ std::string load_path::sys_path;
+ load_path::abs_dir_cache_type load_path::abs_dir_cache;
+ 
+ void
+ load_path::dir_info::update (void)
+ {
+   file_stat fs (dir_name);
+@@ -2215,23 +2215,23 @@ execute_pkg_add_or_del (const std::strin
+ 
+   file_stat fs (file);
+ 
+   if (fs.exists ())
+     source_file (file, "base");
+ }
+ 
+ void
+-execute_pkg_add (const std::string& dir)
++load_path::execute_pkg_add (const std::string& dir)
+ {
+   execute_pkg_add_or_del (dir, "PKG_ADD");
+ }
+ 
+ void
+-execute_pkg_del (const std::string& dir)
++load_path::execute_pkg_del (const std::string& dir)
+ {
+   execute_pkg_add_or_del (dir, "PKG_DEL");
+ }
+ 
+ DEFUN (genpath, args, ,
+        "-*- texinfo -*-\n\
+ @deftypefn  {} {} genpath (@var{dir})\n\
+ @deftypefnx {} {} genpath (@var{dir}, @var{skip}, @dots{})\n\
+diff --git a/libinterp/corefcn/load-path.h b/libinterp/corefcn/load-path.h
+--- a/libinterp/corefcn/load-path.h
++++ b/libinterp/corefcn/load-path.h
+@@ -254,20 +254,25 @@ public:
+   }
+ 
+   static void display (std::ostream& os)
+   {
+     if (instance_ok ())
+       instance->do_display (os);
+   }
+ 
+-  static void set_add_hook (hook_fcn_ptr f) { add_hook = f; }
++  static hook_fcn_ptr get_add_hook (void) { return add_hook; }
++  static hook_fcn_ptr get_remove_hook (void) { return remove_hook; }
+ 
++  static void set_add_hook (hook_fcn_ptr f) { add_hook = f; }
+   static void set_remove_hook (hook_fcn_ptr f) { remove_hook = f; }
+ 
++  static void execute_pkg_add (const std::string& dir);
++  static void execute_pkg_del (const std::string& dir);
++
+   static void set_command_line_path (const std::string& p)
+   {
+     if (command_line_path.empty ())
+       command_line_path = p;
+     else
+       command_line_path += dir_path::path_sep_str () + p;
+   }
+ 
+@@ -728,12 +733,9 @@ private:
+             bool updating = false) const;
+ 
+   friend dir_info::fcn_file_map_type get_fcn_files (const std::string& d);
+ };
+ 
+ extern std::string
+ genpath (const std::string& dir, const string_vector& skip = "private");
+ 
+-extern void execute_pkg_add (const std::string& dir);
+-extern void execute_pkg_del (const std::string& dir);
+-
+ #endif
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -195,16 +195,67 @@ intern_argv (int argc, char **argv)
+ 
+       // Skip program name in argv.
+       int i = argc;
+       while (--i > 0)
+         octave_argv[i-1] = *(argv+i);
+     }
+ }
+ 
++static void
++execute_pkg_add (const std::string& dir)
++{
++  std::string file_name = file_ops::concat (dir, "PKG_ADD");
++
++  try
++    {
++      load_path::execute_pkg_add (dir);
++    }
++  catch (const index_exception& e)
++    {
++      recover_from_exception ();
++
++      std::cerr << "error: index exception in " << file_name << ": "
++                << e.message () << std::endl;
++    }
++  catch (const octave_interrupt_exception&)
++    {
++      recover_from_exception ();
++
++      if (quitting_gracefully)
++        clean_up_and_exit (exit_status);
++    }
++  catch (const octave_execution_exception&)
++    {
++      recover_from_exception ();
++
++      std::cerr << "error: execution exception in " << file_name << std::endl;
++    }
++}
++
++static void
++initialize_load_path (void)
++{
++  // Temporarily set the execute_pkg_add function to one that catches
++  // exceptions.  This is better than wrapping load_path::initialize in
++  // a try-catch block because it will not stop executing PKG_ADD files
++  // at the first exception.  It's also better than changing the default
++  // execute_pkg_add function to use safe_source file because that will
++  // normally be evaluated from the normal intepreter loop where
++  // exceptions are already handled.
++
++  unwind_protect frame;
++
++  frame.add_fcn (load_path::set_add_hook, load_path::get_add_hook ());
++
++  load_path::set_add_hook (execute_pkg_add);
++
++  load_path::initialize (set_initial_path);
++}
++
+ DEFUN (__version_info__, args, ,
+        "-*- texinfo -*-\n\
+ @deftypefn {} {retval =} __version_info__ (@var{name}, @var{version}, @var{release}, @var{date})\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   static octave_map vinfo;
+ 
+@@ -252,52 +303,50 @@ initialize_version_info (void)
+   args(3) = OCTAVE_RELEASE_DATE;
+   args(2) = OCTAVE_RELEASE;
+   args(1) = OCTAVE_VERSION;
+   args(0) = "GNU Octave";
+ 
+   F__version_info__ (args, 0);
+ }
+ 
+-static void
+-gripe_safe_source_exception (const std::string& file, const std::string& msg)
+-{
+-  std::cerr << "error: " << msg << "\n"
+-            << "error: execution of " << file << " failed\n"
+-            << "error: trying to make my way to a command prompt"
+-            << std::endl;
+-}
+-
+ // Execute commands from a file and catch potential exceptions in a consistent
+ // way.  This function should be called anywhere we might parse and execute
+ // commands from a file before before we have entered the main loop in
+ // toplev.cc.
+ 
+ static void
+ safe_source_file (const std::string& file_name,
+                   const std::string& context = "",
+                   bool verbose = false, bool require_file = true,
+                   const std::string& warn_for = "")
+ {
+   try
+     {
+       source_file (file_name, context, verbose, require_file, warn_for);
+     }
++  catch (const index_exception& e)
++    {
++      recover_from_exception ();
++
++      std::cerr << "error: index exception in " << file_name << ": "
++                << e.message () << std::endl;
++    }
+   catch (const octave_interrupt_exception&)
+     {
+       recover_from_exception ();
+ 
+       if (quitting_gracefully)
+         clean_up_and_exit (exit_status);
+     }
+   catch (const octave_execution_exception&)
+     {
+       recover_from_exception ();
+ 
+-      gripe_safe_source_exception (file_name, "unhandled execution exception");
++      std::cerr << "error: execution exception in " << file_name << std::endl;
+     }
+ }
+ 
+ // Initialize by reading startup files.
+ 
+ static void
+ execute_startup_files (void)
+ {
+@@ -835,17 +884,17 @@ octave_initialize_interpreter (int argc,
+ 
+   initialize_version_info ();
+ 
+   // Make all command-line arguments available to startup files,
+   // including PKG_ADD files.
+ 
+   intern_argv (argc, argv);
+ 
+-  load_path::initialize (set_initial_path);
++  initialize_load_path ();
+ 
+   initialize_history (read_history_file);
+ }
+ 
+ int
+ octave_execute_interpreter (void)
+ {
+   if (! inhibit_startup_message)

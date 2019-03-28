@@ -1,0 +1,440 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1500567423 25200
+#      Thu Jul 20 09:17:03 2017 -0700
+# Node ID 7b43a96c21799981c735252f66524bd77bcdb718
+# Parent  41795b504a8b616547af77007ed15aa50cfcde30
+Replace OCTAVE_LOCAL_BUFFER code with std::unique_ptr (bug #48793).
+
+* oct-locbuf.h: Replace handwritten code with call to std::unique_ptr.
+Rewrite OCTAVE_LOCAL_BUFFER_INIT to use std::fill_n rather than for loop
+with temporary variables that could clash with existing code.
+
+* liboctave/util/oct-locbuf.cc: Delete file.
+
+* liboctave/util/module.mk: Remove oct-locbuf.cc from build system.
+
+* interpreter.cc (interpreter::cleanup): Remove code to clean up chunk_buffer.
+
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -1157,18 +1157,16 @@ namespace octave
+     // function from the examples directory to create an integer
+     // object and then exit Octave.  Octave should crash with a
+     // segfault when cleaning up the typinfo singleton.  We need some
+     // way to force new octave_value_X types that are created in
+     // .oct files to be unregistered when the .oct file shared library
+     // is unloaded.
+     //
+     // OCTAVE_SAFE_CALL (singleton_cleanup_list::cleanup, ());
+-
+-    OCTAVE_SAFE_CALL (chunk_buffer::clear, ());
+   }
+ 
+   tree_evaluator& interpreter::get_evaluator (void)
+   {
+     return m_evaluator;
+   }
+ 
+   stream_list& interpreter::get_stream_list (void)
+diff --git a/liboctave/util/module.mk b/liboctave/util/module.mk
+--- a/liboctave/util/module.mk
++++ b/liboctave/util/module.mk
+@@ -76,17 +76,16 @@ UTIL_SRC = \
+   %reldir%/lo-ieee.cc \
+   %reldir%/lo-regexp.cc \
+   %reldir%/lo-utils.cc \
+   %reldir%/f77-extern.cc \
+   %reldir%/quit.cc \
+   %reldir%/oct-base64.cc \
+   %reldir%/oct-glob.cc \
+   %reldir%/oct-inttypes.cc \
+-  %reldir%/oct-locbuf.cc \
+   %reldir%/oct-mutex.cc \
+   %reldir%/oct-shlib.cc \
+   %reldir%/oct-sparse.cc \
+   %reldir%/oct-string.cc \
+   %reldir%/pathsearch.cc \
+   %reldir%/singleton-cleanup.cc \
+   %reldir%/sparse-sort.cc \
+   %reldir%/sparse-util.cc \
+diff --git a/liboctave/util/oct-locbuf.cc b/liboctave/util/oct-locbuf.cc
+deleted file mode 100644
+--- a/liboctave/util/oct-locbuf.cc
++++ /dev/null
+@@ -1,155 +0,0 @@
+-/*
+-
+-Copyright (C) 2008-2017 Jaroslav Hajek
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by
+-the Free Software Foundation; either version 3 of the License, or
+-(at your option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but
+-WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if defined (HAVE_CONFIG_H)
+-#  include "config.h"
+-#endif
+-
+-#include <iostream>
+-
+-#include "lo-error.h"
+-#include "oct-locbuf.h"
+-
+-// FIXME: Maybe we should querying for available physical memory?
+-
+-#if ! defined (OCTAVE_LOCBUF_CHUNKSIZE_MB)
+-#  define OCTAVE_LOCBUF_CHUNKSIZE_MB 32
+-#endif
+-
+-namespace octave
+-{
+-// Each chunk will be at least this big.
+-
+-  const size_t chunk_buffer::chunk_size =
+-    static_cast<size_t> (OCTAVE_LOCBUF_CHUNKSIZE_MB) << 20;
+-
+-  char *chunk_buffer::top = nullptr;
+-  char *chunk_buffer::chunk = nullptr;
+-  size_t chunk_buffer::left = 0;
+-  size_t chunk_buffer::active = 0;
+-
+-  chunk_buffer::chunk_buffer (size_t size) : cnk (0), dat (0)
+-  {
+-    // Alignment mask.  The size of double or long int, whichever is
+-    // greater.  All data will be aligned to this size.  If it's not
+-    // enough for a type, that type should not be declared as POD.
+-
+-    static const size_t align_mask = (sizeof (long) < sizeof (double)
+-                                      ? sizeof (double)
+-                                      : sizeof (long)) - 1;
+-
+-    // Always allocate, even for zero-size buffers so that local buffers
+-    // always have valid addresses, same as for directly using operator
+-    // new.
+-
+-    active++;
+-
+-    // Align size.  Note that size_t is unsigned, so size-1 must correctly
+-    // wrap around.
+-
+-    size = ((size - 1) | align_mask) + 1;
+-
+-    if (size > left)
+-      {
+-        // Big buffers (> 1/8 chunk) will be allocated as stand-alone and
+-        // won't disrupt the chain.
+-
+-        if (size > chunk_size >> 3)
+-          {
+-            // Use new [] to get std::bad_alloc if out of memory.
+-
+-            dat = new char [size];
+-            return;
+-          }
+-
+-        dat = new char [chunk_size];
+-        chunk = top = dat;
+-        left = chunk_size;
+-      }
+-
+-    // Now allocate memory from the chunk and update state.
+-
+-    cnk = chunk;
+-    dat = top;
+-    left -= size;
+-    top += size;
+-  }
+-
+-  chunk_buffer::~chunk_buffer (void)
+-  {
+-    active--;
+-
+-    if (cnk == chunk)
+-      {
+-        // Our chunk is still the active one.  Just restore the state.
+-
+-        left += top - dat;
+-        top = dat;
+-      }
+-    else
+-      {
+-        if (cnk)
+-          {
+-            // Responsible for deletion.
+-
+-            delete [] chunk;
+-            chunk = cnk;
+-            top = dat;
+-
+-            // FIXME: the following calcuation of remaining data will
+-            //        only work if each chunk has the same chunk_size.
+-
+-            left = chunk_size - (dat - cnk);
+-          }
+-        else
+-          {
+-            // We were a stand-alone buffer.
+-
+-            delete [] dat;
+-          }
+-      }
+-  }
+-
+-  // Clear the final chunk of allocated memory.
+-
+-  void
+-  chunk_buffer::clear (void)
+-  {
+-    if (active == 0)
+-      {
+-        delete [] chunk;
+-        chunk = 0;
+-        top = 0;
+-        left = 0;
+-      }
+-    else
+-      {
+-        // FIXME: Doesn't this situation represent a programming error of
+-        // some kind?  If so, maybe this should be a fatal error?
+-
+-        (*current_liboctave_warning_with_id_handler)
+-          ("Octave:local-buffer-inconsistency",
+-           "chunk_buffer::clear: %d active allocations remain!",
+-           active);
+-      }
+-  }
+-}
+diff --git a/liboctave/util/oct-locbuf.h b/liboctave/util/oct-locbuf.h
+--- a/liboctave/util/oct-locbuf.h
++++ b/liboctave/util/oct-locbuf.h
+@@ -21,203 +21,32 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if ! defined (octave_oct_locbuf_h)
+ #define octave_oct_locbuf_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <cstddef>
+-#include "oct-cmplx.h"
+-
+-namespace octave
+-{
+-  // The default local buffer simply encapsulates an *array* pointer
+-  // that gets deleted automatically.  For common POD types, we provide
+-  // specializations.
+-
+-  template <typename T>
+-  class local_buffer
+-  {
+-  public:
+-
+-    // Always allocate, even for zero-size buffers so that local
+-    // buffers always have valid addresses, same as for directly using
+-    // operator new.
+-
+-    local_buffer (size_t size) : data (new T [size]) { }
+-
+-    // No copying!
+-
+-    local_buffer (const local_buffer&) = delete;
+-
+-    local_buffer& operator = (const local_buffer&) = delete;
+-
+-    ~local_buffer (void) { delete [] data; }
+-
+-    operator T *() const { return data; }
+-
+-  private:
+-
+-    T *data;
+-  };
+-
+-  // For buffers of POD types, we'll be smarter.  There is one thing
+-  // that differentiates a local buffer from a dynamic array - the local
+-  // buffers, if not manipulated improperly, have a FIFO semantics,
+-  // meaning that if buffer B is allocated after buffer A, B *must* be
+-  // deallocated before A.  This is *guaranteed* if you use local buffer
+-  // exclusively through the OCTAVE_LOCAL_BUFFER macro, because the C++
+-  // standard requires that explicit local objects be destroyed in
+-  // reverse order of declaration.  Therefore, we can avoid memory
+-  // fragmentation by allocating fairly large chunks of memory and
+-  // serving local buffers from them in a stack-like manner.  The first
+-  // returning buffer in previous chunk will be responsible for
+-  // deallocating the chunk.
+-
+-  class chunk_buffer
+-  {
+-  public:
+-
+-    OCTAVE_API chunk_buffer (size_t size);
+-
+-    // No copying!
+-
+-    chunk_buffer (const chunk_buffer&) = delete;
+-
+-    chunk_buffer& operator = (const chunk_buffer&) = delete;
+-
+-    OCTAVE_API virtual ~chunk_buffer (void);
+-
+-    char * data (void) const { return dat; }
+-
+-    static OCTAVE_API void clear (void);
+-
+-  private:
+-
+-    // The number of bytes we allocate for each large chunk of memory we
+-    // manage.
+-    static const size_t chunk_size;
+-
+-    // Pointer to the end end of the last allocation.
+-    static char *top;
+-
+-    // Pointer to the current active chunk.
+-    static char *chunk;
+-
+-    // The number of bytes remaining in the active chunk.
+-    static size_t left;
+ 
+-    // The number of active allocations.
+-    static size_t active;
+-
+-    // Pointer to the current chunk.
+-    char *cnk;
+-
+-    // Pointer to the beginning of the most recent allocation.
+-    char *dat;
+-  };
+-
+-  // This specializes local_buffer to use the chunked buffer
+-  // mechanism for POD types.
+-#define SPECIALIZE_POD_BUFFER(TYPE)                             \
+-  template <>                                                   \
+-  class local_buffer<TYPE> : private chunk_buffer \
+-  {                                                             \
+-  public:                                                       \
+-    local_buffer (size_t size)                           \
+-      : chunk_buffer (size * sizeof (TYPE)) { }          \
+-                                                                \
+-    operator TYPE *() const                                     \
+-    {                                                           \
+-      return reinterpret_cast<TYPE *> (this->data ());          \
+-    }                                                           \
+-  }
+-
+-  SPECIALIZE_POD_BUFFER (bool);
+-  SPECIALIZE_POD_BUFFER (char);
+-  SPECIALIZE_POD_BUFFER (unsigned short);
+-  SPECIALIZE_POD_BUFFER (short);
+-  SPECIALIZE_POD_BUFFER (int);
+-  SPECIALIZE_POD_BUFFER (unsigned int);
+-  SPECIALIZE_POD_BUFFER (long);
+-  SPECIALIZE_POD_BUFFER (unsigned long);
+-  SPECIALIZE_POD_BUFFER (float);
+-  SPECIALIZE_POD_BUFFER (double);
+-  // FIXME: Are these guaranteed to be POD and satisfy alignment?
+-  SPECIALIZE_POD_BUFFER (Complex);
+-  SPECIALIZE_POD_BUFFER (FloatComplex);
+-  // MORE ?
++#include <algorithm>
++#include <memory>
+ 
+-  // All pointers and const pointers are also POD types.
+-  template <typename T>
+-  class local_buffer<T *> : private chunk_buffer
+-  {
+-  public:
+-    local_buffer (size_t size)
+-      : chunk_buffer (size * sizeof (T *))
+-    { }
+-
+-    operator T **() const { return reinterpret_cast<T **> (this->data ()); }
+-  };
+-
+-  template <typename T>
+-  class local_buffer<const T *> : private chunk_buffer
+-  {
+-  public:
+-    local_buffer (size_t size)
+-      : chunk_buffer (size * sizeof (const T *))
+-    { }
+-
+-    operator const T **() const
+-    {
+-      return reinterpret_cast<const T **> (this->data ());
+-    }
+-  };
+-}
+-
+-// If the compiler supports dynamic stack arrays, we can use the
+-// attached hack to place small buffer arrays on the stack.  It may be
+-// even faster than our obstack-like optimization, but is dangerous
+-// because stack is a very limited resource, so we disable it.
+-
+-#if 0 // defined (HAVE_DYNAMIC_AUTO_ARRAYS)
+-
+-// Maximum buffer size (in bytes) to be placed on the stack.
+-
+-#define OCTAVE_LOCAL_BUFFER_MAX_STACK_SIZE 8192
+-
+-// If we have automatic arrays, we use an automatic array if the size
+-// is small enough.  To avoid possibly evaluating 'size' multiple
+-// times, we first cache it.  Note that we always construct both the
+-// stack array and the octave::local_buffer object, but only one of
+-// them will be nonempty.
++#if __cplusplus >= 201402L
+ 
+ #define OCTAVE_LOCAL_BUFFER(T, buf, size)                               \
+-  const size_t _bufsize_ ## buf = size;                                 \
+-  const bool _lbufaut_ ## buf = _bufsize_ ## buf * sizeof (T)           \
+-    <= OCTAVE_LOCAL_BUFFER_MAX_STACK_SIZE;                              \
+-  T _bufaut_ ## buf [_lbufaut_ ## buf ? _bufsize_ ## buf : 0];          \
+-  octave::local_buffer<T> _bufheap_ ## buf (! _lbufaut_ ## buf ? _bufsize_ ## buf : 0); \
+-  T *buf = (_lbufaut_ ## buf                                            \
+-            ? _bufaut_ ## buf : static_cast<T *> (_bufheap_ ## buf))
++  auto octave_local_buffer_ ## buf = std::make_unique<T []> (size);     \
++  T *buf = octave_local_buffer_ ## buf.get (); \
++  assert (0);
+ 
+ #else
+ 
+-// If we don't have automatic arrays, we simply always use
+-// octave::local_buffer.
+-
+-#define OCTAVE_LOCAL_BUFFER(T, buf, size)               \
+-  octave::local_buffer<T> _buffer_ ## buf (size);       \
+-  T *buf = _buffer_ ## buf
++#define OCTAVE_LOCAL_BUFFER(T, buf, size)                               \
++  std::unique_ptr<T []> octave_local_buffer_ ## buf { new T [size] };   \
++  T *buf = octave_local_buffer_ ## buf.get ()
+ 
+ #endif
+ 
+-// Note: we use weird variables in the for loop to avoid warnings
+-// about shadowed parameters.
+-
+-#define OCTAVE_LOCAL_BUFFER_INIT(T, buf, size, value)   \
+-  OCTAVE_LOCAL_BUFFER (T, buf, size);                   \
+-  for (size_t _buf_iter = 0, _buf_size = size;          \
+-       _buf_iter < _buf_size; _buf_iter++)              \
+-    buf[_buf_iter] = value
++#define OCTAVE_LOCAL_BUFFER_INIT(T, buf, size, value)                   \
++  OCTAVE_LOCAL_BUFFER (T, buf, size);                                   \
++  std::fill_n (buf, size, value)
+ 
+ #endif

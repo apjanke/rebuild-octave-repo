@@ -1,0 +1,827 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1231499514 18000
+#      Fri Jan 09 06:11:54 2009 -0500
+# Node ID adab48231a03df9cc198b5175aec42a4a7400861
+# Parent  7b25349b32e6debab897aca7a1aa259d6b1f248d
+make input_line_number work again
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,29 @@
++2009-01-09  John W. Eaton  <jwe@octave.org>
++
++	* input.cc (get_user_input (void)): Don't increment input_line_number.
++	* lex.l (xunput): New function.  Use it in place of yyunput
++	anywhere a newline character may be put back on the input stream.
++	Increment input_line_number in all rules that consume newlines
++	characters.
++	(text_yyinput): Increment input_line_number
++	(fixup_column_count): Increment input_line_number.
++	(prep_for_function): Set input_line_number to 1, not 0.
++	(reset_parser): Set input_line_number to current_command_number,
++	not current_command_number-1.
++	(flex_stream_reader::ungetc): Call xunput, not yyunput.
++	* parse.y (input_line_number): Initialize to 1, not 0.
++	(text_getc): Increment input_line_number correctly.
++	(stdio_stream_reader::ungetc): Decrement input_line_number if
++	putting back a newline character.
++	(parse_fcn_file): Set input_line_number to 1, not 0.
++	(eval_string): Unwind-protect input_line_number and
++	current_input_column.
++
+ 2009-01-08  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* ov-cell.cc (octave_cell::subsasgn): Erase duplicate lhs value 
+ 	prior to assignment to avoid a redundant copy.
+ 
+ 2008-12-26  Thorsten Meyer  <thorsten.meyier@gmx.de>
+ 
+ 	* mappers.cc (Ftoascii), mappers.cc (Ftolower), mappers.cc
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -325,19 +325,16 @@ get_user_input (void)
+ 	    retval.append ("\n");
+ 	}
+     }
+   else
+     retval = octave_gets ();
+ 
+   current_input_line = retval;
+ 
+-  if (! get_input_from_eval_string)
+-    input_line_number++;
+-
+   return retval;
+ }
+ 
+ int
+ octave_read (char *buf, unsigned max_size)
+ {
+   // FIXME -- is this a safe way to buffer the input?
+ 
+diff --git a/src/lex.l b/src/lex.l
+--- a/src/lex.l
++++ b/src/lex.l
+@@ -252,16 +252,17 @@ static unsigned int Vtoken_count = 0;
+ // The start state that was in effect when the beginning of a block
+ // comment was noticed.
+ static int block_comment_nesting_level = 0;
+ 
+ // Forward declarations for functions defined at the bottom of this
+ // file.
+ 
+ static int text_yyinput (void);
++static void xunput (char c, char *buf);
+ static void fixup_column_count (char *s);
+ static void do_comma_insert_check (void);
+ static int is_keyword_token (const std::string& s);
+ static void prep_for_function (void);
+ static void prep_for_nested_function (void);
+ static int process_comment (bool start_in_block, bool& eof);
+ static bool match_any (char c, const char *s);
+ static bool next_token_is_sep_op (void);
+@@ -303,41 +304,42 @@ POW     ((\*\*)|(\^))
+ EPOW    (\.{POW})
+ IDENT	([_$a-zA-Z][_$a-zA-Z0-9]*)
+ EXPON	([DdEe][+-]?{D}+)
+ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EXPON}?)|(0[xX][0-9a-fA-F]+))
+ %%
+ 
+ <SCRIPT_FILE_BEGIN>. {
+     BEGIN (INITIAL);
+-    yyunput (yytext[0], yytext);
++    xunput (yytext[0], yytext);
+     COUNT_TOK_AND_RETURN (SCRIPT);
+   }
+ 
+ <NESTED_FUNCTION_END>. {
+     BEGIN (NESTED_FUNCTION_BEGIN);
+-    yyunput (yytext[0], yytext);
++    xunput (yytext[0], yytext);
+     COUNT_TOK_AND_RETURN (';');
+   }
+ 
+ <NESTED_FUNCTION_BEGIN>. {
+     BEGIN (INITIAL);
+-    yyunput (yytext[0], yytext);
++    xunput (yytext[0], yytext);
+     prep_for_nested_function ();
+     COUNT_TOK_AND_RETURN (FCN);
+   }
+ 
+ %{
+ // Help and other command-style functions are a pain in the ass.  This
+ // stuff needs to be simplified.  May require some changes in the
+ // parser too.
+ %}
+ 
+ <COMMAND_START>{NL} {
+     BEGIN (INITIAL);
++    input_line_number++;
+     current_input_column = 1;
+     lexer_flags.quote_is_transpose = false;
+     lexer_flags.convert_spaces_to_comma = true;
+     lexer_flags.doing_rawcommand = false;
+     COUNT_TOK_AND_RETURN ('\n');
+   }
+ 
+ <COMMAND_START>[\;\,] {
+@@ -569,16 +571,17 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ %}
+ 
+ {CONT}{S}*{NL} |
+ {CONT}{S}*{COMMENT} {
+     if (yytext[0] == '\\')
+       gripe_matlab_incompatible_continuation ();
+     scan_for_comments (yytext);
+     promptflag--;
++    input_line_number++;
+     current_input_column = 1;
+   }
+ 
+ %{
+ // End of file.
+ %}
+ 
+ <<EOF>> {
+@@ -621,16 +624,17 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ 
+ %{
+ // A new line character.  New line characters inside matrix constants
+ // are handled by the <MATRIX_START> start state code above.  If closest
+ // nesting is inside parentheses, don't return a row separator.
+ %}
+ 
+ {NL} {
++    input_line_number++;
+     current_input_column = 1;
+     lexer_flags.quote_is_transpose = false;
+     lexer_flags.convert_spaces_to_comma = true;
+     if (nesting_level.none ())
+       COUNT_TOK_AND_RETURN ('\n');
+     else if (nesting_level.is_paren ())
+       gripe_matlab_incompatible ("bare newline inside parentheses");
+     else if (nesting_level.is_bracket_or_brace ())
+@@ -669,32 +673,33 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ }
+ 
+ %{
+ // Gobble comments.  If closest nesting is inside parentheses, don't
+ // return a new line.
+ %} 
+ 
+ {CCHAR} {
+-    yyunput (yytext[0], yytext);
++    xunput (yytext[0], yytext);
+ 
+     bool eof = false;
+     int tok = process_comment (false, eof);
+ 
+     if (eof)
+       TOK_RETURN (END_OF_INPUT);
+     else if (tok > 0)
+       COUNT_TOK_AND_RETURN (tok);
+   }
+ 
+ %{
+ // Block comments.
+ %}
+ 
+ ^{S}*{CCHAR}\{{S}*{NL} {
++    input_line_number++;
+     current_input_column = 1;
+     block_comment_nesting_level++;
+     promptflag--;
+     bool eof = false;
+     process_comment (true, eof);
+   }
+ 
+ %{
+@@ -802,17 +807,17 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ 
+ %{
+ // Unrecognized input is a lexical error.
+ %}
+ 
+ . {
+     // EOF happens here if we are parsing nested functions.
+ 
+-    yyunput (yytext[0], yytext);
++    xunput (yytext[0], yytext);
+ 
+     int c = text_yyinput ();
+ 
+     if (c != EOF)
+       {
+ 	current_input_column++;
+ 
+ 	error ("invalid character `%s' (ASCII %d) near line %d, column %d",
+@@ -834,17 +839,17 @@ NUMBER	(({D}+\.?{D}*{EXPON}?)|(\.{D}+{EX
+ 
+ void
+ do_comma_insert_check (void)
+ {
+   int spc_gobbled = eat_continuation ();
+ 
+   int c = text_yyinput ();
+ 
+-  yyunput (c, yytext);
++  xunput (c, yytext);
+ 
+   if (spc_gobbled)
+     yyunput (' ', yytext);
+ 
+   lexer_flags.do_comma_insert = (lexer_flags.bracketflag && c == '[');
+ }
+ 
+ // Fix things up for errors or interrupts.  The parser is never called
+@@ -881,17 +886,17 @@ reset_parser (void)
+       delete token_stack.top ();
+       token_stack.pop ();
+     }
+ 
+   // Can be reset by defining a function.
+   if (! (reading_script_file || reading_fcn_file))
+     {
+       current_input_column = 1;
+-      input_line_number = command_editor::current_command_number () - 1;
++      input_line_number = command_editor::current_command_number ();
+     }
+ 
+   // Only ask for input from stdin if we are expecting interactive
+   // input.
+   if ((interactive || forced_interactive)
+       && ! (reading_fcn_file
+ 	    || reading_script_file
+ 	    || get_input_from_eval_string
+@@ -919,30 +924,45 @@ text_yyinput (void)
+ 
+       if (c != '\n')
+ 	{
+ 	  yyunput (c, yytext);
+ 	  c = '\n';
+ 	}
+     }
+ 
++  if (c == '\n')
++    input_line_number++;
++
+   return c;
+ }
+ 
++static void
++xunput (char c, char *buf)
++{
++  if (c == '\n')
++    input_line_number--;
++
++  yyunput (c, buf);
++}
++
+ // If we read some newlines, we need figure out what column we're
+ // really looking at.
+ 
+ static void
+ fixup_column_count (char *s)
+ {
+   char c;
+   while ((c = *s++) != '\0')
+     {
+       if (c == '\n')
+-	  current_input_column = 1;
++        {
++          input_line_number++;
++          current_input_column = 1;
++        }
+       else
+ 	current_input_column++;
+     }
+ }
+ 
+ // Include these so that we don't have to link to libfl.a.
+ 
+ int
+@@ -1456,17 +1476,17 @@ grab_comment_block (stream_reader& reade
+ 
+ class
+ flex_stream_reader : public stream_reader
+ {
+ public:
+   flex_stream_reader (char *buf_arg) : stream_reader (), buf (buf_arg) { }
+ 
+   int getc (void) { return ::text_yyinput (); }
+-  int ungetc (int c) { ::yyunput (c, buf); return 0; }
++  int ungetc (int c) { ::xunput (c, buf); return 0; }
+   
+ private:
+   char *buf;
+ };
+ 
+ static int
+ process_comment (bool start_in_block, bool& eof)
+ {
+@@ -1552,17 +1572,17 @@ static bool
+ next_token_is_sep_op (void)
+ {
+   bool retval = false;
+ 
+   int c = text_yyinput ();
+ 
+   retval = match_any (c, ",;\n]");
+ 
+-  yyunput (c, yytext);
++  xunput (c, yytext);
+ 
+   return retval;
+ }
+ 
+ // Try to determine if the next token should be treated as a postfix
+ // unary operator.  This is ugly, but it seems to do the right thing.
+ 
+ static bool
+@@ -1575,32 +1595,32 @@ next_token_is_postfix_unary_op (bool spc
+   if (c0 == '\'' && ! spc_prev)
+     {
+       un_op = true;
+     }
+   else if (c0 == '.')
+     {
+       int c1 = text_yyinput ();
+       un_op = (c1 == '\'');
+-      yyunput (c1, yytext);
++      xunput (c1, yytext);
+     }
+   else if (c0 == '+')
+     {
+       int c1 = text_yyinput ();
+       un_op = (c1 == '+');
+-      yyunput (c1, yytext);
++      xunput (c1, yytext);
+     }
+   else if (c0 == '-')
+     {
+       int c1 = text_yyinput ();
+       un_op = (c1 == '-');
+-      yyunput (c1, yytext);
++      xunput (c1, yytext);
+     }
+ 
+-  yyunput (c0, yytext);
++  xunput (c0, yytext);
+ 
+   return un_op;
+ }
+ 
+ // Try to determine if the next token should be treated as a binary
+ // operator.
+ //
+ // This kluge exists because whitespace is not always ignored inside
+@@ -1639,17 +1659,17 @@ next_token_is_bin_op (bool spc_prev)
+ 	    break;
+ 
+ 	  default:
+ 	    // Could be either, spacing matters.
+ 	    bin_op = looks_like_bin_op (spc_prev, c1);
+ 	    break;
+ 	  }
+ 
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     case ':':
+     case '/':
+     case '\\':
+     case '^':
+       // Always a binary op (may also include /=, \=, and ^=).
+@@ -1663,17 +1683,17 @@ next_token_is_bin_op (bool spc_prev)
+ 
+ 	if (match_any (c1, "+-/\\^*"))
+ 	  // Always a binary op (may also include .+=, .-=, ./=, ...).
+ 	  bin_op = true;
+ 	else if (! isdigit (c1) && c1 != ' ' && c1 != '\t' && c1 != '.')
+ 	  // A structure element reference is a binary op.
+ 	  bin_op = true;
+ 
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     // = == & && | || * **
+     case '=':
+     case '&':
+     case '|':
+     case '*':
+@@ -1693,25 +1713,25 @@ next_token_is_bin_op (bool spc_prev)
+     case '!':
+       {
+ 	int c1 = text_yyinput ();
+ 
+ 	// ~ and ! can be unary ops, so require following =.
+ 	if (c1 == '=')
+ 	  bin_op = true;
+ 
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     default:
+       break;
+     }
+ 
+-  yyunput (c0, yytext);
++  xunput (c0, yytext);
+ 
+   return bin_op;
+ }
+ 
+ // Used to delete trailing white space from tokens.
+ 
+ static std::string
+ strip_trailing_whitespace (char *s)
+@@ -1892,17 +1912,17 @@ eat_whitespace (void)
+ 	    goto done;
+ 	}
+     }
+ 
+   if (! comment_buf.empty ())
+     octave_comment_buffer::append (comment_buf);
+ 
+  done:
+-  yyunput (c, yytext);
++  xunput (c, yytext);
+   current_input_column--;
+   return retval;
+ }
+ 
+ static inline bool
+ looks_like_hex (const char *s, int len)
+ {
+   return (len > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X'));
+@@ -2029,26 +2049,26 @@ have_continuation (bool trailing_comment
+ 	      beginning_of_comment = false;
+ 	    }
+ 	  else
+ 	    goto cleanup;
+ 	  break;
+ 	}
+     }
+ 
+-  yyunput (c, yytext);
++  xunput (c, yytext);
+   return false;
+ 
+ cleanup:
+ 
+   std::string s = buf.str ();
+ 
+   int len = s.length ();
+   while (len--)
+-    yyunput (s[len], yytext);
++    xunput (s[len], yytext);
+ 
+   return false;
+ }
+ 
+ // We have seen a `.' and need to see if it is the start of a
+ // continuation.  If so, this eats it, up to and including the new
+ // line character.
+ 
+@@ -2058,22 +2078,22 @@ have_ellipsis_continuation (bool trailin
+   char c1 = text_yyinput ();
+   if (c1 == '.')
+     {
+       char c2 = text_yyinput ();
+       if (c2 == '.' && have_continuation (trailing_comments_ok))
+ 	return true;
+       else
+ 	{
+-	  yyunput (c2, yytext);
+-	  yyunput (c1, yytext);
++	  xunput (c2, yytext);
++	  xunput (c1, yytext);
+ 	}
+     }
+   else
+-    yyunput (c1, yytext);
++    xunput (c1, yytext);
+ 
+   return false;
+ }
+ 
+ // See if we have a continuation line.  If so, eat it and the leading
+ // whitespace on the next line.
+ //
+ // Return value is the same as described for eat_whitespace().
+@@ -2084,17 +2104,17 @@ eat_continuation (void)
+   int retval = ATE_NOTHING;
+ 
+   int c = text_yyinput ();
+ 
+   if ((c == '.' && have_ellipsis_continuation ())
+       || (c == '\\' && have_continuation ()))
+     retval = eat_whitespace ();
+   else
+-    yyunput (c, yytext);
++    xunput (c, yytext);
+ 
+   return retval;
+ }
+ 
+ static int
+ handle_string (char delim, int text_style)
+ {
+   std::ostringstream buf;
+@@ -2149,17 +2169,17 @@ handle_string (char delim, int text_styl
+ 		{
+ 		  buf << static_cast<char> (c);		    
+ 		  if (lexer_flags.doing_rawcommand)
+ 		    buf << static_cast<char> (c);
+ 		}
+ 	      else
+ 		{
+ 		  std::string s;  
+-		  yyunput (c, yytext);
++		  xunput (c, yytext);
+ 
+ 		  if (lexer_flags.doing_rawcommand || delim == '\'')
+ 		    s = buf.str ();
+ 		  else
+ 		    s = do_string_escapes (buf.str ());
+ 
+ 		  if (text_style && lexer_flags.doing_rawcommand)
+ 		    s = std::string (1, delim) + s + std::string (1, delim);
+@@ -2199,93 +2219,93 @@ next_token_is_assign_op (void)
+ 
+   int c0 = text_yyinput ();
+ 
+   switch (c0)
+     {
+     case '=':
+       {
+ 	int c1 = text_yyinput ();
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+ 	if (c1 != '=')
+ 	  retval = true;
+       }
+       break;
+ 
+     case '+':
+     case '-':
+     case '*':
+     case '/':
+     case '\\':
+     case '&':
+     case '|':
+       {
+ 	int c1 = text_yyinput ();
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+ 	if (c1 == '=')
+ 	  retval = true;
+       }
+       break;
+ 
+     case '.':
+       {
+ 	int c1 = text_yyinput ();
+ 	if (match_any (c1, "+-*/\\"))
+ 	  {
+ 	    int c2 = text_yyinput ();
+-	    yyunput (c2, yytext);
++	    xunput (c2, yytext);
+ 	    if (c2 == '=')
+ 	      retval = true;
+ 	  }
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     case '>':
+       {
+ 	int c1 = text_yyinput ();
+ 	if (c1 == '>')
+ 	  {
+ 	    int c2 = text_yyinput ();
+-	    yyunput (c2, yytext);
++	    xunput (c2, yytext);
+ 	    if (c2 == '=')
+ 	      retval = true;
+ 	  }
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     case '<':
+       {
+ 	int c1 = text_yyinput ();
+ 	if (c1 == '<')
+ 	  {
+ 	    int c2 = text_yyinput ();
+-	    yyunput (c2, yytext);
++	    xunput (c2, yytext);
+ 	    if (c2 == '=')
+ 	      retval = true;
+ 	  }
+-	yyunput (c1, yytext);
++	xunput (c1, yytext);
+       }
+       break;
+ 
+     default:
+       break;
+     }
+ 
+-  yyunput (c0, yytext);
++  xunput (c0, yytext);
+ 
+   return retval;
+ }
+ 
+ static bool
+ next_token_is_index_op (void)
+ {
+   int c = text_yyinput ();
+-  yyunput (c, yytext);
++  xunput (c, yytext);
+   return c == '(' || c == '{';
+ }
+ 
+ static int
+ handle_close_bracket (bool spc_gobbled, int bracket_type)
+ {
+   int retval = bracket_type;
+ 
+@@ -2359,18 +2379,18 @@ maybe_unput_comma (int spc_gobbled)
+     {
+       int bin_op = next_token_is_bin_op (spc_gobbled);
+ 
+       int postfix_un_op = next_token_is_postfix_unary_op (spc_gobbled);
+ 
+       int c1 = text_yyinput ();
+       int c2 = text_yyinput ();
+ 
+-      yyunput (c2, yytext);
+-      yyunput (c1, yytext);
++      xunput (c2, yytext);
++      xunput (c1, yytext);
+ 
+       int sep_op = next_token_is_sep_op ();
+ 
+       int dot_op = (c1 == '.'
+ 		    && (isalpha (c2) || isspace (c2) || c2 == '_'));
+ 
+       if (postfix_un_op || bin_op || sep_op || dot_op)
+ 	return;
+@@ -2473,23 +2493,23 @@ handle_identifier (void)
+   int c1 = text_yyinput ();
+ 
+   bool next_tok_is_paren = (c1 == '(');
+ 
+   bool next_tok_is_eq = false;
+   if (c1 == '=')
+     {
+       int c2 = text_yyinput ();
+-      yyunput (c2, yytext);
++      xunput (c2, yytext);
+ 
+       if (c2 != '=')
+ 	next_tok_is_eq = true;
+     }
+ 
+-  yyunput (c1, yytext);
++  xunput (c1, yytext);
+ 
+   // Kluge alert.
+   //
+   // If we are looking at a text style function, set up to gobble its
+   // arguments.
+   //
+   // If the following token is `=', or if we are parsing a function
+   // return list or function parameter list, or if we are looking at
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -72,17 +72,17 @@ along with Octave; see the file COPYING.
+ #include "pt-all.h"
+ #include "symtab.h"
+ #include "token.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // The current input line number.
+-int input_line_number = 0;
++int input_line_number = 1;
+ 
+ // The column of the current token.
+ int current_input_column = 1;
+ 
+ // Buffer for help text snagged from function files.
+ std::stack<std::string> help_buf;
+ 
+ // Buffer for comments appearing before a function statement.
+@@ -2890,38 +2890,43 @@ text_getc (FILE *f)
+   int c = getc (f);
+ 
+   // Convert CRLF into just LF and single CR into LF.
+ 
+   if (c == '\r')
+     {
+       c = getc (f);
+ 
+-      if (c == '\n')
+-        input_line_number++;
+-      else
++      if (c != '\n')
+ 	{
+ 	  ungetc (c, f);
+ 	  c = '\n';
+ 	}
+     }
+-  else if (c == '\n')
++
++  if (c == '\n')
+     input_line_number++;
+ 
+   return c;
+ }
+ 
+ class
+ stdio_stream_reader : public stream_reader
+ {
+ public:
+   stdio_stream_reader (FILE *f_arg) : stream_reader (), f (f_arg) { }
+ 
+   int getc (void) { return ::text_getc (f); }
+-  int ungetc (int c) { return ::ungetc (c, f); }
++  int ungetc (int c)
++  {
++    if (c == '\n')
++      input_line_number--;
++
++    return ::ungetc (c, f);
++  }
+   
+ private:
+   FILE *f;
+ };
+ 
+ static bool
+ skip_white_space (stream_reader& reader)
+ {
+@@ -3046,17 +3051,17 @@ parse_fcn_file (const std::string& ff, c
+   unwind_protect_int (input_line_number);
+   unwind_protect_int (current_input_column);
+   unwind_protect_int (end_tokens_expected);
+   unwind_protect_bool (reading_fcn_file);
+   unwind_protect_bool (line_editing);
+   unwind_protect_str (parent_function_name);
+   unwind_protect_str (current_class_name);
+ 
+-  input_line_number = 0;
++  input_line_number = 1;
+   current_input_column = 1;
+   end_tokens_expected = 0;
+   reading_fcn_file = true;
+   line_editing = false;
+   parent_function_name = "";
+   current_class_name = dispatch_type;
+ 
+   // The next four lines must be in this order.
+@@ -3733,22 +3738,26 @@ by name, and use @code{feval} to call th
+ 
+ octave_value_list
+ eval_string (const std::string& s, bool silent, int& parse_status, int nargout)
+ {
+   octave_value_list retval;
+ 
+   unwind_protect::begin_frame ("eval_string");
+ 
++  unwind_protect_int (input_line_number);
++  unwind_protect_int (current_input_column);
+   unwind_protect_bool (get_input_from_eval_string);
+   unwind_protect_bool (input_from_eval_string_pending);
+   unwind_protect_bool (parser_end_of_input);
+   unwind_protect_bool (line_editing);
+   unwind_protect_str (current_eval_string);
+ 
++  input_line_number = 1;
++  current_input_column = 1;
+   get_input_from_eval_string = true;
+   input_from_eval_string_pending = true;
+   parser_end_of_input = false;
+   line_editing = false;
+ 
+   current_eval_string = s;
+ 
+   YY_BUFFER_STATE old_buf = current_buffer ();

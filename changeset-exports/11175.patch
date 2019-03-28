@@ -1,0 +1,1649 @@
+# HG changeset patch
+# User David Bateman <dbateman@free.fr>
+# Date 1288655251 -3600
+#      Tue Nov 02 00:47:31 2010 +0100
+# Node ID c0a95a5c6d2505c2be25774a0356c735c675c1a1
+# Parent  2114867f2a50ba199eb1e1e6779c7b9ebc539892
+Address the speed of plotting large hggroup groups and in particular
+contours (bug #31305). Changes to address this include
+       - Use __go_patch__ in __contour__ rather than patch so that
+         the cost of setting up the callback functions is avoided.
+	 The contourgroup callback handles the updating of properties.
+       - Add children_property class to store children in a list so
+         that adding and deleting children is a low cost operation.
+       - Create a new version of update_axis_limits code that doesn't
+         force the recalculation of all of the objects children.
+Patch also allows unclosed patch contours with the FLTK backend.
+
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,20 +1,27 @@
++2010-11-01  David Bateman  <dbateman@free.fr>
++
++	* plot/__private__/__contour__.m: Use __go_patch__ rather than patch
++	to avoid the cost of the patch callback functions. Ensure that the
++	properties that are normally set by patch are correctly set in the
++	call to __go_patch__.
++
+ 2010-11-01  Ben Abbott <bpabbott@mac.com>
+ 
+ 	* plot/axis.m: Exclude hggroup {x,y,z}data properties when determing
+ 	tight axis limits.
+ 
+ 2010-10-31  Rik  <octave@nomad.inbox5.com>
+ 
+ 	* strings/base2dec.m, strings/bin2dec.m, strings/dec2base.m,
+ 	  strings/dec2bin.m, strings/dec2hex.m, strings/hex2dec.m:
+ 	  Improve docstrings, use more descriptive variable names,
+ 	  add more tests for functions used to convert between bases.
+-	  
++
+ 2010-10-31  Konstantinos Poulios  <logari81@googlemail.com>
+ 
+ 	* plot/__go_draw_axes__.m: Removing deprecated code handling the case
+         of both plotboxaspectratiomode and dataaspectratiomode set to manual
+         for the gnuplot backend. Now this case is handled already in
+         src/graphics.cc where xlim, ylim, zlim are recalculated if necessary.
+ 
+ 2010-10-30  Gunnar Farnebäck <gunnar@lysator.liu.se>
+diff --git a/scripts/plot/private/__contour__.m b/scripts/plot/private/__contour__.m
+--- a/scripts/plot/private/__contour__.m
++++ b/scripts/plot/private/__contour__.m
+@@ -138,20 +138,20 @@ function [c, hg] = __contour__ (varargin
+   addlistener (hg, "contourmatrix", @update_data);
+ 
+   addproperty ("fill", hg, "radio", "on|{off}", filled);
+ 
+   ## The properties zlevel and zlevelmode don't exist in matlab, but
+   ## allow the use of contourgroups with the contour3, meshc and surfc 
+   ## functions. 
+   if (isnumeric (zlevel))
+-    addproperty ("zlevelmode", hg, "radio", "{none}|auto|manual", "manual")
++    addproperty ("zlevelmode", hg, "radio", "{none}|auto|manual", "manual");
+     addproperty ("zlevel", hg, "data", zlevel);
+   else
+-    addproperty ("zlevelmode", hg, "radio", "{none}|auto|manual", zlevel)
++    addproperty ("zlevelmode", hg, "radio", "{none}|auto|manual", zlevel);
+     if (ischar (zlevel) && strcmpi (zlevel, "manual"))
+       z = varargin{3};
+       z = 2 * (min (z(:)) - max (z(:)));
+       addproperty ("zlevel", hg, "data", z);
+     else
+       addproperty ("zlevel", hg, "data", 0.);
+     endif
+   endif
+@@ -206,31 +206,34 @@ function [c, hg] = __contour__ (varargin
+   addlistener (hg, "linecolor", @update_line);
+   addlistener (hg, "linestyle", @update_line);
+   addlistener (hg, "linewidth", @update_line);
+ 
+   addlistener (hg, "edgecolor", @update_edgecolor);
+ 
+   add_patch_children (hg);
+ 
++  axis("tight");
++
+   if (!isempty (opts))
+     set (hg, opts{:});
+   endif
+ endfunction
+ 
+ function add_patch_children (hg)
+   c = get (hg, "contourmatrix");
+   lev = get (hg, "levellist");
+   fill = get (hg, "fill");
+-  z = get (hg, "zlevel");
++  zlev = get (hg, "zlevel");
+   zmode = get (hg, "zlevelmode");
+   lc = get (hg, "linecolor");
+   lw = get (hg, "linewidth");
+   ls = get (hg, "linestyle");
+   filled = get (hg, "fill");
++  ca = gca ();
+ 
+   if (strcmpi (lc, "auto"))
+     lc = "flat";
+   endif
+ 
+   if (strcmpi (filled, "on"))
+ 
+     lvl_eps = get_lvl_eps (lev);
+@@ -238,21 +241,17 @@ function add_patch_children (hg)
+     ## Decode contourc output format.
+     i1 = 1;
+     ncont = 0;
+     while (i1 < columns (c))
+       ncont++;
+       cont_lev(ncont) = c(1, i1);
+       cont_len(ncont) = c(2, i1);
+       cont_idx(ncont) = i1+1;
+-
+       ii = i1+1:i1+cont_len(ncont);
+-      cur_cont = c(:, ii);
+-      startidx = ii(1);
+-      stopidx = ii(end);
+       cont_area(ncont) = polyarea (c(1, ii), c(2, ii));
+       i1 += c(2, i1) + 1;
+     endwhile
+ 
+     ## Handle for each level the case where we have (a) hole(s) in a patch.
+     ## Those are to be filled with the color of level below or with the
+     ## background colour.
+     for k = 1:numel (lev)
+@@ -315,58 +314,72 @@ function add_patch_children (hg)
+     for n = len:(-1):1
+       idx = svec(n);
+       ctmp = c(:, cont_idx(idx):cont_idx(idx) + cont_len(idx) - 1);
+       if (all (ctmp(:,1) == ctmp(:,end)))
+         ctmp(:, end) = [];
+       else
+         ## Special case unclosed contours
+       endif
+-      h = [h; patch(ctmp(1, :), ctmp(2, :), cont_lev(idx), "edgecolor", lc, 
+-                    "linestyle", ls, "linewidth", lw, "parent", hg)];
++      h = [h; __go_patch__(ca, "xdata", ctmp(1, :)(:), "ydata", ctmp(2, :)(:), 
++                           "vertices", ctmp.', "faces", 1:(cont_len(idx)-1),
++                           "facevertexcdata", cont_lev(idx),
++                           "facecolor", "flat", "cdata", cont_lev(idx),
++                           "edgecolor", lc, "linestyle", ls, 
++                           "linewidth", lw, "parent", hg)];
+     endfor
+ 
+     if (min (lev) == max (lev))
+-      set (gca (), "clim", [min(lev)-1, max(lev)+1]);
++      set (ca, "clim", [min(lev)-1, max(lev)+1], "layer", "top");
+     else
+-      set (gca(), "clim", [min(lev), max(lev)]);
++      set (ca, "clim", [min(lev), max(lev)], "layer", "top");
+     endif
+-
+-    set (gca (), "layer", "top");
+   else
+     ## Decode contourc output format.
+     i1 = 1;
+     h = [];
+     while (i1 < length (c))
+       clev = c(1,i1);
+       clen = c(2,i1);
+ 
+       if (all (c(:,i1+1) == c(:,i1+clen)))
+-        p = c(:, i1+1:i1+clen-1);
++        p = c(:, i1+1:i1+clen-1).';
+       else
+-        p = [c(:, i1+1:i1+clen), NaN(2, 1)];
++        p = [c(:, i1+1:i1+clen), NaN(2, 1)].';
+       endif
+ 
+       switch (zmode)
+         case "none"
+-          h = [h; patch(p(1,:), p(2,:), "facecolor", "none", 
+-                        "edgecolor", lc, "linestyle", ls, "linewidth", lw,
+-                        "cdata", clev, "parent", hg)]; 
++          h = [h; __go_patch__(ca, "xdata", p(:,1), "ydata", p(:,2),
++                               "zdata", [], "facecolor", "none", 
++                               "vertices", p, "faces", 1:rows(p),
++                               "facevertexcdata", clev,
++                               "edgecolor", lc, "linestyle", ls,
++                               "linewidth", lw,
++                               "cdata", clev, "parent", hg)]; 
+         case "auto"
+-          h = [h; patch(p(1,:), p(2,:), clev * ones (1, columns (p)),
+-                        "facecolor", "none", "edgecolor", lc, 
+-                        "linestyle", ls, "linewidth", lw, "cdata", clev, 
+-                        "parent", hg)];
++          h = [h; __go_patch__(ca, "xdata", p(:,1), "ydata", p(:,2),
++                               "zdata", clev * ones(rows(p),1),
++                               "vertices", [p, clev * ones(rows(p),1)], 
++                               "faces", 1:rows(p),
++                               "facevertexcdata", clev,
++                               "facecolor", "none", "edgecolor", lc, 
++                               "linestyle", ls, "linewidth", lw,
++                               "cdata", clev, "parent", hg)];
+         otherwise
+-          h = [h; patch(p(1,:), p(2,:), z * ones (1, columns (p)),
+-                        "facecolor", "none", "edgecolor", lc,
+-                        "linestyle", ls, "linewidth", lw, "cdata", clev,
+-                        "parent", hg)];
++          h = [h; __go_patch__(ca, "xdata", p(:,1), "ydata", p(:,2),
++                               "zdata", zlev * ones (rows(p), 1),
++                               "vertices", [p, zlev * ones(rows(p),1)], 
++                               "faces", 1:rows(p),
++                               "facevertexcdata", clev,
++                               "facecolor", "none", "edgecolor", lc,
++                               "linestyle", ls, "linewidth", lw,
++                               "cdata", clev, "parent", hg)];
+       endswitch
+-      i1 += clen+1;
++      i1 += clen + 1;
+     endwhile
+   endif
+ 
+ endfunction
+ 
+ function update_zlevel (h, d)
+   z = get (h, "zlevel");
+   zmode = get (h, "zlevelmode");
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,51 @@
++2010-11-01  David Bateman  <dbateman@free.fr>
++
++	* gl-render.cc (void opengl_renderer::draw_patch (const
++	patch::properties &)): Draw clipped contours of patches.
++	* graphics.cc (template<class T> static void get_array_limits
++	(const Array<T>&, double&, double&, double&)): Don't need to test
++	for NaN as comparison is always false.
++	(Matrix children_property::do_get_children (bool) const): New method of
++	new children_property class.
++	(void children_property::do_delete_children (bool)): Ditto.
++	(void base_properties::remove_child (const graphics_handle&)): Delete.
++	(void base_properties::set_children (const octave_value&)): Delete.
++	(void base_properties::delete_children (void)): Delete.
++	(base_properties::update_axis_limits (const std::string&,
++        const graphics_handle&) const): New method.
++	(void base_graphics_object::update_axis_limits (const std::string&,
++        const graphics_handle&)): New Method.
++	(Matrix base_properties::get_children_internal (bool) const): Delete.
++	(Matrix base_properties::get_children (void) const): Delete.
++	(Matrix base_properties::get_hidden_children (void) const): Delete.
++	(void axes::update_axis_limits (const std::string&,
++        const graphics_handle&): New Method.
++	(void hggroup::properties::update_limits (void) const): New method.
++	(void hggroup::properties::update_limits (const graphics_handle&)
++	const): New method.
++	(void hggroup::update_axis_limits (const std::string&,
++        const graphics_handle&)): New method.
++	* graphics.h.in (class children_property): New class.
++	(class base_properties): Use it.
++	(base_graphics_object::update_axis_limits(const std::string&,
++	const graphics_handle&)): New method.
++	(graphics_object::update_axis_limits(const std::string&,
++	const graphics_handle&)): New method.
++	(axes::update_axis_limits(const std::string&,
++	const graphics_handle&)): New method.
++	(hggroup::adopt (const graphics_handle&)): Use it
++	(void hggroup::properties::update_limits (void) const): Remove inline
++	definition of the methid.
++	(void hggroup::properties::update_limits (const graphics_handle&)
++	const): New method.
++	(void hggroup::update_axis_limits (const std::string&,
++        const graphics_handle&)): New method.
++
+ 2010-10-31  Michael Goffioul  <michael.goffioul@gmail.com>
+ 
+ 	* xnorm.h (xnorm, xcolnorms, xrownorms, xfrobnorm): tag with
+ 	OCTINTERP_API.
+ 
+ 2010-10-31  Kai Habel  <kai.habel@gmx.de>
+ 
+ 	* fltk-backend.cc (find_uimenu_children): Remove template argument.
+diff --git a/src/gl-render.cc b/src/gl-render.cc
+--- a/src/gl-render.cc
++++ b/src/gl-render.cc
+@@ -2654,37 +2654,65 @@ opengl_renderer::draw_patch (const patch
+             }
+ 
+           if (el_mode > 0)
+             glEnable (GL_LIGHTING);
+ 
+           set_linestyle (props.get_linestyle (), false);
+           set_linewidth (props.get_linewidth ());
+ 
++
+           // FIXME: use __index__ property from patch object; should we
+           // offset patch contour as well?
+           patch_tesselator tess (this, ec_mode, el_mode);
+ 
+           for (int i = 0; i < nf; i++)
+             {
+               if (clip_f(i))
+-                continue;
+-
+-              tess.begin_polygon (false);
+-              tess.begin_contour ();
+-
+-              for (int j = 0; j < count_f(i); j++)
+                 {
+-                  vertex_data::vertex_data_rep *vv = vdata[i+j*fr].get_rep ();
+-        
+-                  tess.add_vertex (vv->coords.fortran_vec (), vv);
++                  // This is an unclosed contour. Draw it as a line
++                  bool flag = false;
++
++                  for (int j = 0; j < count_f(i); j++)
++                    {
++                      if (! clip(int (f(i,j) - 1)))
++                        {
++                          vertex_data::vertex_data_rep *vv = vdata[i+j*fr].get_rep ();
++                          const Matrix m = vv->coords;
++                          if (! flag)
++                            {
++                              flag = true;
++                              glBegin (GL_LINE_STRIP);
++                            }
++                          glVertex3d (m(0), m(1), m(2));
++                        }
++                      else if (flag)
++                        {
++                          flag = false;
++                          glEnd ();
++                        }
++                    }
++
++                  if (flag)
++                    glEnd ();
+                 }
+-
+-              tess.end_contour ();
+-              tess.end_polygon ();
++              else
++                {
++                  tess.begin_polygon (false);
++                  tess.begin_contour ();
++
++                  for (int j = 0; j < count_f(i); j++)
++                    {
++                      vertex_data::vertex_data_rep *vv = vdata[i+j*fr].get_rep ();
++                      tess.add_vertex (vv->coords.fortran_vec (), vv);
++                    }
++
++                  tess.end_contour ();
++                  tess.end_polygon ();
++                }
+             }
+ 
+           set_linestyle ("-");
+           set_linewidth (0.5);
+ 
+           if (el_mode > 0)
+             glDisable (GL_LIGHTING);
+         }
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -683,17 +683,18 @@ get_array_limits (const Array<T>& m, dou
+ {
+   const T *data = m.data ();
+   octave_idx_type n = m.numel ();
+ 
+   for (octave_idx_type i = 0; i < n; i++)
+     {
+       double e = double (data[i]);
+ 
+-      if (! (xisinf (e) || xisnan (e)))
++      // Don't need to test for NaN here as NaN>x and NaN<x is always false 
++      if (! xisinf (e))
+         {
+           if (e < emin)
+             emin = e;
+ 
+           if (e > emax)
+             emax = e;
+ 
+           if (e > 0 && e < eminp)
+@@ -1201,16 +1202,72 @@ handle_property::do_set (const octave_va
+     }
+   else
+     error ("set: invalid graphics handle for property \"%s\"",
+            get_name ().c_str ());
+ 
+   return false;
+ }
+ 
++Matrix 
++children_property::do_get_children (bool return_hidden) const
++{
++  Matrix retval (children_list.size (), 1);
++  octave_idx_type k = 0;
++
++  graphics_object go = gh_manager::get_object (0);
++          
++  root_figure::properties& props =
++    dynamic_cast<root_figure::properties&> (go.get_properties ());
++
++  if (! props.is_showhiddenhandles ())
++    {
++      for (const_children_list_iterator p = children_list.begin ();
++           p != children_list.end (); p++)
++        {
++          graphics_handle kid = *p;
++
++          if (gh_manager::is_handle_visible (kid))
++            {
++              if (! return_hidden)
++                retval(k++) = *p;
++            }
++          else if (return_hidden)
++            retval(k++) = *p;
++        }
++
++      retval.resize (k, 1);
++    }
++  else
++    {
++      for (const_children_list_iterator p = children_list.begin ();
++           p != children_list.end (); p++)
++        retval(k++) = *p;
++    }
++      
++  return retval;
++}
++
++void 
++children_property::do_delete_children (bool clear)
++{
++  for (children_list_iterator p = children_list.begin ();
++       p != children_list.end (); p++)
++    {
++      graphics_object go = gh_manager::get_object (*p);
++
++      if (go.valid_object ())
++        gh_manager::free (*p);
++
++    }
++
++  if (clear)
++    children_list.clear ();
++}
++
+ bool
+ callback_property::validate (const octave_value& v) const
+ {
+   // case 1: function handle
+   // case 2: cell array with first element being a function handle
+   // case 3: string corresponding to known function name
+   // case 4: evaluatable string
+   // case 5: empty matrix
+@@ -1878,17 +1935,16 @@ xset (const graphics_handle& h, const oc
+ {
+   if (args.length () > 0)
+     {
+       graphics_object obj = gh_manager::get_object (h);
+       obj.set (args);
+     }
+ }
+ 
+-
+ static octave_value
+ xget (const graphics_handle& h, const caseless_str& name)
+ {
+   graphics_object obj = gh_manager::get_object (h);
+   return obj.get (name);
+ }
+ 
+ static graphics_handle
+@@ -1947,17 +2003,16 @@ gca (void)
+ 
+   return val.is_empty () ? octave_NaN : val.double_value ();
+ }
+ 
+ static void
+ adopt (const graphics_handle& p, const graphics_handle& h)
+ {
+   graphics_object parent_obj = gh_manager::get_object (p);
+-
+   parent_obj.adopt (h);
+ }
+ 
+ static bool
+ is_handle (const graphics_handle& h)
+ {
+   return h.ok ();
+ }
+@@ -2142,44 +2197,16 @@ base_properties::get_property_dynamic (c
+       error ("get_property: unknown property \"%s\"", name.c_str ());
+       return property ();
+     }
+   else
+     return it->second;
+ }
+ 
+ void
+-base_properties::remove_child (const graphics_handle& h)
+-{
+-  octave_idx_type k = -1;
+-  octave_idx_type n = children.numel ();
+-  for (octave_idx_type i = 0; i < n; i++)
+-    {
+-      if (h.value () == children(i))
+-        {
+-          k = i;
+-          break;
+-        }
+-    }
+-
+-  if (k >= 0)
+-    {
+-      Matrix new_kids (n-1, 1);
+-      octave_idx_type j = 0;
+-      for (octave_idx_type i = 0; i < n; i++)
+-        {
+-          if (i != k)
+-            new_kids(j++) = children(i);
+-        }
+-      children = new_kids;
+-      mark_modified ();
+-    }
+-}
+-
+-void
+ base_properties::set_parent (const octave_value& val)
+ {
+   double tmp = val.double_value ();
+ 
+   graphics_handle new_parent = octave_NaN;
+ 
+   if (! error_state)
+     {
+@@ -2198,55 +2225,16 @@ base_properties::set_parent (const octav
+       else
+         error ("set: invalid graphics handle (= %g) for parent", tmp);
+     }
+   else
+     error ("set: expecting parent to be a graphics handle");
+ }
+ 
+ void
+-base_properties::set_children (const octave_value& val)
+-{
+-  const Matrix new_kids = val.matrix_value ();
+-
+-  octave_idx_type nel = new_kids.numel ();
+-
+-  const Matrix new_kids_column = new_kids.reshape (dim_vector (nel, 1));
+-
+-  bool ok = true;
+-
+-  if (! error_state)
+-    {
+-      const Matrix visible_kids = get_children ();
+-
+-      if (visible_kids.numel () == new_kids.numel ())
+-        {
+-          Matrix t1 = visible_kids.sort ();
+-          Matrix t2 = new_kids_column.sort ();
+-
+-          if (t1 != t2)
+-            ok = false;
+-        }
+-      else
+-        ok = false;
+-
+-      if (! ok)
+-        error ("set: new children must be a permutation of existing children");
+-    }
+-  else
+-    {
+-      ok = false;
+-      error ("set: expecting children to be array of graphics handles");
+-    }
+-
+-  if (ok)
+-    children = new_kids_column.stack (get_hidden_children ());
+-}
+-
+-void
+ base_properties::mark_modified (void)
+ {
+   __modified__ = "on";
+   graphics_object parent_obj = gh_manager::get_object (get_parent ());
+   if (parent_obj)
+     parent_obj.mark_modified ();
+ }
+ 
+@@ -2264,29 +2252,23 @@ base_properties::update_axis_limits (con
+ {
+   graphics_object obj = gh_manager::get_object (__myhandle__);
+ 
+   if (obj)
+     obj.update_axis_limits (axis_type);
+ }
+ 
+ void
+-base_properties::delete_children (void)
+-{
+-  octave_idx_type n = children.numel ();
+-
+-  // A callback function might have already deleted the child,
+-  // so check before deleting
+-  for (octave_idx_type i = 0; i < n; i++)
+-    {
+-      graphics_object go = gh_manager::get_object (children(i));
+-
+-      if (go.valid_object ())
+-        gh_manager::free (children(i));
+-    }
++base_properties::update_axis_limits (const std::string& axis_type,
++                                     const graphics_handle& h) const
++{
++  graphics_object obj = gh_manager::get_object (__myhandle__);
++
++  if (obj)
++    obj.update_axis_limits (axis_type, h);
+ }
+ 
+ graphics_backend
+ base_properties::get_backend (void) const
+ {
+   graphics_object go = gh_manager::get_object (get_parent ());
+ 
+   if (go)
+@@ -2465,16 +2447,31 @@ base_graphics_object::update_axis_limits
+       if (parent_obj)
+         parent_obj.update_axis_limits (axis_type);
+     }
+   else
+     error ("base_graphics_object::update_axis_limits: invalid graphics object");
+ }
+ 
+ void
++base_graphics_object::update_axis_limits (const std::string& axis_type,
++                                          const graphics_handle& h)
++{
++  if (valid_object ())
++    {
++      graphics_object parent_obj = gh_manager::get_object (get_parent ());
++
++      if (parent_obj)
++        parent_obj.update_axis_limits (axis_type, h);
++    }
++  else
++    error ("base_graphics_object::update_axis_limits: invalid graphics object");
++}
++
++void
+ base_graphics_object::remove_all_listeners (void)
+ {
+   octave_map m = get (true).map_value ();
+ 
+   for (octave_map::const_iterator pa = m.begin (); pa != m.end (); pa++)
+     {
+       // FIXME -- there has to be a better way.  I think we want to
+       // ask whether it is OK to delete the listener for the given
+@@ -2723,19 +2720,21 @@ void
+ figure::properties::remove_child (const graphics_handle& gh)
+ {
+   base_properties::remove_child (gh);
+ 
+   if (gh == currentaxes.handle_value ())
+     {
+       graphics_handle new_currentaxes;
+ 
+-      for (octave_idx_type i = 0; i < children.numel (); i++)
+-        {
+-          graphics_handle kid = children(i);
++      Matrix kids = get_children ();
++
++      for (octave_idx_type i = 0; i < kids.numel (); i++)
++        {
++          graphics_handle kid = kids(i);
+ 
+           graphics_object go = gh_manager::get_object (kid);
+ 
+           if (go.isa ("axes"))
+             {
+               new_currentaxes = kid;
+               break;
+             }
+@@ -3413,19 +3412,17 @@ axes::properties::set_defaults (base_gra
+       touterposition(3) = 1;
+       outerposition = touterposition;
+ 
+       position = default_axes_position ();
+ 
+       activepositionproperty = "outerposition";
+     }
+ 
+-  delete_children ();
+-
+-  children = Matrix ();
++  delete_children (true);
+ 
+   xlabel = gh_manager::make_graphics_handle ("text", __myhandle__, false);
+   ylabel = gh_manager::make_graphics_handle ("text", __myhandle__, false);
+   zlabel = gh_manager::make_graphics_handle ("text", __myhandle__, false);
+   title = gh_manager::make_graphics_handle ("text", __myhandle__, false);
+ 
+   xset (xlabel.handle_value (), "handlevisibility", "off");
+   xset (ylabel.handle_value (), "handlevisibility", "off");
+@@ -3499,64 +3496,16 @@ axes::properties::remove_child (const gr
+   else if (zlabel.handle_value ().ok () && h == zlabel.handle_value ())
+     delete_text_child (zlabel);
+   else if (title.handle_value ().ok () && h == title.handle_value ())
+     delete_text_child (title);
+   else
+     base_properties::remove_child (h);
+ }
+ 
+-Matrix
+-base_properties::get_children_internal (bool return_hidden) const
+-{
+-  Matrix retval = children;
+-  
+-  graphics_object go = gh_manager::get_object (0);
+-
+-  root_figure::properties& props =
+-      dynamic_cast<root_figure::properties&> (go.get_properties ());
+-
+-  if (! props.is_showhiddenhandles ())
+-    {
+-      octave_idx_type k = 0;
+-
+-      for (octave_idx_type i = 0; i < children.numel (); i++)
+-        {
+-          graphics_handle kid = children (i);
+-
+-          if (gh_manager::is_handle_visible (kid))
+-            {
+-              if (! return_hidden)
+-                retval(k++) = children(i);
+-            }
+-          else
+-            {
+-              if (return_hidden)
+-                retval(k++) = children(i);
+-            }
+-        }
+-
+-      retval.resize (k, 1);
+-    }
+-
+-  return retval;
+-}
+-
+-Matrix
+-base_properties::get_children (void) const
+-{
+-  return get_children_internal (false);
+-}
+-
+-Matrix
+-base_properties::get_hidden_children (void) const
+-{
+-  return get_children_internal (true);
+-}
+-
+ inline Matrix
+ xform_matrix (void)
+ {
+   Matrix m (4, 4, 0.0);
+   for (int i = 0; i < 4; i++)
+     m(i,i) = 1;
+   return m;
+ }
+@@ -4550,16 +4499,208 @@ get_children_limits (double& min_val, do
+     default:
+       break;
+     }
+ }
+ 
+ static bool updating_axis_limits = false;
+ 
+ void
++axes::update_axis_limits (const std::string& axis_type,
++                          const graphics_handle& h)
++{
++  if (updating_axis_limits)
++    return;
++
++  Matrix kids = Matrix (1, 1, h.value ());
++ 
++  double min_val = octave_Inf;
++  double max_val = -octave_Inf;
++  double min_pos = octave_Inf;
++
++  char update_type = 0;
++
++  Matrix limits;
++  double val;
++
++#define FIX_LIMITS \
++  if (limits.numel() == 3) \
++    { \
++      val = limits(0); \
++      if (! (xisinf (val) || xisnan (val))) \
++        min_val = val; \
++      val = limits(1); \
++      if (! (xisinf (val) || xisnan (val))) \
++        max_val = val; \
++      val = limits(2); \
++      if (! (xisinf (val) || xisnan (val))) \
++        min_pos = val; \
++    } \
++  else \
++    { \
++      limits.resize(3, 1); \
++      limits(0) = min_val; \
++      limits(1) = max_val; \
++      limits(2) = min_pos; \
++    }
++
++  if (axis_type == "xdata" || axis_type == "xscale"
++      || axis_type == "xlimmode" || axis_type == "xliminclude"
++      || axis_type == "xlim")
++    {
++      if (xproperties.xlimmode_is ("auto"))
++        {
++          limits = xproperties.get_xlim ().matrix_value ();
++          FIX_LIMITS ;
++
++          get_children_limits (min_val, max_val, min_pos, kids, 'x');
++          
++          limits = xproperties.get_axis_limits (min_val, max_val, min_pos,
++                                                xproperties.xscale_is ("log"));
++
++          update_type = 'x';
++        }
++    }
++  else if (axis_type == "ydata" || axis_type == "yscale"
++           || axis_type == "ylimmode" || axis_type == "yliminclude"
++           || axis_type == "ylim")
++    {
++      if (xproperties.ylimmode_is ("auto"))
++        {
++          limits = xproperties.get_ylim ().matrix_value ();
++          FIX_LIMITS ;
++
++          get_children_limits (min_val, max_val, min_pos, kids, 'y');
++
++          limits = xproperties.get_axis_limits (min_val, max_val, min_pos,
++                                                xproperties.yscale_is ("log"));
++
++          update_type = 'y';
++        }
++    }
++  else if (axis_type == "zdata" || axis_type == "zscale"
++           || axis_type == "zlimmode" || axis_type == "zliminclude"
++           || axis_type == "zlim")
++    {
++      if (xproperties.zlimmode_is ("auto"))
++        {
++          limits = xproperties.get_zlim ().matrix_value ();
++          FIX_LIMITS ;
++
++          get_children_limits (min_val, max_val, min_pos, kids, 'z');
++
++          limits = xproperties.get_axis_limits (min_val, max_val, min_pos,
++                                                xproperties.zscale_is ("log"));
++
++          update_type = 'z';
++        }
++    }
++  else if (axis_type == "cdata" || axis_type == "climmode"
++           || axis_type == "cdatamapping" || axis_type == "climinclude"
++           || axis_type == "clim")
++    {
++      if (xproperties.climmode_is ("auto"))
++        {
++          limits = xproperties.get_clim ().matrix_value ();
++          FIX_LIMITS ;
++
++          get_children_limits (min_val, max_val, min_pos, kids, 'c');
++
++          if (min_val > max_val)
++            {
++              min_val = min_pos = 0;
++              max_val = 1;
++            }
++          else if (min_val == max_val)
++            max_val = min_val + 1;
++
++          limits.resize (1, 2);
++
++          limits(0) = min_val;
++          limits(1) = max_val;
++
++          update_type = 'c';
++        }
++
++    }
++  else if (axis_type == "alphadata" || axis_type == "alimmode"
++           || axis_type == "alphadatamapping" || axis_type == "aliminclude"
++           || axis_type == "alim")
++    {
++      if (xproperties.alimmode_is ("auto"))
++        {
++          limits = xproperties.get_alim ().matrix_value ();
++          FIX_LIMITS ;
++
++          get_children_limits (min_val, max_val, min_pos, kids, 'a');
++
++          if (min_val > max_val)
++            {
++              min_val = min_pos = 0;
++              max_val = 1;
++            }
++          else if (min_val == max_val)
++            max_val = min_val + 1;
++
++          limits.resize (1, 2);
++
++          limits(0) = min_val;
++          limits(1) = max_val;
++
++          update_type = 'a';
++        }
++
++    }
++
++#undef FIX_LIMITS
++
++  unwind_protect frame;
++  frame.protect_var (updating_axis_limits);
++
++  updating_axis_limits = true;
++
++  switch (update_type)
++    {
++    case 'x':
++      xproperties.set_xlim (limits);
++      xproperties.set_xlimmode ("auto");
++      xproperties.update_xlim ();
++      break;
++
++    case 'y':
++      xproperties.set_ylim (limits);
++      xproperties.set_ylimmode ("auto");
++      xproperties.update_ylim ();
++      break;
++
++    case 'z':
++      xproperties.set_zlim (limits);
++      xproperties.set_zlimmode ("auto");
++      xproperties.update_zlim ();
++      break;
++
++    case 'c':
++      xproperties.set_clim (limits);
++      xproperties.set_climmode ("auto");
++      break;
++
++    case 'a':
++      xproperties.set_alim (limits);
++      xproperties.set_alimmode ("auto");
++      break;
++
++    default:
++      break;
++    }
++
++  xproperties.update_transform ();
++
++}
++
++void
+ axes::update_axis_limits (const std::string& axis_type)
+ {
+   if (updating_axis_limits || updating_aspectratios)
+     return;
+ 
+   Matrix kids = xproperties.get_children ();
+ 
+   double min_val = octave_Inf;
+@@ -5064,31 +5205,173 @@ surface::properties::update_normals (voi
+             }
+         }
+       vertexnormals = n;
+     }
+ }
+ 
+ // ---------------------------------------------------------------------
+ 
++void 
++hggroup::properties::update_limits (void) const
++{
++  graphics_object obj = gh_manager::get_object (__myhandle__);
++
++  if (obj)
++    {
++      obj.update_axis_limits ("xlim");
++      obj.update_axis_limits ("ylim");
++      obj.update_axis_limits ("zlim");
++      obj.update_axis_limits ("clim");
++      obj.update_axis_limits ("alim");
++    }
++}
++
++void 
++hggroup::properties::update_limits (const graphics_handle& h) const
++{
++  graphics_object obj = gh_manager::get_object (__myhandle__);
++
++  if (obj)
++    {
++      obj.update_axis_limits ("xlim", h);
++      obj.update_axis_limits ("ylim", h);
++      obj.update_axis_limits ("zlim", h);
++      obj.update_axis_limits ("clim", h);
++      obj.update_axis_limits ("alim", h);
++    }
++}
++
++static bool updating_hggroup_limits = false;
++
++void
++hggroup::update_axis_limits (const std::string& axis_type,
++                             const graphics_handle& h)
++{
++  if (updating_hggroup_limits)
++    return;
++
++  Matrix kids = Matrix (1, 1, h.value ());
++ 
++  double min_val = octave_Inf;
++  double max_val = -octave_Inf;
++  double min_pos = octave_Inf;
++
++  Matrix limits;
++  double val;
++
++  char update_type = 0;
++
++  if (axis_type == "xlim" || axis_type == "xliminclude")
++    {
++      limits = xproperties.get_xlim ().matrix_value ();
++      update_type = 'x';
++    }
++  else if (axis_type == "ylim" || axis_type == "yliminclude")
++    {
++      limits = xproperties.get_ylim ().matrix_value ();
++      update_type = 'y';
++    }
++  else if (axis_type == "zlim" || axis_type == "zliminclude")
++    {
++      limits = xproperties.get_zlim ().matrix_value ();
++      update_type = 'z';
++    }
++  else if (axis_type == "clim" || axis_type == "climinclude")
++    {
++      limits = xproperties.get_clim ().matrix_value ();
++      update_type = 'c';
++    }
++  else if (axis_type == "alim" || axis_type == "aliminclude")
++    {
++      limits = xproperties.get_alim ().matrix_value ();
++      update_type = 'a';
++    }
++
++  if (limits.numel() == 3)
++    {
++      val = limits(0);
++      if (! (xisinf (val) || xisnan (val)))
++        min_val = val;
++      val = limits(1);
++      if (! (xisinf (val) || xisnan (val)))
++        max_val = val;
++      val = limits(2);
++      if (! (xisinf (val) || xisnan (val)))
++        min_pos = val;
++    }
++  else
++    {
++      limits.resize(3,1);
++      limits(0) = min_val;
++      limits(1) = max_val;
++      limits(2) = min_pos;
++    }
++
++  get_children_limits (min_val, max_val, min_pos, kids, update_type);
++
++  unwind_protect frame;
++  frame.protect_var (updating_hggroup_limits);
++
++  updating_hggroup_limits = true;
++
++  if (limits(0) != min_val || limits(1) != max_val || limits(2) != min_pos)
++    {
++      limits(0) = min_val;
++      limits(1) = max_val;
++      limits(2) = min_pos;
++
++      switch (update_type)
++        {
++        case 'x':
++          xproperties.set_xlim (limits);
++          break;
++
++        case 'y':
++          xproperties.set_ylim (limits);
++          break;
++
++        case 'z':
++          xproperties.set_zlim (limits);
++          break;
++
++        case 'c':
++          xproperties.set_clim (limits);
++          break;
++
++        case 'a':
++          xproperties.set_alim (limits);
++          break;
++
++        default:
++          break;
++        }
++
++      base_graphics_object::update_axis_limits (axis_type, h);
++    }
++}
++
+ void
+ hggroup::update_axis_limits (const std::string& axis_type)
+ {
++  if (updating_hggroup_limits)
++    return;
++
+   Matrix kids = xproperties.get_children ();
+ 
+   double min_val = octave_Inf;
+   double max_val = -octave_Inf;
+   double min_pos = octave_Inf;
+ 
+   char update_type = 0;
+ 
+   if (axis_type == "xlim" || axis_type == "xliminclude")
+     {
+       get_children_limits (min_val, max_val, min_pos, kids, 'x');
+-      
++          
+       update_type = 'x';
+     }
+   else if (axis_type == "ylim" || axis_type == "yliminclude")
+     {
+       get_children_limits (min_val, max_val, min_pos, kids, 'y');
+ 
+       update_type = 'y';
+     }
+@@ -5098,25 +5381,29 @@ hggroup::update_axis_limits (const std::
+ 
+       update_type = 'z';
+     }
+   else if (axis_type == "clim" || axis_type == "climinclude")
+     {
+       get_children_limits (min_val, max_val, min_pos, kids, 'c');
+ 
+       update_type = 'c';
+-
+     }
+   else if (axis_type == "alim" || axis_type == "aliminclude")
+     {
+       get_children_limits (min_val, max_val, min_pos, kids, 'a');
+ 
+       update_type = 'a';
+     }
+ 
++  unwind_protect frame;
++  frame.protect_var (updating_hggroup_limits);
++
++  updating_hggroup_limits = true;
++
+   Matrix limits (1, 3, 0.0);
+ 
+   limits(0) = min_val;
+   limits(1) = max_val;
+   limits(2) = min_pos;
+ 
+   switch (update_type)
+     {
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -1363,16 +1363,184 @@ protected:
+     }
+ 
+ private:
+   octave_value data;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
++class children_property : public base_property
++{
++public: 
++  children_property (void)
++    : base_property ("", graphics_handle ())
++    {
++      do_init_children (Matrix ());
++    }
++  
++  children_property (const std::string& nm, const graphics_handle& h,
++                     const Matrix &val)
++    : base_property (nm, h)
++    {
++      do_init_children (val);
++    }
++
++  children_property (const children_property& p)
++    : base_property (p) 
++    {
++      do_init_children (p.children_list);
++    }
++
++  children_property& operator = (const octave_value& val)
++    {
++      set (val);
++      return *this;
++    }
++
++  base_property* clone (void) const { return new children_property (*this); }
++
++  bool remove_child (const double &val)
++    {
++      return do_remove_child (val);
++    }
++  
++  void adopt (const double &val)
++    {
++      do_adopt_child (val);
++    }
++  
++  Matrix get_children (void) const
++    {
++      return do_get_children (false);
++    }
++  
++  Matrix get_hidden (void) const
++    {
++      return do_get_children (true);
++    }
++
++  Matrix get_all (void) const
++   {
++     return do_get_all_children ();
++   }
++  
++  octave_value get (void) const
++    {
++      return octave_value (get_children ());
++    }
++  
++  void delete_children (bool clear = false)
++    {
++      do_delete_children (clear);
++    }
++  
++private:
++  typedef std::list<double>::iterator children_list_iterator;
++  typedef std::list<double>::const_iterator const_children_list_iterator;
++  std::list<double> children_list;
++
++protected:
++  bool do_set (const octave_value& val)
++    {
++      const Matrix new_kids = val.matrix_value ();
++
++      octave_idx_type nel = new_kids.numel ();
++
++      const Matrix new_kids_column = new_kids.reshape (dim_vector (nel, 1));
++
++      bool is_ok = true;
++
++      if (! error_state)
++        {
++          const Matrix visible_kids = do_get_children (false);
++
++          if (visible_kids.numel () == new_kids.numel ())
++            {
++              Matrix t1 = visible_kids.sort ();
++              Matrix t2 = new_kids_column.sort ();
++
++              if (t1 != t2)
++                is_ok = false;
++            }
++          else
++            is_ok = false;
++
++          if (! is_ok)
++            error ("set: new children must be a permutation of existing children");
++        }
++      else
++        {
++          is_ok = false;
++          error ("set: expecting children to be array of graphics handles");
++        }
++
++      if (is_ok)
++        {
++          children_list.clear ();
++          do_init_children (new_kids_column.stack (get_hidden ()));
++        }
++
++      return is_ok;
++    }
++
++private:
++  void do_init_children (const Matrix &val)
++    {
++      children_list.clear ();
++      for (octave_idx_type i = 0; i < val.numel (); i++)
++        children_list.push_front (val.xelem (i));
++    }
++
++  void do_init_children (const std::list<double> &val)
++    {
++      children_list.clear ();
++      for (const_children_list_iterator p = val.begin (); p != val.end (); p++)
++        children_list.push_front (*p);
++    }
++
++  Matrix do_get_children (bool return_hidden) const;
++
++  Matrix do_get_all_children (void) const
++    {
++      Matrix retval (children_list.size (), 1);
++      octave_idx_type i  = 0;
++      
++      for (const_children_list_iterator p = children_list.begin ();
++           p != children_list.end (); p++)
++        retval(i++) = *p;
++      return retval;
++    }
++
++  bool do_remove_child (double child)
++    {
++      for (children_list_iterator p = children_list.begin ();
++           p != children_list.end (); p++)
++        {
++          if (*p == child)
++            {
++              children_list.erase (p);
++              return true;
++            }
++        }
++      return false;
++    }
++
++  void do_adopt_child (const double &val)
++    {
++      children_list.push_front (val);
++    }
++  
++  void do_delete_children (bool clear);
++};
++
++
++
++// ---------------------------------------------------------------------
++
+ class callback_property : public base_property
+ {
+ public:
+   callback_property (const std::string& nm, const graphics_handle& h,
+                      const octave_value& m)
+     : base_property (nm, h), callback (m) { }
+ 
+   callback_property (const callback_property& p)
+@@ -1843,25 +2011,25 @@ public:
+   virtual bool has_property (const caseless_str&) const
+   {
+     panic_impossible ();
+     return false;
+   }
+ 
+   bool is_modified (void) const { return is___modified__ (); }
+  
+-  virtual void remove_child (const graphics_handle& h);
++  virtual void remove_child (const graphics_handle& h)
++    {
++      if (children.remove_child (h.value ()))
++        mark_modified ();
++    }
+ 
+   virtual void adopt (const graphics_handle& h)
+   {
+-    octave_idx_type n = children.numel ();
+-    children.resize (n+1, 1);
+-    for (octave_idx_type i = n; i > 0; i--)
+-      children(i) = children(i-1);
+-    children(0) = h.value ();
++    children.adopt (h.value ());
+     mark_modified ();
+   }
+ 
+   virtual graphics_backend get_backend (void) const;
+ 
+   virtual Matrix get_boundingbox (bool /*internal*/ = false) const
+     { return Matrix (1, 4, 0.0); }
+ 
+@@ -1872,35 +2040,50 @@ public:
+ 
+   virtual void delete_listener (const caseless_str&, const octave_value&,
+                                 listener_mode = POSTSET);
+ 
+   void set_tag (const octave_value& val) { tag = val; }
+ 
+   void set_parent (const octave_value& val);
+ 
+-  Matrix get_all_children (void) const { return children; }
+-
+-  Matrix get_hidden_children (void) const;
+-
+-  void set_children (const octave_value& val);
++  Matrix get_children (void) const
++    {
++      return children.get_children ();
++    }
++  
++  Matrix get_all_children (void) const 
++    { 
++      return children.get_all ();
++    }
++
++  Matrix get_hidden_children (void) const
++    {
++      return children.get_hidden ();
++    }
+ 
+   void set_modified (const octave_value& val) { set___modified__ (val); }
+ 
+   void set___modified__ (const octave_value& val) { __modified__ = val; }
+ 
+   void reparent (const graphics_handle& new_parent) { parent = new_parent; }
+ 
+   // Update data limits for AXIS_TYPE (xdata, ydata, etc.) in the parent
+   // axes object.
+ 
+   virtual void update_axis_limits (const std::string& axis_type) const;
+ 
+-  virtual void delete_children (void);
+-
++  virtual void update_axis_limits (const std::string& axis_type,
++                                   const graphics_handle& h) const;
++
++  virtual void delete_children (bool clear = false)
++    {
++      children.delete_children (clear);
++    }
++  
+   static property_list::pval_map_type factory_defaults (void);
+ 
+   // FIXME -- these functions should be generated automatically by the
+   // genprops.awk script.
+   //
+   // EMIT_BASE_PROPERTIES_GET_FUNCTIONS
+ 
+   virtual octave_value get_xlim (void) const { return octave_value (); }
+@@ -1935,18 +2118,17 @@ protected:
+ 
+   property get_property_dynamic (const caseless_str& pname);
+ 
+   BEGIN_BASE_PROPERTIES
+     // properties common to all objects
+     bool_property beingdeleted , "off"
+     radio_property busyaction , "{queue}|cancel"
+     callback_property buttondownfcn , Matrix ()
+-    // FIXME -- use a property class for children.
+-    Matrix children Gfs , Matrix ()
++    children_property children gf , Matrix ()
+     bool_property clipping , "on"
+     callback_property createfcn , Matrix ()
+     callback_property deletefcn , Matrix ()
+     radio_property handlevisibility , "{on}|callback|off"
+     bool_property hittest , "on"
+     bool_property interruptible , "on"
+     handle_property parent fs , p
+     bool_property selected , "off"
+@@ -1978,19 +2160,16 @@ protected:
+ 
+   std::map<caseless_str, property, cmp_caseless_str> all_props;
+ 
+ protected:
+   void insert_static_property (const std::string& name, base_property& p)
+     { insert_property (name, property (&p, true)); }
+   
+   virtual void init (void) { }
+-
+-private:
+-  Matrix get_children_internal (bool return_hidden) const;
+ };
+ 
+ class OCTINTERP_API base_graphics_object
+ {
+ public:
+   friend class graphics_object;
+ 
+   base_graphics_object (void) : count (1) { }
+@@ -2146,16 +2325,19 @@ public:
+   {
+     static base_properties properties;
+     error ("base_graphics_object::get_properties: invalid graphics object");
+     return properties;
+   }
+ 
+   virtual void update_axis_limits (const std::string& axis_type);
+ 
++  virtual void update_axis_limits (const std::string& axis_type,
++                                   const graphics_handle& h);
++
+   virtual bool valid_object (void) const { return false; }
+ 
+   virtual std::string type (void) const
+   {
+     return (valid_object () ? get_properties ().graphics_object_name ()
+         : "unknown");
+   }
+ 
+@@ -2331,16 +2513,22 @@ public:
+     return rep->get_properties ();
+   }
+ 
+   void update_axis_limits (const std::string& axis_type)
+   {
+     rep->update_axis_limits (axis_type);
+   }
+ 
++  void update_axis_limits (const std::string& axis_type,
++                           const graphics_handle& h)
++  {
++    rep->update_axis_limits (axis_type, h);
++  }
++
+   bool valid_object (void) const { return rep->valid_object (); }
+ 
+   std::string type (void) const { return rep->type (); }
+ 
+   operator bool (void) const { return rep->valid_object (); }
+ 
+   // FIXME -- these functions should be generated automatically by the
+   // genprops.awk script.
+@@ -3190,16 +3378,19 @@ public:
+   }
+ 
+   base_properties& get_properties (void) { return xproperties; }
+ 
+   const base_properties& get_properties (void) const { return xproperties; }
+ 
+   void update_axis_limits (const std::string& axis_type);
+ 
++  void update_axis_limits (const std::string& axis_type,
++                           const graphics_handle& h);
++
+   bool valid_object (void) const { return true; }
+ 
+   void reset_default_properties (void);
+ 
+ private:
+   property_list default_properties;
+ };
+ 
+@@ -3795,18 +3986,19 @@ public:
+     void remove_child (const graphics_handle& h)
+       {
+         base_properties::remove_child (h);
+         update_limits ();
+       }
+ 
+     void adopt (const graphics_handle& h)
+       {
++
+         base_properties::adopt (h);
+-        update_limits ();
++        update_limits (h);
+       }
+ 
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+ 
+     BEGIN_PROPERTIES (hggroup)
+       // hidden properties for limit computation
+       row_vector_property xlim hr , Matrix()
+@@ -3817,28 +4009,24 @@ public:
+       bool_property xliminclude h , "on"
+       bool_property yliminclude h , "on"
+       bool_property zliminclude h , "on"
+       bool_property climinclude h , "on"
+       bool_property aliminclude h , "on"
+     END_PROPERTIES
+ 
+   private:
+-    void update_limits (void)
+-      {
+-        update_axis_limits ("xlim");
+-        update_axis_limits ("ylim");
+-        update_axis_limits ("zlim");
+-        update_axis_limits ("clim");
+-        update_axis_limits ("alim");
+-      }
++      void update_limits (void) const;
++
++      void update_limits (const graphics_handle& h) const;
+ 
+   protected:
+     void init (void)
+       { }
++
+   };
+ 
+ private:
+   properties xproperties;
+ 
+ public:
+   hggroup (const graphics_handle& mh, const graphics_handle& p)
+     : base_graphics_object (), xproperties (mh, p)
+@@ -3848,18 +4036,22 @@ public:
+ 
+   ~hggroup (void) { xproperties.delete_children (); }
+ 
+   base_properties& get_properties (void) { return xproperties; }
+ 
+   const base_properties& get_properties (void) const { return xproperties; }
+ 
+   bool valid_object (void) const { return true; }
+-  
++
+   void update_axis_limits (const std::string& axis_type);
++
++  void update_axis_limits (const std::string& axis_type,
++                           const graphics_handle& h);
++
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class OCTINTERP_API uimenu : public base_graphics_object
+ {
+ public:
+   class OCTINTERP_API properties : public base_properties

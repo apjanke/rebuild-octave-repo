@@ -1,0 +1,673 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1445633723 14400
+#      Fri Oct 23 16:55:23 2015 -0400
+# Node ID e0e2c2ce7e944a46fa7a7e7028f2823b2f4af28b
+# Parent  67e6343cd29ab91d2cf91a070841bc817afb1b7e
+defer stack trace until back at top level
+
+* error.cc (debug_or_throw_exception): New arg, show_stack_trace.
+Store stack trace info in exception object.  Change all uses.
+(pr_where, pr_where_1, pr_where_2): New arg, os.  Write to it instead
+of writing to std::cerr unconditionally.  Change all uses.
+(error_1): Don't print stack trace here, just determine whether stack
+trace should be shown by the current exception.
+
+* toplev.cc (main_loop): Display stack trace when catching
+octave_execution_exception.
+
+* ov-base.cc (octave_base_value::cell_value,
+octave_base_value::string_value): Use gripe_wrong_type_arg.
+
+* oct-parse.in.yy (Feval, Fevalin): Also call recover_from_exception
+when handling octave_execution_exception.
+
+* pt-eval.cc (tree_evaluator::visit_try_catch_command,
+tree_evaluator::do_unwind_protect_cleanup): Also call recover_from_exception
+when handling octave_execution_exception.
+
+* quit.h (octave_execution_exception): Extend class to handle a text
+message for stack trace info.
+
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -129,73 +129,16 @@ initialize_warning_options (const std::s
+ 
+ static octave_map
+ initialize_last_error_stack (void)
+ {
+   return octave_call_stack::empty_backtrace ();
+ }
+ 
+ static void
+-debug_or_throw_exception (void)
+-{
+-  if ((interactive || forced_interactive)
+-      && Vdebug_on_error && octave_call_stack::caller_user_code ())
+-    {
+-      unwind_protect frame;
+-      frame.protect_var (Vdebug_on_error);
+-      Vdebug_on_error = false;
+-
+-      tree_evaluator::debug_mode = true;
+-
+-      tree_evaluator::current_frame = octave_call_stack::current_frame ();
+-
+-      do_keyboard (octave_value_list ());
+-    }
+-  else
+-    octave_throw_execution_exception ();
+-}
+-
+-// Warning messages are never buffered.
+-
+-static void
+-vwarning (const char *name, const char *id, const char *fmt, va_list args)
+-{
+-  if (discard_warning_messages)
+-    return;
+-
+-  flush_octave_stdout ();
+-
+-  std::ostringstream output_buf;
+-
+-  octave_vformat (output_buf, fmt, args);
+-
+-  // FIXME: we really want to capture the message before it has all the
+-  //        formatting goop attached to it.  We probably also want just the
+-  //        message, not the traceback information.
+-
+-  std::string base_msg = output_buf.str ();
+-  std::string msg_string;
+-
+-  if (name)
+-    msg_string = std::string (name) + ": ";
+-
+-  msg_string += base_msg + "\n";
+-
+-  Vlast_warning_id = id;
+-  Vlast_warning_message = base_msg;
+-
+-  if (! Vquiet_warning)
+-    {
+-      octave_diary << msg_string;
+-
+-      std::cerr << msg_string;
+-    }
+-}
+-
+-static void
+ verror (bool save_last_error, std::ostream& os,
+         const char *name, const char *id, const char *fmt, va_list args,
+         bool with_cfn = false)
+ {
+   if (discard_error_messages)
+     return;
+ 
+   if (! buffer_error_messages)
+@@ -267,83 +210,157 @@ verror (bool save_last_error, std::ostre
+   if (! buffer_error_messages)
+     {
+       octave_diary << msg_string;
+       os << msg_string;
+     }
+ }
+ 
+ static void
+-pr_where_2 (const char *fmt, va_list args)
++pr_where_2 (std::ostream& os, const char *fmt, va_list args)
+ {
+   if (fmt)
+     {
+       if (*fmt)
+         {
+           size_t len = strlen (fmt);
+ 
+           if (len > 0)
+             {
+               if (fmt[len - 1] == '\n')
+                 {
+                   if (len > 1)
+                     {
+                       char *tmp_fmt = strsave (fmt);
+                       tmp_fmt[len - 1] = '\0';
+-                      verror (false, std::cerr, 0, "", tmp_fmt, args);
++                      verror (false, os, 0, "", tmp_fmt, args);
+                       delete [] tmp_fmt;
+                     }
+                 }
+               else
+-                verror (false, std::cerr, 0, "", fmt, args);
++                verror (false, os, 0, "", fmt, args);
+             }
+         }
+     }
+   else
+     panic ("pr_where_2: invalid format");
+ }
+ 
+ static void
+-pr_where_1 (const char *fmt, ...)
++pr_where_1 (std::ostream& os, const char *fmt, ...)
+ {
+   va_list args;
+   va_start (args, fmt);
+-  pr_where_2 (fmt, args);
++  pr_where_2 (os, fmt, args);
+   va_end (args);
+ }
+ 
+ static void
+-pr_where (const char *who)
++pr_where (std::ostream& os, const char *who)
+ {
+   std::list<octave_call_stack::stack_frame> frames
+     = octave_call_stack::backtrace_frames ();
+ 
+   size_t nframes = frames.size ();
+ 
+   if (nframes > 0)
+-    pr_where_1 ("%s: called from\n", who);
++    pr_where_1 (os, "%s: called from\n", who);
+ 
+   // Print the error message only if it is different from the previous one;
+   // Makes the output more concise and readable.
+   frames.unique ();
+ 
+   for (std::list<octave_call_stack::stack_frame>::const_iterator p = frames.begin ();
+        p != frames.end (); p++)
+     {
+       const octave_call_stack::stack_frame& elt = *p;
+ 
+       std::string fcn_name = elt.fcn_name ();
+       int line = elt.line ();
+       int column = elt.column ();
+ 
+-      pr_where_1 ("    %s at line %d column %d\n",
++      pr_where_1 (os, "    %s at line %d column %d\n",
+                   fcn_name.c_str (), line, column);
+     }
+ }
+ 
++static void
++debug_or_throw_exception (bool show_stack_trace = false)
++{
++  if ((interactive || forced_interactive)
++      && Vdebug_on_error && octave_call_stack::caller_user_code ())
++    {
++      unwind_protect frame;
++      frame.protect_var (Vdebug_on_error);
++      Vdebug_on_error = false;
++
++      tree_evaluator::debug_mode = true;
++
++      tree_evaluator::current_frame = octave_call_stack::current_frame ();
++
++      if (show_stack_trace)
++        pr_where (std::cerr, "error");
++
++      do_keyboard (octave_value_list ());
++    }
++  else
++    {
++      octave_execution_exception e;
++
++      if (show_stack_trace
++          && octave_exception_state != octave_exec_exception)
++        {
++          std::ostringstream buf;
++          pr_where (buf, "error");
++          e.set_stack_trace (buf.str ());
++        }
++
++      octave_exception_state = octave_exec_exception;
++
++      throw e;
++    }
++}
++
++// Warning messages are never buffered.
++
++static void
++vwarning (const char *name, const char *id, const char *fmt, va_list args)
++{
++  if (discard_warning_messages)
++    return;
++
++  flush_octave_stdout ();
++
++  std::ostringstream output_buf;
++
++  octave_vformat (output_buf, fmt, args);
++
++  // FIXME: we really want to capture the message before it has all the
++  //        formatting goop attached to it.  We probably also want just the
++  //        message, not the traceback information.
++
++  std::string base_msg = output_buf.str ();
++  std::string msg_string;
++
++  if (name)
++    msg_string = std::string (name) + ": ";
++
++  msg_string += base_msg + "\n";
++
++  Vlast_warning_id = id;
++  Vlast_warning_message = base_msg;
++
++  if (! Vquiet_warning)
++    {
++      octave_diary << msg_string;
++
++      std::cerr << msg_string;
++    }
++}
++
+ void
+ vmessage (const char *name, const char *fmt, va_list args)
+ {
+   verror (false, std::cerr, name, "", fmt, args);
+ }
+ 
+ void
+ message (const char *name, const char *fmt, ...)
+@@ -407,16 +424,18 @@ usage_with_id (const char *id, const cha
+   vusage_with_id (id, fmt, args);
+   va_end (args);
+ }
+ 
+ static void
+ error_1 (std::ostream& os, const char *name, const char *id,
+          const char *fmt, va_list args, bool with_cfn = false)
+ {
++  bool show_stack_trace = false;
++
+   if (fmt)
+     {
+       if (*fmt)
+         {
+           size_t len = strlen (fmt);
+ 
+           if (len > 0)
+             {
+@@ -432,25 +451,25 @@ error_1 (std::ostream& os, const char *n
+                 }
+               else
+                 {
+                   verror (true, os, name, id, fmt, args, with_cfn);
+ 
+                   bool in_user_code = octave_call_stack::caller_user_code () != 0;
+ 
+                   if (in_user_code && ! discard_error_messages)
+-                    pr_where ("error");
++                    show_stack_trace = true;
+                 }
+             }
+         }
+     }
+   else
+     panic ("error_1: invalid format");
+ 
+-  debug_or_throw_exception ();
++  debug_or_throw_exception (show_stack_trace);
+ }
+ 
+ void
+ verror (const char *fmt, va_list args)
+ {
+   error_1 (std::cerr, "error", "", fmt, args);
+ }
+ 
+@@ -627,17 +646,17 @@ warning_1 (const char *id, const char *f
+       else
+         vwarning ("warning", id, fmt, args);
+ 
+       bool in_user_code = octave_call_stack::caller_user_code () != 0;
+ 
+       if (! fmt_suppresses_backtrace && in_user_code
+           && Vbacktrace_on_warning
+           && ! discard_warning_messages)
+-        pr_where ("warning");
++        pr_where (std::cerr, "warning");
+ 
+       if ((interactive || forced_interactive)
+           && Vdebug_on_warning && in_user_code)
+         {
+           unwind_protect frame;
+           frame.protect_var (Vdebug_on_warning);
+           Vdebug_on_warning = false;
+ 
+@@ -891,58 +910,65 @@ error.  Typically @var{err} is returned 
+             {
+               if (file.empty ())
+                 {
+                   if (nm.empty ())
+                     {
+                       if (l > 0)
+                         {
+                           if (c > 0)
+-                            pr_where_1 ("error: near line %d, column %d",
++                            pr_where_1 (std::cerr,
++                                        "error: near line %d, column %d",
+                                         l, c);
+                           else
+-                            pr_where_1 ("error: near line %d", l);
++                            pr_where_1 (std::cerr, "error: near line %d", l);
+                         }
+                     }
+                   else
+                     {
+                       if (l > 0)
+                         {
+                           if (c > 0)
+-                            pr_where_1 ("error: called from '%s' near line %d, column %d",
++                            pr_where_1 (std::cerr,
++                                        "error: called from '%s' near line %d, column %d",
+                                         nm.c_str (), l, c);
+                           else
+-                            pr_where_1 ("error: called from '%d' near line %d",
++                            pr_where_1 (std::cerr,
++                                        "error: called from '%d' near line %d",
+                                         nm.c_str (), l);
+                         }
+                     }
+                 }
+               else
+                 {
+                   if (nm.empty ())
+                     {
+                       if (l > 0)
+                         {
+                           if (c > 0)
+-                            pr_where_1 ("error: in file %s near line %d, column %d",
++                            pr_where_1 (std::cerr,
++                                        "error: in file %s near line %d, column %d",
+                                         file.c_str (), l, c);
+                           else
+-                            pr_where_1 ("error: in file %s near line %d",
++                            pr_where_1 (std::cerr,
++                                        "error: in file %s near line %d",
+                                         file.c_str (), l);
+                         }
+                     }
+                   else
+                     {
+                       if (l > 0)
+                         {
+                           if (c > 0)
+-                            pr_where_1 ("error: called from '%s' in file %s near line %d, column %d",
++                            pr_where_1 (std::cerr,
++                                        "error: called from '%s' in file %s near line %d, column %d",
+                                         nm.c_str (), file.c_str (), l, c);
+                           else
+-                            pr_where_1 ("error: called from '%d' in file %s near line %d",
++                            pr_where_1 (std::cerr,
++                                        "error: called from '%d' in file %s near line %d",
+                                         nm.c_str (), file.c_str (), l);
+                         }
+                     }
+                 }
+             }
+         }
+       else
+         error ("rethrow: ERR structure must contain the fields 'message and 'identifier'");
+diff --git a/libinterp/corefcn/toplev.cc b/libinterp/corefcn/toplev.cc
+--- a/libinterp/corefcn/toplev.cc
++++ b/libinterp/corefcn/toplev.cc
+@@ -660,18 +660,23 @@ main_loop (void)
+         }
+       catch (const index_exception& e)
+         {
+           recover_from_exception ();
+           std::cerr << "error: unhandled index exception: "
+                     << e.message () << " -- trying to return to prompt"
+                     << std::endl;
+         }
+-      catch (const octave_execution_exception&)
++      catch (const octave_execution_exception& e)
+         {
++          std::string stack_trace = e.info ();
++
++          if (! stack_trace.empty ())
++            std::cerr << stack_trace;
++
+           recover_from_exception ();
+         }
+       catch (const std::bad_alloc&)
+         {
+           recover_from_exception ();
+           std::cerr << "error: out of memory -- trying to return to prompt"
+                     << std::endl;
+         }
+diff --git a/libinterp/octave-value/ov-base.cc b/libinterp/octave-value/ov-base.cc
+--- a/libinterp/octave-value/ov-base.cc
++++ b/libinterp/octave-value/ov-base.cc
+@@ -544,19 +544,17 @@ octave_base_value::cell_value (const cha
+   // since it is already an error to end up here.
+ 
+   // FIXME: do we want both the wrong-type-argument error and any custom
+   // error message, or just the custom error message, or should that
+   // behavior be optional in some way?
+ 
+   try
+     {
+-      std::string tn = type_name ();
+-
+-      error ("wrong type argument '%s'\n", tn.c_str ());
++      gripe_wrong_type_arg ("cell value", type_name ());
+     }
+   catch (const octave_execution_exception&)
+     {
+       if (fmt)
+         verror (fmt, args);
+ 
+       throw;
+     }
+@@ -944,19 +942,17 @@ octave_base_value::string_value (const c
+   // since it is already an error to end up here.
+ 
+   // FIXME: do we want both the wrong-type-argument error and any custom
+   // error message, or just the custom error message, or should that
+   // behavior be optional in some way?
+ 
+   try
+     {
+-      std::string tn = type_name ();
+-
+-      error ("wrong type argument '%s'\n", tn.c_str ());
++      gripe_wrong_type_arg ("string value", type_name ());
+     }
+   catch (const octave_execution_exception&)
+     {
+       if (fmt)
+         verror (fmt, args);
+ 
+       throw;
+     }
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -4960,16 +4960,18 @@ the security considerations that the eva
+       octave_value_list tmp;
+ 
+       try
+         {
+           tmp = eval_string (args(0), nargout > 0, parse_status, nargout);
+         }
+       catch (const octave_execution_exception&)
+         {
++          recover_from_exception ();
++
+           execution_error = true;
+         }
+ 
+       if (nargin > 1 && (parse_status != 0 || execution_error))
+         {
+           // Set up for letting the user print any messages from
+           // errors that occurred in the first part of this eval().
+ 
+@@ -5117,16 +5119,18 @@ Like @code{eval}, except that the expres
+ 
+       try
+         {
+           tmp = eval_string (args(1), nargout > 0,
+                              parse_status, nargout);
+         }
+       catch (const octave_execution_exception&)
+         {
++          recover_from_exception ();
++
+           execution_error = true;
+         }
+ 
+       if (nargin > 2 && (parse_status != 0 || execution_error))
+         {
+           // Set up for letting the user print any messages from
+           // errors that occurred in the first part of this eval().
+ 
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ #include "gripes.h"
+ #include "input.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ #include "variables.h"
+ #include "pt-all.h"
+ #include "pt-eval.h"
+ #include "symtab.h"
++#include "toplev.h"
+ #include "unwind-prot.h"
+ 
+ //FIXME: This should be part of tree_evaluator
+ #include "pt-jit.h"
+ 
+ static tree_evaluator std_evaluator;
+ 
+ tree_evaluator *current_evaluator = &std_evaluator;
+@@ -862,16 +863,18 @@ tree_evaluator::visit_try_catch_command 
+   if (try_code)
+     {
+       try
+         {
+           try_code->accept (*this);
+         }
+       catch (const octave_execution_exception&)
+         {
++          recover_from_exception ();
++
+           execution_error = true;
+         }
+     }
+ 
+   if (execution_error)
+     {
+       if (catch_code)
+         {
+@@ -932,16 +935,18 @@ tree_evaluator::do_unwind_protect_cleanu
+ 
+   try
+     {
+       if (list)
+         list->accept (*this);
+     }
+   catch (const octave_execution_exception&)
+     {
++      recover_from_exception ();
++
+       execution_error_in_cleanup = true;
+     }
+ 
+   // The unwind_protects are popped off the stack in the reverse of
+   // the order they are pushed on.
+ 
+   // FIXME: these statements say that if we see a break or
+   // return statement in the cleanup block, that we want to use the
+@@ -1006,16 +1011,18 @@ tree_evaluator::visit_unwind_protect_com
+       unwind_protect_exception = false;
+ 
+       try
+         {
+           unwind_protect_code->accept (*this);
+         }
+       catch (const octave_execution_exception&)
+         {
++          recover_from_exception ();
++
+           unwind_protect_exception = true;
+ 
+           // Run the cleanup code on exceptions, so that it is run even in case
+           // of interrupt or out-of-memory.
+           do_unwind_protect_cleanup_code (cleanup_code);
+ 
+           // We want to rethrow the exception so that interrupts continue.
+           throw;
+diff --git a/liboctave/cruft/misc/quit.h b/liboctave/cruft/misc/quit.h
+--- a/liboctave/cruft/misc/quit.h
++++ b/liboctave/cruft/misc/quit.h
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <stdio.h>
+ 
+ #include <signal.h>
+ #include <setjmp.h>
+ 
+ #ifdef __cplusplus
+ #include <new>
++#include <string>
+ extern "C" {
+ #endif
+ 
+ #if defined (__WIN32__) && ! defined (_POSIX_VERSION)
+ 
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ 
+@@ -70,16 +71,45 @@ CRUFT_API extern void octave_jump_to_enc
+ CRUFT_API extern void octave_save_signal_mask (void);
+ 
+ CRUFT_API extern void octave_restore_signal_mask (void);
+ 
+ #ifdef __cplusplus
+ class
+ octave_execution_exception
+ {
++public:
++
++  octave_execution_exception (void) : m_stack_trace () { }
++
++  octave_execution_exception (const octave_execution_exception& x)
++    : m_stack_trace (x.m_stack_trace) { }
++
++  octave_execution_exception& operator = (const octave_execution_exception& x)
++  {
++    if (&x != this)
++      m_stack_trace = x.m_stack_trace;
++
++    return *this;
++  }
++
++  ~octave_execution_exception (void) { }
++
++  virtual void set_stack_trace (const std::string& st)
++  {
++    m_stack_trace = st;
++  }
++
++  virtual std::string info (void) const
++  {
++    return m_stack_trace;
++  }
++
++private:
++  std::string m_stack_trace;
+ };
+ 
+ class
+ octave_interrupt_exception
+ {
+ };
+ #endif
+ 

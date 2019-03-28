@@ -1,0 +1,240 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1526323639 14400
+#      Mon May 14 14:47:19 2018 -0400
+# Branch stable
+# Node ID 97f1d513aaf6ec47412de427af4875c8758de10c
+# Parent  2205c0ca02e7f0b9069706e02f0ead04b9c10089
+defer deletion of temporaries in argument lists (bug #53844)
+
+* pt-eval.h, pt-eval.cc (tree_evaluator::deferred_delete_stack):
+New class.
+(tree_evaluator::m_deferred_delete_stack): New data member.
+(tree_evaluator::tree_evaluator): Initialize it.
+(tree_evaluator::reset): Clear it.
+(tree_evaluator::defer_deletion): New function.
+(tree_evaluator::visit_statement): Arrange to clear deferred deletion
+stack at end of each statement evaluation.
+
+* pt-arg-list.cc (tree_argument_list::convert_to_const_vector):
+Defer deletion of temporary values in argument lists.
+
+diff --git a/libinterp/parse-tree/pt-arg-list.cc b/libinterp/parse-tree/pt-arg-list.cc
+--- a/libinterp/parse-tree/pt-arg-list.cc
++++ b/libinterp/parse-tree/pt-arg-list.cc
+@@ -242,22 +242,39 @@ namespace octave
+             index_position = k;
+             num_indices = len;
+           }
+ 
+         tree_expression *elt = *p++;
+ 
+         if (elt)
+           {
++            bool is_assignment = elt->is_assignment_expression ();
++
+             octave_value tmp = tw->evaluate (elt);
+ 
+             if (tmp.is_cs_list ())
+               args.push_back (tmp.list_value ());
+             else if (tmp.is_defined ())
+-              args.push_back (tmp);
++              {
++                args.push_back (tmp);
++
++                // Defer deletion of any temporary values until the end
++                // of the containing statement.  That way destructors
++                // for temporary classdef handle objects will be called
++                // when it is safe to do so.
++                //
++                // FIXME: We could further limit this action to classdef
++                // handle objects, but we don't currently have a
++                // octave_value predicate for that so should add it on
++                // the default branch, not stable.
++
++                if (! is_assignment)
++                  tw->defer_deletion (tmp);
++              }
+           }
+         else
+           {
+             args.push_back (octave_value ());
+             break;
+           }
+       }
+ 
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -76,16 +76,17 @@ namespace octave
+   // Normal evaluator.
+ 
+   void
+   tree_evaluator::reset (void)
+   {
+     m_result_type = RT_UNDEFINED;
+     m_expr_result_value = octave_value ();
+     m_expr_result_value_list = octave_value_list ();
++    m_deferred_delete_stack.clear ();
+     m_lvalue_list_stack.clear ();
+     m_nargout_stack.clear ();
+   }
+ 
+   void
+   tree_evaluator::visit_anon_fcn_handle (tree_anon_fcn_handle& anon_fh)
+   {
+     // FIXME: should CMD_LIST be limited to a single expression?
+@@ -2265,16 +2266,23 @@ namespace octave
+           }
+ 
+         try
+           {
+             if (cmd)
+               cmd->accept (*this);
+             else
+               {
++                unwind_protect frame;
++
++                frame.add_method (m_deferred_delete_stack,
++                                  &deferred_delete_stack::pop_frame);
++
++                m_deferred_delete_stack.mark ();
++
+                 if (m_echo_state)
+                   {
+                     size_t line = stmt.line ();
+                     echo_code (line);
+                     m_echo_file_pos = line + 1;
+                   }
+ 
+                 if (debug_mode)
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -62,16 +62,64 @@ namespace octave
+     enum echo_state
+     {
+       ECHO_OFF = 0,
+       ECHO_SCRIPTS = 1,
+       ECHO_FUNCTIONS = 2,
+       ECHO_ALL = 4
+     };
+ 
++    class deferred_delete_stack
++    {
++    public:
++
++      deferred_delete_stack (void) = default;
++
++      deferred_delete_stack (const deferred_delete_stack&) = default;
++
++      deferred_delete_stack& operator = (const deferred_delete_stack&) = default;
++
++      ~deferred_delete_stack (void) = default;
++
++      // An undefined value on the stack marks the boundary of the
++      // current frame.
++
++      void mark (void) { push (octave_value ()); }
++
++      void push (const octave_value& val) { m_stack.push (val); }
++
++      void pop_frame (void)
++      {
++        while (! m_stack.empty ())
++          {
++            octave_value val = val_pop ();
++
++            if (val.is_undefined ())
++              break;
++          }
++      }
++
++      void clear (void)
++      {
++        while (! m_stack.empty ())
++          m_stack.pop ();
++      }
++
++    private:
++
++      std::stack<octave_value> m_stack;
++
++      octave_value val_pop (void)
++      {
++        octave_value retval = m_stack.top ();
++        m_stack.pop ();
++        return retval;
++      }
++    };
++
+     template <typename T>
+     class value_stack
+     {
+     public:
+ 
+       value_stack (void) = default;
+ 
+       value_stack (const value_stack&) = default;
+@@ -120,18 +168,18 @@ namespace octave
+       std::stack<T> m_stack;
+     };
+ 
+     typedef void (*decl_elt_init_fcn) (tree_decl_elt&);
+ 
+     tree_evaluator (interpreter& interp)
+       : m_interpreter (interp), m_result_type (RT_UNDEFINED),
+         m_expr_result_value (), m_expr_result_value_list (),
+-        m_lvalue_list_stack (), m_nargout_stack (),
+-        m_call_stack (interp), m_profiler (),
++        m_deferred_delete_stack (), m_lvalue_list_stack (),
++        m_nargout_stack (), m_call_stack (interp), m_profiler (),
+         m_max_recursion_depth (256), m_silent_functions (false),
+         m_string_fill_char (' '), m_PS4 ("+ "), m_echo (ECHO_OFF),
+         m_echo_state (false), m_echo_file_name (), m_echo_file_pos (1),
+         m_echo_files ()
+     { }
+ 
+     // No copying!
+ 
+@@ -262,16 +310,21 @@ namespace octave
+     };
+ 
+     // The context for the current evaluation.
+     static stmt_list_type statement_context;
+ 
+     // TRUE means we are evaluating some kind of looping construct.
+     static bool in_loop_command;
+ 
++    void defer_deletion (const octave_value& val)
++    {
++      m_deferred_delete_stack.push (val);
++    }
++
+     Matrix ignored_fcn_outputs (void) const;
+ 
+     bool isargout (int nargout, int iout) const;
+ 
+     void isargout (int nargout, int nout, bool *isargout) const;
+ 
+     const std::list<octave_lvalue> * lvalue_list (void) const
+     {
+@@ -482,16 +535,18 @@ namespace octave
+     void echo_code (size_t line);
+ 
+     interpreter& m_interpreter;
+ 
+     result_type m_result_type;
+     octave_value m_expr_result_value;
+     octave_value_list m_expr_result_value_list;
+ 
++    deferred_delete_stack m_deferred_delete_stack;
++
+     value_stack<const std::list<octave_lvalue>*> m_lvalue_list_stack;
+ 
+     value_stack<int> m_nargout_stack;
+ 
+     call_stack m_call_stack;
+ 
+     profiler m_profiler;
+ 

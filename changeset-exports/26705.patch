@@ -1,0 +1,371 @@
+# HG changeset patch
+# User Markus Mützel <markus.muetzel@gmx.de>
+# Date 1549730508 -3600
+#      Sat Feb 09 17:41:48 2019 +0100
+# Node ID c13143821eefaccf953e605c5e5a1bb5feaaa07a
+# Parent  7c027116ee21e1d7c927f258377446164360c47d
+Add front-end support for encodings in "fopen" (bug #55452).
+
+* file-io.cc (Ffopen): Add support for input and output argument "encoding".
+  (do_stream_open): Check if encoding is valid.
+* oct-stream.cc (stream_list::get_info): Return encoding.
+* io.tst (fopen): Adapt for new syntax. Add test for writing and reading with
+  specified encoding.
+
+diff --git a/libinterp/corefcn/file-io.cc b/libinterp/corefcn/file-io.cc
+--- a/libinterp/corefcn/file-io.cc
++++ b/libinterp/corefcn/file-io.cc
+@@ -47,16 +47,17 @@ along with Octave; see the file COPYING.
+ #include <vector>
+ 
+ #if defined (HAVE_ZLIB_H)
+ #  include <zlib.h>
+ #endif
+ 
+ #include "file-ops.h"
+ #include "file-stat.h"
++#include "iconv-wrappers.h"
+ #include "lo-ieee.h"
+ #include "lo-sysdep.h"
+ #include "mkostemp-wrapper.h"
+ #include "oct-env.h"
+ #include "oct-locbuf.h"
+ #include "tmpfile-wrapper.h"
+ #include "unistd-wrappers.h"
+ 
+@@ -400,22 +401,34 @@ Returns the number of lines skipped (end
+   if (! err)
+     return ovl (tmp);
+   else
+     return ovl ();
+ }
+ 
+ static octave::stream
+ do_stream_open (const std::string& name, const std::string& mode_arg,
+-                const std::string& arch, int& fid)
++                const std::string& arch, std::string encoding, int& fid)
+ {
+   octave::stream retval;
+ 
+   fid = -1;
+ 
++  // Valid names for encodings consist of ASCII characters only.
++  std::transform (encoding.begin (), encoding.end (), encoding.begin (),
++                  ::tolower);
++  if (encoding.compare ("utf-8"))
++  {
++    // check if encoding is valid
++    octave_iconv_open_wrapper (encoding.c_str (), "utf-8");
++    if (errno == EINVAL)
++      error ("fopen: conversion from codepage '%s' not supported",
++             encoding.c_str ());
++  }
++
+   std::string mode = mode_arg;
+   bool use_zlib = false;
+   normalize_fopen_mode (mode, use_zlib);
+ 
+   std::ios::openmode md = fopen_mode_to_ios_mode (mode);
+ 
+   octave::mach_info::float_format flt_fmt =
+     octave::mach_info::string_to_float_format (arch);
+@@ -435,74 +448,79 @@ do_stream_open (const std::string& name,
+           FILE *fptr = octave::sys::fopen (fname.c_str (), mode.c_str ());
+ 
+           if (fptr)
+             {
+               int fd = fileno (fptr);
+ 
+               gzFile gzf = ::gzdopen (fd, mode.c_str ());
+ 
+-              retval = octave_zstdiostream::create (fname, gzf, fd,
+-                                                    md, flt_fmt);
++              retval = octave_zstdiostream::create (fname, gzf, fd, md,
++                                                    flt_fmt, encoding);
+             }
+           else
+             retval.error (std::strerror (errno));
+         }
+       else
+ #endif
+         {
+           FILE *fptr = octave::sys::fopen (fname.c_str (), mode.c_str ());
+ 
+-          retval = octave_stdiostream::create (fname, fptr, md,
+-                                               flt_fmt);
++          retval = octave_stdiostream::create (fname, fptr, md, flt_fmt,
++                                               encoding);
+ 
+           if (! fptr)
+             retval.error (std::strerror (errno));
+         }
+ 
+     }
+ 
+   return retval;
+ }
+ 
+ static octave::stream
+ do_stream_open (const octave_value& tc_name, const octave_value& tc_mode,
+-                const octave_value& tc_arch, const char *fcn, int& fid)
++                const octave_value& tc_arch, const octave_value& tc_encoding,
++                const char *fcn, int& fid)
+ {
+   octave::stream retval;
+ 
+   fid = -1;
+ 
+   std::string name = tc_name.xstring_value ("%s: filename must be a string", fcn);
+   std::string mode = tc_mode.xstring_value ("%s: file mode must be a string", fcn);
+   std::string arch = tc_arch.xstring_value ("%s: architecture type must be a string", fcn);
+-
+-  retval = do_stream_open (name, mode, arch, fid);
++  std::string encoding = tc_encoding.xstring_value ("%s: ENCODING must be a string", fcn);
++
++  retval = do_stream_open (name, mode, arch, encoding, fid);
+ 
+   return retval;
+ }
+ 
+ DEFMETHOD (fopen, interp, args, nargout,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{fid} =} fopen (@var{name})
+ @deftypefnx {} {@var{fid} =} fopen (@var{name}, @var{mode})
+ @deftypefnx {} {@var{fid} =} fopen (@var{name}, @var{mode}, @var{arch})
++@deftypefnx {} {@var{fid} =} fopen (@var{name}, @var{mode}, @var{arch}, @var{encoding})
+ @deftypefnx {} {[@var{fid}, @var{msg}] =} fopen (@dots{})
+ @deftypefnx {} {@var{fid_list} =} fopen ("all")
+-@deftypefnx {} {[@var{file}, @var{mode}, @var{arch}] =} fopen (@var{fid})
++@deftypefnx {} {[@var{file}, @var{mode}, @var{arch}, @var{encoding}] =} fopen (@var{fid})
+ Open a file for low-level I/O or query open files and file descriptors.
+ 
+ The first form of the @code{fopen} function opens the named file with
+-the specified mode (read-write, read-only, etc.@:) and architecture
+-interpretation (IEEE big endian, IEEE little endian, etc.), and returns
+-an integer value that may be used to refer to the file later.  If an
+-error occurs, @var{fid} is set to @minus{}1 and @var{msg} contains the
++the specified mode (read-write, read-only, etc.@:), architecture
++interpretation (IEEE big endian, IEEE little endian, etc.) and file encoding,
++and returns an integer value that may be used to refer to the file later.  If
++an error occurs, @var{fid} is set to @minus{}1 and @var{msg} contains the
+ corresponding system error message.  The @var{mode} is a one or two
+ character string that specifies whether the file is to be opened for
+-reading, writing, or both.
++reading, writing, or both.  The @var{encoding} is a character string with a
++valid code page identifier.  This code page is used when strings are read from
++or written to the file.
+ 
+ The second form of the @code{fopen} function returns a vector of file ids
+ corresponding to all the currently open files, excluding the
+ @code{stdin}, @code{stdout}, and @code{stderr} streams.
+ 
+ The third form of the @code{fopen} function returns information about the
+ open file given its file id.
+ 
+@@ -566,36 +584,32 @@ The format of the current machine.
+ 
+ @item @qcode{"ieee-be"} or @qcode{"b"}
+ IEEE big endian format.
+ 
+ @item @qcode{"ieee-le"} or @qcode{"l"}
+ IEEE little endian format.
+ @end table
+ 
+-@noindent
+-However, conversions are currently only supported for @samp{native},
+-@samp{ieee-be}, and @samp{ieee-le} formats.
+-
+ When opening a new file that does not yet exist, permissions will be set to
+ @code{0666 - @var{umask}}.
+ 
+ Compatibility Note: Octave opens files using buffered I/O.  Small writes are
+ accumulated until an internal buffer is filled, and then everything is written
+ in a single operation.  This is very efficient and improves performance.
+ @sc{matlab}, however, opens files using flushed I/O where every write operation
+ is immediately performed.  If the write operation must be performed immediately
+ after data has been written then the write should be followed by a call to
+ @code{fflush} to flush the internal buffer.
+ @seealso{fclose, fgets, fgetl, fscanf, fread, fputs, fdisp, fprintf, fwrite, fskipl, fseek, frewind, ftell, feof, ferror, fclear, fflush, freport, umask}
+ @end deftypefn */)
+ {
+   int nargin = args.length ();
+ 
+-  if (nargin < 1 || nargin > 3)
++  if (nargin < 1 || nargin > 4)
+     print_usage ();
+ 
+   octave_value_list retval = ovl (-1.0);
+ 
+   octave::stream_list& streams = interp.get_stream_list ();
+ 
+   if (nargin == 1)
+     {
+@@ -607,50 +621,52 @@ after data has been written then the wri
+           // to supply more than one argument.
+           if (nargout < 2 && args(0).string_value () == "all")
+             return streams.open_file_numbers ();
+         }
+       else
+         {
+           string_vector tmp = streams.get_info (args(0));
+ 
+-          retval = ovl (tmp(0), tmp(1), tmp(2));
++          retval = ovl (tmp(0), tmp(1), tmp(2), tmp(3));
+ 
+           return retval;
+         }
+     }
+ 
+-  octave_value mode = (nargin == 2 || nargin == 3)
+-                      ? args(1) : octave_value ("r");
+-
+-  octave_value arch = (nargin == 3)
+-                      ? args(2) : octave_value ("native");
++  octave_value mode = (nargin > 1) ? args(1) : octave_value ("r");
++
++  octave_value arch = (nargin > 2) ? args(2) : octave_value ("native");
++
++  octave_value encoding = (nargin > 3) ? args(3) : octave_value ("utf-8");
+ 
+   int fid = -1;
+ 
+-  octave::stream os = do_stream_open (args(0), mode, arch, "fopen", fid);
++  octave::stream os = do_stream_open (args(0), mode, arch, encoding, "fopen",
++                                      fid);
+ 
+   if (os)
+     retval = ovl (streams.insert (os), "");
+   else
+     {
+       int error_number = 0;
+ 
+       retval = ovl (-1.0, os.error (false, error_number));
+     }
+ 
+   return retval;
+ }
+ 
+ /*
+-## FIXME: Only have tests for query mode.  Need others for regular fopen call.
++## Further tests are in io.tst
+ %!test   # Uses hardcoded value of 1 for stdout
+-%! [name, mode, arch] = fopen (1);
++%! [name, mode, arch, encoding] = fopen (1);
+ %! assert (name, "stdout");
+ %! assert (mode, "w");
++%! assert (encoding, "utf-8");
+ 
+ %!test   # Query of non-existent stream returns all ""
+ %! [name, mode, arch] = fopen (-1);
+ %! assert (name, "");
+ %! assert (mode, "");
+ %! assert (arch, "");
+ */
+ 
+diff --git a/libinterp/corefcn/oct-stream.cc b/libinterp/corefcn/oct-stream.cc
+--- a/libinterp/corefcn/oct-stream.cc
++++ b/libinterp/corefcn/oct-stream.cc
+@@ -7479,17 +7479,17 @@ namespace octave
+         list.erase (iter++);
+       }
+ 
+     lookup_cache = list.end ();
+   }
+ 
+   string_vector stream_list::get_info (int fid) const
+   {
+-    string_vector retval (3);
++    string_vector retval (4);
+ 
+     if (fid < 0)
+       return retval;
+ 
+     stream os;
+     if (lookup_cache != list.end () && lookup_cache->first == fid)
+       os = lookup_cache->second;
+     else
+@@ -7504,16 +7504,17 @@ namespace octave
+       }
+ 
+     if (! os.is_valid ())
+       return retval;
+ 
+     retval(0) = os.name ();
+     retval(1) = stream::mode_as_string (os.mode ());
+     retval(2) = mach_info::float_format_as_string (os.float_format ());
++    retval(3) = os.encoding ();
+ 
+     return retval;
+   }
+ 
+   string_vector stream_list::get_info (const octave_value& fid) const
+   {
+     int conv_err = 0;
+ 
+diff --git a/test/io.tst b/test/io.tst
+--- a/test/io.tst
++++ b/test/io.tst
+@@ -490,17 +490,17 @@
+ %! fail ("fopen (s)");
+ 
+ %!error fopen ("foo", "x")
+ 
+ %! fopen ("foo", "wb", "noodle");
+ %! assert (__prog_output_assert__ ("error:"));
+ 
+ %!error <Invalid call to fopen> fopen ()
+-%!error <Invalid call to fopen> fopen ("foo", "wb", "native", 1)
++%!error <Invalid call to fopen> fopen ("foo", "wb", "native", "utf-8", 1)
+ 
+ %!error fclose (0)
+ %!error <Invalid call to fclose> fclose (1, 2)
+ 
+ %!assert (ischar (tempname ()))
+ 
+ %!error <DIR must be a string> tempname (1)
+ %!error <PREFIX must be a string> tempname ("foo", 1)
+@@ -645,16 +645,44 @@
+ %!     else
+ %!       fclose (id);
+ %!       __printf_assert__ ("EOF not reached when expected to: %s (%s)\n", nm, mode);
+ %!     endif
+ %!   endif
+ %!   unlink (nm);
+ %! endif
+ 
++%!test   # write to and read from file with encoding
++%! temp_file = [tempname(), ".txt"];
++%! fid = fopen (temp_file, "wt", "n", "latin 1");
++%! unwind_protect
++%!   [name, mode, arch, codepage] = fopen (fid);
++%!   assert (name, temp_file);
++%!   assert (mode, "w");
++%!   assert (codepage, "latin 1");
++%!   fprintf (fid, "aäu %s\n", "AÄU");
++%!   fclose (fid);
++%!   # open in binary mode
++%!   fid2 = fopen (temp_file, "rb");
++%!   [name, mode, arch, codepage] = fopen (fid2);
++%!   assert (name, temp_file);
++%!   assert (mode, "rb");
++%!   assert (codepage, "utf-8");
++%!   read_binary = fread (fid2);
++%!   fclose (fid2);
++%!   assert (read_binary, [97 228 117 32 65 196 85 10].');
++%!   # open in text mode with correct encoding
++%!   fid3 = fopen (temp_file, "rt", "n", "latin 1");
++%!   read_text = fscanf (fid3, "%s");
++%!   fclose (fid3);
++%!   assert (read_text, "aäuAÄU");
++%! unwind_protect_cleanup
++%!   unlink (temp_file);
++%! end_unwind_protect
++
+ %!assert (fputs (1, 1),-1)
+ 
+ %!error <Invalid call to fputs> fputs ()
+ %!error <Invalid call to fputs> fputs (1, "foo", 1)
+ 
+ %!error fgetl ("foo", 1)
+ 
+ %!error <Invalid call to fgetl> fgetl ()

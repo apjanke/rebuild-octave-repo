@@ -1,0 +1,837 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1384588350 18000
+#      Sat Nov 16 02:52:30 2013 -0500
+# Node ID 16cf38c39915712d33cfc8c4ab3dfdc75c49579d
+# Parent  cd97a7ef7355271ac20cff48c952e65c336bee33
+display community news in simple window; check timestamp and serial number
+
+* news-dock-widget.cc, news-dock-widget.h: Delete.
+* libgui/src/module.mk: Update file lists.
+* main-window.h, main-window.cc (news_reader): Move here from
+news-dock-widget.h and news-dock-widget.cc.  Store page serial number.
+(news_reader::process): Check serial number.
+Save timestamp and serial number to settings file.
+(main_window::community_news_window): New data member.
+(main_window::main_window): Initialize it.
+Maybe display community news.
+(main_window::~main_window): Delete community_news_window.
+(fixed_community_news): New static constant.
+(main_window::load_and_display_community_news): New slot.
+(main_window::display_community_news): New slot.
+(main_window::news_window): Delete member variable and all uses.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -35,26 +35,31 @@ along with Octave; see the file COPYING.
+ #include <QStyle>
+ #include <QToolBar>
+ #include <QDesktopServices>
+ #include <QDesktopWidget>
+ #include <QFileDialog>
+ #include <QMessageBox>
+ #include <QIcon>
+ #include <QTextStream>
++#include <QThread>
++#include <QDateTime>
++#include <QDebug>
+ 
+ #include <utility>
+ 
+ #ifdef HAVE_QSCINTILLA
+ #include "file-editor.h"
+ #endif
+ #include "main-window.h"
+ #include "settings-dialog.h"
+ 
++#include "Array.h"
+ #include "cmd-edit.h"
++#include "url-transfer.h"
+ 
+ #include "builtin-defun-decls.h"
+ #include "defaults.h"
+ #include "symtab.h"
+ #include "version.h"
+ 
+ static file_editor_interface *
+ create_default_editor (QWidget *p)
+@@ -65,42 +70,60 @@ create_default_editor (QWidget *p)
+   return 0;
+ #endif
+ }
+ 
+ main_window::main_window (QWidget *p)
+   : QMainWindow (p),
+     _workspace_model (new workspace_model ()),
+     status_bar (new QStatusBar ()),
+-    news_window (new news_dock_widget (this)),
+     command_window (new terminal_dock_widget (this)),
+     history_window (new history_dock_widget (this)),
+     file_browser_window (new files_dock_widget (this)),
+     doc_browser_window (new documentation_dock_widget (this)),
+     editor_window (create_default_editor (this)),
+     workspace_window (new workspace_view (this)),
+     find_files_dlg (0),
+     release_notes_window (0),
++    community_news_window (0),
+     _octave_qt_link (0),
+     _clipboard (QApplication::clipboard ()),
+     _cmd_queue (new QStringList ()),  // no command pending
+     _cmd_processing (1),
+     _cmd_queue_mutex ()
+ {
++  QSettings *settings = resource_manager::get_settings ();
++
++  QDateTime last_checked;
++  int serial = 0;
++
++  if (settings)
++    {
++      last_checked
++        = settings->value ("news/last_time_checked", QDateTime ()).toDateTime ();
++
++      serial = settings->value ("news/last_news_item", 0).toInt ();
++    }
++
++  QDateTime current = QDateTime::currentDateTimeUtc ();
++  QDateTime one_day_ago = current.addDays (-1);
++
++  if (! last_checked.isValid () || one_day_ago > last_checked)
++    load_and_display_community_news (serial);
++
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
+ }
+ 
+ main_window::~main_window (void)
+ {
+   // Destroy the terminal first so that STDERR stream is redirected back
+   // to its original pipe to capture error messages at exit.
+ 
+   delete editor_window;     // first one for dialogs of modified editor-tabs
+-  delete news_window;
+   delete command_window;
+   delete workspace_window;
+   delete doc_browser_window;
+   delete file_browser_window;
+   delete history_window;
+   delete status_bar;
+   delete _workspace_model;
+   if (find_files_dlg)
+@@ -108,16 +131,21 @@ main_window::~main_window (void)
+       delete find_files_dlg;
+       find_files_dlg = 0;
+     }
+   if (release_notes_window)
+     {
+       delete release_notes_window;
+       release_notes_window = 0;
+     }
++  if (community_news_window)
++    {
++      delete community_news_window;
++      community_news_window = 0;
++    }
+   delete _octave_qt_link;
+   delete _cmd_queue;
+ }
+ 
+ bool
+ main_window::command_window_has_focus (void) const
+ {
+   return command_window->has_focus ();
+@@ -310,16 +338,161 @@ main_window::display_release_notes (void
+     release_notes_window->show ();
+   else if (release_notes_window->isMinimized ())
+     release_notes_window->showNormal ();
+ 
+   release_notes_window->raise ();
+   release_notes_window->activateWindow ();
+ }
+ 
++static const char fixed_community_news[] = "<html>\n\
++<body>\n\
++<p>\n\
++Octave's community news source seems to be unavailable.\n\
++For the latest news, please check\n\
++<a href=\"http://octave.org/community-news.html\">http://octave.org/community-news.html</a>\n\
++when you have a connection to the web (link opens in an external browser).\n\
++</p>\n\
++<p>\n\
++<small><em>&mdash; The Octave Developers, " OCTAVE_RELEASE_DATE "</em></small>\n\
++</body>\n\
++</html>\n";
++
++void
++news_reader::process (void)
++{
++  // Run this part in a separate thread so Octave can continue to run
++  // while we wait for the page to load.  Then emit the signal to
++  // display it when we have the page contents.
++
++  QString url = base_url + "/" + page;
++  std::ostringstream buf;
++  url_transfer octave_dot_org (url.toStdString (), buf);
++
++  Array<std::string> param;
++  octave_dot_org.http_get (param);
++
++  QString html_text;
++
++  if (octave_dot_org.good ())
++    html_text = QString::fromStdString (buf.str ());
++
++  if (html_text.contains ("this-is-the-gnu-octave-community-news-page"))
++    {
++      if (serial >= 0)
++        {
++          QSettings *settings = resource_manager::get_settings ();
++
++          if (settings)
++            {
++              settings->setValue ("news/last_time_checked",
++                                  QDateTime::currentDateTimeUtc ());
++
++              settings->sync ();
++            }
++
++          QString tag ("community-news-page-serial=");
++
++          int b = html_text.indexOf (tag);
++
++          if (b)
++            {
++              b += tag.length ();
++
++              int e = html_text.indexOf ("\n", b);
++
++              QString tmp = html_text.mid (b, e-b);
++
++              int curr_page_serial = tmp.toInt ();
++
++              if (curr_page_serial > serial)
++                {
++                  if (settings)
++                    {
++                      settings->setValue ("news/last_news_item",
++                                          curr_page_serial);
++
++                      settings->sync ();
++                    }
++                }
++              else
++                return;
++            }
++          else
++            return;
++        }
++    }
++  else
++    html_text = fixed_community_news;
++
++  emit display_news_signal (html_text);
++
++  emit finished ();
++}
++
++void
++main_window::load_and_display_community_news (int serial)
++{
++  QString base_url = "http://octave.org";
++  QString page = "community-news.html";
++
++  QThread *worker_thread = new QThread;
++
++  news_reader *reader = new news_reader (base_url, page, serial);
++
++  reader->moveToThread (worker_thread);
++
++  connect (reader, SIGNAL (display_news_signal (const QString&)),
++           this, SLOT (display_community_news (const QString&)));
++
++  connect (worker_thread, SIGNAL (started (void)),
++           reader, SLOT (process ()));
++
++  connect (reader, SIGNAL (finished (void)), worker_thread, SLOT (quit ()));
++
++  connect (reader, SIGNAL (finished (void)), reader, SLOT (deleteLater ()));
++
++  connect (worker_thread, SIGNAL (finished (void)),
++           worker_thread, SLOT (deleteLater ()));
++
++  worker_thread->start ();
++}
++
++void
++main_window::display_community_news (const QString& news)
++{
++  if (! community_news_window)
++    {
++      community_news_window = new QWidget;
++
++      QTextBrowser *browser = new QTextBrowser (community_news_window);
++
++      browser->setHtml (news);
++      browser->setObjectName ("OctaveNews");
++      browser->setOpenExternalLinks (true);
++
++      QVBoxLayout *vlayout = new QVBoxLayout;
++
++      vlayout->addWidget (browser);
++
++      community_news_window->setLayout (vlayout);
++      community_news_window->setWindowTitle (tr ("Octave Community News"));
++      community_news_window->setWindowIcon (QIcon (":/icons/logo.png"));
++      community_news_window->resize (640, 480);
++    }
++
++  if (! community_news_window->isVisible ())
++    community_news_window->show ();
++  else if (community_news_window->isMinimized ())
++    community_news_window->showNormal ();
++
++  community_news_window->raise ();
++  community_news_window->activateWindow ();
++}
++
+ void
+ main_window::open_bug_tracker_page (void)
+ {
+   QDesktopServices::openUrl (QUrl ("http://octave.org/bugs.html"));
+ }
+ 
+ void
+ main_window::open_octave_packages_page (void)
+@@ -944,17 +1117,16 @@ main_window::construct (void)
+   connect_uiwidget_links ();
+ 
+   setWindowTitle ("Octave");
+ 
+   setDockOptions (QMainWindow::AnimatedDocks
+                   | QMainWindow::AllowNestedDocks
+                   | QMainWindow::AllowTabbedDocks);
+ 
+-  addDockWidget (Qt::RightDockWidgetArea, news_window);
+   addDockWidget (Qt::RightDockWidgetArea, command_window);
+   addDockWidget (Qt::RightDockWidgetArea, doc_browser_window);
+   tabifyDockWidget (command_window, doc_browser_window);
+ 
+ #ifdef HAVE_QSCINTILLA
+   addDockWidget (Qt::RightDockWidgetArea, editor_window);
+   tabifyDockWidget (command_window, editor_window);
+ #endif
+@@ -1365,20 +1537,16 @@ main_window::construct_window_menu (QMen
+   QAction *show_editor_action = construct_window_menu_item
+                                 (window_menu, tr ("Show Editor"), true,
+                                  ctrl_shift + Qt::Key_4);
+ 
+   QAction *show_documentation_action = construct_window_menu_item
+                                        (window_menu, tr ("Show Documentation"),
+                                         true, ctrl_shift + Qt::Key_5);
+ 
+-  QAction *show_news_action = construct_window_menu_item
+-                              (window_menu, tr ("Show News Window"), true,
+-                               ctrl_shift + Qt::Key_6);
+-
+   window_menu->addSeparator ();
+ 
+   QAction *command_window_action = construct_window_menu_item
+                                    (window_menu, tr ("Command Window"), false,
+                                     ctrl + Qt::Key_0);
+ 
+   QAction *history_action = construct_window_menu_item
+                             (window_menu, tr ("Command History"), false,
+@@ -1395,19 +1563,16 @@ main_window::construct_window_menu (QMen
+   QAction *editor_action = construct_window_menu_item
+                            (window_menu, tr ("Editor"), false,
+                             ctrl + Qt::Key_4);
+ 
+   QAction *documentation_action = construct_window_menu_item
+                                   (window_menu, tr ("Documentation"), false,
+                                    ctrl + Qt::Key_5);
+ 
+-  QAction *news_action = construct_window_menu_item
+-                         (window_menu, tr ("News"), false, ctrl + Qt::Key_6);
+-
+   window_menu->addSeparator ();
+ 
+   QAction *reset_windows_action
+     = window_menu->addAction (tr ("Reset Default Window Layout"));
+ 
+   connect (show_command_window_action, SIGNAL (toggled (bool)),
+            command_window, SLOT (setVisible (bool)));
+ 
+@@ -1435,22 +1600,16 @@ main_window::construct_window_menu (QMen
+ #ifdef HAVE_QSCINTILLA
+   connect (show_editor_action, SIGNAL (toggled (bool)),
+            editor_window, SLOT (setVisible (bool)));
+ 
+   connect (editor_window, SIGNAL (active_changed (bool)),
+            show_editor_action, SLOT (setChecked (bool)));
+ #endif
+ 
+-  connect (show_news_action, SIGNAL (toggled (bool)),
+-           news_window, SLOT (setVisible (bool)));
+-
+-  connect (news_window, SIGNAL (active_changed (bool)),
+-           show_news_action, SLOT (setChecked (bool)));
+-
+   connect (show_documentation_action, SIGNAL (toggled (bool)),
+            doc_browser_window, SLOT (setVisible (bool)));
+ 
+   connect (doc_browser_window, SIGNAL (active_changed (bool)),
+            show_documentation_action, SLOT (setChecked (bool)));
+ 
+   connect (command_window_action, SIGNAL (triggered ()),
+            command_window, SLOT (focus ()));
+@@ -1464,19 +1623,16 @@ main_window::construct_window_menu (QMen
+   connect (file_browser_action, SIGNAL (triggered ()),
+            file_browser_window, SLOT (focus ()));
+ 
+ #ifdef HAVE_QSCINTILLA
+   connect (editor_action, SIGNAL (triggered ()),
+            editor_window, SLOT (focus ()));
+ #endif
+ 
+-  connect (news_action, SIGNAL (triggered ()),
+-           news_window, SLOT (focus ()));
+-
+   connect (documentation_action, SIGNAL (triggered ()),
+            doc_browser_window, SLOT (focus ()));
+ 
+   connect (reset_windows_action, SIGNAL (triggered ()),
+            this, SLOT (reset_windows ()));
+ }
+ 
+ void
+@@ -1555,17 +1711,17 @@ main_window::construct_news_menu (QMenuB
+ 
+   QAction *current_news_action
+     = news_menu->addAction (tr ("Community News"));
+ 
+   connect (release_notes_action, SIGNAL (triggered ()),
+            this, SLOT (display_release_notes ()));
+ 
+   connect (current_news_action, SIGNAL (triggered ()),
+-           news_window, SLOT (focus ()));
++           this, SLOT (load_and_display_community_news ()));
+ }
+ 
+ void
+ main_window::construct_tool_bar (void)
+ {
+   _main_tool_bar = addToolBar ("Main");
+ 
+   _main_tool_bar->setObjectName ("MainToolBar");
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -46,17 +46,16 @@ along with Octave; see the file COPYING.
+ 
+ // Own includes
+ #include "dialog.h"
+ #include "resource-manager.h"
+ #include "workspace-model.h"
+ #include "workspace-view.h"
+ #include "history-dock-widget.h"
+ #include "files-dock-widget.h"
+-#include "news-dock-widget.h"
+ #include "terminal-dock-widget.h"
+ #include "documentation-dock-widget.h"
+ #include "octave-qt-link.h"
+ #include "octave-dock-widget.h"
+ #include "find-files-dialog.h"
+ 
+ /**
+  * \class MainWindow
+@@ -105,16 +104,18 @@ public slots:
+   void handle_clear_history_request (void);
+   void handle_rename_variable_request (const QString& old_name,
+                                        const QString& new_name);
+   void handle_undo_request (void);
+   void new_file (const QString& commands = QString ());
+   void open_file (const QString& file_name = QString ());
+   void open_online_documentation_page (void);
+   void display_release_notes (void);
++  void load_and_display_community_news (int serial = -1);
++  void display_community_news (const QString& news);
+   void open_bug_tracker_page (void);
+   void open_octave_packages_page (void);
+   void open_agora_page (void);
+   void open_contribute_page (void);
+   void open_developer_page (void);
+   void process_settings_dialog_request (const QString& desired_tab
+                                                          = QString ());
+   void show_about_octave (void);
+@@ -263,27 +264,25 @@ private:
+   void queue_command (QString command);  // Data models.
+ 
+   workspace_model *_workspace_model;
+ 
+   // Toolbars.
+   QStatusBar *status_bar;
+ 
+   // Subwindows.
+-  news_dock_widget *news_window;
+   terminal_dock_widget *command_window;
+   history_dock_widget *history_window;
+   files_dock_widget *file_browser_window;
+   documentation_dock_widget *doc_browser_window;
+   file_editor_interface *editor_window;
+   workspace_view *workspace_window;
+   QList<octave_dock_widget *> dock_widget_list ()
+   {
+     QList<octave_dock_widget *> list = QList<octave_dock_widget *> ();
+-    list.append (static_cast<octave_dock_widget *> (news_window));
+     list.append (static_cast<octave_dock_widget *> (command_window));
+     list.append (static_cast<octave_dock_widget *> (history_window));
+     list.append (static_cast<octave_dock_widget *> (file_browser_window));
+     list.append (static_cast<octave_dock_widget *> (doc_browser_window));
+ #ifdef HAVE_QSCINTILLA
+     list.append (static_cast<octave_dock_widget *> (editor_window));
+ #endif
+     list.append (static_cast<octave_dock_widget *> (workspace_window));
+@@ -322,22 +321,52 @@ private:
+   QLineEdit *_current_directory_line_edit;
+ 
+   // Find files dialog
+   find_files_dialog * find_files_dlg;
+ 
+   // release notes window
+   QWidget * release_notes_window;
+ 
++  QWidget * community_news_window;
++
+   octave_qt_link *_octave_qt_link;
+ 
+   QClipboard *_clipboard;
+ 
+   // Flag for closing whole application.
+   bool _closing;
+ 
+   // semaphore to synchronize execution signals and related callback
+   QStringList *_cmd_queue;
+   QSemaphore   _cmd_processing;
+   QMutex       _cmd_queue_mutex;
+ };
+ 
++class news_reader : public QObject
++{
++  Q_OBJECT
++
++public:
++
++  news_reader (const QString& xbase_url, const QString& xpage,
++               int xserial = -1)
++    : QObject (), base_url (xbase_url), page (xpage), serial (xserial)
++  { }
++
++public slots:
++
++  void process (void);
++
++signals:
++
++  void display_news_signal (const QString& news);
++
++  void finished (void);
++
++private:
++
++  QString base_url;
++  QString page;
++  int serial;
++};
++
+ #endif // MAINWINDOW_H
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -88,17 +88,16 @@ octave_gui_MOC += \
+   src/moc-dialog.cc \
+   src/moc-documentation-dock-widget.cc \
+   src/moc-files-dock-widget.cc \
+   src/moc-history-dock-widget.cc \
+   src/moc-main-window.cc \
+   src/moc-octave-interpreter.cc \
+   src/moc-octave-qt-link.cc \
+   src/moc-settings-dialog.cc \
+-  src/moc-news-dock-widget.cc \
+   src/moc-terminal-dock-widget.cc \
+   src/moc-color-picker.cc \
+   src/moc-welcome-wizard.cc \
+   src/moc-workspace-model.cc \
+   src/moc-workspace-view.cc \
+   src/moc-find-files-dialog.cc \
+   src/moc-find-files-model.cc \
+   src/qtinfo/moc-parser.cc \
+@@ -129,17 +128,16 @@ noinst_HEADERS += \
+   src/octave-gui.h \
+   src/octave-interpreter.h \
+   src/octave-qt-link.h \
+   src/qtinfo/parser.h \
+   src/qtinfo/webinfo.h \
+   src/resource-manager.h \
+   src/settings-dialog.h \
+   src/thread-manager.h \
+-  src/news-dock-widget.h \
+   src/terminal-dock-widget.h \
+   src/color-picker.h \
+   src/welcome-wizard.h \
+   src/find-files-dialog.h \
+   src/find-files-model.h \
+   src/workspace-model.h \
+   src/workspace-view.h
+ 
+@@ -157,17 +155,16 @@ src_libgui_src_la_SOURCES = \
+   src/octave-gui.cc \
+   src/octave-interpreter.cc \
+   src/octave-qt-link.cc \
+   src/qtinfo/parser.cc \
+   src/qtinfo/webinfo.cc \
+   src/resource-manager.cc \
+   src/settings-dialog.cc \
+   src/thread-manager.cc \
+-  src/news-dock-widget.cc \
+   src/terminal-dock-widget.cc \
+   src/color-picker.cc \
+   src/welcome-wizard.cc \
+   src/find-files-dialog.cc \
+   src/find-files-model.cc \
+   src/workspace-model.cc \
+   src/workspace-view.cc
+ 
+diff --git a/libgui/src/news-dock-widget.cc b/libgui/src/news-dock-widget.cc
+deleted file mode 100644
+--- a/libgui/src/news-dock-widget.cc
++++ /dev/null
+@@ -1,146 +0,0 @@
+-/*
+-
+-Copyright (C) 2013 John W. Eaton
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by the
+-Free Software Foundation; either version 3 of the License, or (at your
+-option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but WITHOUT
+-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#ifdef HAVE_CONFIG_H
+-#include <config.h>
+-#endif
+-
+-#include <iostream>
+-
+-#include <QThread>
+-
+-#include "news-dock-widget.h"
+-
+-#include "Array.h"
+-#include "str-vec.h"
+-#include "url-transfer.h"
+-
+-#include "version.h"
+-
+-news_dock_widget::news_dock_widget (QWidget *p)
+-  : octave_dock_widget (p), browser (new QTextBrowser (this))
+-{
+-  setObjectName ("NewsDockWidget");
+-  setWindowIcon (QIcon (":/icons/logo.png"));
+-  set_title (tr ("Community News"));
+-
+-  browser->setObjectName ("OctaveNews");
+-  browser->setOpenExternalLinks (true);
+-
+-  setWidget (browser);
+-
+-  load_news ();
+-}
+-
+-void
+-news_dock_widget::load_news (void)
+-{
+-  QString base_url = "http://octave.org";
+-  QString page = "community-news.html";
+-
+-  QThread *worker_thread = new QThread;
+-
+-  news_reader *reader = new news_reader (base_url, page);
+-
+-  reader->moveToThread (worker_thread);
+-
+-  connect (reader, SIGNAL (display_news_signal (const QString&)),
+-           this, SLOT (display_news (const QString&)));
+-
+-  connect (worker_thread, SIGNAL (started (void)), reader, SLOT (process ()));
+-
+-  connect (reader, SIGNAL (finished (void)), worker_thread, SLOT (quit ()));
+-
+-  connect (reader, SIGNAL (finished (void)), reader, SLOT (deleteLater ()));
+-
+-  connect (worker_thread, SIGNAL (finished (void)),
+-           worker_thread, SLOT (deleteLater ()));
+-
+-  worker_thread->start ();
+-}
+-
+-static const char fixed_news[] = "<html>\n\
+-<body>\n\
+-<p>\n\
+-This window will be used to inform you about Octave community events.\n\
+-Octave may show it to you even if you've chosen hide the window by\n\
+-default.  We'll try not to bother you too much, but we do want to keep\n\
+-you up to date with the latest information about important bug fixes,\n\
+-new releases, or any other news that all Octave users should be aware of.\n\
+-</p>\n\
+-<p>\n\
+-Currently, Octave's community news source seems to be unavailable.\n\
+-For the latest news, please check\n\
+-<a href=\"http://octave.org/community-news.html\">http://octave.org/community-news.html</a>\n\
+-when you have a connection to the web.\n\
+-</p>\n\
+-<p>\n\
+-<small><em>&mdash; The Octave Developers, " OCTAVE_RELEASE_DATE "</em></small>\n\
+-</body>\n\
+-</html>\n";
+-
+-void
+-news_dock_widget::display_news (const QString& news)
+-{
+-  if (news.contains ("this-is-the-gnu-octave-community-news-page"))
+-    {
+-      browser->setHtml (news);
+-
+-      if (news.contains ("critical-news-event") && ! isVisible ())
+-        setVisible (true);
+-    }
+-  else
+-    browser->setHtml (fixed_news);
+-}
+-
+-void
+-news_dock_widget::copyClipboard ()
+-{
+-  if (browser->hasFocus ())
+-    {
+-      browser->copy ();
+-    }
+-}
+-
+-void
+-news_reader::process (void)
+-{
+-  // Run this part in a separate thread so Octave can continue to run
+-  // while we wait for the page to load.  Then emit the signal to
+-  // display it when we have the page contents.
+-
+-  QString url = base_url + "/" + page;
+-  std::ostringstream buf;
+-  url_transfer octave_dot_org (url.toStdString (), buf);
+-
+-  Array<std::string> param;
+-  octave_dot_org.http_get (param);
+-
+-  QString html_text;
+-
+-  if (octave_dot_org.good ())
+-    html_text = QString::fromStdString (buf.str ());
+-
+-  emit display_news_signal (html_text);
+-
+-  emit finished ();
+-}
+diff --git a/libgui/src/news-dock-widget.h b/libgui/src/news-dock-widget.h
+deleted file mode 100644
+--- a/libgui/src/news-dock-widget.h
++++ /dev/null
+@@ -1,77 +0,0 @@
+-/*
+-
+-Copyright (C) 2013 John W. Eaton
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by the
+-Free Software Foundation; either version 3 of the License, or (at your
+-option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but WITHOUT
+-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#ifndef NEWSDOCKWIDGET_H
+-#define NEWSDOCKWIDGET_H
+-
+-#include <QTextBrowser>
+-
+-#include "octave-dock-widget.h"
+-
+-class news_dock_widget : public octave_dock_widget
+-{
+-  Q_OBJECT
+-
+-public:
+-
+-  news_dock_widget (QWidget *parent = 0);
+-
+-  void load_news (void);
+-
+-protected slots:
+-
+-  void display_news (const QString& news);
+-
+-  /* from octave_dock_widget */
+-  void copyClipboard ();
+-
+-private:
+-
+-  QTextBrowser *browser;
+-};
+-
+-class news_reader : public QObject
+-{
+-  Q_OBJECT
+-
+-public:
+-
+-  news_reader (const QString& xbase_url, const QString& xpage)
+-    : QObject (), base_url (xbase_url), page (xpage) { }
+-
+-public slots:
+-
+-  void process (void);
+-
+-signals:
+-
+-  void display_news_signal (const QString& news);
+-
+-  void finished (void);
+-
+-private:
+-
+-  QString base_url;
+-  QString page;
+-};
+-
+-#endif // NEWSDOCKWIDGET_H

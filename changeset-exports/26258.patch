@@ -1,0 +1,325 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1545080770 28800
+#      Mon Dec 17 13:06:10 2018 -0800
+# Node ID 6cd1752f21e945885dd068e9d687050f6cdbefe4
+# Parent  3f46b474d2bb077da54fe6224ed03d3166acd0c1
+movslice.m, movfun.m: Eliminate duplicate input validation between these functions.
+
+* movfun.m: Remove input validation for WLEN argument.  Call movslice which
+will validate WLEN and produce the output we need.
+* movfun.m (shrink_bc): eliminate '!' operator on logical index for 30%
+performance increase.
+
+* movslice.m: Add more input validation for WLEN argument.  Add new BIST tests.
+
+diff --git a/scripts/signal/movfun.m b/scripts/signal/movfun.m
+--- a/scripts/signal/movfun.m
++++ b/scripts/signal/movfun.m
+@@ -163,87 +163,61 @@
+ ## @end deftypefn
+ 
+ function y = movfun (fcn, x, wlen, varargin)
+ 
+   if (nargin < 3)
+     print_usage ();
+   endif
+ 
+-  valid_bc = {"shrink", "discard", "fill", "periodic", "same"};
++  valid_bc = {"shrink", "discard", "fill", "same", "periodic"};
+ 
+   ## Parse input arguments
+   parser = inputParser ();
+   parser.FunctionName = "movfun";
+   parser.addParamValue ("Endpoints", "shrink", ...
+-    @(x) any (strcmpi (x, valid_bc)) || (isscalar (x) && isnumeric (x)));
++    @(x) any (strcmpi (x, valid_bc)) || (isnumeric (x) && isscalar (x)));
+   parser.addParamValue ("dim", [], ...
+     @(d) isempty (d) || (isscalar (d) && isindex (d, ndims (x))));
+   parser.addParamValue ("nancond", "includenan", ...
+     @(x) any (strcmpi (x, {"includenan", "omitnan"})));
+   parser.addParamValue ("outdim", [], ...
+     @(d) isempty (d) || (isvector (d) && isindex (d)));
+ 
+   parser.parse (varargin{:});
+   bc      = parser.Results.Endpoints;   # boundary condition
+   dim     = parser.Results.dim;         # dimension to be used as input
+   nancond = parser.Results.nancond;     # whether NaN are ignored or not
+   outdim  = parser.Results.outdim;      # selected output dimension of fcn
+   clear parser
+   ## End parse input arguments
+ 
+-  ## Window length validation
+-  if (! (isnumeric (wlen) && all (wlen >= 0) && fix (wlen) == wlen))
+-    error ("Octave:invalid-input-arg",
+-           "movfun: WLEN must be a scalar or 2-element array of integers >= 0");
+-  endif
+-  if (isscalar (wlen))
+-    ## Check for proper window length
+-    if (wlen == 1)
+-      error ("Octave:invalid-input-arg", "movfun: WLEN must be > 1");
+-    endif
+-  elseif (numel (wlen) == 2)
+-    ## FIXME: Any further tests needed to validate form: wlen = [nb, na] ???
+-  else
+-    error ("Octave:invalid-input-arg",
+-           "movfun: WLEN must be a scalar or 2-element array of integers >= 0");
+-  endif
+-
+   ## If dim was not provided find the first non-singleton dimension.
+   szx = size (x);
+   if (isempty (dim))
+     (dim = find (szx > 1, 1)) || (dim = 1);
+   endif
+ 
+-  ## Check that array is longer than WLEN at dimension DIM.  At least one full
+-  ## window must fit.  Function max is used to include the case when WLEN is an
+-  ## array.
+-  ## FIXME: Consider using bc to decide what to do here.
+-  if (max (wlen) > szx(dim))
+-      error ("Octave:invalid-input-arg", ...
+-             "movfun: window length WLEN (%d) must be shorter than length along DIM%d (%d)", ...
+-             max (wlen), dim, szx(dim));
+-  endif
++  N = szx(dim);  
++
++  ## Calculate slicing indices.  This call also validates WLEN input.
++  [slc, C, Cpre, Cpos, win] = movslice (N, wlen);
+ 
+   omitnan = strcmpi (nancond, "omitnan");
+   if (omitnan)
+     warning ('movfun: "omitnan" is not yet implemented, using "includenan"');
+   endif
+ 
+-  ## Move the desired dim to the 1st dimension
++  ## Move the desired dim to be the 1st dimension (rows)
+   nd    = length (szx);                  # number of dimensions
+   dperm = [dim, 1:(dim-1), (dim+1):nd];  # permutation of dimensions
+-  x     = permute (x, dperm);            # permute dim to first dimensions
+-  ncols = prod (szx(dperm(2:end)));      # rest dimensions as single column
+-  N     = szx(dperm(1));                 # length of dim
++  x     = permute (x, dperm);            # permute dims to first dimension
++  ncols = prod (szx(dperm(2:end)));      # rest of dimensions as single column
+   x     = reshape (x, N, ncols);         # reshape input
+ 
+-  ## Obtain slicer
+-  [slc, C, Cpre, Cpos, win] = movslice (N, wlen);
+-
+   ## Obtain function for boundary conditions
+   if (isnumeric (bc))
+     bcfunc = @replaceval_bc;
+     bcfunc (true, bc);  # initialize replaceval function with value
+   else
+     switch (tolower (bc))
+       case "shrink"
+         bcfunc = @shrink_bc;
+@@ -254,21 +228,22 @@ function y = movfun (fcn, x, wlen, varar
+         Cpre = Cpos = [];
+         N = length (C);
+         szx(dperm(1)) = N;
+ 
+       case "fill"
+         bcfunc = @replaceval_bc;
+         bcfunc (true, NaN);
+ 
++      case "same"
++        bcfunc = @same_bc;
++
+       case "periodic"
+         bcfunc = @periodic_bc;
+ 
+-      case "same"
+-        bcfunc = @same_bc;
+     endswitch
+   endif
+ 
+   ## FIXME: Validation doesn't seem to work correctly (noted 12/16/2018).
+   ## Validate that outdim makes sense
+   tmp     = fcn (zeros (length (win), 1));  # output for window
+   noutdim = length (tmp);                   # number of output dimensions
+   if (! isempty (outdim))
+@@ -321,50 +296,26 @@ function y = movfun_oncol (fcn, x, wlen,
+ 
+ endfunction
+ 
+ ## Apply "shrink" boundary conditions
+ ## Function is not applied to any window elements outside the original data.
+ function y = shrink_bc (fcn, x, idxp, win, wlen, odim)
+   N   = length (x);
+   idx = idxp + win;
+-  tf  = ! ((idx < 1) | (idx > N));  # idx inside boundaries
++  tf  = (idx > 0) & (idx <= N);  # idx inside boundaries
+ 
+   n   = length (idxp);
+   y   = zeros (n, odim);
+   for i = 1:n
+     k      = idx(tf(:,i),i);
+     y(i,:) = fcn (x(k));
+   endfor
+ endfunction
+ 
+-## Apply "periodic" boundary conditions
+-## Data wraps around padding front of window with data from end of array and
+-## vice versa.
+-function y = periodic_bc (fcn, x, idxp, win)
+-  N       = length (x);
+-  idx     = idxp + win;
+-  tf      = idx < 1;
+-  idx(tf) = N + idx(tf);
+-  tf      = idx > N;
+-  idx(tf) = idx(tf) - N;
+-  y       = fcn (x(idx));
+-endfunction
+-
+-## Apply "same" boundary conditions
+-## 'y' values outside window are set equal to 'x' values at the window
+-## boundary.
+-function y = same_bc (fcn, x, idxp, win)
+-  idx          = idxp + win;
+-  idx(idx < 1) = 1;
+-  N            = length (x);
+-  idx(idx > N) = N;
+-  y            = fcn (x(idx));
+-endfunction
+-
+ ## Apply replacement value boundary conditions
+ ## Window is padded at beginning and end with user-specified value.
+ function y = replaceval_bc (fcn, x, idxp, win, wlen)
+ 
+   persistent substitute;
+ 
+   ## In-band method to initialize substitute value
+   if (islogical (fcn))
+@@ -384,16 +335,40 @@ function y = replaceval_bc (fcn, x, idxp
+     x   = postpad (x, N + wlen(2), substitute);
+     idx = idxp + win;
+   endif
+ 
+   y = fcn (x(idx));
+ 
+ endfunction
+ 
++## Apply "same" boundary conditions
++## 'y' values outside window are replaced by value of 'x' at the window
++## boundary.
++function y = same_bc (fcn, x, idxp, win)
++  idx          = idxp + win;
++  idx(idx < 1) = 1;
++  N            = length (x);
++  idx(idx > N) = N;
++  y            = fcn (x(idx));
++endfunction
++
++## Apply "periodic" boundary conditions
++## Window wraps around.  Window values outside data array are replaced with
++## data from the other end of the array.
++function y = periodic_bc (fcn, x, idxp, win)
++  N       = length (x);
++  idx     = idxp + win;
++  tf      = idx < 1;
++  idx(tf) = N + idx(tf);
++  tf      = idx > N;
++  idx(tf) = idx(tf) - N;
++  y       = fcn (x(idx));
++endfunction
++
+ 
+ %!demo
+ %! clf;
+ %! t  = 2 * pi * linspace (0,1,100).';
+ %! x  = sin (3 * t);
+ %! xn = x + 0.1 * randn (size (x));
+ %! x_s = movfun (@mean, xn, 5, "Endpoints", "shrink");
+ %! x_p = movfun (@mean, xn, 5, "Endpoints", "periodic");
+@@ -615,19 +590,19 @@ endfunction
+ %!error movfun ()
+ %!error movfun (@min)
+ %!error movfun (@min, 1)
+ %!error <WLEN must be .* array of integers> movfun (@min, 1, {1})
+ %!error <WLEN must be .* array of integers .= 0> movfun (@min, 1, -1)
+ %!error <WLEN must be .* array of integers> movfun (@min, 1, 1.5)
+ %!error <WLEN must be . 1> movfun (@min, 1, 1)
+ %!error <WLEN must be a scalar or 2-element array> movfun (@min, 1, [1, 2, 3])
+-%!error <WLEN \(3\) must be shorter than length along DIM1 \(1\)>
+-%! movfun (@min, 1, 3);
+-%!error <WLEN \(4\) must be shorter than length along DIM1 \(1\)>
++%!error <WLEN \(3\) must be shorter than length along DIM \(1\)>
++%! movfun (@min, 1, 3)
++%!error <WLEN \(4\) must be shorter than length along DIM \(1\)>
+ %! movfun (@min, 1, [4, 1]);
+-%!error <WLEN \(5\) must be shorter than length along DIM1 \(1\)>
++%!error <WLEN \(5\) must be shorter than length along DIM \(1\)>
+ %! movfun (@min, 1, [1, 5]);
+ %!warning <"omitnan" is not yet implemented>
+ %! movfun (@min, 1:3, 3, "nancond", "omitnan");
+ ## FIXME: This test is commented out until OUTDIM validation is clarified.
+ %!#error <OUTDIM \(5\) is larger than largest available dimension \(3\)>
+ %! movfun (@min, ones (6,3,4), 3, "outdim", 5);
+diff --git a/scripts/signal/movslice.m b/scripts/signal/movslice.m
+--- a/scripts/signal/movslice.m
++++ b/scripts/signal/movslice.m
+@@ -48,20 +48,25 @@ function [slcidx, C, Cpre, Cpost, win] =
+            "movslice: WLEN must be a scalar or 2-element array of integers >= 0");
+   endif
+   if (isscalar (wlen))
+     ## Check for proper window length
+     if (wlen == 1)
+       error ("Octave:invalid-input-arg", "movslice: WLEN must be > 1");
+     endif
+   elseif (numel (wlen) == 2)
+-    ## FIXME: Any further tests needed to validate form: wlen = [nb, na] ???
++    ## wlen = [nb, na].  No further validation here.
+   else
+     error ("Octave:invalid-input-arg",
+-           "movfun: WLEN must be a scalar or 2-element array of integers >= 0");
++           "movslice: WLEN must be a scalar or 2-element array of integers >= 0");
++  endif
++  if (max (wlen) > N)
++    error ("Octave:invalid-input-arg", ...
++           "movslice: window length WLEN (%d) must be shorter than length along DIM (%d)", ...
++           max (wlen), N);
+   endif
+ 
+   if (isscalar (wlen))
+     if (mod (wlen, 2) == 1)
+       ## Symmetric window
+       nb = na = (wlen - 1) / 2;
+       wlen = [nb, na];
+     else
+@@ -69,27 +74,35 @@ function [slcidx, C, Cpre, Cpost, win] =
+       nb = wlen / 2;
+       na = nb - 1;
+       wlen = [nb, na];
+     endif
+   endif
+ 
+   Cpre  = 1:wlen(1);              # centers that can't fit the pre-window
+   Cnf   = N - wlen(2) + 1;        # first center that can't fit the post-window
+-  Cpost = Cnf:N;                  # centers that can't fit centered  post-window
++  Cpost = Cnf:N;                  # centers that can't fit centered post-window
+   C     = (wlen(1) + 1):(Cnf - 1);
+   win   = (-wlen(1):wlen(2)).';
+   slcidx = C + win;
+ 
+ endfunction
+ 
+ 
+ ## FIXME: Need functional BIST tests
+ 
+ ## Test input validation
+ %!error movslice ()
+ %!error movslice (1)
+ %!error movslice (1,2,3)
++%!error <N must be a positive integer> movslice ([1 2], 1)
++%!error <N must be a positive integer> movslice (0, 1)
+ %!error <WLEN must be .* array of integers> movslice (1, {1})
+ %!error <WLEN must be .* array of integers .= 0> movslice (1, -1)
+ %!error <WLEN must be .* array of integers> movslice (1, 1.5)
+ %!error <WLEN must be . 1> movslice (1, 1)
+ %!error <WLEN must be a scalar or 2-element array> movslice (1, [1, 2, 3])
++%!error <WLEN \(3\) must be shorter than length along DIM \(1\)>
++%! movslice (1, 3);
++%!error <WLEN \(4\) must be shorter than length along DIM \(1\)>
++%! movslice (1, [4, 1]);
++%!error <WLEN \(5\) must be shorter than length along DIM \(1\)>
++%! movslice (1, [1, 5]);

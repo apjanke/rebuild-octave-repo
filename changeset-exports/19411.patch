@@ -1,0 +1,432 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1419092813 -3600
+#      Sat Dec 20 17:26:53 2014 +0100
+# Branch gui-release
+# Node ID ed0df431631bd15c81e2031dfdaca9430b81b401
+# Parent  9887a930465fe500aeb8cd1ea19d221c9fb6d966
+allow to cancel exiting if editor tabs are modified and exit is requested in gui
+
+* file-editor-interface.h: new function check_closing
+
+* file-editor-tab.cc (ctor): set default for app_closing to 0 (not closing);
+  (check_file_modified): dialog boxes for modified editor tabs depending on
+  app closing or not;
+  (conditional_close): no slot, but ordinary function returning close result;
+
+* file-editor-tab.h: conditional_close is function, not a slot;
+  _app_closing is now int for closing from gui, from octave, not closing
+
+* file-editor.cc (dtor): calling new function check_closing if there are
+  open tabs (exit requested octave), do not save session here since the tabs
+  might already have been closed;
+  (check_closing): new function saving session info and closing all tabs,
+  stop closing tabs and returning false if user cancels exiting if there is
+  a modified tab;
+  (request_close_file, request_close_all_files, request_close_other_files,
+  handle_tab_close_request):
+  use conditional_close instead of signal;
+  (construct): do not connect old signal for closing the tabs
+
+* file-editor.h: remove signal fetab_close_request, new function check_closing
+
+* main-window.cc (confirm_exit_octave): call file_editor::check_closing
+  before really closing the app
+
+diff --git a/libgui/src/m-editor/file-editor-interface.h b/libgui/src/m-editor/file-editor-interface.h
+--- a/libgui/src/m-editor/file-editor-interface.h
++++ b/libgui/src/m-editor/file-editor-interface.h
+@@ -55,16 +55,18 @@ public:
+   handle_delete_debugger_pointer_request (const QString& file, int line) = 0;
+ 
+   virtual void
+   handle_update_breakpoint_marker_request (bool insert, const QString& file,
+                                            int line) = 0;
+ 
+   virtual void handle_edit_file_request (const QString& file) = 0;
+ 
++  virtual bool check_closing (int closing_state) = 0;
++
+   virtual void set_focus () = 0;
+ 
+   virtual void empty_script (bool, bool) = 0;
+ 
+   virtual void enable_menu_shortcuts (bool enable) = 0;
+ 
+ public slots:
+   virtual void request_new_file (const QString& command = QString ()) = 0;
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -64,17 +64,17 @@ along with Octave; see the file COPYING.
+ #include <oct-map.h>
+ 
+ // Make parent null for the file editor tab so that warning
+ // WindowModal messages don't affect grandparents.
+ file_editor_tab::file_editor_tab (const QString& directory_arg)
+ {
+   QString directory = directory_arg;
+   _lexer_apis = 0;
+-  _app_closing = false;
++  _app_closing = 0;   // app is not closing
+   _is_octave_file = true;
+   _modal_dialog = false;
+ 
+   // Make sure there is a slash at the end of the directory name
+   // for identification when saved later.
+   if (directory.count () && directory.at (directory.count () - 1) != '/')
+     directory.append ("/");
+ 
+@@ -1238,23 +1238,34 @@ file_editor_tab::check_file_modified ()
+       raise ();
+       // File is modified but not saved, ask user what to do.  The file
+       // editor tab can't be made parent because it may be deleted depending
+       // upon the response.  Instead, change the _edit_area to read only.
+       QMessageBox::StandardButtons buttons = QMessageBox::Save |
+                                              QMessageBox::Discard;
+       QString available_actions;
+ 
+-      if (_app_closing)
+-        available_actions = tr ("Do you want to save or discard the changes?");
+-      else
++      switch (_app_closing)
+         {
+-          buttons = buttons | QMessageBox::Cancel;  // cancel is allowed
+-          available_actions
+-            = tr ("Do you want to cancel closing, save or discard the changes?");
++          case -1:  // octave is exiting and so does the gui
++            available_actions =
++              tr ("Do you want to save or discard the changes?");
++            break;
++
++          case 1:   // gui is exiting
++            available_actions =
++              tr ("Do you want to cancel exiting octave, save or discard the changes?");
++            buttons = buttons | QMessageBox::Cancel;
++            break;
++
++          case 0:   // tab is closing
++            available_actions =
++              tr ("Do you want to cancel closing, save or discard the changes?");
++            buttons = buttons | QMessageBox::Cancel;
++            break;
+         }
+ 
+       QString file;
+       if (valid_file_name ())
+           file = _file_name;
+       else
+           file = tr ("<unnamed>");
+ 
+@@ -1912,24 +1923,26 @@ file_editor_tab::notice_settings (const 
+ }
+ 
+ void
+ file_editor_tab::auto_margin_width ()
+ {
+   _edit_area->setMarginWidth (2, "1"+QString::number (_edit_area->lines ()));
+ }
+ 
+-void
+-file_editor_tab::conditional_close (const QWidget *ID, bool app_closing)
++// the following close request was changed from a signal slot into a
++// normal function because we need the return value from close whether
++// the tab really was closed (for canceling exiting octave).
++// When emitting a signal, only the return value from the last slot
++// goes back to the sender
++bool
++file_editor_tab::conditional_close (int app_closing)
+ {
+-  if (ID != this)
+-    return;
+-
+   _app_closing = app_closing;
+-  close ();
++  return close ();
+ }
+ 
+ void
+ file_editor_tab::change_editor_state (const QWidget *ID)
+ {
+   if (ID != this)
+     {
+       // Widget may be going out of focus.  If so, record location.
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -46,29 +46,30 @@ class file_editor_tab : public QWidget
+ public:
+ 
+   file_editor_tab (const QString& directory = "");
+ 
+   ~file_editor_tab (void);
+ 
+   octave_qscintilla *qsci_edit_area () { return _edit_area; }
+ 
++  // Will initiate close if associated with the identifier tag.
++  bool conditional_close (int app_closing = 0);  // default 0: close tab only
++
++
+ public slots:
+ 
+   void update_window_title (bool modified);
+   void handle_copy_available (bool enableCopy);
+   void handle_margin_clicked (int line, int margin,
+                               Qt::KeyboardModifiers state);
+ 
+   // Tells the editor tab to react on changed settings.
+   void notice_settings (const QSettings *settings);
+ 
+-  // Will initiate close if associated with the identifier tag.
+-  void conditional_close (const QWidget *ID, bool app_closing = false);
+-
+   // Change to a different editor tab by identifier tag.
+   void change_editor_state (const QWidget *ID);
+ 
+   // Simply transmit file name.
+   void file_name_query (const QWidget *ID);
+ 
+   void set_focus (const QWidget *ID);
+   void context_help (const QWidget *ID, bool);
+@@ -227,17 +228,17 @@ private:
+ 
+   QsciScintilla::EolMode _save_as_desired_eol;
+ 
+   QString _file_name;
+   QString _file_name_short;
+ 
+   bool _long_title;
+   bool _copy_available;
+-  bool _app_closing;
++  int _app_closing;     // -1: octave exits, 1: exit request in gui, 0: no exit
+   bool _is_octave_file;
+   bool _modal_dialog;
+   bool _always_reload_changed_files;
+ 
+   QFileSystemWatcher _file_system_watcher;
+ 
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -58,16 +58,30 @@ file_editor::file_editor (QWidget *p)
+ 
+   setVisible (false);
+ 
+   setAcceptDrops(true);
+ }
+ 
+ file_editor::~file_editor (void)
+ {
++  // Close open tabs, if existing. In this case app closing must be
++  // initiated by octave. All tabs will be definetly closed and the
++  // user can not cancel exiting (close state -1)
++  if (_tab_widget->count ())
++    check_closing (-1);
++
++  if (_mru_file_menu)
++    delete _mru_file_menu;
++}
++
++bool
++file_editor::check_closing (int closing_state)
++{
++  // Save open files for restoring in next session; this only is possible
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   // Have all file editor tabs signal what their file names are.
+   editor_tab_map.clear ();
+   emit fetab_file_name_query (0);
+ 
+   // save file names (even if last session will not be restored next time)
+   QStringList fetFileNames;
+@@ -77,26 +91,33 @@ file_editor::~file_editor (void)
+       QString file_name = p->first;
+       if (!file_name.isEmpty () && file_name.at (file_name.size () - 1) != '/')
+         fetFileNames.append (p->first);  // do not append unnamed files
+     }
+ 
+   settings->setValue ("editor/savedSessionTabs", fetFileNames);
+   settings->sync ();
+ 
++  // Close all tabs. If exit is requested by the gui (octave still running)
++  // check whether closing a tab is successful or whether user wnats to cancel
++  // exiting the program. Return false in the latter case.
++  file_editor_tab *editor_tab;
++
+   for (int index = _tab_widget->count ()-1; index >= 0; index--)
+     {
+-      // true: app closing
+-      emit fetab_close_request (_tab_widget->widget (index), true);
++      editor_tab = static_cast <file_editor_tab *> (_tab_widget->widget (index));
++      if ((! editor_tab->conditional_close (closing_state)) && closing_state == 1)
++        return false;
+     }
+ 
+-  if (_mru_file_menu)
+-    delete _mru_file_menu;
++  // Here, we really want to exit and all tabs are closed
++  return true;
+ }
+ 
++
+ void
+ file_editor::focus (void)
+ {
+   set_focus ();
+ }
+ 
+ // set focus to editor and its current tab
+ void
+@@ -914,49 +935,59 @@ file_editor::handle_file_name_changed (c
+             }
+         }
+     }
+ }
+ 
+ void
+ file_editor::request_close_file (bool)
+ {
+-  emit fetab_close_request (_tab_widget->currentWidget ());
++  file_editor_tab *editor_tab =
++      static_cast <file_editor_tab *> (_tab_widget->currentWidget ());
++  editor_tab->conditional_close (0);  // 0: app is not closing, only tab
+ }
+ 
+ void
+ file_editor::request_close_all_files (bool)
+ {
++  file_editor_tab *editor_tab;
++
+   // loop over all tabs starting from last one otherwise deletion changes index
+   for (int index = _tab_widget->count ()-1; index >= 0; index--)
+-    emit fetab_close_request (_tab_widget->widget (index));
++    {
++      editor_tab = static_cast <file_editor_tab *> (_tab_widget->widget (index));
++      editor_tab->conditional_close (0);  // 0: app is not closing, only tab
++    }
+ }
+ 
+ void
+ file_editor::request_close_other_files (bool)
+ {
++  file_editor_tab *editor_tab;
+   QWidget *tabID = _tab_widget->currentWidget ();
++
+   // loop over all tabs starting from last one otherwise deletion changes index
+   for (int index = _tab_widget->count ()-1; index >= 0; index--)
+     {
+       if (tabID != _tab_widget->widget (index))
+-        emit fetab_close_request (_tab_widget->widget (index));
++        {
++          editor_tab =
++              static_cast <file_editor_tab *> (_tab_widget->widget (index));
++          editor_tab->conditional_close (0);  // 0: app is not closing, only tab
++        }
+     }
+ }
+ 
+ 
+ void
+ file_editor::handle_tab_close_request (int index)
+ {
+-  // Signal to the tabs a request to close whomever matches the identifying
+-  // tag (i.e., unique widget pointer).  The reason for this indirection is
+-  // that it will enable a file editor widget to toss up a non-static
+-  // dialog box and later signal that it wants to be removed.
+-  QWidget *tabID = _tab_widget->widget (index);
+-  emit fetab_close_request (tabID);
++  file_editor_tab *editor_tab =
++       static_cast <file_editor_tab *> (_tab_widget->widget (index));
++  editor_tab->conditional_close (0);  // 0: app is not closing, only tab
+ }
+ 
+ void
+ file_editor::handle_tab_remove_request (void)
+ {
+   QObject *fileEditorTab = sender ();
+   if (fileEditorTab)
+     {
+@@ -1591,19 +1622,16 @@ file_editor::add_file_editor_tab (file_e
+ 
+   connect (f, SIGNAL (set_global_edit_shortcuts_signal (bool)),
+            main_win (), SLOT (set_global_edit_shortcuts (bool)));
+ 
+   // Signals from the file_editor non-trivial operations
+   connect (this, SIGNAL (fetab_settings_changed (const QSettings *)),
+            f, SLOT (notice_settings (const QSettings *)));
+ 
+-  connect (this, SIGNAL (fetab_close_request (const QWidget*,bool)),
+-           f, SLOT (conditional_close (const QWidget*,bool)));
+-
+   connect (this, SIGNAL (fetab_change_request (const QWidget*)),
+            f, SLOT (change_editor_state (const QWidget*)));
+ 
+   connect (this, SIGNAL (fetab_file_name_query (const QWidget*)),
+            f, SLOT (file_name_query (const QWidget*)));
+ 
+   connect (this, SIGNAL (fetab_save_file (const QWidget*, const QString&,
+                                           bool)),
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -64,17 +64,16 @@ public:
+ 
+   void check_actions (void);
+   void empty_script (bool startup, bool visible);
+   void enable_menu_shortcuts (bool enable);
+ 
+ signals:
+ 
+   void fetab_settings_changed (const QSettings *settings);
+-  void fetab_close_request (const QWidget* ID, bool app_closing = false);
+   void fetab_change_request (const QWidget* ID);
+   void fetab_file_name_query (const QWidget* ID);
+   // Save is a ping-pong type of communication
+   void fetab_save_file (const QWidget* ID, const QString& fileName,
+                         bool remove_on_success);
+   // No fetab_open, functionality in editor
+   // No fetab_new, functionality in editor
+   void fetab_context_help (const QWidget* ID, bool);
+@@ -112,16 +111,17 @@ signals:
+   void fetab_zoom_normal (const QWidget* ID);
+ 
+   void request_settings_dialog (const QString&);
+   void execute_command_in_terminal_signal (const QString&);
+   void file_loaded_signal ();
+ 
+ public slots:
+   void focus (void);
++  bool check_closing (int closing_state);
+ 
+   void request_new_file (const QString& commands);
+   void request_new_script (const QString& commands);
+   void request_new_function (bool triggered = true);
+   void request_open_file (void);
+   void request_close_file (bool);
+   void request_close_all_files (bool);
+   void request_close_other_files (bool);
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -2456,15 +2456,18 @@ main_window::confirm_exit_octave ()
+ 
+   if (settings->value ("prompt_to_exit", false ).toBool())
+     {
+       int ans = QMessageBox::question (this, tr ("Octave"),
+          tr ("Are you sure you want to exit Octave?"),
+           QMessageBox::Ok | QMessageBox::Cancel, QMessageBox::Ok);
+ 
+       if (ans !=  QMessageBox::Ok)
+-        closenow = false;
++        return false;
+ 
+     }
++
++  closenow = editor_window->check_closing (1);  // 1: exit request from gui
++
+   return closenow;
+ }
+ 
+ 

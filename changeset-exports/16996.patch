@@ -1,0 +1,463 @@
+# HG changeset patch
+# User Carnë Draug <carandraug@octave.org>
+# Date 1374108729 -3600
+#      Thu Jul 18 01:52:09 2013 +0100
+# Node ID a1d091243d11cab89cebfaa52304b93d43786b9c
+# Parent  1a1e831fe6b4703fa75c364b2702d0035dbead28
+Read alpha values from indexed images. Always read indexes from indexed images.
+
+* __magick_read__.cc (read_indexed_images): turn function into template to
+  remove duplicated loop. Create alpha channel from alpha values colormap.
+  Skip reading of colormap unless requested. Use fortran_vec to fill the
+  image instead of indexing the Array<T> with a dim_vector which requires
+  multiple calls to dim_vector::operator() per iteration.
+  (__magick_read__): Always read the indexes of an indexed image and not the
+  RGB or grayscale values when no colormap is requested for output (Matlab
+  compatibility).
+* imread.m: document that an indexed image is always read as such,
+  independently of the colormap having been requested or not.
+* NEWS: add note on the change for reading indexed images.
+
+diff --git a/NEWS b/NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -98,17 +98,19 @@ Summary of important user-visible change
+     The principal benefit is that Octave will now no longer automatically
+     convert images stored with integers to doubles.  Storing images as uint8
+     or uint16 requires only 1/8 or 1/4 the memory of an image stored using
+     doubles.  For certain operations, such as fft2, the image must still be
+     converted to double in order to work.
+ 
+     Other changes include fixes to the way indexed images are read from a
+     colormap depending on the image class (integer images have a -1 offset to
+-    the colormap row number).
++    the colormap row number), and always returning the actual indexed image
++    with imread instead of a RGB image if the colormap was not requested
++    as output.
+ 
+  ** The colormap function now provides new options--"list", "register",
+     and "unregister"--to list all available colormap functions, and to
+     add or remove a function name from the list of known colormap
+     functions.  Packages that implement extra colormaps should use these
+     commands with PKG_ADD and PKG_DEL statements.
+ 
+  ** strsplit has been modified to be compatible with Matlab.  There
+diff --git a/libinterp/dldfcn/__magick_read__.cc b/libinterp/dldfcn/__magick_read__.cc
+--- a/libinterp/dldfcn/__magick_read__.cc
++++ b/libinterp/dldfcn/__magick_read__.cc
+@@ -39,155 +39,111 @@ along with Octave; see the file COPYING.
+ 
+ #include "gripes.h"
+ 
+ #ifdef HAVE_MAGICK
+ 
+ #include <Magick++.h>
+ #include <clocale>
+ 
+-octave_value_list
++template <class T>
++static octave_value_list
+ read_indexed_images (std::vector<Magick::Image>& imvec,
+-                     const Array<int>& frameidx, bool wantalpha)
++                     const Array<octave_idx_type>& frameidx,
++                     const octave_idx_type nargout)
+ {
+-  octave_value_list output;
++  typedef typename T::element_type P;
+ 
+-  const int rows    = imvec[0].baseRows ();
+-  const int columns = imvec[0].baseColumns ();
+-  const int nframes = frameidx.length ();
++  octave_value_list retval;
+ 
+-  const dim_vector idim = dim_vector (rows, columns, 1, nframes);
++  const octave_idx_type nRows    = imvec[0].baseRows ();
++  const octave_idx_type nCols    = imvec[0].baseColumns ();
++  const octave_idx_type nFrames  = frameidx.length ();
+ 
+-  Array<int> idx (dim_vector (4, 1));
+-
+-  Magick::ImageType type = imvec[0].type ();
++  T img       = T (dim_vector (nRows, nCols, 1, nFrames));
++  P* img_fvec = img.fortran_vec ();
+ 
+-  unsigned int mapsize = imvec[0].colorMapSize ();
+-  unsigned int i = mapsize;
+-  unsigned int depth = 0;
+-  while (i >>= 1)
+-    depth++;
+-  i = 0;
+-  depth--;
+-  while (depth >>= 1)
+-    i++;
+-  depth = 1 << i;
+-
+-  switch (depth)
++  // When reading PixelPackets from the Image Pixel Cache, they come in
++  // row major order. So we keep moving back and forth there so we can
++  // write the image in column major order.
++  octave_idx_type idx = 0;
++  for (octave_idx_type frame = 0; frame < nFrames; frame++)
+     {
+-    case 1:
+-    case 2:
+-    case 4:
+-    case 8:
+-      {
+-        uint8NDArray im = uint8NDArray (idim);
++      imvec[frameidx(frame)].getConstPixels (0, 0, nCols, nRows);
++
++      const Magick::IndexPacket *pix
++        = imvec[frameidx(frame)].getConstIndexes ();
+ 
+-        idx(2) = 0;
+-        for (int frame = 0; frame < nframes; frame++)
+-          {
+-            imvec[frameidx(frame)].getConstPixels (0, 0, columns, rows);
+-
+-            const Magick::IndexPacket *pix
+-              = imvec[frameidx(frame)].getConstIndexes ();
+-
+-            i = 0;
+-            idx(3) = frame;
++      for (octave_idx_type col = 0; col < nCols; col++)
++        {
++          for (octave_idx_type row = 0; row < nRows; row++)
++            {
++              img_fvec[idx++] = static_cast<P> (*pix);
++              pix += nCols;
++            }
++          pix -= nCols * nRows -1;
++        }
++    }
++  retval(0) = octave_value (img);
+ 
+-            for (int y = 0; y < rows; y++)
+-              {
+-                idx(0) = y;
+-                for (int x = 0; x < columns; x++)
+-                  {
+-                    idx(1) = x;
+-                    im(idx) = static_cast<octave_uint8> (pix[i++]);
+-                  }
+-              }
+-          }
++  // Do we need to get the colormap to interpret the image and alpha channel?
++  if (nargout > 1)
++    {
++      const octave_idx_type mapsize = imvec[0].colorMapSize ();
++      Matrix cmap                   = Matrix (mapsize, 3);
++      NDArray alpha;
++
++      // In theory, it should be possible for each frame of an image to
++      // have different colormaps but for Matlab compatibility, we only
++      // return the colormap of the first frame.
+ 
+-        output(0) = octave_value (im);
+-      }
+-      break;
+-
+-    case 16:
+-      {
+-        uint16NDArray im = uint16NDArray (idim);
+-
+-        idx(2) = 0;
+-        for (int frame = 0; frame < nframes; frame++)
+-          {
+-            imvec[frameidx(frame)].getConstPixels (0, 0, columns, rows);
++      // only get alpha channel if it exists and was requested as output
++      if (imvec[0].matte () && nargout >= 3)
++        {
++          Matrix amap = Matrix (mapsize, 1);
++          for (octave_idx_type i = 0; i < mapsize; i++)
++            {
++              const Magick::ColorRGB c = imvec[0].colorMap (i);
++              cmap(i,0) = c.red   ();
++              cmap(i,1) = c.green ();
++              cmap(i,2) = c.blue  ();
++              amap(i,0) = c.alpha ();
++            }
+ 
+-            const Magick::IndexPacket *pix
+-              = imvec[frameidx(frame)].getConstIndexes ();
++          alpha.resize (dim_vector (nRows, nCols, 1, nFrames));
++          const octave_idx_type nPixels = alpha.numel ();
+ 
+-            i = 0;
+-            idx(3) = frame;
++          double* alpha_fvec = alpha.fortran_vec ();
+ 
+-            for (int y = 0; y < rows; y++)
+-              {
+-                idx(0) = y;
+-                for (int x = 0; x < columns; x++)
+-                  {
+-                    idx(1) = x;
+-                    im(idx) = static_cast<octave_uint16> (pix[i++]);
+-                  }
+-              }
+-          }
++          idx = 0;
++          for (octave_idx_type pix = 0; pix < nPixels; pix++)
++            {
++              // GraphicsMagick stores the alpha values inverted, i.e.,
++              // 1 for transparent and 0 for opaque so we fix that here.
++              alpha_fvec[idx] = abs (amap(img(idx), 0) - 1);
++              idx++;
++            }
++        }
+ 
+-        output(0) = octave_value (im);
+-      }
+-      break;
++      else
++        {
++          for (octave_idx_type i = 0; i < mapsize; i++)
++            {
++              const Magick::ColorRGB c = imvec[0].colorMap (i);
++              cmap(i,0) = c.red   ();
++              cmap(i,1) = c.green ();
++              cmap(i,2) = c.blue  ();
++            }
++        }
+ 
+-    default:
+-      error ("__magic_read__: index depths greater than 16-bit are not supported");
+-      return octave_value_list ();
++      retval(1) = cmap;
++      retval(2) = alpha;
+     }
+ 
+-  Matrix map = Matrix (mapsize, 3);
+-  Matrix alpha;
+-
+-  switch (type)
+-    {
+-    case Magick::PaletteMatteType:
+-//      warning ("palettematte");
+-//      Matrix map (mapsize, 3);
+-//      Matrix alpha (mapsize, 1);
+-//      for (i = 0; i < mapsize; i++)
+-//        {
+-//          warning ("%d", i);
+-//          Magick::ColorRGB c = imvec[0].colorMap (i);
+-//          map(i,0) = c.red ();
+-//          map(i,1) = c.green ();
+-//          map(i,2) = c.blue ();
+-//          alpha(i,1) = c.alpha ();
+-//        }
+-//      break;
+-
+-    case Magick::PaletteType:
+-      alpha = Matrix (0, 0);
+-      for (i = 0; i < mapsize; i++)
+-        {
+-          Magick::ColorRGB c = imvec[0].colorMap (i);
+-          map(i,0) = c.red ();
+-          map(i,1) = c.green ();
+-          map(i,2) = c.blue ();
+-        }
+-      break;
+-
+-    default:
+-      error ("__magick_read__: unsupported indexed image type");
+-      return octave_value_list ();
+-    }
+-
+-  if (wantalpha)
+-    output(2) = alpha;
+-
+-  output(1) = map;
+-
+-  return output;
++  return retval;
+ }
+ 
+ template <class T>
+ octave_value_list
+ read_images (const std::vector<Magick::Image>& imvec,
+              const Array<int>& frameidx, unsigned int depth)
+ {
+   typedef typename T::element_type P;
+@@ -395,26 +351,26 @@ maybe_initialize_magick (void)
+   if (! initialized)
+     {
+       // Save locale as GraphicsMagick might change this (fixed in
+       // GraphicsMagick since version 1.3.13 released on December 24, 2011)
+       const char *static_locale = setlocale (LC_ALL, NULL);
+       const std::string locale (static_locale);
+ 
+       const std::string program_name = octave_env::get_program_invocation_name ();
+-
+       Magick::InitializeMagick (program_name.c_str ());
+ 
+       // Restore locale from before GraphicsMagick initialisation
+       setlocale (LC_ALL, locale.c_str ());
+ 
+       if (QuantumDepth < 32)
+-        warning ("your version of %s limits images to %d bits per pixel",
+-                 MagickPackageName, QuantumDepth);
+-
++        {
++          warning ("your version of %s limits images to %d bits per pixel",
++                   MagickPackageName, QuantumDepth);
++        }
+       initialized = true;
+     }
+ }
+ #endif
+ 
+ DEFUN_DLD (__magick_read__, args, nargout,
+   "-*- texinfo -*-\n\
+ @deftypefn {Loadable Function} {[@var{img}, @var{map}, @var{alpha}] =} __magick_read__ (@var{fname}, @var{options})\n\
+@@ -448,60 +404,73 @@ use @code{imread}.\n\
+ 
+   std::vector<Magick::Image> imvec;
+   read_file (args(0).string_value (), imvec);
+   if (error_state)
+     {
+       return output;
+     }
+ 
+-  const int nframes = imvec.size ();
+-  Array<int> frameidx;
+-
++  // Prepare an Array with the indexes for the requested frames.
++  const octave_idx_type nFrames = imvec.size ();
++  Array<octave_idx_type> frameidx;
+   const octave_value indexes = options.getfield ("index")(0);
+   if (indexes.is_string () && indexes.string_value () == "all")
+     {
+-      frameidx = Array<int> (dim_vector (1, nframes));
+-      for (int i = 0; i < nframes; i++)
++      frameidx.resize (dim_vector (1, nFrames));
++      for (octave_idx_type i = 0; i < nFrames; i++)
+         {
+           frameidx(i) = i;
+         }
+     }
+   else
+     {
+       frameidx = indexes.int_vector_value ();
+       if (error_state)
+         {
+           error ("__magick_read__: invalid value for Index/Frame");
+         }
+       // Fix indexes from base 1 to base 0, and at the same time, make
+       // sure none of the indexes is outside the range of image number.
+-      const int n = frameidx.nelem ();
+-      for (int i = 0; i < n; i++)
++      const octave_idx_type n = frameidx.nelem ();
++      for (octave_idx_type i = 0; i < n; i++)
+         {
+           frameidx(i)--;
+-          if (frameidx(i) < 0 || frameidx(i) > nframes - 1)
++          if (frameidx(i) < 0 || frameidx(i) > nFrames - 1)
+             {
+               error ("imread: index/frames specified are outside the number of images");
+               return output;
+             }
+         }
+     }
+ 
+   const Magick::ClassType klass = imvec[0].classType ();
+ 
+   // PseudoClass:
+   // Image is composed of pixels which specify an index in a color palette.
+-  if (klass == Magick::PseudoClass && nargout > 1)
++  if (klass == Magick::PseudoClass)
+     {
+-      output = read_indexed_images (imvec, frameidx, (nargout == 3));
++      const octave_idx_type mapsize = imvec[0].colorMapSize ();
++      if (mapsize <= 256)
++        {
++          output = read_indexed_images <uint8NDArray> (imvec, frameidx, nargout);
++        }
++      else if (mapsize <= 65536)
++        {
++          output = read_indexed_images <uint16NDArray> (imvec, frameidx, nargout);
++        }
++      else
++        {
++          error ("imread: indexed images with depths greater than 16-bit are not supported");
++          return output;
++        }
+     }
+-  // If not PseudoClass then it must be DirectClass: Image is composed of
+-  // pixels which represent literal color values.
+-  else
++  // DirectClass:
++  // Image is composed of pixels which represent literal color values.
++  else if (klass == Magick::DirectClass)
+     {
+       unsigned int depth = imvec[0].modulusDepth ();
+       if (depth > 1)
+         {
+           --depth;
+           int i = 1;
+           while (depth >>= 1)
+             i++;
+@@ -525,16 +494,20 @@ use @code{imread}.\n\
+           break;
+ 
+         case 32:
+         case 64:
+         default:
+           error ("__magick_read__: image depths greater than 16-bit are not supported");
+         }
+     }
++  else
++    {
++      error ("imread: unsupported image class type");
++    }
+ 
+ #endif
+   return output;
+ }
+ 
+ /*
+ ## No test needed for internal helper function.
+ %!assert (1)
+diff --git a/scripts/image/imread.m b/scripts/image/imread.m
+--- a/scripts/image/imread.m
++++ b/scripts/image/imread.m
+@@ -37,33 +37,36 @@
+ ## The size and class of the output depends on the
+ ## format of the image.  A color image is returned as an
+ ## @nospell{MxNx3} matrix.  Gray-level and black-and-white images are
+ ## of size @nospell{MxN}.  Multipage images will have an additional 4th
+ ## dimension.
+ ## The bit depth of the image determines the
+ ## class of the output: "uint8" or "uint16" for gray
+ ## and color, and "logical" for black and white.
++## Note that indexed images always return the indexes for a colormap,
++## independent if @var{map} is a requested output.  To obtain the actual
++## RGB image, use @code{ind2rgb}.
+ ## See the Octave manual for more information in representing images.
+ ##
+ ## Some file formats, such as TIFF and GIF, are able to store multiple
+ ## images in a single file.  @var{idx} can be a scalar or vector
+ ## specifying the index of the images to read.  By default, Octave
+ ## will only read the first page.
+ ##
+ ## Depending on the file format, it is possible to configure the reading
+ ## of images with @var{param}, @var{val} pairs.  The following options
+ ## are supported:
+ ##
+-## @table @asis
+-## @item Frames or Index
++## @table @samp
++## @item "Frames" or "Index"
+ ## This is an alternative method to specify @var{idx}.  When specifying it
+ ## in this way, its value can also be the string "all".
+ ##
+-## @item Info
++## @item "Info"
+ ## This option exists for @sc{Matlab} compatibility and has no effect.  For
+ ## maximum performance while reading multiple images from a single file,
+ ## use the Index option.
+ ## @end table
+ ##
+ ## @seealso{imwrite, imfinfo, imformats}
+ ## @end deftypefn
+ 

@@ -1,0 +1,625 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1340652105 18000
+#      Mon Jun 25 14:21:45 2012 -0500
+# Node ID bbeef7b8ea2ef49e1d5e16cff33874e0cfeef677
+# Parent  7f60cdfcc0e50f463a665b341a4b3a3cb20d4850
+Add support for matrix indexed assignment to JIT
+
+* src/pt-jit.cc (octave_jit_subsasgn_impl, jit_convert::resolve): New function.
+  (jit_typeinfo::jit_typeinfo): Add subsasgn implementation in llvm.
+  (jit_convert::visit_simple_for_command): Use new do_assign overload.
+  (jit_convert::visit_index_expression): Use new do_assign overload and resolve.
+  (jit_convert::visit_simple_assignment): Use new do_assign overload.
+  (jit_convert::do_assign): New overload.
+  (jit_convert::convert_llvm::visit): Check if assignment is artificial.
+
+* src/pt-jit.h (jit_typeinfo::paren_subsasgn, jit_convert::create_check):
+    New function.
+  (jit_assign::jit_assign): Initialize martificial.
+  (jit_assign::artificial, jit_assign::mark_artificial): New function.
+  (jit_assign::print): Print the artificial flag.
+  (jit_convert::create_checked_impl): Call create_check.
+  (jit_convert::resolve): New declaration.
+  (jit_convert::do_assign): New overload declaration.
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -232,16 +232,34 @@ octave_jit_gindex_range (int nd, int dim
+     }
+   catch (const octave_execution_exception&)
+     {
+       gripe_library_execution_error ();
+     }
+ }
+ 
+ extern "C" void
++octave_jit_paren_subsasgn_impl (jit_matrix *mat, octave_idx_type index,
++                                double value)
++{
++  std::cout << "impl\n";
++  NDArray *array = mat->array;
++  if (array->nelem () < index)
++    array->resize1 (index);
++
++  double *data = array->fortran_vec ();
++  data[index - 1] = value;
++
++  mat->ref_count = array->jit_ref_count ();
++  mat->slice_data = array->jit_slice_data () - 1;
++  mat->dimensions = array->jit_dimensions ();
++  mat->slice_len = array->nelem ();
++}
++
++extern "C" void
+ octave_jit_print_matrix (jit_matrix *m)
+ {
+   std::cout << *m << std::endl;
+ }
+ 
+ // -------------------- jit_range --------------------
+ std::ostream&
+ operator<< (std::ostream& os, const jit_range& rng)
+@@ -750,16 +768,102 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+     merge->addIncoming (undef, conv_error);
+     merge->addIncoming (undef, bounds_error);
+     merge->addIncoming (ret, success);
+     builder.CreateRet (merge);
+   }
+   llvm::verifyFunction (*fn);
+   paren_subsref_fn.add_overload (fn, true, scalar, matrix, scalar);
+ 
++  // paren subsasgn
++  paren_subsasgn_fn.stash_name ("()subsasgn");
++
++  llvm::Function *resize_paren_subsasgn
++    = create_function ("octave_jit_paren_subsasgn_impl", void_t,
++                       matrix_t->getPointerTo (), index_t, scalar_t);
++  engine->addGlobalMapping (resize_paren_subsasgn,
++                            reinterpret_cast<void *> (&octave_jit_paren_subsasgn_impl));
++
++  fn = create_function ("octave_jit_paren_subsasgn", matrix, matrix, scalar,
++                        scalar);
++  body = llvm::BasicBlock::Create (context, "body", fn);
++  builder.SetInsertPoint (body);
++  {
++    llvm::Value *one = llvm::ConstantInt::get (index_t, 1);
++
++    llvm::Function::arg_iterator args = fn->arg_begin ();
++    llvm::Value *mat = args++;
++    llvm::Value *idx = args++;
++    llvm::Value *value = args;
++
++    llvm::Value *int_idx = builder.CreateFPToSI (idx, index_t);
++    llvm::Value *check_idx = builder.CreateSIToFP (int_idx, scalar_t);
++    llvm::Value *cond0 = builder.CreateFCmpUNE (idx, check_idx);
++    llvm::Value *cond1 = builder.CreateICmpSLT (int_idx, one);
++    llvm::Value *cond = builder.CreateOr (cond0, cond1);
++
++    llvm::BasicBlock *done = llvm::BasicBlock::Create (context, "done", fn);
++
++    llvm::BasicBlock *conv_error = llvm::BasicBlock::Create (context,
++                                                             "conv_error", fn,
++                                                             done);
++    llvm::BasicBlock *normal = llvm::BasicBlock::Create (context, "normal", fn,
++                                                         done);
++    builder.CreateCondBr (cond, conv_error, normal);
++    builder.SetInsertPoint (conv_error);
++    builder.CreateCall (ginvalid_index);
++    builder.CreateBr (done);
++
++    builder.SetInsertPoint (normal);
++    llvm::Value *len = builder.CreateExtractValue (mat,
++                                                   llvm::ArrayRef<unsigned> (2));
++    cond0 = builder.CreateICmpSGT (int_idx, len);
++
++    llvm::Value *rcount = builder.CreateExtractValue (mat, 0);
++    rcount = builder.CreateLoad (rcount);
++    cond1 = builder.CreateICmpSGT (rcount, one);
++    cond = builder.CreateOr (cond0, cond1);
++
++    llvm::BasicBlock *bounds_error = llvm::BasicBlock::Create (context,
++                                                               "bounds_error",
++                                                               fn, done);
++
++    llvm::BasicBlock *success = llvm::BasicBlock::Create (context, "success",
++                                                          fn, done);
++    builder.CreateCondBr (cond, bounds_error, success);
++
++    // resize on out of bounds access
++    builder.SetInsertPoint (bounds_error);
++    llvm::Value *resize_result = builder.CreateAlloca (matrix_t);
++    builder.CreateStore (mat, resize_result);
++    builder.CreateCall3 (resize_paren_subsasgn, resize_result, int_idx, value);
++    resize_result = builder.CreateLoad (resize_result);
++    builder.CreateBr (done);
++
++    builder.SetInsertPoint (success);
++    llvm::Value *data = builder.CreateExtractValue (mat,
++                                                    llvm::ArrayRef<unsigned> (1));
++    llvm::Value *gep = builder.CreateInBoundsGEP (data, int_idx);
++    builder.CreateStore (value, gep);
++    builder.CreateBr (done);
++
++    builder.SetInsertPoint (done);
++
++    llvm::PHINode *merge = llvm::PHINode::Create (matrix_t, 3);
++    builder.Insert (merge);
++    merge->addIncoming (mat, conv_error);
++    merge->addIncoming (resize_result, bounds_error);
++    merge->addIncoming (mat, success);
++    builder.CreateRet (merge);
++  }
++  llvm::verifyFunction (*fn);
++  paren_subsasgn_fn.add_overload (fn, true, matrix, matrix, scalar, scalar);
++
++  // paren_subsasgn
++
+   casts[any->type_id ()].stash_name ("(any)");
+   casts[scalar->type_id ()].stash_name ("(scalar)");
+ 
+   // cast any <- matrix
+   fn = create_function ("octave_jit_cast_any_matrix", any_t,
+                         matrix_t->getPointerTo ());
+   engine->addGlobalMapping (fn,
+                             reinterpret_cast<void*> (&octave_jit_cast_any_matrix));
+@@ -1684,22 +1788,16 @@ jit_convert::visit_simple_for_command (t
+   // If we are a nested for loop we need to store the previous breaks
+   assert (! breaking);
+   unwind_protect prot;
+   prot.protect_var (breaks);
+   prot.protect_var (continues);
+   prot.protect_var (breaking);
+   breaks.clear ();
+ 
+-  // FIXME: one of these days we will introduce proper lvalues...
+-  tree_identifier *lhs = dynamic_cast<tree_identifier *>(cmd.left_hand_side ());
+-  if (! lhs)
+-    fail ();
+-  std::string lhs_name = lhs->name ();
+-
+   // we need a variable for our iterator, because it is used in multiple blocks
+   std::stringstream ss;
+   ss << "#iter" << iterator_count++;
+   std::string iter_name = ss.str ();
+   jit_variable *iterator = create<jit_variable> (iter_name);
+   vmap[iter_name] = iterator;
+ 
+   jit_block *body = create<jit_block> ("for_body");
+@@ -1714,19 +1812,20 @@ jit_convert::visit_simple_for_command (t
+   block->append (create<jit_assign> (iterator, init_iter));
+ 
+   jit_value *check = block->append (create<jit_call> (jit_typeinfo::for_check,
+                                                       control, iterator));
+   block->append (create<jit_cond_branch> (check, body, tail));
+   block = body;
+ 
+   // compute the syntactical iterator
+-  jit_call *idx_rhs = create<jit_call> (jit_typeinfo::for_index, control, iterator);
++  jit_call *idx_rhs = create<jit_call> (jit_typeinfo::for_index, control,
++                                        iterator);
+   block->append (idx_rhs);
+-  do_assign (lhs_name, idx_rhs, false);
++  do_assign (cmd.left_hand_side (), idx_rhs);
+ 
+   // do loop
+   tree_statement_list *pt_body = cmd.body ();
+   pt_body->accept (*this);
+ 
+   if (breaking && continues.empty ())
+     {
+       // WTF are you doing user? Every branch was a continue, why did you have
+@@ -1896,36 +1995,19 @@ jit_convert::visit_if_command_list (tree
+   else
+     // every branch broke, so we don't have a tail
+     breaking = true;
+ }
+ 
+ void
+ jit_convert::visit_index_expression (tree_index_expression& exp)
+ {
+-  std::string type = exp.type_tags ();
+-  if (! (type.size () == 1 && type[0] == '('))
+-    fail ("Unsupported index operation");
+-
+-  std::list<tree_argument_list *> args = exp.arg_lists ();
+-  if (args.size () != 1)
+-    fail ("Bad number of arguments in tree_index_expression");
+-
+-  tree_argument_list *arg_list = args.front ();
+-  if (! arg_list)
+-    fail ("null argument list");
+-
+-  if (arg_list->size () != 1)
+-    fail ("Bad number of arguments in arg_list");
+-
+-  tree_expression *tree_object = exp.expression ();
+-  jit_value *object = visit (tree_object);
+-
+-  tree_expression *arg0 = arg_list->front ();
+-  jit_value *index = visit (arg0);
++  std::pair<jit_value *, jit_value *> res = resolve (exp);
++  jit_value *object = res.first;
++  jit_value *index = res.second;
+ 
+   result = create_checked (jit_typeinfo::paren_subsref, object, index);
+ }
+ 
+ void
+ jit_convert::visit_matrix (tree_matrix&)
+ {
+   fail ();
+@@ -2008,23 +2090,17 @@ jit_convert::visit_simple_assignment (tr
+ {
+   if (tsa.op_type () != octave_value::op_asn_eq)
+     fail ("Unsupported assign");
+ 
+   // resolve rhs
+   tree_expression *rhs = tsa.right_hand_side ();
+   jit_value *rhsv = visit (rhs);
+ 
+-  // resolve lhs
+-  tree_expression *lhs = tsa.left_hand_side ();
+-  if (! lhs->is_identifier ())
+-    fail ();
+-
+-  std::string lhs_name = lhs->name ();
+-  result = do_assign (lhs_name, rhsv, tsa.print_result ());
++  do_assign (tsa.left_hand_side (), rhsv);
+ }
+ 
+ void
+ jit_convert::visit_statement (tree_statement& stmt)
+ {
+   tree_command *cmd = stmt.command ();
+   tree_expression *expr = stmt.expression ();
+ 
+@@ -2151,22 +2227,78 @@ jit_convert::get_variable (const std::st
+   jit_type *type = jit_typeinfo::type_of (val);
+   jit_extract_argument *extract;
+   extract = create<jit_extract_argument> (type, var);
+   entry_block->prepend (extract);
+ 
+   return vmap[vname] = var;
+ }
+ 
++std::pair<jit_value *, jit_value *>
++jit_convert::resolve (tree_index_expression& exp)
++{
++  std::string type = exp.type_tags ();
++  if (! (type.size () == 1 && type[0] == '('))
++    fail ("Unsupported index operation");
++
++  std::list<tree_argument_list *> args = exp.arg_lists ();
++  if (args.size () != 1)
++    fail ("Bad number of arguments in tree_index_expression");
++
++  tree_argument_list *arg_list = args.front ();
++  if (! arg_list)
++    fail ("null argument list");
++
++  if (arg_list->size () != 1)
++    fail ("Bad number of arguments in arg_list");
++
++  tree_expression *tree_object = exp.expression ();
++  jit_value *object = visit (tree_object);
++  tree_expression *arg0 = arg_list->front ();
++  jit_value *index = visit (arg0);
++
++  return std::make_pair (object, index);
++}
++
++jit_value *
++jit_convert::do_assign (tree_expression *exp, jit_value *rhs, bool artificial)
++{
++  if (! exp)
++    fail ("NULL lhs in assign");
++
++  if (isa<tree_identifier> (exp))
++    return do_assign (exp->name (), rhs, exp->print_result (), artificial);
++  else if (tree_index_expression *idx
++           = dynamic_cast<tree_index_expression *> (exp))
++    {
++      std::pair<jit_value *, jit_value *> res = resolve (*idx);
++      jit_value *object = res.first;
++      jit_value *index = res.second;
++      jit_call *new_object = create<jit_call> (&jit_typeinfo::paren_subsasgn,
++                                               object, index, rhs);
++      block->append (new_object);
++      do_assign (idx->expression (), new_object, true);
++      create_check (new_object);
++
++      // FIXME: Will not work for values that must be release/grabed
++      return rhs;
++    }
++  else
++    fail ("Unsupported assignment");
++}
++
+ jit_value *
+ jit_convert::do_assign (const std::string& lhs, jit_value *rhs,
+-                        bool print)
++                        bool print, bool artificial)
+ {
+   jit_variable *var = get_variable (lhs);
+-  block->append (create<jit_assign> (var, rhs));
++  jit_assign *assign = block->append (create<jit_assign> (var, rhs));
++
++  if (artificial)
++    assign->mark_artificial ();
+ 
+   if (print)
+     {
+       const jit_function& print_fn = jit_typeinfo::print_value ();
+       jit_const_string *name = create<jit_const_string> (lhs);
+       block->append (create<jit_call> (print_fn, name, var));
+     }
+ 
+@@ -2771,16 +2903,19 @@ jit_convert::convert_llvm::visit (jit_er
+   check.stash_llvm (br);
+ }
+ 
+ void
+ jit_convert::convert_llvm::visit (jit_assign& assign)
+ {
+   assign.stash_llvm (assign.src ()->to_llvm ());
+ 
++  if (assign.artificial ())
++    return;
++
+   jit_value *new_value = assign.src ();
+   if (isa<jit_assign_base> (new_value))
+     {
+       const jit_function::overload& ol
+         = jit_typeinfo::get_grab (new_value->type ());
+       if (ol.function)
+         assign.stash_llvm (create_call (ol, new_value));
+     }
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -34,44 +34,35 @@ along with Octave; see the file COPYING.
+ 
+ #include "Array.h"
+ #include "Range.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
+ 
+ // -------------------- Current status --------------------
+ // Simple binary operations (+-*/) on octave_scalar's (doubles) are optimized.
+-// However, there is no warning emitted on divide by 0. For example,
+ // a = 5;
+ // b = a * 5 + a;
+ //
+-// For other types all binary operations are compiled but not optimized. For
+-// example,
+-// a = [1 2 3]
+-// b = a + a;
+-// will compile to do_binary_op (a, a).
++// Indexing matrices with scalars works.
+ //
+-// For loops are compiled again!
+-// if, elseif, and else statements compile again!
+-// break and continue now work!
+-//
+-// NOTE: Matrix access is currently broken!
++// if, elseif, else, break, continue, and for compile. Compilation is triggered
++// at the start of a simple for loop.
+ //
+ // The octave low level IR is a linear IR, it works by converting everything to
+ // calls to jit_functions. This turns expressions like c = a + b into
+ // c = call binary+ (a, b)
+-// The jit_functions contain information about overloads for differnt types. For
+-// example, if we know a and b are scalars, then c must also be a scalar.
++// The jit_functions contain information about overloads for different types.
++// For, example, if we know a and b are scalars, then c must also be a scalar.
+ //
+ //
+ // TODO:
+-// 1. Support some simple matrix case (and cleanup Octave low level IR)
+-// 2. Function calls
+-// 3. Cleanup/documentation
+-// 4. ...
++// 1. Function calls
++// 2. Cleanup/documentation
++// 3. ...
+ // ---------------------------------------------------------
+ 
+ 
+ // we don't want to include llvm headers here, as they require
+ // __STDC_LIMIT_MACROS and __STDC_CONSTANT_MACROS be defined in the entire
+ // compilation unit
+ namespace llvm
+ {
+@@ -88,16 +79,17 @@ namespace llvm
+   class GlobalVariable;
+   class TerminatorInst;
+   class PHINode;
+ }
+ 
+ class octave_base_value;
+ class octave_value;
+ class tree;
++class tree_expression;
+ 
+ template <typename HOLDER_T, typename SUB_T>
+ class jit_internal_node;
+ 
+ // jit_internal_list and jit_internal_node implement generic embedded doubly
+ // linked lists. List items extend from jit_internal_list, and can be placed
+ // in nodes of type jit_internal_node. We use CRTP twice.
+ template <typename LIST_T, typename NODE_T>
+@@ -493,16 +485,21 @@ public:
+     return instance->make_range_fn;
+   }
+ 
+   static const jit_function& paren_subsref (void)
+   {
+     return instance->paren_subsref_fn;
+   }
+ 
++  static const jit_function& paren_subsasgn (void)
++  {
++    return instance->paren_subsasgn_fn;
++  }
++
+   static const jit_function& logically_true (void)
+   {
+     return instance->logically_true_fn;
+   }
+ 
+   static const jit_function& cast (jit_type *result)
+   {
+     return instance->do_cast (result);
+@@ -690,16 +687,17 @@ private:
+   jit_function release_fn;
+   jit_function print_fn;
+   jit_function for_init_fn;
+   jit_function for_check_fn;
+   jit_function for_index_fn;
+   jit_function logically_true_fn;
+   jit_function make_range_fn;
+   jit_function paren_subsref_fn;
++  jit_function paren_subsasgn_fn;
+ 
+   // type id -> cast function TO that type
+   std::vector<jit_function> casts;
+ 
+   // type id -> identity function
+   std::vector<llvm::Function *> identities;
+ };
+ 
+@@ -1552,46 +1550,60 @@ private:
+   jit_variable *mdest;
+ };
+ 
+ class
+ jit_assign : public jit_assign_base
+ {
+ public:
+   jit_assign (jit_variable *adest, jit_value *asrc)
+-    : jit_assign_base (adest, adest, asrc) {}
++    : jit_assign_base (adest, adest, asrc), martificial (false) {}
+ 
+   jit_value *overwrite (void) const
+   {
+     return argument (0);
+   }
+ 
+   jit_value *src (void) const
+   {
+     return argument (1);
+   }
+ 
++  // variables don't get modified in an SSA, but COW requires we modify
++  // variables. An artificial assign is for when a variable gets modified. We
++  // need an assign in the SSA, but the reference counts shouldn't be updated.
++  bool artificial (void) const { return martificial; }
++
++  void mark_artificial (void) { martificial = true; }
++
+   virtual bool infer (void)
+   {
+     jit_type *stype = src ()->type ();
+     if (stype != type())
+       {
+         stash_type (stype);
+         return true;
+       }
+ 
+     return false;
+   }
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
+   {
+-    return print_indent (os, indent) << *this << " = " << *src ();
++    print_indent (os, indent) << *this << " = " << *src ();
++
++    if (artificial ())
++      os << " [artificial]";
++
++    return os;
+   }
+ 
+   JIT_VALUE_ACCEPT;
++private:
++  bool martificial;
+ };
+ 
+ class
+ jit_phi : public jit_assign_base
+ {
+ public:
+   jit_phi (jit_variable *adest, size_t npred)
+     : jit_assign_base (adest, npred)
+@@ -2145,16 +2157,24 @@ public:
+   template <typename ARG0, typename ARG1, typename ARG2>
+   jit_call *create_checked (const ARG0& arg0, const ARG1& arg1,
+                             const ARG2& arg2)
+   {
+     jit_call *ret = create<jit_call> (arg0, arg1, arg2);
+     return create_checked_impl (ret);
+   }
+ 
++  template <typename ARG0, typename ARG1, typename ARG2, typename ARG3>
++  jit_call *create_checked (const ARG0& arg0, const ARG1& arg1,
++                            const ARG2& arg2, const ARG3& arg3)
++  {
++    jit_call *ret = create<jit_call> (arg0, arg1, arg2, arg3);
++    return create_checked_impl (ret);
++  }
++
+   typedef std::list<jit_block *> block_list;
+   typedef block_list::iterator block_iterator;
+ 
+   void append (jit_block *ablock);
+ 
+   void insert_before (block_iterator iter, jit_block *ablock);
+ 
+   void insert_before (jit_block *loc, jit_block *ablock)
+@@ -2194,29 +2214,40 @@ private:
+   size_t iterator_count;
+ 
+   typedef std::map<std::string, jit_variable *> vmap_t;
+   vmap_t vmap;
+ 
+   jit_call *create_checked_impl (jit_call *ret)
+   {
+     block->append (ret);
+-
++    create_check (ret);
++    return ret;
++  }
++
++  jit_error_check *create_check (jit_call *call)
++  {
+     jit_block *normal = create<jit_block> (block->name ());
+-    block->append (create<jit_error_check> (ret, normal, final_block));
++    jit_error_check *ret
++      = block->append (create<jit_error_check> (call, normal, final_block));
+     append (normal);
+     block = normal;
+ 
+     return ret;
+   }
+ 
+   jit_variable *get_variable (const std::string& vname);
+ 
+-  jit_value *do_assign (const std::string& lhs, jit_value *rhs, bool print);
+-
++  std::pair<jit_value *, jit_value *> resolve (tree_index_expression& exp);
++
++  jit_value *do_assign (tree_expression *exp, jit_value *rhs,
++                        bool artificial = false);
++
++  jit_value *do_assign (const std::string& lhs, jit_value *rhs, bool print,
++                        bool artificial = false);
+ 
+   jit_value *visit (tree *tee) { return visit (*tee); }
+ 
+   jit_value *visit (tree& tee);
+ 
+   void push_worklist (jit_instruction *instr)
+   {
+     if (! instr->in_worklist ())

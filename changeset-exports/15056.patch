@@ -1,0 +1,415 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1343671529 18000
+#      Mon Jul 30 13:05:29 2012 -0500
+# Node ID bc32288f4a42a21ee0a869e15f37eaa5447b1934
+# Parent  a6d4965ef04bb6ebce4c74e9df55f8cb26991d7e
+Support the end keyword for one dimentional indexing in JIT.
+
+* src/jit-ir.cc (jit_magic_end): New class.
+* src/jit-ir.h (jit_magic_end): New class.
+(jit_instruction::jit_instruction): New overload.
+
+* src/jit-typeinfo.cc (jit_function::call): Throw jit_fail_exception if invalid.
+(jit_typeinfo::jit_typeinfo): Initialize end_fn.
+* src/jit-typeinfo.h (jit_typeinfo::end): New function.
+
+* src/pt-jit.cc (jit_convert::visit_identifier): Handle magic_end.
+(jit_convert::resolve): Keep track of end context.
+(jit_convert::convert_llvm::visit): New overload.
+
+* src/pt-jit.h (jit_convert): Add end_context.
+
+diff --git a/src/jit-ir.cc b/src/jit-ir.cc
+--- a/src/jit-ir.cc
++++ b/src/jit-ir.cc
+@@ -593,9 +593,41 @@ jit_call::infer (void)
+     {
+       stash_type (infered);
+       return true;
+     }
+ 
+   return false;
+ }
+ 
++// -------------------- jit_magic_end --------------------
++const jit_function&
++jit_magic_end::overload () const
++{
++  jit_value *ctx = resolve_context ();
++  if (ctx)
++    return jit_typeinfo::end (ctx->type ());
++
++  static jit_function null_ret;
++  return null_ret;
++}
++
++jit_value *
++jit_magic_end::resolve_context (void) const
++{
++  // FIXME: We need to have a way of marking functions so we can skip them here
++  return argument_count () ? argument (0) : 0;
++}
++
++bool
++jit_magic_end::infer (void)
++{
++  jit_type *new_type = overload ().result ();
++  if (new_type != type ())
++    {
++      stash_type (new_type);
++      return true;
++    }
++
++  return false;
++}
++
+ #endif
+diff --git a/src/jit-ir.h b/src/jit-ir.h
+--- a/src/jit-ir.h
++++ b/src/jit-ir.h
+@@ -41,17 +41,18 @@ along with Octave; see the file COPYING.
+   JIT_METH(cond_branch);                        \
+   JIT_METH(call);                               \
+   JIT_METH(extract_argument);                   \
+   JIT_METH(store_argument);                     \
+   JIT_METH(phi);                                \
+   JIT_METH(variable);                           \
+   JIT_METH(error_check);                        \
+   JIT_METH(assign)                              \
+-  JIT_METH(argument)
++  JIT_METH(argument)                            \
++  JIT_METH(magic_end)
+ 
+ #define JIT_VISIT_IR_CONST                      \
+   JIT_METH(const_bool);                         \
+   JIT_METH(const_scalar);                       \
+   JIT_METH(const_complex);                      \
+   JIT_METH(const_index);                        \
+   JIT_METH(const_string);                       \
+   JIT_METH(const_range)
+@@ -251,16 +252,24 @@ public:
+   JIT_INSTRUCTION_CTOR(1)
+   JIT_INSTRUCTION_CTOR(2)
+   JIT_INSTRUCTION_CTOR(3)
+   JIT_INSTRUCTION_CTOR(4)
+ 
+ #undef STASH_ARG
+ #undef JIT_INSTRUCTION_CTOR
+ 
++  jit_instruction (const std::vector<jit_value *>& aarguments)
++  : already_infered (aarguments.size ()), marguments (aarguments.size ()),
++    mid (next_id ()), mparent (0)
++  {
++    for (size_t i = 0; i < aarguments.size (); ++i)
++      stash_argument (i, aarguments[i]);
++  }
++
+   static void reset_ids (void)
+   {
+     next_id (true);
+   }
+ 
+   jit_value *argument (size_t i) const
+   {
+     return marguments[i].value ();
+@@ -1132,16 +1141,44 @@ public:
+   JIT_VALUE_ACCEPT;
+ protected:
+   virtual bool check_alive (size_t idx) const
+   {
+     return idx == 1 ? true : check_for ()->can_error ();
+   }
+ };
+ 
++// for now only handles the 1D case
++class
++jit_magic_end : public jit_instruction
++{
++public:
++  jit_magic_end (const std::vector<jit_value *>& context)
++    : jit_instruction (context)
++  {}
++
++  const jit_function& overload () const;
++
++  jit_value *resolve_context (void) const;
++
++  virtual bool infer (void);
++
++  virtual std::ostream& short_print (std::ostream& os) const
++  {
++    return os << "magic_end";
++  }
++
++  virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
++  {
++    return short_print (print_indent (os, indent));
++  }
++
++  JIT_VALUE_ACCEPT;
++};
++
+ class
+ jit_extract_argument : public jit_assign_base
+ {
+ public:
+   jit_extract_argument (jit_type *atype, jit_variable *adest)
+     : jit_assign_base (adest)
+   {
+     stash_type (atype);
+diff --git a/src/jit-typeinfo.cc b/src/jit-typeinfo.cc
+--- a/src/jit-typeinfo.cc
++++ b/src/jit-typeinfo.cc
+@@ -517,30 +517,34 @@ jit_function::new_block (const std::stri
+   return llvm::BasicBlock::Create (context, aname, llvm_function,
+                                    insert_before);
+ }
+ 
+ llvm::Value *
+ jit_function::call (llvm::IRBuilderD& builder,
+                     const std::vector<jit_value *>& in_args) const
+ {
++  if (! valid ())
++    throw jit_fail_exception ("Call not implemented");
++
+   assert (in_args.size () == args.size ());
+-
+   std::vector<llvm::Value *> llvm_args (args.size ());
+   for (size_t i = 0; i < in_args.size (); ++i)
+     llvm_args[i] = in_args[i]->to_llvm ();
+ 
+   return call (builder, llvm_args);
+ }
+ 
+ llvm::Value *
+ jit_function::call (llvm::IRBuilderD& builder,
+                     const std::vector<llvm::Value *>& in_args) const
+ {
+-  assert (valid ());
++  if (! valid ())
++    throw jit_fail_exception ("Call not implemented");
++
+   assert (in_args.size () == args.size ());
+   llvm::Function *stacksave
+     = llvm::Intrinsic::getDeclaration (module, llvm::Intrinsic::stacksave);
+   llvm::SmallVector<llvm::Value *, 10> llvm_args;
+   llvm_args.reserve (in_args.size () + sret ());
+ 
+   llvm::Value *sret_mem = 0;
+   llvm::Value *saved_stack = 0;
+@@ -1337,18 +1341,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+     llvm::BasicBlock *conv_error = fn.new_block ("conv_error", done);
+     llvm::BasicBlock *normal = fn.new_block ("normal", done);
+     builder.CreateCondBr (cond, conv_error, normal);
+     builder.SetInsertPoint (conv_error);
+     ginvalid_index.call (builder);
+     builder.CreateBr (done);
+ 
+     builder.SetInsertPoint (normal);
+-    llvm::Value *len = builder.CreateExtractValue (mat,
+-                                                   llvm::ArrayRef<unsigned> (2));
++    llvm::Value *len = builder.CreateExtractValue (mat, 2);
+     cond0 = builder.CreateICmpSGT (int_idx, len);
+ 
+     llvm::Value *rcount = builder.CreateExtractValue (mat, 0);
+     rcount = builder.CreateLoad (rcount);
+     cond1 = builder.CreateICmpSGT (rcount, one);
+     cond = builder.CreateOr (cond0, cond1);
+ 
+     llvm::BasicBlock *bounds_error = fn.new_block ("bounds_error", done);
+@@ -1381,16 +1384,28 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+ 
+   fn = create_function (jit_convention::external,
+                         "octave_jit_paren_subsasgn_matrix_range", matrix,
+                         matrix, range, scalar);
+   fn.add_mapping (engine, &octave_jit_paren_subsasgn_matrix_range);
+   fn.mark_can_error ();
+   paren_subsasgn_fn.add_overload (fn);
+ 
++  end_fn.stash_name ("end");
++  fn = create_function (jit_convention::internal, "octave_jit_end_matrix",
++                        scalar, matrix);
++  body = fn.new_block ();
++  builder.SetInsertPoint (body);
++  {
++    llvm::Value *mat = fn.argument (builder, 0);
++    llvm::Value *ret = builder.CreateExtractValue (mat, 2);
++    fn.do_return (builder, builder.CreateSIToFP (ret, scalar_t));
++  }
++  end_fn.add_overload (fn);
++
+   casts[any->type_id ()].stash_name ("(any)");
+   casts[scalar->type_id ()].stash_name ("(scalar)");
+   casts[complex->type_id ()].stash_name ("(complex)");
+   casts[matrix->type_id ()].stash_name ("(matrix)");
+   casts[any->type_id ()].stash_name ("(range)");
+ 
+   // cast any <- matrix
+   fn = create_function (jit_convention::external, "octave_jit_cast_any_matrix",
+diff --git a/src/jit-typeinfo.h b/src/jit-typeinfo.h
+--- a/src/jit-typeinfo.h
++++ b/src/jit-typeinfo.h
+@@ -466,16 +466,26 @@ public:
+   {
+     return instance->do_cast (to, from);
+   }
+ 
+   static llvm::Value *insert_error_check (llvm::IRBuilderD& bld)
+   {
+     return instance->do_insert_error_check (bld);
+   }
++
++  static const jit_operation& end (void)
++  {
++    return instance->end_fn;
++  }
++
++  static const jit_function& end (jit_type *ty)
++  {
++    return instance->end_fn.overload (ty);
++  }
+ private:
+   jit_typeinfo (llvm::Module *m, llvm::ExecutionEngine *e);
+ 
+   // FIXME: Do these methods really need to be in jit_typeinfo?
+   jit_type *do_join (jit_type *lhs, jit_type *rhs)
+   {
+     // empty case
+     if (! lhs)
+@@ -650,16 +660,17 @@ private:
+   jit_operation print_fn;
+   jit_operation for_init_fn;
+   jit_operation for_check_fn;
+   jit_operation for_index_fn;
+   jit_operation logically_true_fn;
+   jit_operation make_range_fn;
+   jit_operation paren_subsref_fn;
+   jit_operation paren_subsasgn_fn;
++  jit_operation end_fn;
+ 
+   // type id -> cast function TO that type
+   std::vector<jit_operation> casts;
+ 
+   // type id -> identity function
+   std::vector<jit_function> identities;
+ 
+   llvm::IRBuilderD& builder;
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -407,17 +407,24 @@ void
+ jit_convert::visit_function_def (tree_function_def&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+ void
+ jit_convert::visit_identifier (tree_identifier& ti)
+ {
+-  result = get_variable (ti.name ());
++  if (ti.has_magic_end ())
++    {
++      if (!end_context.size ())
++        throw jit_fail_exception ("Illegal end");
++      result = block->append (create<jit_magic_end> (end_context));
++    }
++  else
++    result = get_variable (ti.name ());
+ }
+ 
+ void
+ jit_convert::visit_if_clause (tree_if_clause&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+@@ -821,16 +828,22 @@ jit_convert::resolve (tree_index_express
+   if (! arg_list)
+     throw jit_fail_exception ("null argument list");
+ 
+   if (arg_list->size () != 1)
+     throw jit_fail_exception ("Bad number of arguments in arg_list");
+ 
+   tree_expression *tree_object = exp.expression ();
+   jit_value *object = visit (tree_object);
++
++  end_context.push_back (object);
++
++  unwind_protect prot;
++  prot.add_method (&end_context, &std::vector<jit_value *>::pop_back);
++
+   tree_expression *arg0 = arg_list->front ();
+   jit_value *index = visit (arg0);
+ 
+   return std::make_pair (object, index);
+ }
+ 
+ jit_value *
+ jit_convert::do_assign (tree_expression *exp, jit_value *rhs, bool artificial)
+@@ -1474,16 +1487,24 @@ jit_convert::convert_llvm::visit (jit_as
+       ol.call (builder, overwrite);
+     }
+ }
+ 
+ void
+ jit_convert::convert_llvm::visit (jit_argument&)
+ {}
+ 
++void
++jit_convert::convert_llvm::visit (jit_magic_end& me)
++{
++  const jit_function& ol = me.overload ();
++  llvm::Value *ret = ol.call (builder, me.resolve_context ());
++  me.stash_llvm (ret);
++}
++
+ // -------------------- tree_jit --------------------
+ 
+ tree_jit::tree_jit (void) : module (0), engine (0)
+ {
+ }
+ 
+ tree_jit::~tree_jit (void)
+ {}
+@@ -1818,9 +1839,18 @@ Test some simple cases that compile.
+ %!test
+ %! niter = 1001;
+ %! i = 0;
+ %! while (i < niter)
+ %!   i = i + 1;
+ %! endwhile
+ %! assert (i == niter);
+ 
++%!test
++%! niter = 1001;
++%! result = 0;
++%! m = [5 10];
++%! for i=1:niter
++%!   result = result + m(end);
++%! endfor
++%! assert (result == m(end) * niter);
++
+ */
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -239,16 +239,18 @@ private:
+   std::list<jit_block *> blocks;
+ 
+   std::list<jit_instruction *> worklist;
+ 
+   std::list<jit_value *> constants;
+ 
+   std::list<jit_value *> all_values;
+ 
++  std::vector<jit_value *> end_context;
++
+   size_t iterator_count;
+   size_t for_bounds_count;
+   size_t short_count;
+ 
+   typedef std::map<std::string, jit_variable *> vmap_t;
+   vmap_t vmap;
+ 
+   jit_call *create_checked_impl (jit_call *ret)

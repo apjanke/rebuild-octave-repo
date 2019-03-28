@@ -1,0 +1,198 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1532861827 -7200
+#      Sun Jul 29 12:57:07 2018 +0200
+# Node ID bd30c6f8cfb704a2a3a4fffb305b1b154d4e9be5
+# Parent  9a385fab138eca18f29b1e1c3dd95865fc05812b
+update internal __mfile_encoding__ when gui default encoding changes (bug #54310)
+
+* gui-preferences.h: define constants for editor default encoding prefs
+
+* main-window.cc (main_window): initialize new class variable storing the
+  default encoding;
+  (notice_settings): check for changes in default encoding and update
+  __mfile_encoding__ via worker thread if required;
+  (gui_preference_adjust): use constants for pref key;
+
+
+* main-window.h: new class variable storing the default encoding
+
+* resource-manager.cc: include gui-preferences.h;
+  (do_combo_encoding): use constants for key and default of encoding
+
+diff --git a/libgui/src/gui-preferences.h b/libgui/src/gui-preferences.h
+--- a/libgui/src/gui-preferences.h
++++ b/libgui/src/gui-preferences.h
+@@ -47,11 +47,17 @@ const gui_pref ed_comment_str ("editor/o
+ const gui_pref ed_uncomment_str ("editor/oct_uncomment_str", QVariant (1 + 2 + 4 + 8));
+ 
+ const QString ed_last_comment_str ("editor/oct_last_comment_str");
+ const QStringList ed_comment_strings (QStringList () << "##" << "#" << "%"<< "%%" << "%!");
+ const int ed_comment_strings_count = 5;
+ 
+ // File handling
+ const gui_pref ed_show_dbg_file ("editor/show_dbg_file", QVariant (true));
++#if defined (Q_OS_WIN32)
++const gui_pref ed_default_enc ("editor/default_encoding", QVariant ("SYSTEM"));
++#else
++const gui_pref ed_default_enc ("editor/default_encoding", QVariant ("UTF-8"));
++#endif
++
+ 
+ 
+ #endif
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -206,16 +206,18 @@ namespace octave
+       {
+         connect_to_web
+           = settings->value ("news/allow_web_connection", false).toBool ();
+ 
+         last_checked
+           = settings->value ("news/last_time_checked", QDateTime ()).toDateTime ();
+ 
+         serial = settings->value ("news/last_news_item", 0).toInt ();
++        m_default_encoding = settings->value (ed_default_enc.key,
++                                              ed_default_enc.def).toString ();
+       }
+ 
+     QDateTime current = QDateTime::currentDateTime ();
+     QDateTime one_day_ago = current.addDays (-1);
+ 
+     if (m_start_gui && connect_to_web
+         && (! last_checked.isValid () || one_day_ago > last_checked))
+       load_and_display_community_news (serial);
+@@ -753,16 +755,27 @@ namespace octave
+     resource_manager::update_network_settings ();
+ 
+     emit active_dock_changed (nullptr, m_active_dock); // update dock widget styles
+ 
+     configure_shortcuts ();
+     set_global_shortcuts (m_active_dock == m_command_window);
+     disable_menu_shortcuts (m_active_dock == m_editor_window);
+ 
++    // Ckeck whether some octave internal preferences have to be updated
++    QString new_default_encoding
++      = settings->value (ed_default_enc.key, ed_default_enc.def).toString ();
++    if (new_default_encoding != m_default_encoding)
++      {
++        m_default_encoding = new_default_encoding;
++        octave_cmd_builtin *cmd = new octave_cmd_builtin (
++                                    &F__mfile_encoding__,
++                                    ovl (m_default_encoding.toStdString ()));
++        m_cmd_queue.add_cmd (cmd);
++      }
+ 
+     // Set cursor blinking depending on the settings
+     // Cursor blinking: consider old terminal related setting if not yet set
+     // TODO: This pref. can be deprecated / removed if Qt adds support for
+     //       getting the cursor blink preferences from all OS environments
+     bool cursor_blinking;
+ 
+     if (settings->contains ("cursor_blinking"))
+@@ -2498,17 +2511,17 @@ namespace octave
+     QString adjusted_value = value;
+ 
+     // Immediately return if no new value is given
+     if (adjusted_value.isEmpty ())
+       return adjusted_value;
+ 
+     // Not all encodings are available. Encodings are uppercase and do not
+     // use CPxxx but IBMxxx or WINDOWS-xxx.
+-    if (key == "editor/default_encoding")
++    if (key == ed_default_enc.key)
+       {
+         adjusted_value = adjusted_value.toUpper ();
+ 
+         QStringList codecs;
+         resource_manager::get_codecs (&codecs);
+ 
+         QRegExp re ("^CP(\\d+)$");
+         if (re.indexIn (adjusted_value) > -1)
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -360,16 +360,18 @@ namespace octave
+     octave_interpreter *m_interpreter;
+ 
+     QThread *m_main_thread;
+ 
+     workspace_model *m_workspace_model;
+ 
+     QHash<QMenu*, QStringList> m_hash_menu_text;
+ 
++    QString m_default_encoding;
++
+     //! Toolbar.
+ 
+     QStatusBar *m_status_bar;
+ 
+     //! Dock widgets.
+     //!@{
+     terminal_dock_widget *m_command_window;
+     history_dock_widget *m_history_window;
+diff --git a/libgui/src/resource-manager.cc b/libgui/src/resource-manager.cc
+--- a/libgui/src/resource-manager.cc
++++ b/libgui/src/resource-manager.cc
+@@ -42,16 +42,17 @@ along with Octave; see the file COPYING.
+ #include "oct-env.h"
+ 
+ #include "defaults.h"
+ 
+ #include "QTerminal.h"
+ #include "workspace-model.h"
+ #include "variable-editor.h"
+ #include "resource-manager.h"
++#include "gui-preferences.h"
+ 
+ namespace octave
+ {
+   resource_manager *resource_manager::instance = nullptr;
+ 
+   static QString
+   default_qt_settings_file (void)
+   {
+@@ -355,39 +356,32 @@ namespace octave
+   }
+ 
+   // initialize a given combo box with available text encodings
+   void resource_manager::do_combo_encoding (QComboBox *combo, QString current)
+   {
+     QStringList all_codecs;
+     do_get_codecs (&all_codecs);
+ 
+-    // the default encoding
+-#if defined (Q_OS_WIN32)
+-    QString def_enc = "SYSTEM";
+-#else
+-    QString def_enc = "UTF-8";
+-#endif
+-
+     // get the value from the settings file if no current encoding is given
+     QString enc = current;
+     if (enc.isEmpty ())
+       {
+-        enc = m_settings->value ("editor/default_encoding",def_enc).toString ();
++        enc = m_settings->value (ed_default_enc.key, ed_default_enc.def).toString ();
+         if (enc.isEmpty ())  // still empty?
+-          enc = def_enc;     // take default
++          enc = ed_default_enc.def.toString ();     // take default
+       }
+ 
+     // fill the combo box
+     foreach (QString c, all_codecs)
+       combo->addItem (c);
+ 
+     // prepend the default item
+     combo->insertSeparator (0);
+-    combo->insertItem (0, def_enc);
++    combo->insertItem (0, ed_default_enc.def.toString ());
+ 
+     // select the current/default item
+     int idx = combo->findText (enc);
+     if (idx >= 0)
+       combo->setCurrentIndex (idx);
+     else
+       combo->setCurrentIndex (0);
+ 

@@ -1,0 +1,173 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1532628257 -7200
+#      Thu Jul 26 20:04:17 2018 +0200
+# Node ID 3418d3729a51b87e63d74f000e565600560201dd
+# Parent  5401dfadd2f6368e5432b5abef1516c29181ed76
+use exisitng mutex in octave_qt_link for changing gui preferences (bug #54369)
+
+* main-window.cc (construct_octave_qt_link): signal gui_preference_signal
+  and related slot wihtout mutex as argument;
+  (gui_preference): mutex not passed via arguments, use lock/unlock and
+  wake_all of m_octave_qt_link instead
+
+* main-window.h: slot gui_preference wihtout mutex as argument
+
+* octave-qt-link.cc (do_gui_preference): no new mutex required, signal
+  gui_preference_signal without mutex pointer, use internal lock, wait and
+  unlock
+
+* octave-qt-link.h: gui_preference_signal without mutey pointer
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1979,20 +1979,19 @@ namespace octave
+                  this, SLOT (handle_exit_debugger (void)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (show_preferences_signal (void)),
+                  this, SLOT (process_settings_dialog_request (void)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (gui_preference_signal (const QString&, const QString&,
+-                                                QMutex*, QString*)),
+-                 this,
+-                 SLOT (gui_preference (const QString&, const QString&,
+-                                       QMutex*, QString*)));
++                                                QString*)),
++                 this, SLOT (gui_preference (const QString&, const QString&,
++                                             QString*)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (edit_file_signal (const QString&)),
+                  m_active_editor,
+                  SLOT (handle_edit_file_request (const QString&)));
+ 
+         connect (m_octave_qt_link,
+                  SIGNAL (insert_debugger_pointer_signal (const QString&, int)),
+@@ -2489,29 +2488,33 @@ namespace octave
+     connect (current_dir_up, SIGNAL (triggered (void)),
+              this, SLOT (change_directory_up (void)));
+ 
+     connect (m_undo_action, SIGNAL (triggered (void)),
+              this, SLOT (handle_undo_request (void)));
+   }
+ 
+   void main_window::gui_preference (const QString& key, const QString& value,
+-                                    QMutex* wait_for_gui, QString* read_value)
++                                    QString* read_value)
+   {
+     QSettings *settings = resource_manager::get_settings ();
+-
+     *read_value = settings->value (key).toString ();
+ 
++    // Wait for worker to suspend
++    m_octave_qt_link->lock ();
++
+     if (! value.isEmpty ())
+       {
+         settings->setValue (key, QVariant (value));
+         emit settings_changed (settings);
+       }
+ 
+-    wait_for_gui->unlock ();    // data is ready, resume worker threat
++    // We are done: Unlock and wake the worker thread
++    m_octave_qt_link->unlock ();
++    m_octave_qt_link->wake_all ();
+   }
+ 
+   void main_window::save_workspace_callback (const std::string& file)
+   {
+     // INTERPRETER THREAD
+ 
+     Fsave (ovl (file));
+   }
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -236,17 +236,17 @@ namespace octave
+ 
+     void handle_create_filedialog (const QStringList& filters,
+                                    const QString& title,
+                                    const QString& filename,
+                                    const QString& dirname,
+                                    const QString& multimode);
+ 
+     void gui_preference (const QString& key, const QString& value,
+-                         QMutex* wait_for_gui, QString* read_value);
++                         QString* read_value);
+     void handle_show_doc (const QString& file);
+     void handle_register_doc (const QString& file);
+     void handle_unregister_doc (const QString& file);
+ 
+     void handle_octave_ready ();
+     void handle_octave_finished (int);
+ 
+     //! Find files dialog.
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -571,32 +571,28 @@ namespace octave
+   void octave_qt_link::do_show_preferences (void)
+   {
+     emit show_preferences_signal ();
+   }
+ 
+   std::string octave_qt_link::do_gui_preference (const std::string& key,
+                                                  const std::string& value)
+   {
+-    QMutex wait_for_gui;
+     QString pref_value;
+ 
++    // Lock the mutex before signaling
++    lock ();
++
+     // Emit the signal for changing or getting a preference
+     emit gui_preference_signal (QString::fromStdString (key),
+-                                QString::fromStdString (value),
+-                                &wait_for_gui, &pref_value);
++                                QString::fromStdString (value), &pref_value);
+ 
+-    // Unlock and lock the mutex (make sure it is locked without being blocked)
+-    wait_for_gui.unlock ();
+-    wait_for_gui.lock ();
+-
+-    // Try to lock it again, thus waiting for the unlock of the gui after
+-    // reading/changing desired preference. A timeout of 3 s for not being
+-    // blocked forever if something goes wrong
+-    wait_for_gui.tryLock (3000);
++    // Wait for the GUI and unlock when resumed
++    wait ();
++    unlock ();
+ 
+     return pref_value.toStdString ();
+   }
+ 
+   void octave_qt_link::do_show_doc (const std::string& file)
+   {
+     emit show_doc_signal (QString::fromStdString (file));
+   }
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -190,18 +190,17 @@ namespace octave
+     void update_breakpoint_marker_signal (bool insert, const QString& file,
+                                           int line, const QString& cond);
+ 
+     void insert_debugger_pointer_signal (const QString&, int);
+     void delete_debugger_pointer_signal (const QString&, int);
+ 
+     void show_preferences_signal (void);
+ 
+-    void gui_preference_signal (const QString&, const QString&,
+-                                QMutex*, QString*);
++    void gui_preference_signal (const QString&, const QString&, QString*);
+ 
+     void show_doc_signal (const QString& file);
+ 
+     void register_doc_signal (const QString& file);
+ 
+     void unregister_doc_signal (const QString& file);
+ 
+     void edit_variable_signal (const QString& name, const octave_value& val);

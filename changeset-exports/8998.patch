@@ -1,0 +1,1015 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1237481198 -3600
+#      Thu Mar 19 17:46:38 2009 +0100
+# Node ID a48fba01e4ac615f7b92bda5dc8d540340f77b41
+# Parent  187a9d9c2f04f6b8ec2cc9b9372e52cb55471704
+optimize isnan/isinf/isfinite mappers
+
+diff --git a/ChangeLog b/ChangeLog
+--- a/ChangeLog
++++ b/ChangeLog
+@@ -1,8 +1,13 @@
++2009-03-20  Jaroslav Hajek  <highegg@gmail.com>
++
++	* aclocal.m4 (OCTAVE_CMATH_FUNC): New macro.
++	* configure.in: Use it.
++
+ 2009-03-09  John W. Eaton  <jwe@octave.org>
+ 
+ 	* run-octave.in: Use doc-cache instead of DOC for doc cache file.
+ 	* configure.in: Likewise.
+ 
+ 	* configure.in (--enable-extra-warning-flags): New option to
+ 	control extra compiler warning flags.
+ 	(--enable-strict-warning-flags): Rename from --enable-picky-flags.
+diff --git a/aclocal.m4 b/aclocal.m4
+--- a/aclocal.m4
++++ b/aclocal.m4
+@@ -1280,16 +1280,51 @@ main()
+      FT2_LIBS=""
+      m4_if([$3], [], [:], [$3])
+    fi
+ 
+    AC_SUBST([FT2_CFLAGS])
+    AC_SUBST([FT2_LIBS])])
+ dnl end of freetype2.m4
+ 
++dnl Check whether a math mapper function is available in <cmath>.
++dnl Will define HAVE_CMATH_FUNC if there is a double variant and
++dnl HAVE_CMATH_FUNCF if there is a float variant.
++dnl Currently capable of checking for functions with single 
++dnl argument and returning bool/int/real.
++AC_DEFUN([OCTAVE_CMATH_FUNC],[
++AC_MSG_CHECKING([for std::$1 in <cmath>])
++AC_LANG_PUSH(C++)
++AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++#include <cmath>
++void take_func (bool (*func) (double x));
++void take_func (int (*func) (double x));
++void take_func (double (*func) (double x));
++]],
++[[
++take_func(std::$1);
++]])],
++[AC_MSG_RESULT([yes])
++ AC_DEFINE(HAVE_CMATH_[]AS_TR_CPP($1),1,[Define if <cmath> provides $1])],
++[AC_MSG_RESULT([no])])
++AC_MSG_CHECKING([for std::$1 (float variant) in <cmath>])
++AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
++#include <cmath>
++void take_func (bool (*func) (float x));
++void take_func (int (*func) (float x));
++void take_func (float (*func) (float x));
++]],
++[[
++take_func(std::$1);
++]])],
++[AC_MSG_RESULT([yes])
++ AC_DEFINE(HAVE_CMATH_[]AS_TR_CPP($1)F,1,[Define if <cmath> provides float variant of $1])],
++[AC_MSG_RESULT([no])])
++])
++
+ dnl Check whether fast signed integer arithmetics using bit tricks
+ dnl can be used in oct-inttypes.h. Defines HAVE_FAST_INT_OPS if
+ dnl the following conditions hold:
+ dnl 1. Signed numbers are represented by twos complement
+ dnl    (see <http://en.wikipedia.org/wiki/Two%27s_complement>)
+ dnl 2. static_cast to unsigned int counterpart works like interpreting
+ dnl    the signed bit pattern as unsigned (and is thus zero-cost).
+ dnl 3. Signed addition and subtraction yield the same bit results as unsigned.
+diff --git a/configure.in b/configure.in
+--- a/configure.in
++++ b/configure.in
+@@ -1771,16 +1771,22 @@ AC_LINK_IFELSE([AC_LANG_PROGRAM([[#ifdef
+   struct timezone dummy;
+   gettimeofday (&time, &dummy);]])],
+   [AC_MSG_RESULT(no)],
+   [AC_MSG_RESULT(yes)
+    AC_DEFINE(GETTIMEOFDAY_NO_TZ, 1,
+      [Define if your system has a single-arg prototype for gettimeofday.])])
+ fi
+ 
++dnl Maybe <cmath> defines the IEEE functions we need.
++
++OCTAVE_CMATH_FUNC(isnan)
++OCTAVE_CMATH_FUNC(isinf)
++OCTAVE_CMATH_FUNC(isfinite)
++
+ dnl Would like to get rid of this cruft, and just have
+ dnl
+ dnl   AC_CHECK_FUNCS(finite isnan isinf)
+ dnl
+ dnl instead, but that used to fail on some systems...
+ dnl
+ dnl Also just using AC_CHECK_FUNCS doesn't seem to work to find isinf
+ dnl and isnan on Linux systems, so we use AC_CHECK_FUNC, and if that
+diff --git a/liboctave/Array.h b/liboctave/Array.h
+--- a/liboctave/Array.h
++++ b/liboctave/Array.h
+@@ -596,16 +596,36 @@ public:
+       {
+ 	OCTAVE_QUIT;
+ 
+ 	p[i] = fcn (m[i]);
+       }
+ 
+     return result;
+   }
++
++  // This is non-breakable map, suitable for fast functions. Efficiency
++  // relies on compiler's ability to inline a function pointer. This seems
++  // to be OK with recent GCC.
++  template <class U>
++  Array<U>
++  fastmap (U (*fcn) (typename ref_param<T>::type)) const
++  {
++    octave_idx_type len = length ();
++
++    const T *m = data ();
++
++    Array<U> result (dims ());
++    U *p = result.fortran_vec ();
++
++    std::transform (m, m + len, p, fcn);
++
++    return result;
++  }
++
+ };
+ 
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+diff --git a/liboctave/CNDArray.cc b/liboctave/CNDArray.cc
+--- a/liboctave/CNDArray.cc
++++ b/liboctave/CNDArray.cc
+@@ -749,16 +749,34 @@ ComplexNDArray::cummin (ArrayN<octave_id
+ 
+ NDArray
+ ComplexNDArray::abs (void) const
+ {
+   return NDArray (mx_inline_cabs_dup (data (), length ()),
+                   dims ());
+ }
+ 
++boolNDArray
++ComplexNDArray::isnan (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisnan));
++}
++
++boolNDArray
++ComplexNDArray::isinf (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisinf));
++}
++
++boolNDArray
++ComplexNDArray::isfinite (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xfinite));
++}
++
+ ComplexNDArray
+ conj (const ComplexNDArray& a)
+ {
+   return ComplexNDArray (mx_inline_conj_dup (a.data (), a.length ()),
+                          a.dims ());
+ }
+ 
+ ComplexNDArray&
+diff --git a/liboctave/CNDArray.h b/liboctave/CNDArray.h
+--- a/liboctave/CNDArray.h
++++ b/liboctave/CNDArray.h
+@@ -93,16 +93,19 @@ public:
+   ComplexNDArray cummin (int dim = 0) const;
+   ComplexNDArray cummin (ArrayN<octave_idx_type>& index, int dim = 0) const;
+ 
+   ComplexNDArray& insert (const NDArray& a, octave_idx_type r, octave_idx_type c);
+   ComplexNDArray& insert (const ComplexNDArray& a, octave_idx_type r, octave_idx_type c);
+   ComplexNDArray& insert (const ComplexNDArray& a, const Array<octave_idx_type>& ra_idx);
+   
+   NDArray abs (void) const;
++  boolNDArray isnan (void) const;
++  boolNDArray isinf (void) const;
++  boolNDArray isfinite (void) const;
+ 
+   friend ComplexNDArray conj (const ComplexNDArray& a);
+ 
+   ComplexNDArray fourier (int dim = 1) const;
+   ComplexNDArray ifourier (int dim = 1) const;
+ 
+   ComplexNDArray fourier2d (void) const;
+   ComplexNDArray ifourier2d (void) const;
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,26 @@
++2009-03-20  Jaroslav Hajek  <highegg@gmail.com>
++
++	* Array.h (Array<T>::fastmap): New method.
++	* dNDArray.cc (NDArray::isnan, NDArray::isinf, NDArray::isfinite):
++	New methods.
++	* dNDArray.h: Declare them.
++	* fNDArray.cc (FloatNDArray::isnan, FloatNDArray::isinf,
++	FloatNDArray::isfinite): New methods.
++	* fNDArray.h: Declare them.
++	* CNDArray.cc (ComplexNDArray::isnan, ComplexNDArray::isinf,
++	ComplexNDArray::isfinite): New methods.
++	* CNDArray.h: Declare them.
++	* fCNDArray.cc (FloatComplexNDArray::isnan, FloatComplexNDArray::isinf,
++	FloatComplexNDArray::isfinite): New methods.
++	* fCNDArray.h: Declare them.
++	* lo-mappers.h (xisnan, xisinf, xfinite): If possible, use definitions
++	from <cmath>.
++
+ 2009-03-18  Jaroslav Hajek <highegg@gmail.com>
+ 
+ 	* oct-norm.cc (get_eps): Remove that hack.
+ 	(higham): Use std::numeric_limits instead.
+ 	Include OCTAVE_QUIT.
+ 
+ 2009-03-16  Jason Riedy  <jason@acm.org>
+ 
+diff --git a/liboctave/dNDArray.cc b/liboctave/dNDArray.cc
+--- a/liboctave/dNDArray.cc
++++ b/liboctave/dNDArray.cc
+@@ -869,16 +869,34 @@ NDArray::insert (const NDArray& a, const
+ 
+ NDArray
+ NDArray::abs (void) const
+ {
+   return NDArray (mx_inline_fabs_dup (data (), length ()),
+                   dims ());
+ }
+ 
++boolNDArray
++NDArray::isnan (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisnan));
++}
++
++boolNDArray
++NDArray::isinf (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisinf));
++}
++
++boolNDArray
++NDArray::isfinite (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xfinite));
++}
++
+ Matrix
+ NDArray::matrix_value (void) const
+ {
+   Matrix retval;
+ 
+   if (ndims () == 2)
+       retval = Matrix (Array2<double> (*this));
+   else
+diff --git a/liboctave/dNDArray.h b/liboctave/dNDArray.h
+--- a/liboctave/dNDArray.h
++++ b/liboctave/dNDArray.h
+@@ -104,16 +104,19 @@ public:
+   NDArray cummax (ArrayN<octave_idx_type>& index, int dim = 0) const;
+   NDArray cummin (int dim = 0) const;
+   NDArray cummin (ArrayN<octave_idx_type>& index, int dim = 0) const;
+ 
+   NDArray& insert (const NDArray& a, octave_idx_type r, octave_idx_type c);
+   NDArray& insert (const NDArray& a, const Array<octave_idx_type>& ra_idx);
+ 
+   NDArray abs (void) const;
++  boolNDArray isnan (void) const;
++  boolNDArray isinf (void) const;
++  boolNDArray isfinite (void) const;
+ 
+   ComplexNDArray fourier (int dim = 1) const;
+   ComplexNDArray ifourier (int dim = 1) const;
+ 
+   ComplexNDArray fourier2d (void) const;
+   ComplexNDArray ifourier2d (void) const;
+ 
+   ComplexNDArray fourierNd (void) const;
+diff --git a/liboctave/fCNDArray.cc b/liboctave/fCNDArray.cc
+--- a/liboctave/fCNDArray.cc
++++ b/liboctave/fCNDArray.cc
+@@ -744,16 +744,34 @@ FloatComplexNDArray::cummin (ArrayN<octa
+ 
+ FloatNDArray
+ FloatComplexNDArray::abs (void) const
+ {
+   return FloatNDArray (mx_inline_cabs_dup (data (), length ()),
+                        dims ());
+ }
+ 
++boolNDArray
++FloatComplexNDArray::isnan (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisnan));
++}
++
++boolNDArray
++FloatComplexNDArray::isinf (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisinf));
++}
++
++boolNDArray
++FloatComplexNDArray::isfinite (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xfinite));
++}
++
+ FloatComplexNDArray
+ conj (const FloatComplexNDArray& a)
+ {
+   return FloatComplexNDArray (mx_inline_conj_dup (a.data (), a.length ()),
+                               a.dims ());
+ }
+ 
+ FloatComplexNDArray&
+diff --git a/liboctave/fCNDArray.h b/liboctave/fCNDArray.h
+--- a/liboctave/fCNDArray.h
++++ b/liboctave/fCNDArray.h
+@@ -93,16 +93,19 @@ public:
+   FloatComplexNDArray cummin (int dim = 0) const;
+   FloatComplexNDArray cummin (ArrayN<octave_idx_type>& index, int dim = 0) const;
+ 
+   FloatComplexNDArray& insert (const NDArray& a, octave_idx_type r, octave_idx_type c);
+   FloatComplexNDArray& insert (const FloatComplexNDArray& a, octave_idx_type r, octave_idx_type c);
+   FloatComplexNDArray& insert (const FloatComplexNDArray& a, const Array<octave_idx_type>& ra_idx);
+   
+   FloatNDArray abs (void) const;
++  boolNDArray isnan (void) const;
++  boolNDArray isinf (void) const;
++  boolNDArray isfinite (void) const;
+ 
+   friend FloatComplexNDArray conj (const FloatComplexNDArray& a);
+ 
+   FloatComplexNDArray fourier (int dim = 1) const;
+   FloatComplexNDArray ifourier (int dim = 1) const;
+ 
+   FloatComplexNDArray fourier2d (void) const;
+   FloatComplexNDArray ifourier2d (void) const;
+diff --git a/liboctave/fNDArray.cc b/liboctave/fNDArray.cc
+--- a/liboctave/fNDArray.cc
++++ b/liboctave/fNDArray.cc
+@@ -824,16 +824,34 @@ FloatNDArray::insert (const FloatNDArray
+ 
+ FloatNDArray
+ FloatNDArray::abs (void) const
+ {
+   return FloatNDArray (mx_inline_fabs_dup (data (), length ()),
+                        dims ());
+ }
+ 
++boolNDArray
++FloatNDArray::isnan (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisnan));
++}
++
++boolNDArray
++FloatNDArray::isinf (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xisinf));
++}
++
++boolNDArray
++FloatNDArray::isfinite (void) const
++{
++  return ArrayN<bool> (fastmap<bool> (xfinite));
++}
++
+ FloatMatrix
+ FloatNDArray::matrix_value (void) const
+ {
+   FloatMatrix retval;
+ 
+   if (ndims () == 2)
+       retval = FloatMatrix (Array2<float> (*this));
+   else
+diff --git a/liboctave/fNDArray.h b/liboctave/fNDArray.h
+--- a/liboctave/fNDArray.h
++++ b/liboctave/fNDArray.h
+@@ -101,16 +101,19 @@ public:
+   FloatNDArray cummax (ArrayN<octave_idx_type>& index, int dim = 0) const;
+   FloatNDArray cummin (int dim = 0) const;
+   FloatNDArray cummin (ArrayN<octave_idx_type>& index, int dim = 0) const;
+ 
+   FloatNDArray& insert (const FloatNDArray& a, octave_idx_type r, octave_idx_type c);
+   FloatNDArray& insert (const FloatNDArray& a, const Array<octave_idx_type>& ra_idx);
+ 
+   FloatNDArray abs (void) const;
++  boolNDArray isnan (void) const;
++  boolNDArray isinf (void) const;
++  boolNDArray isfinite (void) const;
+ 
+   FloatComplexNDArray fourier (int dim = 1) const;
+   FloatComplexNDArray ifourier (int dim = 1) const;
+ 
+   FloatComplexNDArray fourier2d (void) const;
+   FloatComplexNDArray ifourier2d (void) const;
+ 
+   FloatComplexNDArray fourierNd (void) const;
+diff --git a/liboctave/lo-mappers.cc b/liboctave/lo-mappers.cc
+--- a/liboctave/lo-mappers.cc
++++ b/liboctave/lo-mappers.cc
+@@ -185,33 +185,39 @@ xlog2 (const Complex& x, int& exp)
+ {
+   double ax = std::abs (x);
+   double lax = xlog2 (ax, exp);
+   return (exp == 0) ? x : (x / ax) * lax;
+ }
+ 
+ // double -> bool mappers.
+ 
++#if ! defined(HAVE_CMATH_ISNAN)
+ bool
+ xisnan (double x)
+ {
+   return lo_ieee_isnan (x);
+ }
++#endif
+ 
++#if ! defined(HAVE_CMATH_ISFINITE)
+ bool
+ xfinite (double x)
+ {
+   return lo_ieee_finite (x);
+ }
++#endif
+ 
++#if ! defined(HAVE_CMATH_ISINF)
+ bool
+ xisinf (double x)
+ {
+   return lo_ieee_isinf (x);
+ }
++#endif
+ 
+ bool
+ octave_is_NA (double x)
+ {
+   return lo_ieee_is_NA (x);
+ }
+ 
+ bool
+@@ -316,38 +322,16 @@ signum (const Complex& x)
+   double tmp = abs (x);
+ 
+   return tmp == 0 ? 0.0 : x / tmp;
+ }
+ 
+ // complex -> bool mappers.
+ 
+ bool
+-xisnan (const Complex& x)
+-{
+-  return (xisnan (real (x)) || xisnan (imag (x)));
+-}
+-
+-bool
+-xfinite (const Complex& x)
+-{
+-  double rx = real (x);
+-  double ix = imag (x);
+-
+-  return (xfinite (rx) && ! xisnan (rx)
+-	  && xfinite (ix) && ! xisnan (ix));
+-}
+-
+-bool
+-xisinf (const Complex& x)
+-{
+-  return (xisinf (real (x)) || xisinf (imag (x)));
+-}
+-
+-bool
+ octave_is_NA (const Complex& x)
+ {
+   return (octave_is_NA (real (x)) || octave_is_NA (imag (x)));
+ }
+ 
+ bool
+ octave_is_NaN_or_NA (const Complex& x)
+ {
+@@ -519,33 +503,39 @@ xlog2 (const FloatComplex& x, int& exp)
+ {
+   float ax = std::abs (x);
+   float lax = xlog2 (ax, exp);
+   return (exp == 0) ? x : (x / ax) * lax;
+ }
+ 
+ // float -> bool mappers.
+ 
++#if ! defined(HAVE_CMATH_ISNANF)
+ bool
+ xisnan (float x)
+ {
+   return lo_ieee_isnan (x);
+ }
++#endif
+ 
++#if ! defined(HAVE_CMATH_ISFINITEF)
+ bool
+ xfinite (float x)
+ {
+   return lo_ieee_finite (x);
+ }
++#endif
+ 
++#if ! defined(HAVE_CMATH_ISINFF)
+ bool
+ xisinf (float x)
+ {
+   return lo_ieee_isinf (x);
+ }
++#endif
+ 
+ bool
+ octave_is_NA (float x)
+ {
+   return lo_ieee_is_NA (x);
+ }
+ 
+ bool
+@@ -650,38 +640,16 @@ signum (const FloatComplex& x)
+   float tmp = abs (x);
+ 
+   return tmp == 0 ? 0.0 : x / tmp;
+ }
+ 
+ // complex -> bool mappers.
+ 
+ bool
+-xisnan (const FloatComplex& x)
+-{
+-  return (xisnan (real (x)) || xisnan (imag (x)));
+-}
+-
+-bool
+-xfinite (const FloatComplex& x)
+-{
+-  float rx = real (x);
+-  float ix = imag (x);
+-
+-  return (xfinite (rx) && ! xisnan (rx)
+-	  && xfinite (ix) && ! xisnan (ix));
+-}
+-
+-bool
+-xisinf (const FloatComplex& x)
+-{
+-  return (xisinf (real (x)) || xisinf (imag (x)));
+-}
+-
+-bool
+ octave_is_NA (const FloatComplex& x)
+ {
+   return (octave_is_NA (real (x)) || octave_is_NA (imag (x)));
+ }
+ 
+ bool
+ octave_is_NaN_or_NA (const FloatComplex& x)
+ {
+diff --git a/liboctave/lo-mappers.h b/liboctave/lo-mappers.h
+--- a/liboctave/lo-mappers.h
++++ b/liboctave/lo-mappers.h
+@@ -20,16 +20,17 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_liboctave_mappers_h)
+ #define octave_liboctave_mappers_h 1
+ 
+ #include "oct-cmplx.h"
++#include "lo-math.h"
+ 
+ // Double Precision 
+ extern OCTAVE_API double arg (double x);
+ extern OCTAVE_API double conj (double x);
+ extern OCTAVE_API double fix (double x);
+ extern OCTAVE_API double imag (double x);
+ extern OCTAVE_API double real (double x);
+ extern OCTAVE_API double xround (double x);
+@@ -41,19 +42,34 @@ extern OCTAVE_API Complex xlog2 (const C
+ extern OCTAVE_API double xlog2 (double x, int& exp);
+ extern OCTAVE_API Complex xlog2 (const Complex& x, int& exp);
+ extern OCTAVE_API double xexp2 (double x);
+ 
+ // These are used by the BOOL_OP macros in mx-op-defs.h.
+ inline bool xisnan (bool) { return false; }
+ inline bool xisnan (char) { return false; }
+ 
++#if defined (HAVE_CMATH_ISNAN)
++inline bool xisnan (double x)
++{ return std::isnan (x); }
++#else
+ extern OCTAVE_API bool xisnan (double x);
++#endif
++#if defined (HAVE_CMATH_ISFINITE)
++inline bool xfinite (double x)
++{ return std::isfinite (x); }
++#else
+ extern OCTAVE_API bool xfinite (double x);
++#endif
++#if defined (HAVE_CMATH_ISINF)
++inline bool xisinf (double x)
++{ return std::isinf (x); }
++#else
+ extern OCTAVE_API bool xisinf (double x);
++#endif
+ 
+ extern OCTAVE_API bool octave_is_NA (double x);
+ extern OCTAVE_API bool octave_is_NaN_or_NA (double x) GCC_ATTR_DEPRECATED;
+ 
+ extern OCTAVE_API double xmin (double x, double y);
+ extern OCTAVE_API double xmax (double x, double y);
+ 
+ extern OCTAVE_API Complex acos (const Complex& x);
+@@ -65,19 +81,25 @@ extern OCTAVE_API Complex atanh (const C
+ 
+ extern OCTAVE_API Complex ceil (const Complex& x);
+ extern OCTAVE_API Complex fix (const Complex& x);
+ extern OCTAVE_API Complex floor (const Complex& x);
+ extern OCTAVE_API Complex xround (const Complex& x);
+ extern OCTAVE_API Complex xroundb (const Complex& x);
+ extern OCTAVE_API Complex signum (const Complex& x);
+ 
+-extern OCTAVE_API bool xisnan (const Complex& x);
+-extern OCTAVE_API bool xfinite (const Complex& x);
+-extern OCTAVE_API bool xisinf (const Complex& x);
++inline bool
++xisnan (const Complex& x)
++{ return (xisnan (real (x)) || xisnan (imag (x))); }
++inline bool
++xfinite (const Complex& x)
++{ return (xfinite (real (x)) && xfinite (imag (x))); }
++inline bool
++xisinf (const Complex& x)
++{ return (xisinf (real (x)) || xisinf (imag (x))); }
+ 
+ extern OCTAVE_API bool octave_is_NA (const Complex& x);
+ extern OCTAVE_API bool octave_is_NaN_or_NA (const Complex& x);
+ 
+ extern OCTAVE_API Complex xmin (const Complex& x, const Complex& y);
+ extern OCTAVE_API Complex xmax (const Complex& x, const Complex& y);
+ 
+ // Single Precision 
+@@ -91,19 +113,35 @@ extern OCTAVE_API float xroundb (float x
+ extern OCTAVE_API float signum (float x);
+ extern OCTAVE_API float xtrunc (float x);
+ extern OCTAVE_API float xlog2 (float x); 
+ extern OCTAVE_API FloatComplex xlog2 (const FloatComplex& x); 
+ extern OCTAVE_API float xlog2 (float x, int& exp);
+ extern OCTAVE_API FloatComplex xlog2 (const FloatComplex& x, int& exp);
+ extern OCTAVE_API float xexp2 (float x);
+ 
++#if defined (HAVE_CMATH_ISNANF)
++inline bool xisnan (float x)
++{ return std::isnan (x); }
++#else
+ extern OCTAVE_API bool xisnan (float x);
++#endif
++#if defined (HAVE_CMATH_ISFINITEF)
++inline bool xfinite (float x)
++{ return std::isfinite (x); }
++#else
+ extern OCTAVE_API bool xfinite (float x);
++#endif
++#if defined (HAVE_CMATH_ISINFF)
++inline bool xisinf (float x)
++{ return std::isinf (x); }
++#else
+ extern OCTAVE_API bool xisinf (float x);
++#endif
++
+ 
+ extern OCTAVE_API bool octave_is_NA (float x);
+ extern OCTAVE_API bool octave_is_NaN_or_NA (float x) GCC_ATTR_DEPRECATED;
+ 
+ extern OCTAVE_API float xmin (float x, float y);
+ extern OCTAVE_API float xmax (float x, float y);
+ 
+ extern OCTAVE_API FloatComplex acos (const FloatComplex& x);
+@@ -115,19 +153,25 @@ extern OCTAVE_API FloatComplex atanh (co
+ 
+ extern OCTAVE_API FloatComplex ceil (const FloatComplex& x);
+ extern OCTAVE_API FloatComplex fix (const FloatComplex& x);
+ extern OCTAVE_API FloatComplex floor (const FloatComplex& x);
+ extern OCTAVE_API FloatComplex xround (const FloatComplex& x);
+ extern OCTAVE_API FloatComplex xroundb (const FloatComplex& x);
+ extern OCTAVE_API FloatComplex signum (const FloatComplex& x);
+ 
+-extern OCTAVE_API bool xisnan (const FloatComplex& x);
+-extern OCTAVE_API bool xfinite (const FloatComplex& x);
+-extern OCTAVE_API bool xisinf (const FloatComplex& x);
++inline bool
++xisnan (const FloatComplex& x)
++{ return (xisnan (real (x)) || xisnan (imag (x))); }
++inline bool
++xfinite (const FloatComplex& x)
++{ return (xfinite (real (x)) && xfinite (imag (x))); }
++inline bool
++xisinf (const FloatComplex& x)
++{ return (xisinf (real (x)) || xisinf (imag (x))); }
+ 
+ extern OCTAVE_API bool octave_is_NA (const FloatComplex& x);
+ extern OCTAVE_API bool octave_is_NaN_or_NA (const FloatComplex& x);
+ 
+ extern OCTAVE_API FloatComplex xmin (const FloatComplex& x, const FloatComplex& y);
+ extern OCTAVE_API FloatComplex xmax (const FloatComplex& x, const FloatComplex& y);
+ 
+ #endif
+diff --git a/liboctave/mx-op-defs.h b/liboctave/mx-op-defs.h
+--- a/liboctave/mx-op-defs.h
++++ b/liboctave/mx-op-defs.h
+@@ -1115,16 +1115,23 @@ M operator * (const M& x, const PM& p) \
+ }
+ 
+ #define PMM_BIN_OPS(R, PM, M) \
+   PMM_MULTIPLY_OP(PM, M);
+ 
+ #define MPM_BIN_OPS(R, M, PM) \
+   MPM_MULTIPLY_OP(M, PM);
+ 
++#define NDND_MAPPER_BODY(R, NAME) \
++  R retval (dims ()); \
++  octave_idx_type n = numel (); \
++  for (octave_idx_type i = 0; i < n; i++) \
++    retval.xelem (i) = NAME (elem (i)); \
++  return retval;
++
+ #endif
+ 
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,21 @@
++2009-03-20  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov-re-mat.cc (octave_matrix::isnan, octave_matrix::isinf,
++	octave_matrix::finite): Simplify.
++	* ov-flt-re-mat.cc (octave_float_matrix::isnan,
++	octave_float_matrix::isinf, octave_float_matrix::finite): Simplify.
++	* ov-cx-mat.cc (octave_complex_matrix::isnan,
++	octave_complex_matrix::isinf, octave_complex_matrix::finite):
++	Simplify.
++	* ov-flt-cx-mat.cc (octave_float_complex_matrix::isnan,
++	octave_float_complex_matrix::isinf,
++	octave_float_complex_matrix::finite): Simplify.
++
+ 2009-03-19  Benjamin Lindner  <lindnerb@users.sourceforge.net>
+ 
+ 	* ls-oct-ascii.cc (extract_keyword): Replace loop with call to
+ 	read_until_newline to avoid leaving stray '\r' in stream when
+ 	reading files with CRLF line endings.
+ 
+ 2009-03-18  Jaroslav Hajek <highegg@gmail.com>
+ 
+diff --git a/src/ov-cx-mat.cc b/src/ov-cx-mat.cc
+--- a/src/ov-cx-mat.cc
++++ b/src/ov-cx-mat.cc
+@@ -851,16 +851,34 @@ octave_complex_matrix::conj (void) const
+ }
+ 
+ octave_value
+ octave_complex_matrix::imag (void) const
+ {
+   return ::imag (matrix);
+ }
+ 
++octave_value
++octave_complex_matrix::isnan (void) const
++{
++  return matrix.isnan ();
++}
++
++octave_value
++octave_complex_matrix::isinf (void) const
++{
++  return matrix.isinf ();
++}
++
++octave_value
++octave_complex_matrix::finite (void) const
++{
++  return matrix.isfinite ();
++}
++
+ DARRAY_MAPPER (erf, NDArray::dmapper, ::erf)
+ DARRAY_MAPPER (erfc, NDArray::dmapper, ::erfc)
+ DARRAY_MAPPER (gamma, NDArray::dmapper, xgamma)
+ CD_ARRAY_MAPPER (lgamma, xlgamma, xlgamma, 0.0, octave_Inf)
+ 
+ ARRAY_MAPPER (acos, ComplexNDArray::cmapper, ::acos)
+ ARRAY_MAPPER (acosh, ComplexNDArray::cmapper, ::acosh)
+ ARRAY_MAPPER (angle, ComplexNDArray::dmapper, std::arg)
+@@ -883,18 +901,15 @@ ARRAY_MAPPER (log1p, ComplexNDArray::cma
+ ARRAY_MAPPER (round, ComplexNDArray::cmapper, xround)
+ ARRAY_MAPPER (roundb, ComplexNDArray::cmapper, xroundb)
+ ARRAY_MAPPER (signum, ComplexNDArray::cmapper, ::signum)
+ ARRAY_MAPPER (sin, ComplexNDArray::cmapper, std::sin)
+ ARRAY_MAPPER (sinh, ComplexNDArray::cmapper, std::sinh)
+ ARRAY_MAPPER (sqrt, ComplexNDArray::cmapper, std::sqrt)
+ ARRAY_MAPPER (tan, ComplexNDArray::cmapper, std::tan)
+ ARRAY_MAPPER (tanh, ComplexNDArray::cmapper, std::tanh)
+-ARRAY_MAPPER (finite, ComplexNDArray::bmapper, xfinite)
+-ARRAY_MAPPER (isinf, ComplexNDArray::bmapper, xisinf)
+ ARRAY_MAPPER (isna, ComplexNDArray::bmapper, octave_is_NA)
+-ARRAY_MAPPER (isnan, ComplexNDArray::bmapper, xisnan)
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/ov-flt-cx-mat.cc b/src/ov-flt-cx-mat.cc
+--- a/src/ov-flt-cx-mat.cc
++++ b/src/ov-flt-cx-mat.cc
+@@ -818,16 +818,34 @@ octave_float_complex_matrix::conj (void)
+ }
+ 
+ octave_value
+ octave_float_complex_matrix::imag (void) const
+ {
+   return ::imag (matrix);
+ }
+ 
++octave_value
++octave_float_complex_matrix::isnan (void) const
++{
++  return matrix.isnan ();
++}
++
++octave_value
++octave_float_complex_matrix::isinf (void) const
++{
++  return matrix.isinf ();
++}
++
++octave_value
++octave_float_complex_matrix::finite (void) const
++{
++  return matrix.isfinite ();
++}
++
+ DARRAY_MAPPER (erf, FloatNDArray::dmapper, ::erff)
+ DARRAY_MAPPER (erfc, FloatNDArray::dmapper, ::erfcf)
+ DARRAY_MAPPER (gamma, FloatNDArray::dmapper, xgamma)
+ CD_ARRAY_MAPPER (lgamma, xlgamma, xlgamma, 0.0, octave_Inf)
+ 
+ ARRAY_MAPPER (acos, FloatComplexNDArray::cmapper, ::acos)
+ ARRAY_MAPPER (acosh, FloatComplexNDArray::cmapper, ::acosh)
+ ARRAY_MAPPER (angle, FloatComplexNDArray::dmapper, std::arg)
+@@ -850,18 +868,15 @@ ARRAY_MAPPER (log1p, FloatComplexNDArray
+ ARRAY_MAPPER (round, FloatComplexNDArray::cmapper, xround)
+ ARRAY_MAPPER (roundb, FloatComplexNDArray::cmapper, xroundb)
+ ARRAY_MAPPER (signum, FloatComplexNDArray::cmapper, ::signum)
+ ARRAY_MAPPER (sin, FloatComplexNDArray::cmapper, std::sin)
+ ARRAY_MAPPER (sinh, FloatComplexNDArray::cmapper, std::sinh)
+ ARRAY_MAPPER (sqrt, FloatComplexNDArray::cmapper, std::sqrt)
+ ARRAY_MAPPER (tan, FloatComplexNDArray::cmapper, std::tan)
+ ARRAY_MAPPER (tanh, FloatComplexNDArray::cmapper, std::tanh)
+-ARRAY_MAPPER (finite, FloatComplexNDArray::bmapper, xfinite)
+-ARRAY_MAPPER (isinf, FloatComplexNDArray::bmapper, xisinf)
+ ARRAY_MAPPER (isna, FloatComplexNDArray::bmapper, octave_is_NA)
+-ARRAY_MAPPER (isnan, FloatComplexNDArray::bmapper, xisnan)
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/ov-flt-re-mat.cc b/src/ov-flt-re-mat.cc
+--- a/src/ov-flt-re-mat.cc
++++ b/src/ov-flt-re-mat.cc
+@@ -761,16 +761,34 @@ octave_float_matrix::conj (void) const
+ }
+ 
+ octave_value
+ octave_float_matrix::imag (void) const
+ {
+   return FloatNDArray (matrix.dims (), 0.0);
+ }
+ 
++octave_value
++octave_float_matrix::isnan (void) const
++{
++  return matrix.isnan ();
++}
++
++octave_value
++octave_float_matrix::isinf (void) const
++{
++  return matrix.isinf ();
++}
++
++octave_value
++octave_float_matrix::finite (void) const
++{
++  return matrix.isfinite ();
++}
++
+ ARRAY_MAPPER (erf, FloatNDArray::dmapper, ::erff)
+ ARRAY_MAPPER (erfc, FloatNDArray::dmapper, ::erfcf)
+ ARRAY_MAPPER (gamma, FloatNDArray::dmapper, xgamma)
+ CD_ARRAY_MAPPER (lgamma, xlgamma, xlgamma, 0.0, octave_Float_Inf)
+ ARRAY_MAPPER (acos, FloatNDArray::dmapper, ::acosf)
+ CD_ARRAY_MAPPER (acosh, ::acoshf, ::acosh, 1.0, octave_Float_Inf)
+ ARRAY_MAPPER (angle, FloatNDArray::dmapper, ::arg)
+ ARRAY_MAPPER (arg, FloatNDArray::dmapper, ::arg)
+@@ -792,20 +810,17 @@ CD_ARRAY_MAPPER (log1p, ::log1pf, ::log1
+ ARRAY_MAPPER (round, FloatNDArray::dmapper, xround)
+ ARRAY_MAPPER (roundb, FloatNDArray::dmapper, xroundb)
+ ARRAY_MAPPER (signum, FloatNDArray::dmapper, ::signum)
+ ARRAY_MAPPER (sin, FloatNDArray::dmapper, ::sinf)
+ ARRAY_MAPPER (sinh, FloatNDArray::dmapper, ::sinhf)
+ CD_ARRAY_MAPPER (sqrt, ::sqrtf, std::sqrt, 0.0, octave_Float_Inf)
+ ARRAY_MAPPER (tan, FloatNDArray::dmapper, ::tanf)
+ ARRAY_MAPPER (tanh, FloatNDArray::dmapper, ::tanhf)
+-ARRAY_MAPPER (finite, FloatNDArray::bmapper, xfinite)
+-ARRAY_MAPPER (isinf, FloatNDArray::bmapper, xisinf)
+ ARRAY_MAPPER (isna, FloatNDArray::bmapper, octave_is_NA)
+-ARRAY_MAPPER (isnan, FloatNDArray::bmapper, xisnan)
+ 
+ DEFUN (single, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} single (@var{x})\n\
+ Convert @var{x} to single precision type.\n\
+ @end deftypefn")
+ {
+   // The OCTAVE_TYPE_CONV_BODY3 macro declares retval, so they go
+diff --git a/src/ov-re-mat.cc b/src/ov-re-mat.cc
+--- a/src/ov-re-mat.cc
++++ b/src/ov-re-mat.cc
+@@ -789,16 +789,34 @@ octave_matrix::conj (void) const
+ }
+ 
+ octave_value
+ octave_matrix::imag (void) const
+ {
+   return NDArray (matrix.dims (), 0.0);
+ }
+ 
++octave_value
++octave_matrix::isnan (void) const
++{
++  return matrix.isnan ();
++}
++
++octave_value
++octave_matrix::isinf (void) const
++{
++  return matrix.isinf ();
++}
++
++octave_value
++octave_matrix::finite (void) const
++{
++  return matrix.isfinite ();
++}
++
+ ARRAY_MAPPER (erf, NDArray::dmapper, ::erf)
+ ARRAY_MAPPER (erfc, NDArray::dmapper, ::erfc)
+ ARRAY_MAPPER (gamma, NDArray::dmapper, xgamma)
+ CD_ARRAY_MAPPER (lgamma, xlgamma, xlgamma, 0.0, octave_Inf)
+ ARRAY_MAPPER (acos, NDArray::dmapper, ::acos)
+ CD_ARRAY_MAPPER (acosh, ::acosh, ::acosh, 1.0, octave_Inf)
+ ARRAY_MAPPER (angle, NDArray::dmapper, ::arg)
+ ARRAY_MAPPER (arg, NDArray::dmapper, ::arg)
+@@ -820,20 +838,17 @@ CD_ARRAY_MAPPER (log1p, ::log1p, ::log1p
+ ARRAY_MAPPER (round, NDArray::dmapper, xround)
+ ARRAY_MAPPER (roundb, NDArray::dmapper, xroundb)
+ ARRAY_MAPPER (signum, NDArray::dmapper, ::signum)
+ ARRAY_MAPPER (sin, NDArray::dmapper, ::sin)
+ ARRAY_MAPPER (sinh, NDArray::dmapper, ::sinh)
+ CD_ARRAY_MAPPER (sqrt, ::sqrt, std::sqrt, 0.0, octave_Inf)
+ ARRAY_MAPPER (tan, NDArray::dmapper, ::tan)
+ ARRAY_MAPPER (tanh, NDArray::dmapper, ::tanh)
+-ARRAY_MAPPER (finite, NDArray::bmapper, xfinite)
+-ARRAY_MAPPER (isinf, NDArray::bmapper, xisinf)
+ ARRAY_MAPPER (isna, NDArray::bmapper, octave_is_NA)
+-ARRAY_MAPPER (isnan, NDArray::bmapper, xisnan)
+ 
+ DEFUN (double, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} double (@var{x})\n\
+ Convert @var{x} to double precision type.\n\
+ @end deftypefn")
+ {
+   // The OCTAVE_TYPE_CONV_BODY3 macro declares retval, so they go

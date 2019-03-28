@@ -1,0 +1,1123 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1204303112 -3600
+#      Fri Feb 29 17:38:32 2008 +0100
+# Node ID 3249f64f69b2d89523ead44446f73ef073c22072
+# Parent  6bb2bbc2bf4514c55e4db149eb6a9be3625b1530
+Initial low-level support for property listeners.
+* * *
+Make listeners work for all properties.
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -22,16 +22,46 @@ 2008-06-04  Shai Ayal  <shaiay@users.sou
+ 
+ 	* graphics.h.in (axes::properties::update_xlim): call the new
+ 	axes::properties::calc_ticks_and_lims method
+ 	(axes::properties::update_ylim): ditto
+ 	(axes::properties::update_zlim): ditto
+ 
+ 2008-06-04  Michael Goffioul <michael.goffioul@gmail.com>
+ 
++	* graphics.h.in (base_properties::get_property): Make virtual and
++	remove const modifier.
++	* graphics.cc (base_properties::get_property): Can return built-in
++	properties. Generate an error if the property does not exist.
++	(base_properties::add_listener): Use get_property.
++	(Fadd_listener): Add documentation.
++	* genprops.awk (emit_common_declarations, emit_source): Emit code for
++	overloaded get_property method.
++
++	* genprops.awk (emit_declarations): Run listeners in the property
++	setter methods.
++	* graphics.h.in (enum listener_mode): New enum type for listeners.
++	(base_property::set): Make non-virtual and handle listeners execution.
++	(base_property::listeners): New field holding a map of listeners.
++	(base_property::add_listener, base_property::run_listeners,
++	base_property::do_set): New methods to handle listeners.
++	(property::add_listener, property::run_listeners): Likewise.
++	(base_properties::add_listener): Likewise.
++	(base_graphics_object::add_property_listener,
++	graphics_object::add_property_listener): Likewise.
++	(all property classes): Rename set to do_set and make it protected.
++	* graphics.cc (base_property::run_listeners): New method to execute
++	listeners.
++	(color_property::set, double_radio_property::set,
++	handle_property::set): Rename to do_set.
++	(base_properties::add_listener): New method to handle listener
++	additio. Only handle dynamic properties.
++	(Fadd_listener): New octave interface to add property listeners to
++	graphics object.
++
+ 	* genprops.awk (emit_get_data): Remove.
+ 	(emit_declarations): Treat row_vector_property as array_property and
+ 	remove data_property references.
+ 	* graphics.h.in (array_property::array_property(array_property)): Add
+ 	copy constructor.
+ 	(class data_property): Remove (replaced by array_property).
+ 	(class base_graphics_backend, class graphics_backend): Replace
+ 	data_property references with array_property.
+diff --git a/src/genprops.awk b/src/genprops.awk
+--- a/src/genprops.awk
++++ b/src/genprops.awk
+@@ -239,16 +239,17 @@ function emit_get_array (i)
+ function emit_common_declarations ()
+ {
+   printf ("public:\n");
+   printf ("  properties (const graphics_handle& mh, const graphics_handle& p);\n\n");
+   printf ("  ~properties (void) { }\n\n");
+   printf ("  void set (const caseless_str& pname, const octave_value& val);\n\n");
+   printf ("  octave_value get (bool all = false) const;\n\n");
+   printf ("  octave_value get (const caseless_str& pname) const;\n\n");
++  printf ("  property get_property (const caseless_str& pname);\n\n");
+   printf ("  std::string graphics_object_name (void) const { return go_name; }\n\n");
+   printf ("  static property_list::pval_map_type factory_defaults (void);\n\n");
+   printf ("private:\n  static std::string go_name;\n\n");
+ }
+ 
+ function emit_declarations ()
+ {
+   if (class_name)
+@@ -307,24 +308,31 @@ function emit_declarations ()
+   for (i = 1; i <= idx; i++)
+   {
+     if (emit_set[i])
+     {
+       printf ("  void set_%s (const octave_value& val)", name[i], type[i]);
+ 
+       if (emit_set[i] == "definition")
+       {
+-        printf ("\n  {\n    if (! error_state)\n      {\n        %s = val;\n",
+-          name[i]);
++	if (updaters[i] || limits[i] || mode[i])
++	  has_builtin_listeners = 1;
++	else
++	  has_builtin_listeners = 0;
++
++        printf ("\n  {\n    if (! error_state)\n      {\n        %s.set (val, %s);\n",
++          name[i], (has_builtin_listeners ? "false" : "true"));
+         if (updater[i])
+           printf ("        update_%s ();\n", name[i]);
+         if (limits[i])
+           printf ("        update_axis_limits (\"%s\");\n", name[i]);
+         if (mode[i])
+           printf ("        set_%smode (\"manual\");\n", name[i]);
++	if (has_builtin_listeners)
++	  printf ("        %s.run_listeners (POSTSET);\n", name[i]);
+         printf ("        mark_modified ();\n      }\n  }\n\n");
+       }
+       else
+         printf (";\n\n");
+     }
+ 
+     if (updater[i] == "extern")
+     {
+@@ -424,16 +432,32 @@ function emit_source ()
+               (i > 1 ? "else " : ""), name[i]) >> filename;
+       printf ("    retval = get_%s ()%s;\n", name[i],
+               (type[i] == "handle_property" ? ".as_octave_value ()" : "")) >> filename;
+     }
+ 
+     printf ("  else\n    retval = base_properties::get (pname);\n\n") >> filename;
+     printf ("  return retval;\n}\n\n") >> filename;
+ 
++    ## get_property method
++
++    printf ("property\n%s::properties::get_property (const caseless_str& pname)\n{\n",
++            class_name) >> filename;
++
++    for (i = 1; i<= idx; i++)
++    {
++      printf ("  %sif (pname.compare (\"%s\"))\n",
++              (i > 1 ? "else " : ""), name[i]) >> filename;
++      printf ("    return property (&%s, true);\n", name[i]) >> filename;
++    }
++
++    printf ("  else\n    return base_properties::get_property (pname);\n") >> filename;
++    printf ("}\n\n") >> filename;
++
++
+     ## factory defaults method
+ 
+     printf ("property_list::pval_map_type\n%s::properties::factory_defaults (void)\n{\n",
+             class_name) >> filename;
+     printf ("  property_list::pval_map_type m;\n\n") >> filename;
+ 
+     for (i = 1; i <= idx; i++)
+     {
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -451,16 +451,30 @@ get_array_limits (const Array<T>& m, dou
+ 	  if (e >= 0 && e < eminp)
+ 	    eminp = e;
+ 	}
+     }
+ }
+ 
+ // ---------------------------------------------------------------------
+ 
++void
++base_property::run_listeners (listener_mode mode)
++{
++  const octave_value_list& l = listeners[mode];
++
++  for (int i = 0; i < l.length (); i++)
++    {
++      execute_callback (l(i), parent, octave_value ());
++
++      if (error_state)
++	break;
++    }
++}
++
+ radio_values::radio_values (const std::string& opt_string)
+ {
+   size_t beg = 0;
+   size_t len = opt_string.length ();
+   bool done = len == 0;
+ 
+   while (! done)
+     {
+@@ -524,17 +538,17 @@ color_values::str2rgb (std::string str)
+       for (int i = 0; i < 3; i++)
+ 	xrgb(i) = tmp_rgb[i];
+     }
+ 
+   return retval;
+ }
+ 
+ void
+-color_property::set (const octave_value& val)
++color_property::do_set (const octave_value& val)
+ {
+   if (val.is_string ())
+     {
+       std::string s = val.string_value ();
+ 
+       if (! s.empty ())
+ 	{
+ 	  if (radio_val.contains (s))
+@@ -577,17 +591,17 @@ color_property::set (const octave_value&
+            get_name ().c_str ());
+     }
+   else 
+     error ("invalid value for color property \"%s\"",
+            get_name ().c_str ());
+ }
+ 
+ void
+-double_radio_property::set (const octave_value& val)
++double_radio_property::do_set (const octave_value& val)
+ {
+   if (val.is_string ())
+     {
+       std::string s = val.string_value ();
+ 
+       if (! s.empty () && radio_val.contains (s))
+ 	{
+ 	  current_val = s;
+@@ -685,17 +699,17 @@ array_property::get_data_limits (void)
+ 	    get_array_limits (data.uint64_array_value (), xmin, xmax, xminp);
+ 	}
+       else
+ 	get_array_limits (data.array_value (), xmin, xmax, xminp);
+     }
+ }
+ 
+ void
+-handle_property::set (const octave_value& v)
++handle_property::do_set (const octave_value& v)
+ {
+   double dv = v.double_value ();
+ 
+   if (! error_state)
+     {
+       graphics_handle gh = gh_manager::lookup (dv);
+ 
+       if (xisnan (gh.value ()) || gh.ok ())
+@@ -1362,24 +1376,64 @@ base_properties::set (const caseless_str
+       error ("set: unknown property \"%s\"", name.c_str ());
+   }
+ 
+   if (! error_state && ! name.compare ("__modified__"))
+     mark_modified ();
+ }
+ 
+ property
+-base_properties::get_property (const caseless_str& name) const
++base_properties::get_property (const caseless_str& name)
+ {
+-  std::map<caseless_str, property>::const_iterator it = all_props.find (name);
+-
+-  if (it == all_props.end ())
+-    return property ();
++  if (name.compare ("beingdeleted"))
++    return property (&beingdeleted, true);
++  else if (name.compare ("busyaction"))
++    return property (&busyaction, true);
++  else if (name.compare ("buttondownfcn"))
++    return property (&buttondownfcn, true);
++  else if (name.compare ("clipping"))
++    return property (&clipping, true);
++  else if (name.compare ("createfcn"))
++    return property (&createfcn, true);
++  else if (name.compare ("deletefcn"))
++    return property (&deletefcn, true);
++  else if (name.compare ("handlevisibility"))
++    return property (&handlevisibility, true);
++  else if (name.compare ("hittest"))
++    return property (&hittest, true);
++  else if (name.compare ("interruptible"))
++    return property (&interruptible, true);
++  else if (name.compare ("parent"))
++    return property (&parent, true);
++  else if (name.compare ("selected"))
++    return property (&selected, true);
++  else if (name.compare ("selectionhighlight"))
++    return property (&selectionhighlight, true);
++  else if (name.compare ("tag"))
++    return property (&tag, true);
++  else if (name.compare ("type"))
++    return property (&userdata, true);
++  else if (name.compare ("userdata"))
++    return property (&visible, true);
++  else if (name.compare ("visible"))
++    return property (&visible, true);
++  else if (name.compare ("__modified__"))
++    return property (&__modified__, true);
+   else
+-    return it->second;
++    {
++      std::map<caseless_str, property>::const_iterator it = all_props.find (name);
++
++      if (it == all_props.end ())
++	{
++	  error ("get_property: unknown property \"%s\"", name.c_str ());
++	  return property ();
++	}
++      else
++	return it->second;
++    }
+ }
+ 
+ void
+ base_properties::remove_child (const graphics_handle& h)
+ {
+   octave_idx_type k = -1;
+   octave_idx_type n = children.numel ();
+   for (octave_idx_type i = 0; i < n; i++)
+@@ -1489,16 +1543,26 @@ base_properties::update_boundingbox (voi
+     {
+       graphics_object go = gh_manager::get_object (kids(i));
+ 
+       if (go.valid_object ())
+ 	go.get_properties ().update_boundingbox ();
+     }
+ }
+ 
++void
++base_properties::add_listener (const caseless_str& nm, const octave_value& v,
++			       listener_mode mode)
++{
++  property p = get_property (nm);
++
++  if (! error_state && p.ok ())
++    p.add_listener (v, mode);
++}
++
+ // ---------------------------------------------------------------------
+ 
+ class gnuplot_backend : public base_graphics_backend
+ {
+ public:
+   gnuplot_backend (void)
+       : base_graphics_backend ("gnuplot") { }
+ 
+@@ -3647,16 +3711,81 @@ Undocumented internal function.\n\
+ 	print_usage ();
+     }
+ 
+   unwind_protect::run_frame ("Fdrawnow");
+ 
+   return retval;
+ }
+ 
++DEFUN (add_listener, args, ,
++   "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} add_listener (@var{h}, @var{prop}, @var{fcn})\n\
++Register @var{fcn} as listener for the property @var{prop} of the graphics\n\
++object @var{h}. Property listeners are executed (in order of registration)\n\
++when the property is set. The new value is already available when the\n\
++listeners are executed.\n\
++\n\
++@var{prop} must be a string naming a valid property in @var{h}.\n\
++\n\
++@var{fcn} can be a function handle, a string or a cell array whose first\n\
++element is a function handle. If @var{fcn} is a function handle, the\n\
++corresponding function should accept at least 2 arguments, that will be\n\
++set to the object handle and the empty matrix respectively. If @var{fcn}\n\
++is a string, it must be any valid octave expression. If @var{fcn} is a cell\n\
++array, the first element must be a function handle with the same signature\n\
++as described above. The next elements of the cell array are passed\n\
++as additional arguments to the function.\n\
++\n\
++@example\n\
++function my_listener (h, dummy, p1)\n\
++  fprintf (\"my_listener called with p1=%s\\n\", p1);\n\
++endfunction\n\
++\n\
++add_listener (gcf, \"position\", @{@@my_listener, \"my string\"@})\n\
++@end example\n\
++\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  if (args.length () == 3)
++    {
++      double h = args(0).double_value ();
++
++      if (! error_state)
++	{
++	  std::string pname = args(1).string_value ();
++
++	  if (! error_state)
++	    {
++	      graphics_handle gh = gh_manager::lookup (h);
++
++	      if (gh.ok ())
++		{
++		  graphics_object go = gh_manager::get_object (gh);
++
++		  go.add_property_listener (pname, args(2), POSTSET);
++		}
++	      else
++		error ("add_listener: invalid graphics object (= %g)",
++		       h);
++	    }
++	  else
++	    error ("add_listener: invalid property name, expected a string value");
++	}
++      else
++	error ("add_listener: invalid handle");
++    }
++  else
++    print_usage ();
++
++  return retval;
++}
++
+ octave_value
+ get_property_from_handle (double handle, const std::string& property,
+ 			  const std::string& func)
+ {
+   graphics_object obj = gh_manager::get_object (handle);
+   octave_value retval;
+ 
+   if (obj)
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -334,16 +334,18 @@ public:
+ private:
+   base_scaler *rep;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class property;
+ 
++enum listener_mode { POSTSET };
++
+ class base_property
+ {
+ public:
+   friend class property;
+ 
+ public:
+   base_property (void) : count (0) { }
+ 
+@@ -364,70 +366,94 @@ public:
+   graphics_handle get_parent (void) const { return parent; }
+ 
+   void set_parent (const graphics_handle &h) { parent = h; }
+ 
+   bool is_hidden (void) const { return hidden; }
+ 
+   void set_hidden (bool flag) { hidden = flag; }
+ 
+-  virtual void set (const octave_value&)
+-    { error ("set: invalid property \"%s\"", name.c_str ()); }
++  void set (const octave_value& v, bool do_run = true)
++    {
++      do_set (v);
++
++      if (do_run && ! error_state)
++	run_listeners (POSTSET);
++    }
+ 
+   virtual octave_value get (void) const
+     {
+       error ("get: invalid property \"%s\"", name.c_str ());
+       return octave_value ();
+     }
+ 
+   base_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++  void add_listener (const octave_value& v, listener_mode mode = POSTSET)
++    {
++      octave_value_list& l = listeners[mode];
++      l.resize (l.length () + 1, v);
++    }
++
++  OCTINTERP_API void run_listeners (listener_mode mode = POSTSET);
++
++protected:
++  virtual void do_set (const octave_value&)
++    { error ("set: invalid property \"%s\"", name.c_str ()); }
++
++private:
++  typedef std::map<listener_mode, octave_value_list> listener_map;
++  typedef std::map<listener_mode, octave_value_list>::iterator listener_map_iterator;
++  typedef std::map<listener_mode, octave_value_list>::const_iterator listener_map_const_iterator;
++
+ private:
+   int count;
+   std::string name;
+   graphics_handle parent;
+   bool hidden;
++  listener_map listeners;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class string_property : public base_property
+ {
+ public:
+   string_property (const std::string& s, const graphics_handle& h,
+                    const std::string& val = "")
+     : base_property (s, h), str (val) { }
+ 
+   string_property (const string_property& p)
+     : base_property (p), str (p.str) { }
+ 
+-  void set (const octave_value& val)
+-    {
+-      if (val.is_string ())
+-        str = val.string_value ();
+-      else
+-        error ("set: invalid string property value for \"%s\"",
+-               get_name ().c_str ());
+-    }
+-
+   octave_value get (void) const
+     { return octave_value (str); }
+ 
+   std::string string_value (void) const { return str; }
+ 
+   string_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++protected:
++  void do_set (const octave_value& val)
++    {
++      if (val.is_string ())
++        str = val.string_value ();
++      else
++        error ("set: invalid string property value for \"%s\"",
++               get_name ().c_str ());
++    }
++
+ private:
+   std::string str;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class radio_values
+ {
+@@ -490,45 +516,46 @@ public:
+   radio_property (const std::string& nm, const graphics_handle& h,
+                   const radio_values& v, const std::string& def)
+     : base_property (nm, h),
+       vals (v), current_val (def) { }
+ 
+   radio_property (const radio_property& p)
+     : base_property (p), vals (p.vals), current_val (p.current_val) { }
+ 
+-  void set (const octave_value& newval) 
++  octave_value get (void) const { return octave_value (current_val); }
++
++  const std::string& current_value (void) const { return current_val; }
++
++  bool is (const caseless_str& v) const
++    { return v.compare (current_val); }
++
++  radio_property& operator = (const octave_value& val)
++    {
++      set (val);
++      return *this;
++    }
++
++protected:
++  void do_set (const octave_value& newval) 
+   {
+     if (newval.is_string ())
+       {
+         std::string s = newval.string_value ();
+         if (vals.validate (s))
+           current_val = s;
+         else
+           error ("set: invalid value for radio property \"%s\" (value = %s)",
+               get_name ().c_str (), s.c_str ());
+       }
+     else	
+       error ("set: invalid value for radio property \"%s\"",
+           get_name ().c_str ());
+   }
+ 
+-  octave_value get (void) const { return octave_value (current_val); }
+-
+-  const std::string& current_value (void) const { return current_val; }
+-
+-  bool is (const caseless_str& v) const
+-    { return v.compare (current_val); }
+-
+-  radio_property& operator = (const octave_value& val)
+-    {
+-      set (val);
+-      return *this;
+-    }
+-
+ private:
+   radio_values vals;
+   std::string current_val;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class color_values
+@@ -631,18 +658,16 @@ public:
+   octave_value get (void) const
+   {
+     if (current_type == color_t)
+       return color_val.rgb ();
+ 
+     return current_val;
+   }
+ 
+-  OCTINTERP_API void set (const octave_value& newval);
+-
+   bool is_rgb (void) const { return (current_type == color_t); }
+ 
+   bool is_radio (void) const { return (current_type == radio_t); }
+ 
+   bool is (const std::string& v) const
+     { return (is_radio () && current_val == v); }
+ 
+   Matrix rgb (void) const
+@@ -664,16 +689,19 @@ public:
+   color_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
+   operator octave_value (void) const { return get (); }
+ 
++protected:
++  OCTINTERP_API void do_set (const octave_value& newval);
++
+ private:
+   enum current_enum { color_t, radio_t } current_type;
+   color_values color_val;
+   radio_values radio_val;
+   std::string current_val;
+ };
+ 
+ // ---------------------------------------------------------------------
+@@ -684,35 +712,36 @@ public:
+   double_property (const std::string& nm, const graphics_handle& h,
+                    double d = 0)
+     : base_property (nm, h),
+       current_val (d) { }
+ 
+   double_property (const double_property& p)
+     : base_property (p), current_val (p.current_val) { }
+ 
+-  void set (const octave_value& v)
+-    {
+-      if (v.is_scalar_type () && v.is_real_type ())
+-        current_val = v.double_value ();
+-      else
+-        error ("set: invalid value for double property \"%s\"",
+-               get_name ().c_str ());
+-    }
+-
+   octave_value get (void) const { return octave_value (current_val); }
+ 
+   double double_value (void) const { return current_val; }
+ 
+   double_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++protected:
++  void do_set (const octave_value& v)
++    {
++      if (v.is_scalar_type () && v.is_real_type ())
++        current_val = v.double_value ();
++      else
++        error ("set: invalid value for double property \"%s\"",
++               get_name ().c_str ());
++    }
++
+ private:
+   double current_val;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class double_radio_property : public base_property
+ {
+@@ -740,18 +769,16 @@ public:
+   octave_value get (void) const
+   {
+     if (current_type == double_t)
+       return dval;
+ 
+     return current_val;
+   }
+ 
+-  OCTINTERP_API void set (const octave_value& v);
+-
+   bool is_double (void) const { return (current_type == double_t); }
+ 
+   bool is_radio (void) const { return (current_type == radio_t); }
+ 
+   bool is (const std::string& v) const
+     { return (is_radio () && current_val == v); }
+ 
+   double double_value (void) const
+@@ -773,16 +800,19 @@ public:
+   double_radio_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
+   operator octave_value (void) const { return get (); }
+ 
++protected:
++  OCTINTERP_API void do_set (const octave_value& v);
++
+ private:
+   enum current_enum { double_t, radio_t } current_type;
+   double dval;
+   radio_values radio_val;
+   std::string current_val;
+ };
+ 
+ // ---------------------------------------------------------------------
+@@ -807,45 +837,46 @@ public:
+   // internally to access min/max values; no need to
+   // copy constraints.
+   array_property (const array_property& p)
+     : base_property (p), data (p.data),
+       xmin (p.xmin), xmax (p.xmax), xminp (p.xminp) { }
+ 
+   octave_value get (void) const { return data; }
+ 
+-  void set (const octave_value& v)
+-    {
+-      if (validate (v))
+-	{
+-	  data = v;
+-
+-	  get_data_limits ();
+-	}
+-      else
+-        error ("invalid value for array property \"%s\"",
+-               get_name ().c_str ());
+-    }
+-
+   void add_constraint (const std::string& type)
+     { type_constraints.push_back (type); }
+ 
+   void add_constraint (const dim_vector& dims)
+     { size_constraints.push_back (dims); }
+ 
+   double min_val (void) const { return xmin; }
+   double max_val (void) const { return xmax; }
+   double min_pos (void) const { return xminp; }
+ 
+   array_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++protected:
++  void do_set (const octave_value& v)
++    {
++      if (validate (v))
++	{
++	  data = v;
++
++	  get_data_limits ();
++	}
++      else
++        error ("invalid value for array property \"%s\"",
++               get_name ().c_str ());
++    }
++
+ private:
+   OCTINTERP_API bool validate (const octave_value& v);
+ 
+   OCTINTERP_API void get_data_limits (void);
+ 
+ protected:
+   octave_value data;
+   double xmin;
+@@ -861,35 +892,16 @@ public:
+   row_vector_property (const std::string& nm, const graphics_handle& h,
+ 		       const octave_value& m)
+     : array_property (nm, h, m)
+   {
+     add_constraint (dim_vector (-1, 1));
+     add_constraint (dim_vector (1, -1));
+   }
+ 
+-  void set (const octave_value& v)
+-  {
+-    array_property::set (v);
+-
+-    if (! error_state)
+-      {
+-	dim_vector dv = data.dims ();
+-
+-	if (dv(0) > 1 && dv(1) == 1)
+-	  {
+-	    int tmp = dv(0);
+-	    dv(0) = dv(1);
+-	    dv(1) = tmp;
+-
+-	    data = data.reshape (dv);
+-	  }
+-      }
+-  }
+-
+   void add_constraint (const std::string& type)
+   {
+     array_property::add_constraint (type);
+   }
+ 
+   void add_constraint (const dim_vector& dims)
+   {
+     array_property::add_constraint (dims);
+@@ -905,16 +917,36 @@ public:
+   }
+ 
+   row_vector_property& operator = (const octave_value& val)
+   {
+     set (val);
+     return *this;
+   }
+ 
++protected:
++  void do_set (const octave_value& v)
++  {
++    array_property::do_set (v);
++
++    if (! error_state)
++      {
++	dim_vector dv = data.dims ();
++
++	if (dv(0) > 1 && dv(1) == 1)
++	  {
++	    int tmp = dv(0);
++	    dv(0) = dv(1);
++	    dv(1) = tmp;
++
++	    data = data.reshape (dv);
++	  }
++      }
++  }
++
+ private:
+   OCTINTERP_API bool validate (const octave_value& v);
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class bool_property : public radio_property
+ {
+@@ -927,124 +959,128 @@ public:
+   bool_property (const std::string& nm, const graphics_handle& h,
+                  const char* val)
+     : radio_property (nm, h, radio_values ("on|off"), val)
+     { }
+ 
+   bool_property (const bool_property& p)
+     : radio_property (p) { }
+ 
+-  void set (const octave_value& val)
+-    {
+-      if (val.is_bool_scalar ())
+-        radio_property::set (val.bool_value () ? "on" : "off");
+-      else
+-        radio_property::set (val);
+-    }
+-
+   bool is_on (void) const { return is ("on"); }
+   
+   bool_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
++
++protected:
++  void do_set (const octave_value& val)
++    {
++      if (val.is_bool_scalar ())
++        radio_property::do_set (val.bool_value () ? "on" : "off");
++      else
++        radio_property::do_set (val);
++    }
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class handle_property : public base_property
+ {
+ public:
+   handle_property (const std::string& nm, const graphics_handle& h,
+                    const graphics_handle& val = graphics_handle ())
+     : base_property (nm, h),
+       current_val (val) { }
+ 
+   handle_property (const handle_property& p)
+     : base_property (p), current_val (p.current_val) { }
+ 
+-  OCTINTERP_API void set (const octave_value& v);
+-
+   octave_value get (void) const { return current_val.as_octave_value (); }
+ 
+   graphics_handle handle_value (void) const { return current_val; }
+ 
+   handle_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
+   handle_property& operator = (const graphics_handle& h)
+     {
+       set (octave_value (h.value ()));
+       return *this;
+     }
+ 
++protected:
++  OCTINTERP_API void do_set (const octave_value& v);
++
+ private:
+   graphics_handle current_val;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class any_property : public base_property
+ {
+ public:
+   any_property (const std::string& nm, const graphics_handle& h,
+                   const octave_value& m = Matrix ())
+     : base_property (nm, h), data (m) { }
+ 
+   octave_value get (void) const { return data; }
+ 
+-  void set (const octave_value& v) { data = v; }
+-
+   any_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++protected:
++  void do_set (const octave_value& v) { data = v; }
++
+ private:
+   octave_value data;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class callback_property : public base_property
+ {
+ public:
+   callback_property (const std::string& nm, const graphics_handle& h,
+                      const octave_value& m)
+     : base_property (nm, h), callback (m) { }
+ 
+   octave_value get (void) const { return callback; }
+ 
+-  void set (const octave_value& v)
+-    {
+-      if (validate (v))
+-        callback = v;
+-      else
+-        error ("invalid value for callback property \"%s\"",
+-               get_name ().c_str ());
+-    }
+-
+   OCTINTERP_API void execute (const octave_value& data = octave_value ()) const;
+ 
+   OCTINTERP_API static
+       void execute (const octave_value& cb, const graphics_handle& h,
+ 		    const octave_value& data = octave_value ());
+ 
+ 
+   callback_property& operator = (const octave_value& val)
+     {
+       set (val);
+       return *this;
+     }
+ 
++protected:
++  void do_set (const octave_value& v)
++    {
++      if (validate (v))
++        callback = v;
++      else
++        error ("invalid value for callback property \"%s\"",
++               get_name ().c_str ());
++    }
++
+ private:
+   OCTINTERP_API bool validate (const octave_value& v) const;
+ 
+ private:
+   octave_value callback;
+ };
+ 
+ // ---------------------------------------------------------------------
+@@ -1109,16 +1145,22 @@ public:
+         delete rep;
+       
+       rep = p.rep;
+       rep->count++;
+ 
+       return *this;
+     }
+ 
++  void add_listener (const octave_value& v, listener_mode mode = POSTSET)
++    { rep->add_listener (v, mode); }
++
++  void run_listeners (listener_mode mode = POSTSET)
++    { rep->run_listeners (mode); }
++
+   /*
+   const string_property& as_string_property (void) const
+     { return *(dynamic_cast<string_property*> (rep)); }
+ 
+   const radio_property& as_radio_property (void) const
+     { return *(dynamic_cast<radio_property*> (rep)); }
+ 
+   const color_property& as_color_property (void) const
+@@ -1407,17 +1449,17 @@ public:
+     }
+ 
+   virtual void set (const caseless_str&, const octave_value&);
+ 
+   virtual octave_value get (const caseless_str&) const;
+ 
+   virtual octave_value get (bool all = false) const;
+ 
+-  property get_property (const caseless_str&) const;
++  virtual property get_property (const caseless_str&);
+ 
+   std::string get_tag (void) const { return tag.string_value (); }
+ 
+   graphics_handle get_parent (void) const { return parent.handle_value (); }
+ 
+   std::string get_type (void) const { return type.string_value (); }
+ 
+   bool is_modified (void) const { return __modified__.is_on (); }
+@@ -1472,16 +1514,19 @@ public:
+ 
+   virtual graphics_backend get_backend (void) const;
+ 
+   virtual Matrix get_boundingbox (bool /*internal*/ = false) const
+     { return Matrix (1, 4, 0.0); }
+ 
+   virtual void update_boundingbox (void);
+ 
++  virtual void add_listener (const caseless_str&, const octave_value&,
++			     listener_mode = POSTSET);
++
+   void set_tag (const octave_value& val) { tag = val; }
+ 
+   void set_parent (const octave_value& val);
+ 
+   void set_modified (const octave_value& val) { __modified__ = val; }
+ 
+   void set_busyaction (const octave_value& val)
+   {
+@@ -1880,16 +1925,24 @@ public:
+       return get_properties ().get_backend ();
+     else
+       {
+ 	error ("base_graphics_object::get_backend: invalid graphics object");
+ 	return graphics_backend ();
+       }
+   }
+ 
++  virtual void add_property_listener (const std::string& nm,
++				      const octave_value& v,
++				      listener_mode mode = POSTSET)
++    {
++      if (valid_object ())
++	get_properties ().add_listener (nm, v, mode);
++    }
++
+ protected:
+   // A reference count.
+   int count;
+ };
+ 
+ class OCTINTERP_API graphics_object
+ {
+ public:
+@@ -2046,16 +2099,20 @@ public:
+   array_property get_cdata_property (void) const
+   {
+     const base_properties& props = get_properties ();
+     return props.get_cdata_property ();
+   }
+ 
+   graphics_backend get_backend (void) const { return rep->get_backend (); }
+ 
++  void add_property_listener (const std::string& nm, const octave_value& v,
++			      listener_mode mode = POSTSET)
++    { rep->add_property_listener (nm, v, mode); }
++
+ private:
+   base_graphics_object *rep;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class OCTINTERP_API root_figure : public base_graphics_object
+ {

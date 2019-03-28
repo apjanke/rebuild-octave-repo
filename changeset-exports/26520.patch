@@ -1,0 +1,257 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1547226881 -3600
+#      Fri Jan 11 18:14:41 2019 +0100
+# Branch stable
+# Node ID 278ae90567a79eecd15af9ce960d81f70c0e32c2
+# Parent  9ed51ca683529fea360063f83e1996e18688ee4c
+Don't use C++ callback to notify close request from Qt Figures (bug #54187)
+
+* Figure.h/cc (Figure::close_figure_callback): Remove callback.
+  (Figure::eventNotifyBefore): Use gh_manager::post_callback rather than
+  octave_link::post_event to notify that a figure should be closed.
+
+* graphics.in.h (graphics_event::create_mcode_event): New static function.
+
+* graphics.cc (mcode_event): New class to handle direct mcode evaluation.
+  (gh_manager::do_post_callback): For "closerequestfcn" callback, create an
+  mcode_event and use the "close" function to make the figure current before
+  evaluating the actual closerequestfcn.
+
+diff --git a/libgui/graphics/Figure.cc b/libgui/graphics/Figure.cc
+--- a/libgui/graphics/Figure.cc
++++ b/libgui/graphics/Figure.cc
+@@ -645,25 +645,16 @@ namespace QtHandles
+       }
+ 
+     figure::properties& fp = properties<figure> ();
+ 
+     gh_manager::post_set (m_handle, prop, fp.bbox2position (bb), false,
+                           prop == "position");
+   }
+ 
+-  void
+-  Figure::close_figure_callback (void)
+-  {
+-    figure::properties& fp = properties<figure> ();
+-    octave_value fnum = fp.get___myhandle__ ().as_octave_value ();
+-
+-    Ffeval (ovl ("close", fnum));
+-  }
+-
+   bool
+   Figure::eventNotifyBefore (QObject *obj, QEvent *xevent)
+   {
+     if (! m_blockUpdates)
+       {
+         // Clicking the toolbar or the menubar makes this figure current
+         if (xevent->type () == QEvent::MouseButtonPress)
+           {
+@@ -692,17 +683,17 @@ namespace QtHandles
+               }
+           }
+         else
+           {
+             switch (xevent->type ())
+               {
+               case QEvent::Close:
+                 xevent->ignore ();
+-                octave_link::post_event (this, &Figure::close_figure_callback);
++                gh_manager::post_callback (m_handle, "closerequestfcn");
+                 return true;
+ 
+               default:
+                 break;
+               }
+           }
+       }
+ 
+diff --git a/libgui/graphics/Figure.h b/libgui/graphics/Figure.h
+--- a/libgui/graphics/Figure.h
++++ b/libgui/graphics/Figure.h
+@@ -103,18 +103,16 @@ namespace QtHandles
+   private:
+     void createFigureToolBarAndMenuBar (void);
+     void showFigureToolBar (bool visible);
+     void addCustomToolBar (QToolBar *bar, bool visible);
+     void showCustomToolBar (QToolBar *bar, bool visible);
+     void updateFigureToolBarAndMenuBar (void);
+     void set_geometry (QRect r);
+ 
+-    void close_figure_callback (void);
+-
+     void enableMouseTracking (void);
+ 
+   private slots:
+     void setMouseMode (MouseMode mode);
+     void updateFigureHeight (int delta_h);
+     void updateContainer (void);
+     void toggleAxes (void);
+     void toggleGrid (void);
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -11353,16 +11353,48 @@ private:
+ private:
+   graphics_handle handle;
+   std::string callback_name;
+   octave_value callback;
+   octave_value callback_data;
+ };
+ 
+ class
++mcode_event : public base_graphics_event
++{
++public:
++  mcode_event (const graphics_handle& h, const std::string& cmd,
++               int busyaction = base_graphics_event::QUEUE)
++    : base_graphics_event (busyaction), handle (h), mcode (cmd)
++  { }
++
++  void execute (void)
++  {
++    if (! mcode.empty ())
++      {
++        graphics_object go = gh_manager::get_object (handle);
++        if (go.valid_object ())
++          {
++            octave_value cb (mcode);
++            gh_manager::execute_callback (handle, cb);
++          }
++      }
++  }
++
++private:
++  mcode_event (void)
++    : base_graphics_event (), handle (), mcode ()
++  { }
++
++private:
++  graphics_handle handle;
++  std::string mcode;
++};
++
++class
+ function_event : public base_graphics_event
+ {
+ public:
+ 
+   // function_event objects must be created with at least a function.
+ 
+   function_event (void) = delete;
+ 
+@@ -11476,16 +11508,24 @@ graphics_event::create_callback_event (c
+                                        const octave_value& cb,
+                                        const octave_value& data,
+                                        int busyaction)
+ {
+   return graphics_event (new callback_event (h, cb, data, busyaction));
+ }
+ 
+ graphics_event
++graphics_event::create_mcode_event (const graphics_handle& h,
++                                    const std::string& cmd,
++                                    int busyaction)
++{
++  return graphics_event (new mcode_event (h, cmd, busyaction));
++}
++
++graphics_event
+ graphics_event::create_function_event (graphics_event::event_fcn fcn,
+                                        void *data)
+ {
+   return graphics_event (new function_event (fcn, data));
+ }
+ 
+ graphics_event
+ graphics_event::create_set_event (const graphics_handle& h,
+@@ -11557,17 +11597,16 @@ gh_manager::do_execute_callback (const g
+           // FIXME: Is the lock necessary when we're only calling a
+           //        const "get" method?
+           gh_manager::auto_lock guard;
+           callback_objects.push_front (go);
+           xset_gcbo (h);
+         }
+ 
+       // Copy CB because "function_value" method is non-const.
+-
+       octave_value cb = cb_arg;
+ 
+       if (cb.is_function () || cb.is_function_handle ())
+         fcn = cb.function_value ();
+       else if (cb.is_string ())
+         {
+           int status;
+           std::string s = cb.string_value ();
+@@ -11654,32 +11693,36 @@ gh_manager::do_post_callback (const grap
+ 
+   graphics_object go = get_object (h);
+ 
+   if (go.valid_object ())
+     {
+       caseless_str cname (name);
+       int busyaction = base_graphics_event::QUEUE;
+ 
+-      if (cname.compare ("deletefcn")
+-          || cname.compare ("createfcn")
+-          || (go.isa ("figure")
+-              && cname.compare ("closerequestfcn"))
+-          || ((go.isa ("figure")
+-               || go.isa ("uipanel")
++      if (cname == "deletefcn" || cname == "createfcn"
++          || cname == "closerequestfcn"
++          || ((go.isa ("figure") || go.isa ("uipanel")
+                || go.isa ("uibuttongroup"))
+-              && (cname.compare ("resizefcn")
+-                  || cname.compare ("sizechangedfcn"))))
++              && (cname == "resizefcn" || cname == "sizechangedfcn")))
+         busyaction = base_graphics_event::INTERRUPT;
+       else if (go.get_properties ().get_busyaction () == "cancel")
+         busyaction = base_graphics_event::CANCEL;
+ 
+-
+-      do_post_event (graphics_event::create_callback_event (h, name, data,
+-                                                            busyaction));
++      // The "closerequestfcn" callback must be executed once the figure has
++      // been made current. Let "close" do the job.
++      if (cname == "closerequestfcn")
++        {
++          std::string cmd ("close (gcbf ());");
++          do_post_event (graphics_event::create_mcode_event (h, cmd,
++                                                             busyaction));
++        }
++      else
++        do_post_event (graphics_event::create_callback_event (h, name, data,
++                                                              busyaction));
+     }
+ }
+ 
+ void
+ gh_manager::do_post_function (graphics_event::event_fcn fcn, void *fcn_data)
+ {
+   gh_manager::auto_lock guard;
+ 
+diff --git a/libinterp/corefcn/graphics.in.h b/libinterp/corefcn/graphics.in.h
+--- a/libinterp/corefcn/graphics.in.h
++++ b/libinterp/corefcn/graphics.in.h
+@@ -6156,16 +6156,20 @@ public:
+ 
+   static graphics_event
+   create_callback_event (const graphics_handle& h,
+                          const octave_value& cb,
+                          const octave_value& data = Matrix (),
+                          int busyaction = base_graphics_event::QUEUE);
+ 
+   static graphics_event
++  create_mcode_event (const graphics_handle& h, const std::string& cmd,
++                      int busyaction);
++
++  static graphics_event
+   create_function_event (event_fcn fcn, void *data = nullptr);
+ 
+   static graphics_event
+   create_set_event (const graphics_handle& h, const std::string& name,
+                     const octave_value& value, bool notify_toolkit = true,
+                     bool redraw_figure = false);
+ private:
+ 

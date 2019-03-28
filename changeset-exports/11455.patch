@@ -1,0 +1,776 @@
+# HG changeset patch
+# User Konstantinos Poulios <logari81@googlemail.com>
+# Date 1294343163 -3600
+#      Thu Jan 06 20:46:03 2011 +0100
+# Node ID 2be9e22796d2991b7a2476acbc2f5f851168a263
+# Parent  d7a964a5c57c85bb1ef0102dad53265c544beb66
+improvements in text-extent calculation
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,38 @@
++2011-01-06  Konstantinos Poulios  <logari81@googlemail.com>
++
++	* txt-eng-ft.h, txt-eng-ft.cc: Remove dependency on graphics.h.
++	(ft_render::set_font): New arguments list.
++	(ft_render::text_to_pixels): New method.
++	* graphics.cc (text::properties::update_text_extent): Adapt the call
++	to ft_render::set_font.
++	(text::properties::get_extent_matrix): New function.
++	(text::properties::update_text_extent): Function rewrite.
++	* gl-render.cc (opengl_renderer::set_font): Likewise.
++	(opengl_renderer::text_to_pixels):
++	Make use of ft_render::text_to_pixels.
++	(opengl_renderer::render_text): Simplify.
++	(opengl_renderer::draw_text): Make text drawing aware of the text
++	extent property.
++	* gl-render.h (opengl_renderer::text_to_pixels): Arguments reordering.
++	(opengl_renderer::get_transform): New function.
++	* gl2ps-renderer.cc (glps_renderer::render_text): Adapt the call to
++	text_to_pixels.
++	(glps_renderer::alignment_to_mode): New function.
++	(glps_renderer::draw_text): Overload inherited function.
++	* gl2ps-renderer.h (glps_renderer::alignment_to_mode): New function.
++	* graphics.h.in: Add dependency on txt-eng-ft.h.
++	(class text::properties): Tag horizontalalignment and verticalalignment
++	with "u" qualifier.
++	(text::properties::get_extent_matrix, get_pixels,
++	update_horizontalalignment, update_verticalalignment): New functions.
++	(text::properties::renderer): New class member of type ft_render.
++	(text::properties::pixels): New class member of type uint8NDArray.
++
+ 2011-01-06  John W. Eaton  <jwe@octave.org>
+ 
+ 	* DLD-FUNCTIONS/rand.cc (Frandperm): Tag call to floor with gnulib::.
+ 	* DLD-FUNCTIONS/gcd.cc (divide): Tag calls to floor with gnulib::.
+ 	* ov-scalar.cc (octave_scalar::map): Tag floor with gnulib::.
+ 	* ov-cell.cc (octave_cell::save_hdf5): Tag call to floor with gnulib::.
+ 	* pr-output.cc (engineering_exponent, num_digits,
+ 	octave_print_internal_template): Tag call to floor with gnulib::.
+diff --git a/src/gl-render.cc b/src/gl-render.cc
+--- a/src/gl-render.cc
++++ b/src/gl-render.cc
+@@ -2833,35 +2833,31 @@ opengl_renderer::draw_text (const text::
+ {
+   if (props.get_string ().empty ())
+     return;
+ 
+   set_font (props);
+   set_color (props.get_color_rgb ());
+ 
+   const Matrix pos = xform.scale (props.get_data_position ());
+-  int halign = 0, valign = 0;
+-
+-  if (props.horizontalalignment_is ("center"))
+-    halign = 1;
+-  else if (props.horizontalalignment_is ("right"))
+-    halign = 2;
+-  
+-  if (props.verticalalignment_is ("top"))
+-    valign = 2;
+-  else if (props.verticalalignment_is ("baseline"))
+-    valign = 3;
+-  else if (props.verticalalignment_is ("middle"))
+-    valign = 1;
++  const Matrix bbox = props.get_extent_matrix ();
+ 
+   // FIXME: handle margin and surrounding box
+-
+-  render_text (props.get_string (),
+-             pos(0), pos(1), pos(2),
+-             halign, valign, props.get_rotation ());
++  bool blend = glIsEnabled (GL_BLEND);
++
++  glEnable (GL_BLEND);
++  glEnable (GL_ALPHA_TEST);
++  glRasterPos3d (pos(0), pos(1), pos(2));
++  glBitmap(0, 0, 0, 0, bbox(0), bbox(1), 0);
++  glDrawPixels (bbox(2), bbox(3),
++                GL_RGBA, GL_UNSIGNED_BYTE, props.get_pixels ().data ());
++  glDisable (GL_ALPHA_TEST);
++  if (! blend)
++    glDisable (GL_BLEND);
++
+ }
+ 
+ void
+ opengl_renderer::draw_image (const image::properties& props)
+ {
+   octave_value cdata = props.get_color_data ();
+   dim_vector dv (cdata.dims ());
+   int h = dv(0), w = dv(1);
+@@ -3043,17 +3039,20 @@ opengl_renderer::set_color (const Matrix
+   text_renderer.set_color (c);
+ #endif
+ }
+ 
+ void
+ opengl_renderer::set_font (const base_properties& props)
+ {
+ #if HAVE_FREETYPE
+-  text_renderer.set_font (props);
++  text_renderer.set_font (props.get ("fontname").string_value (),
++                          props.get ("fontweight").string_value (),
++                          props.get ("fontangle").string_value (),
++                          props.get ("fontsize").double_value ());
+ #endif
+ }
+ 
+ void
+ opengl_renderer::set_polygon_offset (bool on, double offset)
+ {
+   if (on)
+     {
+@@ -3369,99 +3368,44 @@ opengl_renderer::make_marker_list (const
+ 
+   glEndList ();
+ 
+   return ID;
+ }
+ 
+ void
+ opengl_renderer::text_to_pixels (const std::string& txt,
+-                                 double rotation,
+                                  uint8NDArray& pixels,
+                                  Matrix& bbox,
+-                                 int& rot_mode)
++                                 int halign, int valign, double rotation)
+ {
+-  // FIXME: clip "rotation" between 0 and 360
+-
+-  rot_mode = ft_render::ROTATION_0;
+-
+-  if (rotation == 90.0)
+-    rot_mode = ft_render::ROTATION_90;
+-  else if (rotation == 180.0)
+-    rot_mode = ft_render::ROTATION_180;
+-  else if (rotation == 270.0)
+-    rot_mode = ft_render::ROTATION_270;
+-
+-  text_element *elt = text_parser_none ().parse (txt);
+-  pixels = text_renderer.render (elt, bbox, rot_mode);
+-  delete elt;
++  text_renderer.text_to_pixels (txt, pixels, bbox,
++                                halign, valign, rotation);
+ }
+ 
+ Matrix
+ opengl_renderer::render_text (const std::string& txt,
+                             double x, double y, double z,
+                             int halign, int valign, double rotation)
+ {
+ #if HAVE_FREETYPE
+   if (txt.empty ())
+     return Matrix (1, 4, 0.0);
+ 
++  uint8NDArray pixels;
+   Matrix bbox;
+-  uint8NDArray pixels;
+-  int rot_mode;
+-  text_to_pixels (txt, rotation, pixels, bbox, rot_mode);
+-
+-  int x0 = 0, y0 = 0;
+-  int w = bbox(2), h = bbox(3);
+-
+-  if (pixels.numel () == 0)
+-    {
+-      // nothing to render
+-      return bbox;
+-    }
+-
+-  switch (halign)
+-    {
+-    default: break;
+-    case 1: x0 = -bbox(2)/2; break;
+-    case 2: x0 = -bbox(2); break;
+-    }
+-  switch (valign)
+-    {
+-    default: break;
+-    case 1: y0 = -bbox(3)/2; break;
+-    case 2: y0 = -bbox(3); break;
+-    case 3: y0 = bbox(1); break;
+-    }
+-
+-  switch (rot_mode)
+-    {
+-    case ft_render::ROTATION_90:
+-      std::swap (x0, y0);
+-      std::swap (w, h);
+-      x0 = -x0-bbox(3);
+-      break;
+-    case ft_render::ROTATION_180:
+-      x0 = -x0-bbox(2);
+-      y0 = -y0-bbox(3);
+-      break;
+-    case ft_render::ROTATION_270:
+-      std::swap (x0, y0);
+-      std::swap (w, h);
+-      y0 = -y0-bbox(2);
+-      break;
+-    }
++  text_to_pixels (txt, pixels, bbox, halign, valign, rotation);
+ 
+   bool blend = glIsEnabled (GL_BLEND);
+ 
+   glEnable (GL_BLEND);
+   glEnable (GL_ALPHA_TEST);
+   glRasterPos3d (x, y, z);
+-  glBitmap(0, 0, 0, 0, x0, y0, 0);
+-  glDrawPixels (w, h,
++  glBitmap(0, 0, 0, 0, bbox(0), bbox(1), 0);
++  glDrawPixels (bbox(2), bbox(3),
+                 GL_RGBA, GL_UNSIGNED_BYTE, pixels.data ());
+   glDisable (GL_ALPHA_TEST);
+   if (! blend)
+     glDisable (GL_BLEND);
+ 
+   return bbox;
+ #else
+   ::warning ("render_text: cannot render text, Freetype library not available");
+diff --git a/src/gl-render.h b/src/gl-render.h
+--- a/src/gl-render.h
++++ b/src/gl-render.h
+@@ -66,16 +66,17 @@ public:
+           graphics_handle h = gh_manager::lookup (hlist(i));
+ 
+           if (h.ok ())
+             draw (h);
+         }
+     }
+ 
+   virtual void set_viewport (int w, int h);
++  virtual graphics_xform get_transform (void) const { return xform; }
+ 
+ protected:
+   virtual void draw_figure (const figure::properties& props);
+   virtual void draw_axes (const axes::properties& props);
+   virtual void draw_line (const line::properties& props);
+   virtual void draw_surface (const surface::properties& props);
+   virtual void draw_patch (const patch::properties& props);
+   virtual void draw_hggroup (const hggroup::properties& props);
+@@ -92,20 +93,20 @@ protected:
+   virtual void set_font (const base_properties& props);
+ 
+   virtual void init_marker (const std::string& m, double size, float width);
+   virtual void end_marker (void);
+   virtual void draw_marker (double x, double y, double z,
+                             const Matrix& lc, const Matrix& fc);
+ 
+   virtual void text_to_pixels (const std::string& txt,
+-                               double rotation,
+                                uint8NDArray& pixels,
+                                Matrix& bbox,
+-                               int& rot_mode);
++                               int halign = 0, int valign = 0,
++                               double rotation = 0.0);
+ 
+   virtual Matrix render_text (const std::string& txt,
+                               double x, double y, double z,
+                               int halign, int valign, double rotation = 0.0);
+ 
+   virtual void draw_pixels (GLsizei w, GLsizei h, GLenum format, 
+                             GLenum type, const GLvoid *data);
+ 
+diff --git a/src/gl2ps-renderer.cc b/src/gl2ps-renderer.cc
+--- a/src/gl2ps-renderer.cc
++++ b/src/gl2ps-renderer.cc
+@@ -83,24 +83,19 @@ glps_renderer::draw (const graphics_obje
+       gnulib::fclose (fp);
+ 
+       in_draw = 0;
+     }
+   else
+     opengl_renderer::draw (go); 
+ }
+ 
+-Matrix 
+-glps_renderer::render_text (const std::string& txt,
+-                            double x, double y, double z,
+-                            int ha, int va, double rotation)
++int
++glps_renderer::alignment_to_mode (int ha, int va) const
+ {
+-  if (txt.empty ())
+-    return Matrix (1, 4, 0.0);
+-
+   int gl2psa=GL2PS_TEXT_BL;
+   if (ha == 0)
+     {
+       if (va == 0 || va == 3)
+         gl2psa=GL2PS_TEXT_BL;
+       else if (va == 2)
+         gl2psa=GL2PS_TEXT_TL;
+       else if (va == 1)
+@@ -119,28 +114,36 @@ glps_renderer::render_text (const std::s
+     {
+       if (va == 0 || va == 3)
+         gl2psa=GL2PS_TEXT_B;
+       else if (va == 2)
+         gl2psa=GL2PS_TEXT_T;
+       else if (va == 1)
+         gl2psa=GL2PS_TEXT_C;
+     }
++  return gl2psa;
++}
++
++Matrix 
++glps_renderer::render_text (const std::string& txt,
++                            double x, double y, double z,
++                            int ha, int va, double rotation)
++{
++  if (txt.empty ())
++    return Matrix (1, 4, 0.0);
+ 
+   glRasterPos3d (x, y, z);
+-
+-  gl2psTextOpt (txt.c_str (), fontname.c_str (), fontsize, gl2psa, rotation);
++  gl2psTextOpt (txt.c_str (), fontname.c_str (), fontsize,
++                alignment_to_mode (ha, va), rotation);
+ 
+   // FIXME? -- we have no way of getting a bounding box from gl2ps, so
+   // we use freetype
+   Matrix bbox;
+   uint8NDArray pixels;
+-  int rot_mode;
+-  text_to_pixels (txt, rotation, pixels, bbox, rot_mode);
+-
++  text_to_pixels (txt, pixels, bbox, 0, 0, rotation);
+   return bbox;
+ }
+ 
+ void
+ glps_renderer::set_font (const base_properties& props)
+ {
+   opengl_renderer::set_font (props);
+ 
+@@ -181,9 +184,41 @@ glps_renderer::draw_pixels (GLsizei w, G
+   if (type == GL_UNSIGNED_SHORT) 
+     ::draw_pixels (w, h, format, static_cast<const GLushort *> (data));
+   else if (type == GL_UNSIGNED_BYTE) 
+     ::draw_pixels (w, h, format, static_cast<const GLubyte *> (data));
+   else
+     gl2psDrawPixels (w, h, 0, 0, format, type, data);
+ }
+ 
++void
++glps_renderer::draw_text (const text::properties& props)
++{
++  if (props.get_string ().empty ())
++    return;
++
++  set_font (props);
++  set_color (props.get_color_rgb ());
++
++  const Matrix pos = get_transform ().scale (props.get_data_position ());
++  int halign = 0, valign = 0;
++
++  if (props.horizontalalignment_is ("center"))
++    halign = 1;
++  else if (props.horizontalalignment_is ("right"))
++    halign = 2;
++  
++  if (props.verticalalignment_is ("top"))
++    valign = 2;
++  else if (props.verticalalignment_is ("baseline"))
++    valign = 3;
++  else if (props.verticalalignment_is ("middle"))
++    valign = 1;
++
++  // FIXME: handle margin and surrounding box
++
++  glRasterPos3d (pos(0), pos(1), pos(2));
++  gl2psTextOpt (props.get_string ().c_str (), fontname.c_str (), fontsize,
++                alignment_to_mode (halign, valign), props.get_rotation ());
++
++}
++
+ #endif
+diff --git a/src/gl2ps-renderer.h b/src/gl2ps-renderer.h
+--- a/src/gl2ps-renderer.h
++++ b/src/gl2ps-renderer.h
+@@ -42,16 +42,17 @@ protected:
+ 
+   virtual Matrix render_text (const std::string& txt,
+                               double x, double y, double z,
+                               int halign, int valign, double rotation = 0.0);
+ 
+ 
+   virtual void set_font (const base_properties& props);
+ 
++  virtual void draw_text (const text::properties& props);
+   virtual void draw_pixels (GLsizei w, GLsizei h, GLenum format, 
+                             GLenum type, const GLvoid *data);
+ 
+   virtual void set_linestyle (const std::string& s, bool use_stipple)
+   {
+     opengl_renderer::set_linestyle (s, use_stipple);
+     if (use_stipple)
+       gl2psEnable (GL2PS_LINE_STIPPLE);
+@@ -69,15 +70,16 @@ protected:
+   }
+ 
+   virtual void set_linewidth (float w)
+   {
+     gl2psLineWidth (w);
+   }
+ 
+ private:
++  int alignment_to_mode (int ha, int va) const;
+   int fid;
+   caseless_str term;
+   double fontsize;
+   std::string fontname;
+ };
+ 
+ #endif
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -5052,53 +5052,66 @@ text::properties::get_data_position (voi
+   Matrix pos = get_position ().matrix_value ();
+ 
+   if (! units_is ("data"))
+     pos = convert_text_position (pos, *this, get_units (), "data");
+ 
+   return pos;
+ }
+ 
++Matrix
++text::properties::get_extent_matrix (void) const
++{
++  return extent.get ().matrix_value ();
++}
++
+ octave_value
+ text::properties::get_extent (void) const
+ {
+   Matrix m = extent.get ().matrix_value ();
+ 
+   return convert_text_position (m, *this, "pixels", get_units ());
+ }
+ 
+ void
+ text::properties::update_text_extent (void)
+ {
+ #ifdef HAVE_FREETYPE
+ 
+-  text_element *elt;
+-  ft_render text_renderer;
+-  Matrix box;
+-
+-  // FIXME: parsed content should be cached for efficiency
+-  
+-  elt = text_parser_none ().parse (get_string ());
++  // FIXME: font and color should be set only when modified, for efficiency
+ #ifdef HAVE_FONTCONFIG
+-  text_renderer.set_font (*this);
++  renderer.set_font (get ("fontname").string_value (),
++                     get ("fontweight").string_value (),
++                     get ("fontangle").string_value (),
++                     get ("fontsize").double_value ());
+ #endif
+-  box = text_renderer.get_extent (elt, get_rotation ());
+-
+-  delete elt;
+-
+-  Matrix ext (1, 4, 0.0);
+-
+-  // FIXME: also handle left and bottom components
+-
+-  ext(0) = ext(1) = 1;
+-  ext(2) = box(0);
+-  ext(3) = box(1);
+-
+-  set_extent (ext);
+-
++  renderer.set_color (get_color_rgb ());
++
++  int halign = 0, valign = 0;
++
++  if (horizontalalignment_is ("center"))
++    halign = 1;
++  else if (horizontalalignment_is ("right"))
++    halign = 2;
++  
++  if (verticalalignment_is ("top"))
++    valign = 2;
++  else if (verticalalignment_is ("baseline"))
++    valign = 3;
++  else if (verticalalignment_is ("middle"))
++    valign = 1;
++
++  Matrix bbox;
++  // FIXME: string should be parsed only when modified, for efficiency
++  renderer.text_to_pixels (get_string (), pixels, bbox,
++                           halign, valign, get_rotation ());
++
++  set_extent (bbox);
++#else
++  warning ("update_text_extent: cannot render text, Freetype library not available");
+ #endif
+ }
+ 
+ void
+ text::properties::update_units (void)
+ {
+   if (! units_is ("data"))
+     {
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "caseless-str.h"
+ #include "lo-ieee.h"
+ 
+ #include "gripes.h"
+ #include "oct-map.h"
+ #include "oct-mutex.h"
+ #include "ov.h"
++#include "txt-eng-ft.h"
+ 
+ // FIXME -- maybe this should be a configure option?
+ // Matlab defaults to "Helvetica", but that causes problems for many
+ // gnuplot users.
+ #if !defined (OCTAVE_DEFAULT_FONTNAME)
+ #define OCTAVE_DEFAULT_FONTNAME "*"
+ #endif
+ 
+@@ -3513,49 +3514,55 @@ public:
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+ 
+     BEGIN_PROPERTIES (text)
+       string_property string u , ""
+       radio_property units u , "{data}|pixels|normalized|inches|centimeters|points"
+       array_property position mu , Matrix (1, 3, 0.0)
+       double_property rotation mu , 0
+-      radio_property horizontalalignment m , "{left}|center|right"
++      radio_property horizontalalignment mu , "{left}|center|right"
+       color_property color , color_values (0, 0, 0)
+       string_property fontname u , OCTAVE_DEFAULT_FONTNAME
+       double_property fontsize u , 10
+       radio_property fontangle u , "{normal}|italic|oblique"
+       radio_property fontweight u , "light|{normal}|demi|bold"
+       radio_property interpreter u , "{tex}|none|latex"
+       color_property backgroundcolor , "{none}"
+       string_property displayname , ""
+       color_property edgecolor , "{none}"
+       radio_property erasemode , "{normal}|none|xor|background"
+       bool_property editing , "off"
+       radio_property fontunits , "inches|centimeters|normalized|{points}|pixels"
+       radio_property linestyle , "{-}|--|:|-.|none"
+       double_property linewidth , 0.5
+       double_property margin , 1
+-      radio_property verticalalignment m , "top|cap|{middle}|baseline|bottom"
++      radio_property verticalalignment mu , "top|cap|{middle}|baseline|bottom"
+       array_property extent rG , Matrix (1, 4, 0.0)
+       // hidden properties for limit computation
+       row_vector_property xlim hlr , Matrix ()
+       row_vector_property ylim hlr , Matrix ()
+       row_vector_property zlim hlr , Matrix ()
+       bool_property xliminclude hl , "off"
+       bool_property yliminclude hl , "off"
+       bool_property zliminclude hl , "off"
+       // hidden properties for auto-positioning
+       radio_property positionmode h , "{auto}|manual"
+       radio_property rotationmode h , "{auto}|manual"
+       radio_property horizontalalignmentmode h , "{auto}|manual"
+       radio_property verticalalignmentmode h , "{auto}|manual"
+     END_PROPERTIES
+ 
+     Matrix get_data_position (void) const;
++    Matrix get_extent_matrix (void) const;
++    const uint8NDArray& get_pixels (void) const { return pixels; }
++#if HAVE_FREETYPE
++    // freetype render, used for text rendering
++    ft_render renderer;
++#endif
+ 
+   protected:
+     void init (void)
+       {
+         position.add_constraint (dim_vector (1, 2));
+         position.add_constraint (dim_vector (1, 3));
+         cached_units = get_units ();
+       }
+@@ -3589,21 +3596,24 @@ public:
+ 
+     void update_string (void) { update_text_extent (); }
+     void update_rotation (void) { update_text_extent (); }
+     void update_fontname (void) { update_text_extent (); }
+     void update_fontsize (void) { update_text_extent (); }
+     void update_fontangle (void) { update_text_extent (); }
+     void update_fontweight (void) { update_text_extent (); }
+     void update_interpreter (void) { update_text_extent (); }
++    void update_horizontalalignment (void) { update_text_extent (); }
++    void update_verticalalignment (void) { update_text_extent (); }
+ 
+     void update_units (void);
+ 
+   private:
+     std::string cached_units;
++    uint8NDArray pixels;
+   };
+ 
+ private:
+   properties xproperties;
+ 
+ public:
+   text (const graphics_handle& mh, const graphics_handle& p)
+     : base_graphics_object (), xproperties (mh, p)
+diff --git a/src/txt-eng-ft.cc b/src/txt-eng-ft.cc
+--- a/src/txt-eng-ft.cc
++++ b/src/txt-eng-ft.cc
+@@ -198,33 +198,29 @@ ft_render::ft_render (void)
+ 
+ ft_render::~ft_render (void)
+ {
+   if (face)
+     FT_Done_Face (face);
+ }
+ 
+ void
+-ft_render::set_font (const base_properties& props)
++ft_render::set_font (const std::string& name, const std::string& weight,
++                     const std::string& angle, double size)
+ {
+   if (face)
+     FT_Done_Face (face);
+ 
+   // FIXME: take "fontunits" into account
+-  double font_size = props.get ("fontsize").double_value ();
+-
+-  face = ft_manager::get_font (props.get ("fontname").string_value (),
+-                               props.get ("fontweight").string_value (),
+-                               props.get ("fontangle").string_value (),
+-                               font_size);
++  face = ft_manager::get_font (name, weight, angle, size);
+ 
+   if (face)
+     {
+-      if (FT_Set_Char_Size (face, 0, font_size*64, 0, 0))
+-        ::warning ("ft_render: unable to set font size to %d", font_size);
++      if (FT_Set_Char_Size (face, 0, size*64, 0, 0))
++        ::warning ("ft_render: unable to set font size to %d", size);
+     }
+   else
+     ::warning ("ft_render: unable to load appropriate font");
+ }
+ 
+ void
+ ft_render::set_mode (int m)
+ {
+@@ -477,9 +473,60 @@ ft_render::rotation_to_mode (double rota
+   else if (rotation == 180.0)
+     return ROTATION_180;
+   else if (rotation == 270.0)
+     return ROTATION_270;
+   else
+     return ROTATION_0;
+ }
+ 
++void
++ft_render::text_to_pixels (const std::string& txt,
++                           uint8NDArray& pixels_, Matrix& box,
++                           int halign, int valign, double rotation)
++{
++  // FIXME: clip "rotation" between 0 and 360
++  int rot_mode = rotation_to_mode (rotation);
++
++  text_element *elt = text_parser_none ().parse (txt);
++  pixels_ = render (elt, box, rot_mode);
++  delete elt;
++
++  if (pixels_.numel () == 0)
++    {
++      // nothing to render
++      return;
++    }
++
++  switch (halign)
++    {
++    default: box(0) = 0; break;
++    case 1: box(0) = -box(2)/2; break;
++    case 2: box(0) = -box(2); break;
++    }
++  switch (valign)
++    {
++    default: box(1) = 0; break;
++    case 1: box(1) = -box(3)/2; break;
++    case 2: box(1) = -box(3); break;
++    case 3: break;
++    }
++
++  switch (rot_mode)
++    {
++    case ROTATION_90:
++      std::swap (box(0), box(1));
++      std::swap (box(2), box(3));
++      box(0) = -box(0)-box(2);
++      break;
++    case ROTATION_180:
++      box(0) = -box(0)-box(2);
++      box(1) = -box(1)-box(3);
++      break;
++    case ROTATION_270:
++      std::swap (box(0), box(1));
++      std::swap (box(2), box(3));
++      box(1) = -box(1)-box(3);
++      break;
++    }
++}
++
+ #endif // HAVE_FREETYPE
+diff --git a/src/txt-eng-ft.h b/src/txt-eng-ft.h
+--- a/src/txt-eng-ft.h
++++ b/src/txt-eng-ft.h
+@@ -25,17 +25,16 @@ along with Octave; see the file COPYING.
+ 
+ #if HAVE_FREETYPE
+ 
+ #include <ft2build.h>
+ #include FT_FREETYPE_H
+ 
+ #include <dMatrix.h>
+ #include <uint8NDArray.h>
+-#include "graphics.h"
+ #include "txt-eng.h"
+ 
+ class
+ OCTINTERP_API
+ ft_render : public text_processor
+ {
+ public:
+   enum {
+@@ -63,22 +62,27 @@ public:
+ 
+   Matrix get_boundingbox (void) const { return bbox; }
+ 
+   uint8NDArray render (text_element* elt, Matrix& box,
+                        int rotation = ROTATION_0);
+ 
+   Matrix get_extent (text_element *elt, double rotation = 0.0);
+ 
+-  void set_font (const base_properties& props);
++  void set_font (const std::string& name, const std::string& weight,
++                 const std::string& angle, double size);
+ 
+   void set_color (Matrix c);
+ 
+   void set_mode (int m);
+ 
++  void text_to_pixels (const std::string& txt,
++                       uint8NDArray& pixels_, Matrix& bbox,
++                       int halign, int valign, double rotation);
++
+ private:
+   int rotation_to_mode (double rotation) const;
+ 
+ private:
+   FT_Face face;
+   Matrix bbox;
+   uint8NDArray pixels;
+   int xoffset;

@@ -1,0 +1,273 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1261123506 18000
+#      Fri Dec 18 03:05:06 2009 -0500
+# Node ID 653716f3d97621b87863e9dfd248ae7f979d6cc6
+# Parent  46493feaab7fe5c02c895e67a583c31b48449c30
+get_debug_input: force interactive input mode; don't get user input unless stdin is a tty
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,18 @@
++2009-12-18  John W. Eaton  <jwe@octave.org>
++
++	* input.cc (get_debug_input): Don't attempt to get user input
++	unless stdin is a tty.  Force interactive input mode when
++	reading debugging input.
++	(octave_gets): Bypass readline if get_input_from_eval_string is true.
++
++	* input.cc, input.h (stdin_is_tty): New variable.
++	* octave.cc (octave_main): Set it to true if stdin is not a tty.
++
+ 2009-12-16  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* DLD-FUNCTIONS/max.cc (do_minmax_red_op<boolNDArray>): New
+ 	specialization.
+ 	(do_minmax_body): Handle btyp_bool.
+ 
+ 2009-12-16  Jaroslav Hajek  <highegg@gmail.com>
+ 
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -50,16 +50,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "debug.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "help.h"
+ #include "input.h"
++#include "lex.h"
+ #include "load-path.h"
+ #include "oct-map.h"
+ #include "oct-hist.h"
+ #include "toplev.h"
+ #include "oct-obj.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pathlen.h"
+@@ -107,16 +108,19 @@ bool get_input_from_eval_string = false;
+ // TRUE means we haven't been asked for the input from
+ // current_eval_string yet.
+ bool input_from_eval_string_pending = false;
+ 
+ // TRUE means that input is coming from a file that was named on
+ // the command line.
+ bool input_from_command_line_file = false;
+ 
++// TRUE means that stdin is a terminal, not a pipe or redirected file.
++bool stdin_is_tty = false;
++
+ // TRUE means we're parsing a function file.
+ bool reading_fcn_file = false;
+ 
+ // TRUE means we're parsing a classdef file.
+ bool reading_classdef_file = false;
+ 
+ // Simple name of function file we are reading.
+ std::string curr_fcn_file_name;
+@@ -259,16 +263,17 @@ octave_gets (void)
+   std::string retval;
+ 
+   bool history_skip_auto_repeated_debugging_command = false;
+ 
+   if ((interactive || forced_interactive)
+       && (! (reading_fcn_file
+ 	     || reading_classdef_file
+ 	     || reading_script_file
++	     || get_input_from_eval_string
+ 	     || input_from_startup_file
+ 	     || input_from_command_line_file)))
+     {
+       std::string ps = (promptflag > 0) ? VPS1 : VPS2;
+ 
+       std::string prompt = command_editor::decode_prompt_string (ps);
+ 
+       pipe_handler_error_count = 0;
+@@ -681,59 +686,102 @@ get_debug_input (const std::string& prom
+   if (! msg.empty ())
+     std::cerr << msg << std::endl;
+ 
+   unwind_protect::frame_id_t uwp_frame = unwind_protect::begin_frame ();
+ 
+   unwind_protect::protect_var (VPS1);
+   VPS1 = prompt;
+ 
+-  while (Vdebugging)
++  if (stdin_is_tty)
+     {
+-      reset_error_handler ();
++      if (! (interactive || forced_interactive)
++          || (reading_fcn_file
++              || reading_classdef_file
++              || reading_script_file
++              || get_input_from_eval_string
++              || input_from_startup_file
++              || input_from_command_line_file))
++        {
++          unwind_protect::protect_var (forced_interactive);
++          forced_interactive = true;
+ 
+-      reset_parser ();
++          unwind_protect::protect_var (reading_fcn_file);
++          reading_fcn_file = false;
+ 
+-      // Save current value of global_command.
+-      unwind_protect::protect_var (global_command);
++          unwind_protect::protect_var (reading_classdef_file);
++          reading_classdef_file = false;
+ 
+-      // Do this with an unwind-protect cleanup function so that the
+-      // forced variables will be unmarked in the event of an interrupt.
+-      symbol_table::scope_id scope = symbol_table::top_scope ();
+-      unwind_protect::add_fcn (symbol_table::unmark_forced_variables, scope);
++          unwind_protect::protect_var (reading_script_file);
++          reading_script_file = false;
++
++          unwind_protect::protect_var (input_from_startup_file);
++          input_from_startup_file = false;
++
++          unwind_protect::protect_var (input_from_command_line_file);
++          input_from_command_line_file = false;
+ 
+-      // This is the same as yyparse in parse.y.
+-      int retval = octave_parse ();
++          unwind_protect::protect_var (get_input_from_eval_string);
++          get_input_from_eval_string = false;
++
++          YY_BUFFER_STATE old_buf = current_buffer ();
++          YY_BUFFER_STATE new_buf = create_buffer (get_input_from_stdin ());
+ 
+-      if (retval == 0 && global_command)
+-	{
+-	  global_command->accept (*current_evaluator);
++          unwind_protect::add_fcn (switch_to_buffer, old_buf);
++          unwind_protect::add_fcn (delete_buffer, new_buf);
++
++          switch_to_buffer (new_buf);
++        }
+ 
+-	  // FIXME -- To avoid a memory leak, global_command should be
+-	  // deleted, I think.  But doing that here causes trouble if
+-	  // an error occurs while executing a debugging command
+-	  // (dbstep, for example). It's not clear to me why that
+-	  // happens.
+-	  //
+-	  // delete global_command;
+-	  //
+-	  // global_command = 0;
++      while (Vdebugging)
++        {
++          reset_error_handler ();
++
++          reset_parser ();
++
++          // Save current value of global_command.
++          unwind_protect::protect_var (global_command);
++
++          // Do this with an unwind-protect cleanup function so that the
++          // forced variables will be unmarked in the event of an interrupt.
++          symbol_table::scope_id scope = symbol_table::top_scope ();
++          unwind_protect::add_fcn (symbol_table::unmark_forced_variables, scope);
++
++          // This is the same as yyparse in parse.y.
++          int retval = octave_parse ();
++
++          if (retval == 0 && global_command)
++            {
++              global_command->accept (*current_evaluator);
+ 
+-	  if (octave_completion_matches_called)
+-	    octave_completion_matches_called = false;
+-	}
++              // FIXME -- To avoid a memory leak, global_command should be
++              // deleted, I think.  But doing that here causes trouble if
++              // an error occurs while executing a debugging command
++              // (dbstep, for example). It's not clear to me why that
++              // happens.
++              //
++              // delete global_command;
++              //
++              // global_command = 0;
+ 
+-      // Unmark forced variables.
+-      unwind_protect::run ();
++              if (octave_completion_matches_called)
++                octave_completion_matches_called = false;
++            }
++
++          // Unmark forced variables.
++          unwind_protect::run ();
+ 
+-      // Restore previous value of global_command.
+-      unwind_protect::run ();
++          // Restore previous value of global_command.
++          unwind_protect::run ();
+ 
+-      OCTAVE_QUIT;
++          OCTAVE_QUIT;
++        }
+     }
++  else
++    warning ("invalid attempt to debug script read from stdin");
+ 
+   unwind_protect::run_frame (uwp_frame);
+ }
+ 
+ // If the user simply hits return, this will produce an empty matrix.
+ 
+ static octave_value_list
+ get_user_input (const octave_value_list& args, int nargout)
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -49,16 +49,19 @@ extern bool get_input_from_eval_string;
+ // TRUE means we haven't been asked for the input from
+ // current_eval_string yet.
+ extern bool input_from_eval_string_pending;
+ 
+ // TRUE means that input is coming from a file that was named on
+ // the command line.
+ extern bool input_from_command_line_file;
+ 
++// TRUE means that stdin is a terminal, not a pipe or redirected file.
++extern bool stdin_is_tty;
++
+ // TRUE means we're parsing a function file.
+ extern bool reading_fcn_file;
+ 
+ // Simple name of function file we are reading.
+ extern std::string curr_fcn_file_name;
+ 
+ // Full name of file we are reading.
+ extern std::string curr_fcn_file_full_name;
+diff --git a/src/octave.cc b/src/octave.cc
+--- a/src/octave.cc
++++ b/src/octave.cc
+@@ -779,18 +779,21 @@ octave_main (int argc, char **argv, int 
+   // leave some junk files around if we exit abnormally.
+ 
+   atexit (do_octave_atexit);
+ #endif
+ 
+   // Is input coming from a terminal?  If so, we are probably
+   // interactive.
+ 
+-  interactive = (! embedded
+-		 && isatty (fileno (stdin)) && isatty (fileno (stdout)));
++  // If stdin is not a tty, then we are reading commands from a pipe or
++  // a redirected file.
++  stdin_is_tty = isatty (fileno (stdin));
++
++  interactive = (! embedded && stdin_is_tty && isatty (fileno (stdout)));
+ 
+   if (! interactive && ! forced_line_editing)
+     line_editing = false;
+ 
+   // Force default line editor if we don't want readline editing.
+   if (! line_editing)
+     command_editor::force_default_editor ();
+ 

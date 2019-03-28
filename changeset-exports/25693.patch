@@ -1,0 +1,204 @@
+# HG changeset patch
+# User Markus Mützel <markus.muetzel@gmx.de>
+# Date 1532032997 -7200
+#      Thu Jul 19 22:43:17 2018 +0200
+# Node ID 038fb01854a0cc7e81da3bac41cf148a51346444
+# Parent  da077c5be8f20b7b0edd0273fa4d5ef1ff3e0fd7
+Save to hdf5 file with non-ASCII chars on Windows.
+
+* ls-hdf5.h, ls-hdf5.cc (open_create): New function to avoid duplicate code.
+If trying to save to a file with non-ASCII characters, create a temporary file
+with ASCII name, move it to the final location and re-open with our wrappers.
+
+diff --git a/libinterp/corefcn/ls-hdf5.cc b/libinterp/corefcn/ls-hdf5.cc
+--- a/libinterp/corefcn/ls-hdf5.cc
++++ b/libinterp/corefcn/ls-hdf5.cc
+@@ -83,38 +83,17 @@ check_hdf5_id_value (octave_hdf5_id id, 
+ }
+ 
+ #endif
+ 
+ hdf5_fstreambase::hdf5_fstreambase (const char *name, int mode, int /* prot */)
+   : file_id (-1), current_item (-1)
+ {
+ #if defined (HAVE_HDF5)
+-
+-  std::string fname (name);
+-
+-  std::string ascii_fname = octave::sys::get_ASCII_filename (fname);
+-
+-  const char *s_name = ascii_fname.c_str ();
+-
+-  if (mode & std::ios::in)
+-    file_id = H5Fopen (s_name, H5F_ACC_RDONLY, octave_H5P_DEFAULT);
+-  else if (mode & std::ios::out)
+-    {
+-      if (mode & std::ios::app && H5Fis_hdf5 (s_name) > 0)
+-        file_id = H5Fopen (s_name, H5F_ACC_RDWR, octave_H5P_DEFAULT);
+-      else
+-        // FIXME: For Windows, create a file with an ASCII name in an
+-        //        accessible folder, close the file move and rename using
+-        //        wide character API and re-open.
+-        file_id = H5Fcreate (name, H5F_ACC_TRUNC, octave_H5P_DEFAULT,
+-                             octave_H5P_DEFAULT);
+-    }
+-  if (file_id < 0)
+-    std::ios::setstate (std::ios::badbit);
++  open_create (name, mode);
+ 
+   current_item = 0;
+ 
+ #else
+   err_disabled_feature ("hdf5_fstreambase", "HDF5");
+ #endif
+ }
+ 
+@@ -140,39 +119,115 @@ hdf5_fstreambase::close (void)
+ 
+ void
+ hdf5_fstreambase::open (const char *name, int mode, int)
+ {
+ #if defined (HAVE_HDF5)
+ 
+   clear ();
+ 
+-  std::string fname (name);
++  open_create (name, mode);
++
++  current_item = 0;
++
++#else
++  // This shouldn't happen because construction of hdf5_fstreambase
++  // objects is supposed to be impossible if HDF5 is not available.
+ 
+-  std::string ascii_fname = octave::sys::get_ASCII_filename (fname);
++  panic_impossible ();
++#endif
++}
+ 
+-  const char *s_name = ascii_fname.c_str ();
++void
++hdf5_fstreambase::open_create (const char *name, int mode)
++{
++#if defined (HAVE_HDF5)
++  // Open the HDF5 file NAME. If it does not exist, create the file.
++
++  std::string fname_str (name);
++  std::string ascii_fname_str = octave::sys::get_ASCII_filename (fname_str);
++  const char *ascii_fname = ascii_fname_str.c_str ();
+ 
+   if (mode & std::ios::in)
+-    file_id = H5Fopen (s_name, H5F_ACC_RDONLY, octave_H5P_DEFAULT);
++    file_id = H5Fopen (ascii_fname, H5F_ACC_RDONLY, octave_H5P_DEFAULT);
+   else if (mode & std::ios::out)
+     {
+-      if (mode & std::ios::app && H5Fis_hdf5 (s_name) > 0)
+-        file_id = H5Fopen (s_name, H5F_ACC_RDWR, octave_H5P_DEFAULT);
++      if (mode & std::ios::app && H5Fis_hdf5 (ascii_fname) > 0)
++        file_id = H5Fopen (ascii_fname, H5F_ACC_RDWR, octave_H5P_DEFAULT);
+       else
+-        // FIXME: For Windows, create a file with an ASCII name in an
+-        //        accessible folder, close the file move and rename using
+-        //        wide character API and re-open.
++#  if defined (OCTAVE_USE_WINDOWS_API)
++        {
++          // Check whether file already exists
++          std::string abs_ascii_fname
++            = octave::sys::canonicalize_file_name (ascii_fname_str);
++          if (! abs_ascii_fname.empty ())
++            {
++              // Use the existing file
++              file_id = H5Fcreate (ascii_fname, H5F_ACC_TRUNC,
++                                   octave_H5P_DEFAULT, octave_H5P_DEFAULT);
++              if (file_id < 0)
++                std::ios::setstate (std::ios::badbit);
++
++              return;
++            }
++
++          // Check whether filename contains non-ASCII (UTF-8) characters.
++          std::string::const_iterator first_non_ASCII
++            = std::find_if (fname_str.begin (), fname_str.end (),
++                            [](char c) { return (c < 0 || c >= 128); });
++          if (first_non_ASCII == fname_str.end ())
++            {
++              // No non-ASCII characters
++              file_id = H5Fcreate (name, H5F_ACC_TRUNC, octave_H5P_DEFAULT,
++                                   octave_H5P_DEFAULT);
++              if (file_id < 0)
++                std::ios::setstate (std::ios::badbit);
++
++              return;
++            }
++
++          // Create file in temp folder
++          std::string tmp_name = octave::sys::tempnam ("", "oct-");
++          octave_hdf5_id hdf5_fid = H5Fcreate (tmp_name.c_str (), H5F_ACC_TRUNC,
++                                               octave_H5P_DEFAULT,
++                                               octave_H5P_DEFAULT);
++          if (hdf5_fid < 0)
++            {
++              file_id = -1;
++              std::ios::setstate (std::ios::badbit);
++              return;
++            }
++
++          // Close file
++          H5Fclose (hdf5_fid);
++
++          // Move temporary file to final destination
++          std::string msg;
++          int res = octave::sys::rename (tmp_name, name, msg);
++          if (res < 0)
++            {
++              std::ios::setstate (std::ios::badbit);
++              file_id = -1;
++              return;
++            }
++
++          // Open file at final location
++          ascii_fname_str = octave::sys::get_ASCII_filename (fname_str);
++          ascii_fname = ascii_fname_str.c_str ();
++          file_id = H5Fopen (ascii_fname, H5F_ACC_RDWR, octave_H5P_DEFAULT);
++        }
++#  else
+         file_id = H5Fcreate (name, H5F_ACC_TRUNC, octave_H5P_DEFAULT,
+                              octave_H5P_DEFAULT);
++#  endif
+     }
+   if (file_id < 0)
+     std::ios::setstate (std::ios::badbit);
+-
+-  current_item = 0;
++  
++  return;
+ 
+ #else
+   // This shouldn't happen because construction of hdf5_fstreambase
+   // objects is supposed to be impossible if HDF5 is not available.
+ 
+   panic_impossible ();
+ #endif
+ }
+diff --git a/libinterp/corefcn/ls-hdf5.h b/libinterp/corefcn/ls-hdf5.h
+--- a/libinterp/corefcn/ls-hdf5.h
++++ b/libinterp/corefcn/ls-hdf5.h
+@@ -50,16 +50,18 @@ public:
+ 
+   ~hdf5_fstreambase () { close (); }
+ 
+   hdf5_fstreambase (const char *name, int mode, int /* prot */ = 0);
+ 
+   void close (void);
+ 
+   void open (const char *name, int mode, int);
++
++  void open_create (const char *name, int mode);
+ };
+ 
+ // input and output streams, subclassing istream and ostream
+ // so that we can pass them for stream parameters in the functions below.
+ 
+ class hdf5_ifstream : public hdf5_fstreambase, public std::istream
+ {
+ public:

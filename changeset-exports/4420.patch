@@ -1,0 +1,254 @@
+# HG changeset patch
+# User jwe
+# Date 1054146282 0
+#      Wed May 28 18:24:42 2003 +0000
+# Node ID 3dfdbcaf4582235a31e57ca1e611c563879eb3fb
+# Parent  8eb47d7ff5949eef9ae2b46510bb457cbe56233e
+[project @ 2003-05-28 18:24:42 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,19 @@
++2003-05-28  Teemu Ikonen <tpikonen@pcu.helsinki.fi>
++
++	* load-save.cc (save_mat5_binary_element, save_mat_binary_data):
++	Allow saving of non-7-bit ASCII characters.
++
++2003-05-28  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	* oct-stream.cc (FINISH_CHARACTER_CONVERSION,
++	octave_base_stream::do_scanf): Do a better job of resizing for
++	charachter conversions.
++
+ 2003-05-25  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* ov-cx-mat.cc (octave_complex_matrix::assign): Move definition here.
+ 	* ov-cx-mat.h: From here.
+ 
+ 2003-05-24  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* ov-range.cc (octave_range::try_narrowing_conversion): Convert to
+diff --git a/src/load-save.cc b/src/load-save.cc
+--- a/src/load-save.cc
++++ b/src/load-save.cc
+@@ -4311,17 +4311,17 @@ save_mat5_binary_element (std::ostream& 
+       write_mat5_tag (os, miUINT16, len);
+ 
+       for (int i = 0; i < nr; i++)
+ 	{
+ 	  std::string tstr = chm.row_as_string (i);
+ 	  const char *s = tstr.data ();
+ 
+ 	  for (int j = 0; j < nc; j++)
+-	    buf[j*nr+i] = *s++;
++	    buf[j*nr+i] = *s++ & 0x00FF;
+ 	}
+       os.write ((char *)buf, nr*nc*2);
+       
+       if (paddedlength > len)
+ 	os.write ((char *)buf, paddedlength - len);
+     }
+   else if (tc.is_real_scalar () || tc.is_real_matrix () || tc.is_range ())
+     {
+@@ -4445,20 +4445,34 @@ save_mat_binary_data (std::ostream& os, 
+   FOUR_BYTE_INT name_len = name.length () + 1;
+ 
+   os.write (X_CAST (char *, &name_len), 4);
+   os << name << '\0';
+ 
+   if (tc.is_string ())
+     {
+       unwind_protect::begin_frame ("save_mat_binary_data");
+-      unwind_protect_int (Vimplicit_str_to_num_ok);
+-      Vimplicit_str_to_num_ok = true;
+-      Matrix m = tc.matrix_value ();
+-      os.write (X_CAST (char *, m.data ()), 8 * len);
++
++      charMatrix chm = tc.char_matrix_value ();
++
++      int nr = chm.rows ();
++      int nc = chm.cols ();
++	
++      OCTAVE_LOCAL_BUFFER (double, buf, nc*nr);
++	
++      for (int i = 0; i < nr; i++)
++      	{
++	  std::string tstr = chm.row_as_string (i);
++	  const char *s = tstr.data ();
++	  
++	  for (int j = 0; j < nc; j++)
++	    buf[j*nr+i] = static_cast<double> (*s++ & 0x00FF);
++       	}
++      os.write ((char *)buf, nr*nc*sizeof(double));
++      
+       unwind_protect::run_frame ("save_mat_binary_data");
+     }
+   else if (tc.is_range ())
+     {
+       Range r = tc.range_value ();
+       double base = r.base ();
+       double inc = r.inc ();
+       int nel = r.nelem ();
+diff --git a/src/oct-stream.cc b/src/oct-stream.cc
+--- a/src/oct-stream.cc
++++ b/src/oct-stream.cc
+@@ -1336,25 +1336,34 @@ do_scanf_conv (std::istream&, const scan
+ 	      conversion_count++; \
+  \
+ 	      while (i < width && tmp[i] != '\0') \
+ 		{ \
+ 		  if (data_index == max_size) \
+ 		    { \
+ 		      max_size *= 2; \
+  \
+-		      if (nr > 0) \
+-			mval.resize (nr, max_size / nr, 0.0); \
+-		      else \
++		      if (all_char_conv) \
+ 			{ \
+-			  if (all_char_conv && one_elt_size_spec) \
++			  if (one_elt_size_spec) \
+ 			    mval.resize (1, max_size, 0.0); \
++			  else if (nr > 0) \
++			    mval.resize (nr, max_size / nr, 0.0); \
+ 			  else \
+-			    mval.resize (max_size, 1, 0.0); \
++			    panic_impossible (); \
+ 			} \
++		      else if (nr > 0) \
++			{ \
++			  if (nc <= 0) \
++			    mval.resize (nr, max_size / nr, 0.0); \
++			  else \
++			    panic_impossible (); \
++			} \
++		      else \
++			mval.resize (max_size, 1, 0.0); \
+  \
+ 		      data = mval.fortran_vec (); \
+ 		    } \
+  \
+ 		  data[data_index++] = tmp[i++]; \
+ 		} \
+ 	    } \
+ 	} \
+@@ -1391,56 +1400,69 @@ octave_base_stream::do_scanf (scanf_form
+   int max_size = 0;
+   int max_conv = 0;
+ 
+   int final_nr = 0;
+   int final_nc = 0;
+ 
+   if (all_char_conv)
+     {
++      // Any of these could be resized later (if we have %s
++      // conversions, we may read more than one element for each
++      // conversion).
++
+       if (one_elt_size_spec)
+ 	{
+ 	  max_size = 512;
+ 	  mval.resize (1, max_size, 0.0);
+-	  data = mval.fortran_vec ();
+ 
+ 	  if (nr > 0)
+ 	    max_conv = nr;
+ 	}
+-      else if (nr > 0 && nc > 0)
++      else if (nr > 0)
+ 	{
+-	  mval.resize (nr, nc, 0.0);
+-	  data = mval.fortran_vec ();
+-	  max_size = max_conv = nr * nc;
++	  if (nc > 0)
++	    {
++	      mval.resize (nr, nc, 0.0);
++	      max_size = max_conv = nr * nc;
++	    }
++	  else
++	    {
++	      mval.resize (nr, 32, 0.0);
++	      max_size = nr * 32;
++	    }
+ 	}
++      else
++	panic_impossible ();
+     }
+   else if (nr > 0)
+     {
+       if (nc > 0)
+ 	{
++	  // Will not resize later.
+ 	  mval.resize (nr, nc, 0.0);
+-	  data = mval.fortran_vec ();
+ 	  max_size = nr * nc;
+-
+ 	  max_conv = max_size;
+ 	}
+       else
+ 	{
++	  // Maybe resize later.
+ 	  mval.resize (nr, 32, 0.0);
+-	  data = mval.fortran_vec ();
+ 	  max_size = nr * 32;
+ 	}
+     }
+   else
+     {
++      // Maybe resize later.
+       mval.resize (32, 1, 0.0);
+-      data = mval.fortran_vec ();
+       max_size = 32;
+     }
+ 
++  data = mval.fortran_vec ();
++
+   if (isp)
+     {
+       std::istream& is = *isp;
+ 
+       const scanf_format_elt *elt = fmt_list.first ();
+ 
+       std::ios::fmtflags flags = is.flags ();
+ 
+@@ -1464,25 +1486,34 @@ octave_base_stream::do_scanf (scanf_form
+ 		    }
+ 
+ 		  break;
+ 		}
+ 	      else if (data_index == max_size)
+ 		{
+ 		  max_size *= 2;
+ 
+-		  if (nr > 0)
+-		    mval.resize (nr, max_size / nr, 0.0);
+-		  else
++		  if (all_char_conv)
+ 		    {
+-		      if (all_char_conv && one_elt_size_spec)
++		      if (one_elt_size_spec)
+ 			mval.resize (1, max_size, 0.0);
++		      else if (nr > 0)
++			mval.resize (nr, max_size / nr, 0.0);
+ 		      else
+-			mval.resize (max_size, 1, 0.0);
++			panic_impossible ();
+ 		    }
++		  else if (nr > 0)
++		    {
++		      if (nc <= 0)
++			mval.resize (nr, max_size / nr, 0.0);
++		      else
++			panic_impossible ();
++		    }
++		  else
++		    mval.resize (max_size, 1, 0.0);
+ 
+ 		  data = mval.fortran_vec ();
+ 		}
+ 
+ 	      const char *fmt = elt->text;
+ 
+ 	      bool discard = elt->discard;
+ 

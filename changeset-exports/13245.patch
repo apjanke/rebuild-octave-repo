@@ -1,0 +1,531 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1317279053 14400
+#      Thu Sep 29 02:50:53 2011 -0400
+# Node ID 027a2186cd9019893750d3d376a724a4fadea615
+# Parent  f9aec0bcf8260b7dc3be121e05eed34736997ef7
+parfor keyword and infrastructure, but handle parfor as normal for loop for now
+
+* octave.gperf (octave_kw_id): New keyword ids, parfor_kw and
+end_parfor_kw.
+(octave_kw): Add parfor and end_parfor to the struct.
+* lex.ll (is_keyword_token): Handle parfor and end_parfor.
+* token.h (token::parfor_end): New end_tok_type enum value.
+* oct-parse.yy (PARFOR): New token.
+(loop_command): Handle PARFOR statements.
+(make_for_command): New args tok_id and maxproc.  Handle PARFOR loops.
+* pt-loop.h (tree_simple_for_command::parallel,
+tree_simple_for_command:maxproc): New data members.
+(tree_simple_for_command::tree_simple_for_command): New args
+parallel_arg and maxproc_arg.  Initialize new data members.
+(tree_simple_for_command::parallel): New function.
+(tree_simple_for_command::maxproc_expr): New function.
+* pt-loop.cc (tree_simple_for_command::~tree_simple_for_command):
+Delete maxproc.
+(tree_simple_for_command::dup): Pass parallel and maxproc to
+constructor for duplicate object.
+* pt-pr-code.cc (tree_print_code::visit_simple_for_command):
+Handle parallel form.
+* pt-check.cc (tree_checker::visit_simple_for_command): Likewise.
+* pt-eval.cc (tree_evaluator::visit_simple_for_command): Note that
+this is where parallel loops need to be handled.
+
+diff --git a/src/lex.ll b/src/lex.ll
+--- a/src/lex.ll
++++ b/src/lex.ll
+@@ -1491,16 +1491,21 @@ is_keyword_token (const std::string& s)
+                       && ! (lexer_flags.looking_at_return_list
+                             || lexer_flags.parsed_function_name.top ()))))
+             return 0;
+ 
+           yylval.tok_val = new token (token::simple_end, l, c);
+           lexer_flags.at_beginning_of_statement = true;
+           break;
+ 
++        case end_parfor_kw:
++          yylval.tok_val = new token (token::parfor_end, l, c);
++          lexer_flags.at_beginning_of_statement = true;
++          break;
++
+         case end_try_catch_kw:
+           yylval.tok_val = new token (token::try_catch_end, l, c);
+           lexer_flags.at_beginning_of_statement = true;
+           break;
+ 
+         case end_unwind_protect_kw:
+           yylval.tok_val = new token (token::unwind_protect_end, l, c);
+           lexer_flags.at_beginning_of_statement = true;
+@@ -1546,17 +1551,19 @@ is_keyword_token (const std::string& s)
+           lexer_flags.at_beginning_of_statement = true;
+           break;
+ 
+         case endproperties_kw:
+           yylval.tok_val = new token (token::properties_end, l, c);
+           lexer_flags.at_beginning_of_statement = true;
+           break;
+ 
++
+         case for_kw:
++        case parfor_kw:
+         case while_kw:
+           promptflag--;
+           lexer_flags.looping++;
+           break;
+ 
+         case do_kw:
+           lexer_flags.at_beginning_of_statement = true;
+           promptflag--;
+diff --git a/src/oct-parse.yy b/src/oct-parse.yy
+--- a/src/oct-parse.yy
++++ b/src/oct-parse.yy
+@@ -227,19 +227,20 @@ make_while_command (token *while_tok, tr
+ 
+ // Build a do-until command.
+ static tree_command *
+ make_do_until_command (token *until_tok, tree_statement_list *body,
+                        tree_expression *expr, octave_comment_list *lc);
+ 
+ // Build a for command.
+ static tree_command *
+-make_for_command (token *for_tok, tree_argument_list *lhs,
+-                  tree_expression *expr, tree_statement_list *body,
+-                  token *end_tok, octave_comment_list *lc);
++make_for_command (int tok_id, token *for_tok, tree_argument_list *lhs,
++                  tree_expression *expr, tree_expression *maxproc,
++                  tree_statement_list *body, token *end_tok,
++                  octave_comment_list *lc);
+ 
+ // Build a break command.
+ static tree_command *
+ make_break_command (token *break_tok);
+ 
+ // Build a continue command.
+ static tree_command *
+ make_continue_command (token *continue_tok);
+@@ -434,17 +435,17 @@ make_statement (T *arg)
+ %token <tok_val> LEFTDIV EMUL EDIV ELEFTDIV EPLUS EMINUS
+ %token <tok_val> QUOTE TRANSPOSE
+ %token <tok_val> PLUS_PLUS MINUS_MINUS POW EPOW
+ %token <tok_val> NUM IMAG_NUM
+ %token <tok_val> STRUCT_ELT
+ %token <tok_val> NAME
+ %token <tok_val> END
+ %token <tok_val> DQ_STRING SQ_STRING
+-%token <tok_val> FOR WHILE DO UNTIL
++%token <tok_val> FOR PARFOR WHILE DO UNTIL
+ %token <tok_val> IF ELSEIF ELSE
+ %token <tok_val> SWITCH CASE OTHERWISE
+ %token <tok_val> BREAK CONTINUE FUNC_RET
+ %token <tok_val> UNWIND CLEANUP
+ %token <tok_val> TRY CATCH
+ %token <tok_val> GLOBAL STATIC
+ %token <tok_val> FCN_HANDLE
+ %token <tok_val> PROPERTIES
+@@ -1138,22 +1139,36 @@ loop_command    : WHILE stash_comment ex
+                   }
+                 | DO stash_comment opt_sep opt_list UNTIL expression
+                   {
+                     if (! ($$ = make_do_until_command ($5, $4, $6, $2)))
+                       ABORT_PARSE;
+                   }
+                 | FOR stash_comment assign_lhs '=' expression opt_sep opt_list END
+                   {
+-                    if (! ($$ = make_for_command ($1, $3, $5, $7, $8, $2)))
++                    if (! ($$ = make_for_command (FOR, $1, $3, $5, 0,
++                                                  $7, $8, $2)))
+                       ABORT_PARSE;
+                   }
+                 | FOR stash_comment '(' assign_lhs '=' expression ')' opt_sep opt_list END
+                   {
+-                    if (! ($$ = make_for_command ($1, $4, $6, $9, $10, $2)))
++                    if (! ($$ = make_for_command (FOR, $1, $4, $6, 0,
++                                                  $9, $10, $2)))
++                      ABORT_PARSE;
++                  }
++                | PARFOR stash_comment assign_lhs '=' expression opt_sep opt_list END
++                  {
++                    if (! ($$ = make_for_command (PARFOR, $1, $3, $5,
++                                                  0, $7, $8, $2)))
++                      ABORT_PARSE;
++                  }
++                | PARFOR stash_comment '(' assign_lhs '=' expression ',' expression ')' opt_sep opt_list END
++                  {
++                    if (! ($$ = make_for_command (PARFOR, $1, $4, $6,
++                                                  $8, $11, $12, $2)))
+                       ABORT_PARSE;
+                   }
+                 ;
+ 
+ // =======
+ // Jumping
+ // =======
+ 
+@@ -2475,43 +2490,51 @@ make_do_until_command (token *until_tok,
+   retval = new tree_do_until_command (expr, body, lc, tc, l, c);
+ 
+   return retval;
+ }
+ 
+ // Build a for command.
+ 
+ static tree_command *
+-make_for_command (token *for_tok, tree_argument_list *lhs,
+-                  tree_expression *expr, tree_statement_list *body,
+-                  token *end_tok, octave_comment_list *lc)
++make_for_command (int tok_id, token *for_tok, tree_argument_list *lhs,
++                  tree_expression *expr, tree_expression *maxproc,
++                  tree_statement_list *body, token *end_tok,
++                  octave_comment_list *lc)
+ {
+   tree_command *retval = 0;
+ 
+-  if (end_token_ok (end_tok, token::for_end))
++  bool parfor = tok_id == PARFOR;
++
++  if (end_token_ok (end_tok, parfor ? token::parfor_end : token::for_end))
+     {
+       octave_comment_list *tc = octave_comment_buffer::get_comment ();
+ 
+       lexer_flags.looping--;
+ 
+       int l = for_tok->line ();
+       int c = for_tok->column ();
+ 
+       if (lhs->length () == 1)
+         {
+           tree_expression *tmp = lhs->remove_front ();
+ 
+-          retval = new tree_simple_for_command (tmp, expr, body,
+-                                                lc, tc, l, c);
++          retval = new tree_simple_for_command (parfor, tmp, expr, maxproc,
++                                                body, lc, tc, l, c);
+ 
+           delete lhs;
+         }
+       else
+-        retval = new tree_complex_for_command (lhs, expr, body,
+-                                               lc, tc, l, c);
++        {
++          if (parfor)
++            yyerror ("invalid syntax for parfor statement");
++          else
++            retval = new tree_complex_for_command (lhs, expr, body,
++                                                   lc, tc, l, c);
++        }
+     }
+ 
+   return retval;
+ }
+ 
+ // Build a break command.
+ 
+ static tree_command *
+diff --git a/src/octave.gperf b/src/octave.gperf
+--- a/src/octave.gperf
++++ b/src/octave.gperf
+@@ -30,16 +30,17 @@ enum octave_kw_id
+   case_kw,
+   catch_kw,
+   classdef_kw,
+   continue_kw,
+   do_kw,
+   else_kw,
+   elseif_kw,
+   end_kw,
++  end_parfor_kw,
+   end_try_catch_kw,
+   end_unwind_protect_kw,
+   endclassdef_kw,
+   endevents_kw,
+   endfor_kw,
+   endfunction_kw,
+   endif_kw,
+   endmethods_kw,
+@@ -51,16 +52,17 @@ enum octave_kw_id
+   function_kw,
+   get_kw,
+   global_kw,
+   if_kw,
+   magic_file_kw,
+   magic_line_kw,
+   methods_kw,
+   otherwise_kw,
++  parfor_kw,
+   properties_kw,
+   return_kw,
+   set_kw,
+   static_kw,
+   switch_kw,
+   try_kw,
+   until_kw,
+   unwind_protect_kw,
+@@ -74,16 +76,17 @@ break, BREAK, break_kw
+ case, CASE, case_kw
+ catch, CATCH, catch_kw
+ classdef, CLASSDEF, classdef_kw
+ continue, CONTINUE, continue_kw
+ do, DO, do_kw
+ else, ELSE, else_kw
+ elseif, ELSEIF, elseif_kw
+ end, END, end_kw
++end_parfor, END, end_parfor_kw
+ end_try_catch, END, end_try_catch_kw
+ end_unwind_protect, END, end_unwind_protect_kw
+ endclassdef, END, endclassdef_kw 
+ endevents, END, endevents_kw
+ endfor, END, endfor_kw
+ endfunction, END, endfunction_kw
+ endif, END, endif_kw
+ endmethods, END, endmethods_kw
+@@ -93,16 +96,17 @@ endwhile, END, endwhile_kw
+ events, EVENTS, events_kw
+ for, FOR, for_kw
+ function, FCN, function_kw
+ get, GET, get_kw
+ global, GLOBAL, global_kw
+ if, IF, if_kw
+ methods, METHODS, methods_kw
+ otherwise, OTHERWISE, otherwise_kw
++parfor, PARFOR, parfor_kw
+ persistent, STATIC, static_kw
+ properties, PROPERTIES, properties_kw
+ return, FUNC_RET, return_kw
+ set, SET, set_kw
+ static, STATIC, static_kw
+ switch, SWITCH, switch_kw
+ try, TRY, try_kw
+ until, UNTIL, until_kw
+diff --git a/src/pt-check.cc b/src/pt-check.cc
+--- a/src/pt-check.cc
++++ b/src/pt-check.cc
+@@ -149,16 +149,21 @@ tree_checker::visit_simple_for_command (
+         gripe ("invalid lvalue in for command", cmd.line ());
+     }
+ 
+   tree_expression *expr = cmd.control_expr ();
+ 
+   if (expr)
+     expr->accept (*this);
+ 
++  tree_expression *maxproc = cmd.maxproc_expr ();
++
++  if (maxproc)
++    maxproc->accept (*this);
++
+   tree_statement_list *list = cmd.body ();
+ 
+   if (list)
+     list->accept (*this);
+ }
+ 
+ void
+ tree_checker::visit_complex_for_command (tree_complex_for_command& cmd)
+diff --git a/src/pt-eval.cc b/src/pt-eval.cc
+--- a/src/pt-eval.cc
++++ b/src/pt-eval.cc
+@@ -285,16 +285,19 @@ void
+ tree_evaluator::visit_simple_for_command (tree_simple_for_command& cmd)
+ {
+   if (error_state)
+     return;
+ 
+   if (debug_mode)
+     do_breakpoint (cmd.is_breakpoint ());
+ 
++  // FIXME -- need to handle PARFOR loops here using cmd.in_parallel ()
++  // and cmd.maxproc_expr ();
++
+   unwind_protect frame;
+ 
+   frame.protect_var (in_loop_command);
+ 
+   in_loop_command = true;
+ 
+   tree_expression *expr = cmd.control_expr ();
+ 
+diff --git a/src/pt-loop.cc b/src/pt-loop.cc
+--- a/src/pt-loop.cc
++++ b/src/pt-loop.cc
+@@ -87,31 +87,33 @@ tree_do_until_command::accept (tree_walk
+   tw.visit_do_until_command (*this);
+ }
+ 
+ // For.
+ 
+ tree_simple_for_command::~tree_simple_for_command (void)
+ {
+   delete expr;
++  delete maxproc;
+   delete list;
+   delete lead_comm;
+   delete trail_comm;
+ }
+ 
+ tree_command *
+ tree_simple_for_command::dup (symbol_table::scope_id scope,
+                               symbol_table::context_id context) const
+ {
+-  return new tree_simple_for_command (lhs ? lhs->dup (scope, context) : 0,
+-                                      expr ? expr->dup (scope, context) : 0,
+-                                      list ? list->dup (scope, context) : 0,
+-                                      lead_comm ? lead_comm->dup () : 0,
+-                                      trail_comm ? trail_comm->dup () : 0,
+-                                      line (), column ());
++  return new tree_simple_for_command
++    (parallel, lhs ? lhs->dup (scope, context) : 0,
++     expr ? expr->dup (scope, context) : 0,
++     maxproc ? maxproc->dup (scope, context) : 0,
++     list ? list->dup (scope, context) : 0,
++     lead_comm ? lead_comm->dup () : 0,
++     trail_comm ? trail_comm->dup () : 0, line (), column ());
+ }
+ 
+ void
+ tree_simple_for_command::accept (tree_walker& tw)
+ {
+   tw.visit_simple_for_command (*this);
+ }
+ 
+diff --git a/src/pt-loop.h b/src/pt-loop.h
+--- a/src/pt-loop.h
++++ b/src/pt-loop.h
+@@ -140,52 +140,67 @@ private:
+ // For.
+ 
+ class
+ tree_simple_for_command : public tree_command
+ {
+ public:
+ 
+   tree_simple_for_command (int l = -1, int c = -1)
+-    : tree_command (l, c), lhs (0), expr (0), list (0), lead_comm (0),
+-      trail_comm (0) { }
++    : tree_command (l, c), parallel (false), lhs (0), expr (0),
++      maxproc (0), list (0), lead_comm (0), trail_comm (0) { }
+ 
+-  tree_simple_for_command (tree_expression *le, tree_expression *re,
++  tree_simple_for_command (bool parallel_arg, tree_expression *le,
++                           tree_expression *re,
++                           tree_expression *maxproc_arg,
+                            tree_statement_list *lst,
+                            octave_comment_list *lc = 0,
+                            octave_comment_list *tc = 0,
+                            int l = -1, int c = -1)
+-    : tree_command (l, c), lhs (le), expr (re), list (lst),
++    : tree_command (l, c), parallel (parallel_arg), lhs (le),
++      expr (re), maxproc (maxproc_arg), list (lst),
+       lead_comm (lc), trail_comm (tc) { }
+ 
+   ~tree_simple_for_command (void);
+ 
++  bool in_parallel (void) { return parallel; }
++
+   tree_expression *left_hand_side (void) { return lhs; }
+ 
+   tree_expression *control_expr (void) { return expr; }
+ 
++  tree_expression *maxproc_expr (void) { return maxproc; }
++
+   tree_statement_list *body (void) { return list; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
+   tree_command *dup (symbol_table::scope_id scope,
+                      symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 
++  // TRUE means operate in parallel (subject to the value of the
++  // maxproc expression).
++  bool parallel;
++
+   // Expression to modify.
+   tree_expression *lhs;
+ 
+   // Expression to evaluate.
+   tree_expression *expr;
+ 
++  // Expression to tell how many processors should be used (only valid
++  // if parallel is TRUE).
++  tree_expression *maxproc;
++
+   // List of commands to execute.
+   tree_statement_list *list;
+ 
+   // Comment preceding FOR token.
+   octave_comment_list *lead_comm;
+ 
+   // Comment preceding ENDFOR token.
+   octave_comment_list *trail_comm;
+diff --git a/src/pt-pr-code.cc b/src/pt-pr-code.cc
+--- a/src/pt-pr-code.cc
++++ b/src/pt-pr-code.cc
+@@ -209,30 +209,42 @@ tree_print_code::visit_decl_init_list (t
+ 
+ void
+ tree_print_code::visit_simple_for_command (tree_simple_for_command& cmd)
+ {
+   print_comment_list (cmd.leading_comment ());
+ 
+   indent ();
+ 
+-  os << "for ";
++  os << (cmd.in_parallel () ? "parfor " : "for ");
+ 
+   tree_expression *lhs = cmd.left_hand_side ();
+ 
++  tree_expression *maxproc = cmd.maxproc_expr ();
++
++  if (maxproc)
++    os << "(";
++
+   if (lhs)
+     lhs->accept (*this);
+ 
+   os << " = ";
+ 
+   tree_expression *expr = cmd.control_expr ();
+ 
+   if (expr)
+     expr->accept (*this);
+ 
++  if (maxproc)
++    {
++      os << ", ";
++      maxproc->accept (*this);
++      os << ")";
++    }
++
+   newline ();
+ 
+   tree_statement_list *list = cmd.body ();
+ 
+   if (list)
+     {
+       increment_indent_level ();
+ 
+diff --git a/src/token.h b/src/token.h
+--- a/src/token.h
++++ b/src/token.h
+@@ -45,16 +45,17 @@ public:
+     {
+       simple_end,
+       classdef_end,
+       events_end,
+       for_end,
+       function_end,
+       if_end,
+       methods_end,
++      parfor_end,
+       properties_end,
+       switch_end,
+       while_end,
+       try_catch_end,
+       unwind_protect_end
+     };
+ 
+   token (int l = -1, int c = -1);

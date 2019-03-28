@@ -1,0 +1,461 @@
+# HG changeset patch
+# User Stefan Mahr <dac922@gmx.de>
+# Date 1376415353 -7200
+#      Tue Aug 13 19:35:53 2013 +0200
+# Node ID 923ce8b42db27c8451495c1defc6af90c96687ef
+# Parent  0b2a0acd03155dc8b3e39b2562a8cedcd4c887ac
+improve try-catch-statement to save exception to a variable (bug #33217)
+
+* oct-parse.in.yy (except_command): Handle exception identifiers.
+* oct-parse.in.yy, parse.h (octave_base_parser::make_try_command):
+New arg, ID.
+* pt-except.cc, pt-except.h (tree_try_catch_command::expr_id): New
+data member.
+(tree_command::tree_command): Initialize it.
+(tree_command::~tree_command): Delete it.
+(tree_command::identifier): New function.
+* pt-check.cc (tree_checker::visit_try_catch_command): Check for valid
+expr_id.
+* pt-pr-code.cc (tree_print_code::visit_try_catch_command):
+Print expr_id.
+* pt-eval.cc (tree_evaluator::visit_try_catch_command): Assign message
+and identifier to variable.
+* try.tst: New test.
+* NEWS: Note change.
+
+diff --git a/NEWS b/NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -95,16 +95,39 @@ Summary of important user-visible change
+     is now deprecated and will be removed from a future version of
+     Octave.  When that is done, the behavior of
+ 
+       (a \
+        b)
+ 
+     will be consistent with other binary operators.
+ 
++ ** Octave now has limited support for named exceptions
++
++    The following syntax is now accepted:
++
++      try
++        statements
++      catch exception-id
++        statements
++      end
++
++    The exception-id is a structure with the fields "message" and
++    "identifier".  For example
++
++      try
++        error ("Octave:error-id", "error message");
++      catch myerr
++        printf ("identifier: %s\n", myerr.identifier);
++        printf ("message:    %s\n", myerr.message);
++      end_try_catch
++
++    When classdef-style classes are added to Octave, the exception-id
++    will become an MException object.
++
+  ** Warning IDs renamed:
+ 
+     Octave:array-as-scalar => Octave:array-to-scalar
+     Octave:array-as-vector => Octave:array-to-vector
+ 
+  ** The m-files in the image directory have been overhauled.
+ 
+     The principal benefit is that Octave will now no longer automatically
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -235,17 +235,17 @@ make_statement (T *arg)
+ %type <tree_constant_type> string constant magic_colon
+ %type <tree_anon_fcn_handle_type> anon_fcn_handle
+ %type <tree_fcn_handle_type> fcn_handle
+ %type <tree_matrix_type> matrix_rows
+ %type <tree_cell_type> cell_rows
+ %type <tree_expression_type> matrix cell
+ %type <tree_expression_type> primary_expr oper_expr
+ %type <tree_expression_type> simple_expr colon_expr assign_expr expression
+-%type <tree_identifier_type> identifier fcn_name magic_tilde
++%type <tree_identifier_type> identifier fcn_name magic_tilde opt_identifier
+ %type <tree_identifier_type> superclass_identifier meta_identifier
+ %type <octave_user_function_type> function1 function2 classdef1
+ %type <tree_index_expression_type> word_list_cmd
+ %type <tree_colon_expression_type> colon_expr1
+ %type <tree_argument_list_type> arg_list word_list assign_lhs
+ %type <tree_argument_list_type> cell_or_matrix_row
+ %type <tree_parameter_list_type> param_list param_list1 param_list2
+ %type <tree_parameter_list_type> return_list return_list1
+@@ -970,29 +970,40 @@ jump_command    : BREAK
+ // ==========
+ 
+ except_command  : UNWIND stash_comment opt_sep opt_list CLEANUP
+                   stash_comment opt_sep opt_list END
+                   {
+                     if (! ($$ = parser.make_unwind_command ($1, $4, $8, $9, $2, $6)))
+                       ABORT_PARSE;
+                   }
+-                | TRY stash_comment opt_sep opt_list CATCH
++                | TRY stash_comment opt_sep opt_list CATCH list END
++                  {
++                    if (! ($$ = parser.make_try_command ($1, $4, $6, 0, $7, $2, 0)))
++                      ABORT_PARSE;
++                  }
++                | TRY stash_comment opt_sep opt_list CATCH opt_identifier
+                   stash_comment opt_sep opt_list END
+                   {
+-                    if (! ($$ = parser.make_try_command ($1, $4, $8, $9, $2, $6)))
++                    if (! ($$ = parser.make_try_command ($1, $4, $9, $6, $10, $2, $7)))
+                       ABORT_PARSE;
+                   }
+                 | TRY stash_comment opt_sep opt_list END
+                   {
+-                    if (! ($$ = parser.make_try_command ($1, $4, 0, $5, $2, 0)))
++                    if (! ($$ = parser.make_try_command ($1, $4, 0, 0, $5, $2, 0)))
+                       ABORT_PARSE;
+                   }
+                 ;
+ 
++opt_identifier: // empty
++                  { $$ = 0; }
++                | identifier sep
++                  { $$ = $1; }
++                ;
++
+ // ===========================================
+ // Some 'subroutines' for function definitions
+ // ===========================================
+ 
+ push_fcn_symtab : // empty
+                   {
+                     parser.curr_fcn_depth++;
+ 
+@@ -2186,30 +2197,31 @@ octave_base_parser::make_unwind_command 
+ }
+ 
+ // Build a try-catch command.
+ 
+ tree_command *
+ octave_base_parser::make_try_command (token *try_tok,
+                                       tree_statement_list *body,
+                                       tree_statement_list *cleanup_stmts,
++                                      tree_identifier *id,
+                                       token *end_tok,
+                                       octave_comment_list *lc,
+                                       octave_comment_list *mc)
+ {
+   tree_command *retval = 0;
+ 
+   if (end_token_ok (end_tok, token::try_catch_end))
+     {
+       octave_comment_list *tc = octave_comment_buffer::get_comment ();
+ 
+       int l = try_tok->line ();
+       int c = try_tok->column ();
+ 
+-      retval = new tree_try_catch_command (body, cleanup_stmts,
++      retval = new tree_try_catch_command (body, cleanup_stmts, id,
+                                            lc, mc, tc, l, c);
+     }
+ 
+   return retval;
+ }
+ 
+ // Build a while command.
+ 
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -196,17 +196,17 @@ public:
+   tree_command *
+   make_unwind_command (token *unwind_tok, tree_statement_list *body,
+                        tree_statement_list *cleanup, token *end_tok,
+                        octave_comment_list *lc, octave_comment_list *mc);
+ 
+   // Build a try-catch command.
+   tree_command *
+   make_try_command (token *try_tok, tree_statement_list *body,
+-                    tree_statement_list *cleanup, token *end_tok,
++                    tree_statement_list *cleanup, tree_identifier *id, token *end_tok,
+                     octave_comment_list *lc, octave_comment_list *mc);
+ 
+   // Build a while command.
+   tree_command *
+   make_while_command (token *while_tok, tree_expression *expr,
+                       tree_statement_list *body, token *end_tok,
+                       octave_comment_list *lc);
+ 
+diff --git a/libinterp/parse-tree/pt-check.cc b/libinterp/parse-tree/pt-check.cc
+--- a/libinterp/parse-tree/pt-check.cc
++++ b/libinterp/parse-tree/pt-check.cc
+@@ -494,16 +494,25 @@ tree_checker::visit_switch_command (tree
+     list->accept (*this);
+ }
+ 
+ void
+ tree_checker::visit_try_catch_command (tree_try_catch_command& cmd)
+ {
+   tree_statement_list *try_code = cmd.body ();
+ 
++  tree_identifier *expr_id = cmd.identifier ();
++
++  if (expr_id)
++    {
++      if (! expr_id->lvalue_ok ())
++        gripe ("invalid lvalue used for identifier in try-catch command",
++               cmd.line ());
++    }
++
+   if (try_code)
+     try_code->accept (*this);
+ 
+   tree_statement_list *catch_code = cmd.cleanup ();
+ 
+   if (catch_code)
+     catch_code->accept (*this);
+ }
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -916,16 +916,37 @@ tree_evaluator::visit_try_catch_command 
+ 
+       if (catch_code)
+         {
+           // Set up for letting the user print any messages from errors that
+           // occurred in the body of the try_catch statement.
+ 
+           buffer_error_messages--;
+ 
++          tree_identifier *expr_id = cmd.identifier ();
++          octave_lvalue ult;
++
++          if (expr_id)
++            {
++
++              octave_scalar_map err;
++
++              ult = expr_id->lvalue ();
++
++              if (error_state)
++                return;
++
++              err.assign ("message", last_error_message ());
++              err.assign ("identifier", last_error_id ());
++
++              if (! error_state)
++                ult.assign (octave_value::op_asn_eq, err);
++
++            }
++
+           if (catch_code)
+             catch_code->accept (*this);
+         }
+     }
+ }
+ 
+ void
+ tree_evaluator::do_unwind_protect_cleanup_code (tree_statement_list *list)
+diff --git a/libinterp/parse-tree/pt-except.cc b/libinterp/parse-tree/pt-except.cc
+--- a/libinterp/parse-tree/pt-except.cc
++++ b/libinterp/parse-tree/pt-except.cc
+@@ -28,40 +28,43 @@ along with Octave; see the file COPYING.
+ 
+ #include "error.h"
+ #include "oct-lvalue.h"
+ #include "ov.h"
+ #include "pt-bp.h"
+ #include "pt-cmd.h"
+ #include "pt-except.h"
+ #include "pt-exp.h"
++#include "pt-id.h"
+ #include "pt-jump.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "unwind-prot.h"
+ #include "variables.h"
+ 
+ // Simple exception handling.
+ 
+ tree_try_catch_command::~tree_try_catch_command (void)
+ {
++  delete expr_id;
+   delete try_code;
+   delete catch_code;
+   delete lead_comm;
+   delete mid_comm;
+   delete trail_comm;
+ }
+ 
+ tree_command *
+ tree_try_catch_command::dup (symbol_table::scope_id scope,
+                              symbol_table::context_id context) const
+ {
+   return new
+     tree_try_catch_command (try_code ? try_code->dup (scope, context) : 0,
+                             catch_code ? catch_code->dup (scope, context) : 0,
++                            expr_id ? expr_id->dup (scope, context) : 0,
+                             lead_comm ? lead_comm->dup () : 0,
+                             mid_comm ? mid_comm->dup () : 0,
+                             trail_comm ? trail_comm->dup () : 0,
+                             line (), column ());
+ }
+ 
+ void
+ tree_try_catch_command::accept (tree_walker& tw)
+diff --git a/libinterp/parse-tree/pt-except.h b/libinterp/parse-tree/pt-except.h
+--- a/libinterp/parse-tree/pt-except.h
++++ b/libinterp/parse-tree/pt-except.h
+@@ -24,39 +24,43 @@ along with Octave; see the file COPYING.
+ #define octave_tree_except_h 1
+ 
+ class tree_statement_list;
+ 
+ class tree_walker;
+ 
+ #include "comment-list.h"
+ #include "pt-cmd.h"
++#include "pt-id.h"
+ #include "symtab.h"
+ 
+ // Simple exception handling.
+ 
+ class
+ tree_try_catch_command : public tree_command
+ {
+ public:
+ 
+   tree_try_catch_command (int l = -1, int c = -1)
+-    : tree_command (l, c), try_code (0), catch_code (0), lead_comm (0),
++    : tree_command (l, c), try_code (0), catch_code (0), expr_id (0), lead_comm (0),
+       mid_comm (0), trail_comm (0) { }
+ 
+   tree_try_catch_command (tree_statement_list *tc, tree_statement_list *cc,
++                          tree_identifier *id,
+                           octave_comment_list *cl = 0,
+                           octave_comment_list *cm = 0,
+                           octave_comment_list *ct = 0,
+                           int l = -1, int c = -1)
+-    : tree_command (l, c), try_code (tc), catch_code (cc),
++    : tree_command (l, c), try_code (tc), catch_code (cc), expr_id (id),
+       lead_comm (cl), mid_comm (cm), trail_comm (ct) { }
+ 
+   ~tree_try_catch_command (void);
+ 
++  tree_identifier *identifier (void) { return expr_id; }
++
+   tree_statement_list *body (void) { return try_code; }
+ 
+   tree_statement_list *cleanup (void) { return catch_code; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+   octave_comment_list *middle_comment (void) { return mid_comm; }
+ 
+@@ -70,16 +74,19 @@ public:
+ private:
+ 
+   // The first block of code to attempt to execute.
+   tree_statement_list *try_code;
+ 
+   // The code to execute if an error occurs in the first block.
+   tree_statement_list *catch_code;
+ 
++  // Identifier to modify.
++  tree_identifier *expr_id;
++
+   // Comment preceding TRY token.
+   octave_comment_list *lead_comm;
+ 
+   // Comment preceding CATCH token.
+   octave_comment_list *mid_comm;
+ 
+   // Comment preceding END_TRY_CATCH token.
+   octave_comment_list *trail_comm;
+diff --git a/libinterp/parse-tree/pt-pr-code.cc b/libinterp/parse-tree/pt-pr-code.cc
+--- a/libinterp/parse-tree/pt-pr-code.cc
++++ b/libinterp/parse-tree/pt-pr-code.cc
+@@ -988,32 +988,39 @@ tree_print_code::visit_try_catch_command
+ 
+   indent ();
+ 
+   os << "try";
+ 
+   newline ();
+ 
+   tree_statement_list *try_code = cmd.body ();
++  tree_identifier *expr_id = cmd.identifier ();
+ 
+   if (try_code)
+     {
+       increment_indent_level ();
+ 
+       try_code->accept (*this);
+ 
+       decrement_indent_level ();
+     }
+ 
+   print_indented_comment (cmd.middle_comment ());
+ 
+   indent ();
+ 
+   os << "catch";
+ 
++  if (expr_id)
++    {
++      os << " ";
++      expr_id->accept (*this);
++    }
++
+   newline ();
+ 
+   tree_statement_list *catch_code = cmd.cleanup ();
+ 
+   if (catch_code)
+     {
+       increment_indent_level ();
+ 
+diff --git a/test/try.tst b/test/try.tst
+--- a/test/try.tst
++++ b/test/try.tst
+@@ -122,8 +122,39 @@
+ %!     error ("Shoudn't get here");
+ %!   catch
+ %!     error (["rethrow: " lasterr]);
+ %!   end_try_catch
+ %! catch
+ %!   assert (lasterr()(1:22), "rethrow: 'a' undefined");
+ %! end_try_catch
+ 
++%!test
++%! clear myerr;
++%! try
++%!   error ("user-defined error");
++%! catch myerr
++%!   assert (myerr.message, "user-defined error");
++%! end_try_catch
++
++%!test
++%! try
++%!   clear a;
++%!   error ("user-defined error");
++%! catch a=1;
++%!   assert (lasterr, "user-defined error");
++%!   assert (a, 1);
++%! end_try_catch
++
++%!test
++%! clear myerr1
++%! clear myerr2
++%! try
++%!   try
++%!     clear a;
++%!     a;
++%!   catch myerr1
++%!     error (myerr1);
++%!   end_try_catch
++%! catch myerr2
++%!   assert (myerr1.message, myerr2.message);
++%!   assert (myerr1.identifier, myerr2.identifier);
++%! end_try_catch

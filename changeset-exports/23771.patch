@@ -1,0 +1,480 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1500494550 -7200
+#      Wed Jul 19 22:02:30 2017 +0200
+# Node ID ed492a5a47fd7547bd136e652236c5e4d67f33b7
+# Parent  fdc60d7b777eddb492facbd93d0822c6c1b5a8ae
+eliminate duplicate code in editor smart indentation and auto close
+
+* file-editor-tab.cc (notice_settings): _auto_endif is stored in
+  file_editor_tab, not in octave_qscintilla;
+  (handle_cursor_moved): new paramters for octave_qscintilla::smart_indent
+
+* file-editor-tab.h: _auto_endif is stored in this class
+
+* octave-qscintilla.cc (octave_qscintilla): no initializaiton of _auto_endif;
+  (is_end): declare parameters as const QString&;
+  (keyPressEvent): removed, no key-press event required anymore;
+  (auto_close): new function instead, which is called by smart_indent, where
+  some of the analysis from keyPressEvent was already made;
+  (smart_indent): new parameters, it is called even if smart indentation is
+  not desired, but auto close is, calls auto close if required;
+
+* octave-qscintilla.h: removed set_auto_endif, new parameters for smart_indent,
+  removed keyPressEvent, removed variable _auto_endif, new function auto_close
+  instead of keyPressEvent
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -2357,27 +2357,26 @@ file_editor_tab::notice_settings (const 
+   _edit_area->setIndentationsUseTabs
+         (settings->value ("editor/indent_uses_tabs",false).toBool ());
+   _edit_area->setIndentationWidth
+         (settings->value ("editor/indent_width",2).toInt ());
+ 
+   _edit_area->setTabWidth
+         (settings->value ("editor/tab_width",2).toInt ());
+ 
+-  _edit_area->set_auto_endif
+-        (settings->value ("editor/auto_endif",1).toInt ());
+-
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETHSCROLLBAR,
+         settings->value ("editor/show_hscroll_bar",true).toBool ());
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTH,-1);
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTHTRACKING,true);
+ 
+   _long_title = settings->value ("editor/longWindowTitle", false).toBool ();
+   update_window_title (_edit_area->isModified ());
+ 
++  _auto_endif = settings->value ("editor/auto_endif",1).toInt ();
++
+   // long line marker
+   int line_length = settings->value ("editor/long_line_column",80).toInt ();
+   _edit_area->setEdgeColumn (line_length);
+   _edit_area->setEdgeMode (QsciScintilla::EdgeNone);
+   if (settings->value ("editor/long_line_marker",true).toBool ())
+     _edit_area->setEdgeMode (QsciScintilla::EdgeLine);
+   if (settings->value ("editor/long_line_marker_background",true).toBool ())
+     _edit_area->setEdgeMode (QsciScintilla::EdgeBackground);
+@@ -2671,21 +2670,25 @@ file_editor_tab::handle_lines_changed ()
+ }
+ 
+ void
+ file_editor_tab::handle_cursor_moved (int line, int col)
+ {
+   if (_edit_area->SendScintilla (QsciScintillaBase::SCI_AUTOCACTIVE))
+     show_auto_completion (this);
+ 
+-  if (_lines_changed)  // check for smart indentation
++  if (_lines_changed)  // cursor moved and lines have changed
+     {
+       _lines_changed = false;
+-      if (_is_octave_file && _smart_indent && line == _line+1 && col < _col)
+-        _edit_area->smart_indent (_line,_col);
++      if (_is_octave_file && line == _line+1 && col < _col)
++        {
++          // Obviously, we have a newline here
++          if (_smart_indent || _auto_endif)
++            _edit_area->smart_indent (_smart_indent, _auto_endif, _line);
++        }
+     }
+ 
+   _line = line;
+   _col  = col;
+ 
+   _row_indicator->setNum (line+1);
+   _col_indicator->setNum (col+1);
+ }
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -278,16 +278,17 @@ private:
+   QString _encoding;
+   QString _new_encoding;
+ 
+   bool _long_title;
+   bool _copy_available;
+   bool _is_octave_file;
+   bool _always_reload_changed_files;
+   bool _smart_indent;
++  int _auto_endif;
+ 
+   QFileSystemWatcher _file_system_watcher;
+ 
+   QIntList _bp_lines;
+   QStringList _bp_conditions;
+ 
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+diff --git a/libgui/src/m-editor/octave-qscintilla.cc b/libgui/src/m-editor/octave-qscintilla.cc
+--- a/libgui/src/m-editor/octave-qscintilla.cc
++++ b/libgui/src/m-editor/octave-qscintilla.cc
+@@ -48,17 +48,17 @@ along with Octave; see the file COPYING.
+ #include <QMessageBox>
+ 
+ #include "octave-qscintilla.h"
+ #include "file-editor-tab.h"
+ #include "shortcut-manager.h"
+ #include "resource-manager.h"
+ 
+ octave_qscintilla::octave_qscintilla (QWidget *p)
+-  : QsciScintilla (p), _auto_endif (1)
++  : QsciScintilla (p)
+ {
+   connect (this, SIGNAL (textChanged ()), this, SLOT (text_changed ()));
+ 
+   // clear scintilla edit shortcuts that are handled by the editor
+   QsciCommandSet *cmd_set = standardCommands ();
+ 
+ #if defined (HAVE_QSCI_VERSION_2_6_0)
+   // find () was added in QScintilla 2.6
+@@ -422,17 +422,17 @@ octave_qscintilla::get_style (int pos)
+   return SendScintilla (QsciScintillaBase::SCI_GETSTYLEAT, position);
+ }
+ 
+ // Return true if CANDIDATE is a "closing" that matches OPENING,
+ // such as "end" or "endif" for "if", or "catch" for "try".
+ // Used for testing the last word of an "if" etc. line,
+ // or the first word of the following line.
+ static bool
+-is_end (QString candidate, QString& opening)
++is_end (const QString& candidate, const QString& opening)
+ {
+   bool retval = false;
+ 
+   if (opening == "do")          // The only one that can't be ended by "end"
+     {
+       if (candidate == "until")
+         retval = true;
+     }
+@@ -459,164 +459,139 @@ is_end (QString candidate, QString& open
+             retval = true;
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ void
+-octave_qscintilla::keyPressEvent (QKeyEvent *e)
++octave_qscintilla::auto_close (int auto_endif, int linenr,
++                               const QString& line, QString& first_word)
+ {
+-  // On receiving Enter, insert and "end" for an "if" etc., if needed.
+-  // (Use of "while" allows "break" to skip the rest.
++  // Insert and "end" for an "if" etc., if needed.
++  // (Use of "while" allows "return" to skip the rest.
+   // It may be clearer to use "if" and "goto",
+   // but that violates the coding standards.)
+-  while (_auto_endif
+-         && e->type () == QEvent::KeyPress
+-         && (e->key () == Qt::Key_Return || e->key () == Qt::Key_Enter)
+-         && !(e->modifiers () & (Qt::ControlModifier | Qt::MetaModifier
+-                                 | Qt::AltModifier)))
+-    {
+-      bool autofill_simple_end = (_auto_endif == 2) ;
+-
+-      // Get line.
+-      QPoint global_pos, local_pos;
+-      get_global_textcursor_pos (&global_pos, &local_pos);
+-      int linenr = lineAt (local_pos);
+-      QString line = text (linenr);   // should always exist;
+ 
+-      // Don't autocomplete an empty line.
+-      size_t start = line.toStdString ().find_first_not_of (" \t");
+-      if (start == std::string::npos)
+-        break;
++  bool autofill_simple_end = (auto_endif == 2);
+ 
+-      // Get the first word of the line
+-          // Keep a compiled regular expression to extract the first word.
+-      QRegExp rx_start, rx_end;
+-      static bool first = true;
+-      if (first)
+-        {
+-          rx_start = QRegExp ("(\\w+)");
+-          // last word except for comments, assuming no ' or " in comment.
+-          // rx_end = QRegExp ("(\\w+)[ \t;\r\n]*([%#][^\"']*)?$");
++  size_t start = line.toStdString ().find_first_not_of (" \t");
+ 
+-          // last word except for comments,
+-          // allowing % and # in single or double quoted strings
+-          // FIXME This will get confused by transpose.
+-          rx_end = QRegExp ("(?:(?:['\"][^'\"]*['\"])?[^%#]*)*"
+-                            "(\\w+)[ \t;\r\n]*([%#].*)?$");
+-        }
+-
+-      int tmp = rx_start.indexIn (line, start);
+-      if (tmp == -1)
+-        break;
+-
+-      QString first_word = rx_start.cap(1);
+-
+-      // Check if the first word of the line was an opening needing a close
+-      if (! (first_word == "classdef" || first_word == "for"
+-             || first_word == "while" || first_word == "if"
+-             || first_word == "switch" || first_word == "properties"
+-             || first_word == "events" || first_word == "function"
+-             || first_word == "parfor" || first_word == "methods"
+-             || first_word == "try" || first_word == "do"
+-             || first_word == "unwind_protect"))
+-        break;
+-      if (rx_end.indexIn (line, start) != -1
+-          && is_end (rx_end.cap(1), first_word))
+-        break;
+-
+-      // Check if following line has the same or less indentation
+-      // Check if the following line does not start with
+-      //       end* (until) (catch)
+-      if (linenr < lines () - 1)
++  // Check if following line has the same or less indentation
++  // Check if the following line does not start with
++  //       end* (until) (catch)
++  if (linenr < lines () - 1)
++    {
++      int offset = 1;
++      size_t next_start;
++      QString next_line;
++      do                            // find next non-blank line
+         {
+-          int offset = 1;
+-          size_t next_start;
+-          QString next_line;
+-          do                            // find next non-blank line
+-            {
+-              next_line = text (linenr + offset++);
+-              next_start = next_line.toStdString ().find_first_not_of (" \t\n");
+-            }
+-          while (linenr + offset < lines ()
+-                 && next_start == std::string::npos);
+-
+-          if (next_start == std::string::npos)
+-            next_start = 0;
+-
+-          if (next_start > start)       // more indented => don't add "end"
+-            break;
+-          if (next_start == start)      // same => check if already is "end"
+-            {
+-              tmp = rx_start.indexIn (next_line, start);
+-              if (tmp != -1 && is_end (rx_start.cap(1), first_word))
+-                 break;
+-            }
++          next_line = text (linenr + offset++);
++          next_start = next_line.toStdString ().find_first_not_of (" \t\n");
+         }
+-
+-      // If all of the above, insert a new line, with matching indent
+-      // and either 'end' or 'end...', depending on a flag.
+-
+-      // If we insert directly after the last line, the "end" is autoindented,
+-      // so add a dummy line.
+-      if (linenr + 1 == lines ())
+-        insertAt (QString ("\n"), linenr + 1, 0);
+-
+-      // For try/catch/end, fill "end" first, so "catch" is top of undo stack
+-      if (first_word == "try")
+-        insertAt (QString (start, ' ')
+-                  + (autofill_simple_end ? "end\n" : "end_try_catch\n"),
+-                  linenr + 1, 0);
+-      else if (first_word == "unwind_protect")
+-        insertAt (QString (start, ' ')
+-                  + (autofill_simple_end ? "end\n" : "end_unwind_protect\n"),
+-                  linenr + 1, 0);
+-
+-      QString next_line;
+-      if (first_word == "do")
+-        next_line = "until\n";
+-      else if (first_word == "try")
+-        next_line = "catch\n";
+-      else if (first_word == "unwind_protect")
+-        next_line = "unwind_protect_cleanup\n";
+-      else if (autofill_simple_end)
+-        next_line = "end\n";
+-      else
++      while (linenr + offset < lines ()
++             && next_start == std::string::npos);
++      if (next_start == std::string::npos)
++        next_start = 0;
++      if (next_start > start)       // more indented => don't add "end"
++        return;
++      if (next_start == start)      // same => check if already is "end"
+         {
+-          if (first_word == "unwind_protect")
+-            first_word = "_" + first_word;
+-          next_line = "end" + first_word + "\n";
++          QRegExp rx_start = QRegExp ("(\\w+)");
++          int tmp = rx_start.indexIn (next_line, start);
++           if (tmp != -1 && is_end (rx_start.cap(1), first_word))
++             return;
+         }
+-
+-      insertAt (QString (start, ' ') + next_line, linenr + 1, 0);
+-
+-      break;
+     }
+ 
+-  // Call default processing, even if we did the above.
+-  QsciScintilla::keyPressEvent (e);
++    // If all of the above, insert a new line, with matching indent
++    // and either 'end' or 'end...', depending on a flag.
++
++    // If we insert directly after the last line, the "end" is autoindented,
++    // so add a dummy line.
++    if (linenr + 2 == lines ())
++      insertAt (QString ("\n"), linenr + 2, 0);
++
++    // For try/catch/end, fill "end" first, so "catch" is top of undo stack
++    if (first_word == "try")
++      insertAt (QString (start, ' ')
++                + (autofill_simple_end ? "end\n" : "end_try_catch\n"),
++                linenr + 2, 0);
++    else if (first_word == "unwind_protect")
++      insertAt (QString (start, ' ')
++                + (autofill_simple_end ? "end\n" : "end_unwind_protect\n"),
++                linenr + 2, 0);
++
++    QString next_line;
++    if (first_word == "do")
++      next_line = "until\n";
++    else if (first_word == "try")
++      next_line = "catch\n";
++    else if (first_word == "unwind_protect")
++      next_line = "unwind_protect_cleanup\n";
++    else if (autofill_simple_end)
++      next_line = "end\n";
++    else
++      {
++        if (first_word == "unwind_protect")
++          first_word = "_" + first_word;
++        next_line = "end" + first_word + "\n";
++      }
++
++    insertAt (QString (start, ' ') + next_line, linenr + 2, 0);
+ }
+ 
++
+ // Do smart indendation after if, for, ...
+ void
+-octave_qscintilla::smart_indent (int line, int /*col*/)
++octave_qscintilla::smart_indent (bool do_smart_indent,
++                                 int do_auto_close, int line)
+ {
+   QString prevline = text (line);
+ 
+   QRegExp bkey = QRegExp ("^[\t ]*(if|for|while|switch|case|do|function"
+-                          "|unwind_protect|unwind_protect_cleanup|try)"
++                          "|properties|events|classdef|unwind_protect"
++                          "|unwind_protect_cleanup|try)"
+                           "[\r]?[\n\t #%]");
+-  if (prevline.contains (bkey))
++  // last word except for comments, assuming no ' or " in comment.
++  // rx_end = QRegExp ("(\\w+)[ \t;\r\n]*([%#][^\"']*)?$");
++
++  // last word except for comments,
++  // allowing % and # in single or double quoted strings
++  // FIXME This will get confused by transpose.
++  QRegExp ekey = QRegExp ("(?:(?:['\"][^'\"]*['\"])?[^%#]*)*"
++                          "(\\w+)[ \t;\r\n]*([%#].*)?$");
++
++  int bpos = bkey.indexIn (prevline, 0);
++  int epos;
++
++  if (bpos > -1)
+     {
+-      indent (line+1);
+-      setCursorPosition (line+1,
+-                                     indentation (line) +
+-                                     indentationWidth ());
++      // Found keyword after that indentation should be added
++
++      // Check for existing end statement in the same line
++      epos = ekey.indexIn (prevline, bpos);
++      QString first_word = bkey.cap(1);
++      bool inline_end = (epos > -1) && is_end (ekey.cap(1), first_word);
++
++      if (do_smart_indent && ! inline_end)
++        {
++          // Do smart indent in the current line (line+1)
++          indent (line+1);
++          setCursorPosition (line+1, indentation (line) + indentationWidth ());
++        }
++
++      if (do_auto_close && ! inline_end)
++        {
++          // Do auto close
++          auto_close (do_auto_close, line, prevline, first_word);
++        }
++
+       return;
+     }
+ 
+   QRegExp mkey = QRegExp ("^[\t ]*(else|elseif|catch)[\r]?[\t #%\n]");
+   if (prevline.contains (mkey))
+     {
+       int prev_ind = indentation (line-1);
+       int act_ind = indentation (line);
+@@ -626,18 +601,18 @@ octave_qscintilla::smart_indent (int lin
+       else if (prev_ind > act_ind)
+         {
+           setIndentation (line+1, prev_ind);
+           setCursorPosition (line+1, prev_ind);
+         }
+       return;
+     }
+ 
+-  QRegExp ekey = QRegExp ("^[\t ]*(end|endif|endfor|endwhile|until|endfunction"
+-                          "|end_try_catch|end_unwind_protext)[\r]?[\t #%\n(;]");
++  ekey = QRegExp ("^[\t ]*(end|endif|endfor|endwhile|until|endfunction"
++                  "|end_try_catch|end_unwind_protext)[\r]?[\t #%\n(;]");
+   if (prevline.contains (ekey))
+     {
+       if (indentation (line-1) <= indentation (line))
+         {
+           unindent (line+1);
+           unindent (line);
+           setCursorPosition (line+1,
+                                          indentation (line));
+diff --git a/libgui/src/m-editor/octave-qscintilla.h b/libgui/src/m-editor/octave-qscintilla.h
+--- a/libgui/src/m-editor/octave-qscintilla.h
++++ b/libgui/src/m-editor/octave-qscintilla.h
+@@ -52,18 +52,17 @@ public:
+   void context_run ();
+   void get_global_textcursor_pos (QPoint *global_pos, QPoint *local_pos);
+   bool get_actual_word ();
+   void clear_indicator (int indicator_style);
+   void get_current_position (int *pos, int *line, int *col);
+   QString comment_string ();
+   int get_style (int pos = -1);
+   int is_style_comment (int pos = -1);
+-  void set_auto_endif (int ai) { _auto_endif = ai; }
+-  void smart_indent (int line, int col);
++  void smart_indent (bool do_smart_indent, int do_auto_close, int line);
+ 
+ signals:
+ 
+   void execute_command_in_terminal_signal (const QString&);
+   void create_context_menu_signal (QMenu*);
+   void context_menu_edit_signal (const QString&);
+   void qsci_has_focus_signal (bool);
+   void status_update (bool,bool);
+@@ -85,17 +84,16 @@ private slots:
+   void text_changed (void);
+ 
+ protected:
+ 
+   void focusInEvent (QFocusEvent *focusEvent);
+ 
+ private:
+ 
+-  void keyPressEvent (QKeyEvent *e);
+-
+-  int _auto_endif;
++  void auto_close (int auto_endif, int l,
++                   const QString& line, QString& first_word);
+ 
+   QString _word_at_cursor;
+ 
+ };
+ 
+ #endif

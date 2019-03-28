@@ -1,0 +1,565 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1402913481 -7200
+#      Mon Jun 16 12:11:21 2014 +0200
+# Branch gui-release
+# Node ID 6504a1932637c9b79e6b70d5b6a625a590d4ee39
+# Parent  4b98fc5c2eb1d41dc04912ad8b6469e815cf6f93
+auto completion offers builtins and file functions for octave (bug #41371)
+
+* file-editor-tab.cc (update_lexer): read settings whether builtin and file
+  functions should also be considered in auto completion for octave files;
+  when functions are also displayed, updating of the files with prepared auto
+  completion informations depends on last modification date of package lists;
+  (add_octave_apis): new function for adding strings to the lexer APIs from
+  the internal octave functions
+
+* file-editor-tab.h (add_octave_apis): new function
+
+* main-window.cc (handle_octave_ready): call function for creating the empty
+  tab in the editor here because all octave functions must be known for creating
+  the auto completion information
+
+* settings-dialog.ui: new checkboxes for auto completion of octaves
+  buitlin and file functions
+
+* settings-dialog.cc (constructor): read states for new checkboxes from the
+  settings file;
+  (write_changed_settings): write states of new checkboxes into the settings
+  file
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -43,26 +43,28 @@ along with Octave; see the file COPYING.
+ #include "resource-manager.h"
+ #include <QApplication>
+ #include <QFileDialog>
+ #include <QMessageBox>
+ #include <QTextStream>
+ #include <QVBoxLayout>
+ #include <QInputDialog>
+ #include <QPrintDialog>
++#include <QDateTime>
+ 
+ #include "file-editor-tab.h"
+ #include "file-editor.h"
+ 
+ #include "file-ops.h"
+ 
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ #include "version.h"
+ #include "utils.h"
++#include "defaults.h"
+ 
+ // Make parent null for the file editor tab so that warning
+ // WindowModal messages don't affect grandparents.
+ file_editor_tab::file_editor_tab (const QString& directory_arg)
+ {
+   QString directory = directory_arg;
+   _lexer_apis = 0;
+   _app_closing = false;
+@@ -325,69 +327,158 @@ file_editor_tab::update_lexer ()
+         }
+       else
+         {
+           // other or no extension
+           lexer = new QsciLexerBash ();
+         }
+     }
+ 
++  QSettings *settings = resource_manager::get_settings ();
++
++  // build information for auto completion (APIs)
+   _lexer_apis = new QsciAPIs(lexer);
++
+   if (_lexer_apis)
+     {
++      bool update_apis_file = false;  // flag, whether update of apis files
++
+       // get path to prepared api info
+       QDesktopServices desktopServices;
+       QString prep_apis_path
+         = desktopServices.storageLocation (QDesktopServices::HomeLocation)
+           + "/.config/octave/"  + QString(OCTAVE_VERSION) + "/qsci/";
+-      _prep_apis_file = prep_apis_path + lexer->lexer () + ".pap";
++
++      // get settings which infos are used for octave
++      bool octave_builtins = settings->value (
++                  "editor/codeCompletion_octave_builtins", true).toBool ();
++      bool octave_functions = settings->value (
++                  "editor/codeCompletion_octave_functions", true).toBool ();
++
++      if (_is_octave_file)
++        {
++          // octave file: keywords are always used
++          _prep_apis_file = prep_apis_path + lexer->lexer () + "_k";
++
++          if (octave_builtins)
++            _prep_apis_file = _prep_apis_file + "b";  // use builtins, too
++
++          if (octave_functions)
++            _prep_apis_file = _prep_apis_file + "f";  // use keywords, too
++
++          _prep_apis_file = _prep_apis_file + ".pap"; // final name of apis file
++
++          // check whether the APIs info needs to be prepared and saved
++          QFileInfo apis_file = QFileInfo (_prep_apis_file);
++          update_apis_file = ! apis_file.exists ();  // flag whether apis file needs update
+ 
+-      if (!_lexer_apis->loadPrepared (_prep_apis_file))
++          // function list depends on installed packages: check mod. date
++          if (! update_apis_file & octave_functions)
++            {
++              // check whether package file is newer than apis_file
++              QDateTime apis_date = apis_file.lastModified ();
++
++              // compare to local package list
++              // FIXME: How to get user chosen location?
++              QFileInfo local_pkg_list = QFileInfo (
++                desktopServices.storageLocation (QDesktopServices::HomeLocation)
++                + "/.octave_packages");
++              if (local_pkg_list.exists ()
++                  & (apis_date < local_pkg_list.lastModified ()) )
++                update_apis_file = true;
++
++              // compare to global package list
++              // FIXME: How to get user chosen location?
++              QFileInfo global_pkg_list = QFileInfo (
++                                        QString::fromStdString (Voctave_home)
++                                        + "/share/octave/octave_packages");
++               if (global_pkg_list.exists ()
++                   & (apis_date < global_pkg_list.lastModified ()) )
++                update_apis_file = true;
++            }
++          }
++        else  // no octave file, just add extension
++          {
++            _prep_apis_file = prep_apis_path + lexer->lexer () + ".pap";
++          }
++
++      if (update_apis_file | !_lexer_apis->loadPrepared (_prep_apis_file))
+         {
+           // no prepared info loaded, prepare and save if possible
+ 
+           // create raw apis info
+           QString keyword;
+           QStringList keyword_list;
+           int i,j;
+-          for (i=1; i<=3; i++) // test the first 5 keyword sets
++
++          if (_is_octave_file)
+             {
+-              keyword = QString(lexer->keywords (i));           // get list
+-              keyword_list = keyword.split (QRegExp ("\\s+"));  // split
+-              for (j = 0; j < keyword_list.size (); j++)        // add to API
+-                _lexer_apis->add (keyword_list.at (j));
++              // octave: get keywords from internal informations depending on
++              //         user preferences
++
++              // keywords are always used
++              add_octave_apis (F__keywords__ ());       // add new entries
++
++              if (octave_builtins)
++                add_octave_apis (F__builtins__ ());       // add new entries
++
++              if (octave_functions)
++                add_octave_apis (F__list_functions__ ()); // add new entries
++
++            }
++          else
++            {
++
++              _prep_apis_file = prep_apis_path + lexer->lexer () + ".pap";
++
++              for (i=1; i<=3; i++) // test the first 5 keyword sets
++                {
++                  keyword = QString(lexer->keywords (i));           // get list
++                  keyword_list = keyword.split (QRegExp ("\\s+"));  // split
++                  for (j = 0; j < keyword_list.size (); j++)        // add to API
++                    _lexer_apis->add (keyword_list.at (j));
++                }
+             }
+ 
+           // dsiconnect slot for saving prepared info if already connected
+           disconnect (_lexer_apis, SIGNAL (apiPreparationFinished ()), 0, 0);
+           // check whether path for prepared info exists or can be created
+           if (QDir("/").mkpath (prep_apis_path))
+             {
+               // path exists, apis info can be saved there
+               connect (_lexer_apis, SIGNAL (apiPreparationFinished ()),
+                        this, SLOT (save_apis_info ()));
+             }
+           _lexer_apis->prepare ();  // prepare apis info
+         }
+     }
+ 
+-  QSettings *settings = resource_manager::get_settings ();
+-  if (settings)
+-    lexer->readSettings (*settings);
++  lexer->readSettings (*settings);
+ 
+   _edit_area->setLexer (lexer);
+ 
+   // fix line number width with respect to the font size of the lexer
+   if (settings->value ("editor/showLineNumbers", true).toBool ())
+     auto_margin_width ();
+   else
+     _edit_area->setMarginWidth (2,0);
+ 
+ }
+ 
++// function for adding entries to the octave lexer's APIs
++void
++file_editor_tab::add_octave_apis (octave_value_list key_ovl)
++{
++  octave_value keys = key_ovl(0);
++  Cell key_list = keys.cell_value ();
++
++  for (int idx = 0; idx < key_list.numel (); idx++)
++    _lexer_apis->add (QString (key_list.elem (idx).string_value ().data ()));
++}
++
+ void
+ file_editor_tab::save_apis_info ()
+ {
+   _lexer_apis->savePrepared (_prep_apis_file);
+ }
+ 
+ QString
+ file_editor_tab::comment_string (const QString& lexer)
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -29,16 +29,17 @@ along with Octave; see the file COPYING.
+ #include <QSettings>
+ #include <QFileInfo>
+ #include <Qsci/qsciapis.h>
+ #include <QStatusBar>
+ #include <QLabel>
+ 
+ #include "find-dialog.h"
+ #include "octave-qscintilla.h"
++#include "builtin-defun-decls.h"
+ 
+ class file_editor;
+ 
+ class file_editor_tab : public QWidget
+ {
+   Q_OBJECT
+ 
+ public:
+@@ -201,16 +202,18 @@ private:
+   QString comment_string (const QString&);
+   void do_indent_selected_text (bool indent);
+ 
+   void add_breakpoint_callback (const bp_info& info);
+   void remove_breakpoint_callback (const bp_info& info);
+   void remove_all_breakpoints_callback (const bp_info& info);
+   void center_current_line ();
+ 
++  void add_octave_apis (octave_value_list key_ovl);
++
+   octave_qscintilla *_edit_area;
+ 
+   QStatusBar *_status_bar;
+   QLabel *_row_indicator;
+   QLabel *_col_indicator;
+ 
+   QString _file_name;
+   QString _file_name_short;
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1009,21 +1009,16 @@ main_window::write_settings (void)
+ 
+ // Connecting the signals emitted when the visibility of a widget changes.
+ // This has to be done after the window is shown (see octave-gui.cc)
+ void
+ main_window::connect_visibility_changed (void)
+ {
+   foreach (octave_dock_widget *widget, dock_widget_list ())
+     widget->connect_visibility_changed ();
+-
+-#ifdef HAVE_QSCINTILLA
+-  // Main window completely shown, determine whether to create an empty script
+-  editor_window->empty_script (true, false);
+-#endif
+ }
+ 
+ void
+ main_window::copyClipboard (void)
+ {
+   if (_current_directory_combo_box->hasFocus ())
+     {
+       QLineEdit * edit = _current_directory_combo_box->lineEdit ();
+@@ -1318,16 +1313,24 @@ main_window::handle_octave_ready ()
+ 
+   if (! startup_dir.exists ())
+     {
+       // the configured startup dir does not exist, take actual one
+       startup_dir = QDir ();
+     }
+ 
+   set_current_working_directory (startup_dir.absolutePath ());
++
++#ifdef HAVE_QSCINTILLA
++  // Octave ready, determine whether to create an empty script.
++  // This can not be done when the editor is created because all functions
++  // must be known for the lexer's auto completion informations
++  editor_window->empty_script (true, false);
++#endif
++
+ }
+ 
+ 
+ void
+ main_window::construct_octave_qt_link (void)
+ {
+   _octave_qt_link = new octave_qt_link (this);
+ 
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -161,16 +161,24 @@ settings_dialog::settings_dialog (QWidge
+     settings->value ("editor/code_folding",true).toBool ());
+ 
+   ui->editor_codeCompletion->setChecked (
+     settings->value ("editor/codeCompletion", true).toBool () );
+   ui->editor_spinbox_ac_threshold->setValue (
+     settings->value ("editor/codeCompletion_threshold",2).toInt ());
+   ui->editor_checkbox_ac_keywords->setChecked (
+     settings->value ("editor/codeCompletion_keywords",true).toBool ());
++  ui->editor_checkbox_ac_builtins->setEnabled (
++    ui->editor_checkbox_ac_keywords->isChecked ());
++  ui->editor_checkbox_ac_functions->setEnabled (
++    ui->editor_checkbox_ac_keywords->isChecked ());
++  ui->editor_checkbox_ac_builtins->setChecked (
++    settings->value ("editor/codeCompletion_octave_builtins",true).toBool ());
++  ui->editor_checkbox_ac_functions->setChecked (
++    settings->value ("editor/codeCompletion_octave_functions",true).toBool ());
+   ui->editor_checkbox_ac_document->setChecked (
+     settings->value ("editor/codeCompletion_document",false).toBool ());
+   ui->editor_checkbox_ac_case->setChecked (
+     settings->value ("editor/codeCompletion_case",true).toBool ());
+   ui->editor_checkbox_ac_replace->setChecked (
+     settings->value ("editor/codeCompletion_replace",false).toBool ());
+   ui->editor_ws_checkbox->setChecked (
+     settings->value ("editor/show_white_space", false).toBool ());
+@@ -600,16 +608,20 @@ settings_dialog::write_changed_settings 
+   settings->setValue ("editor/show_edit_status_bar",
+                       ui->cb_edit_status_bar->isChecked ());
+   settings->setValue ("editor/codeCompletion",
+                       ui->editor_codeCompletion->isChecked ());
+   settings->setValue ("editor/codeCompletion_threshold",
+                       ui->editor_spinbox_ac_threshold->value ());
+   settings->setValue ("editor/codeCompletion_keywords",
+                       ui->editor_checkbox_ac_keywords->isChecked ());
++  settings->setValue ("editor/codeCompletion_octave_builtins",
++                      ui->editor_checkbox_ac_builtins->isChecked ());
++  settings->setValue ("editor/codeCompletion_octave_functions",
++                      ui->editor_checkbox_ac_functions->isChecked ());
+   settings->setValue ("editor/codeCompletion_document",
+                       ui->editor_checkbox_ac_document->isChecked ());
+   settings->setValue ("editor/codeCompletion_case",
+                       ui->editor_checkbox_ac_case->isChecked ());
+   settings->setValue ("editor/codeCompletion_replace",
+                       ui->editor_checkbox_ac_replace->isChecked ());
+   settings->setValue ("editor/show_white_space",
+                       ui->editor_ws_checkbox->isChecked ());
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -27,17 +27,17 @@
+     <widget class="QTabWidget" name="tabWidget">
+      <property name="minimumSize">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+      <property name="currentIndex">
+-      <number>6</number>
++      <number>1</number>
+      </property>
+      <widget class="QWidget" name="tab_general">
+       <property name="enabled">
+        <bool>true</bool>
+       </property>
+       <attribute name="title">
+        <string>General</string>
+       </attribute>
+@@ -399,19 +399,19 @@
+         <widget class="QScrollArea" name="scrollArea">
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+-            <y>0</y>
++            <y>-146</y>
+             <width>662</width>
+-            <height>524</height>
++            <height>553</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_16">
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_9">
+              <item>
+               <layout class="QGridLayout" name="editor_common_settings_grid">
+                <property name="horizontalSpacing">
+@@ -869,30 +869,40 @@
+                    <property name="text">
+                     <string>Match keywords</string>
+                    </property>
+                    <property name="checked">
+                     <bool>true</bool>
+                    </property>
+                   </widget>
+                  </item>
+-                 <item row="1" column="0">
++                 <item row="2" column="0">
+                   <widget class="QCheckBox" name="editor_checkbox_ac_case">
+                    <property name="enabled">
+                     <bool>true</bool>
+                    </property>
+                    <property name="text">
+                     <string>Case sensitive</string>
+                    </property>
+                    <property name="checked">
+                     <bool>true</bool>
+                    </property>
+                   </widget>
+                  </item>
+-                 <item row="1" column="2">
++                 <item row="1" column="0">
++                  <widget class="QCheckBox" name="editor_checkbox_ac_document">
++                   <property name="enabled">
++                    <bool>true</bool>
++                   </property>
++                   <property name="text">
++                    <string>Match words in document</string>
++                   </property>
++                  </widget>
++                 </item>
++                 <item row="2" column="2">
+                   <widget class="QCheckBox" name="editor_checkbox_ac_replace">
+                    <property name="enabled">
+                     <bool>true</bool>
+                    </property>
+                    <property name="text">
+                     <string>Replace word by suggested one</string>
+                    </property>
+                   </widget>
+@@ -905,39 +915,53 @@
+                    <property name="sizeHint" stdset="0">
+                     <size>
+                      <width>40</width>
+                      <height>20</height>
+                     </size>
+                    </property>
+                   </spacer>
+                  </item>
+-                 <item row="0" column="2">
+-                  <widget class="QCheckBox" name="editor_checkbox_ac_document">
+-                   <property name="enabled">
+-                    <bool>true</bool>
+-                   </property>
+-                   <property name="text">
+-                    <string>Match words in document</string>
+-                   </property>
+-                  </widget>
+-                 </item>
+-                 <item row="1" column="3">
++                 <item row="2" column="3">
+                   <spacer name="horizontalSpacer_19">
+                    <property name="orientation">
+                     <enum>Qt::Horizontal</enum>
+                    </property>
+                    <property name="sizeHint" stdset="0">
+                     <size>
+                      <width>40</width>
+                      <height>20</height>
+                     </size>
+                    </property>
+                   </spacer>
+                  </item>
++                 <item row="0" column="2">
++                  <layout class="QHBoxLayout" name="horizontalLayout_14">
++                   <item>
++                    <widget class="QCheckBox" name="editor_checkbox_ac_builtins">
++                     <property name="enabled">
++                      <bool>false</bool>
++                     </property>
++                     <property name="text">
++                      <string>With Octave builtins</string>
++                     </property>
++                    </widget>
++                   </item>
++                   <item>
++                    <widget class="QCheckBox" name="editor_checkbox_ac_functions">
++                     <property name="enabled">
++                      <bool>false</bool>
++                     </property>
++                     <property name="text">
++                      <string>With Octave functions</string>
++                     </property>
++                    </widget>
++                   </item>
++                  </layout>
++                 </item>
+                 </layout>
+                </item>
+                <item row="3" column="1">
+                 <layout class="QGridLayout" name="gridLayout_10">
+                  <item row="0" column="2">
+                   <widget class="QLabel" name="editor_label_ac_threshold">
+                    <property name="enabled">
+                     <bool>false</bool>
+@@ -2595,10 +2619,42 @@
+      <y>187</y>
+     </hint>
+     <hint type="destinationlabel">
+      <x>302</x>
+      <y>187</y>
+     </hint>
+    </hints>
+   </connection>
++  <connection>
++   <sender>editor_checkbox_ac_keywords</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>editor_checkbox_ac_builtins</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>118</x>
++     <y>231</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>296</x>
++     <y>231</y>
++    </hint>
++   </hints>
++  </connection>
++  <connection>
++   <sender>editor_checkbox_ac_keywords</sender>
++   <signal>toggled(bool)</signal>
++   <receiver>editor_checkbox_ac_functions</receiver>
++   <slot>setEnabled(bool)</slot>
++   <hints>
++    <hint type="sourcelabel">
++     <x>118</x>
++     <y>231</y>
++    </hint>
++    <hint type="destinationlabel">
++     <x>446</x>
++     <y>231</y>
++    </hint>
++   </hints>
++  </connection>
+  </connections>
+ </ui>

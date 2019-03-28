@@ -1,0 +1,352 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1369424512 14400
+#      Fri May 24 15:41:52 2013 -0400
+# Branch classdef
+# Node ID 13b3b92ea99c8b4e8915b71f6a9581345216e69f
+# Parent  665fa0f621cc2d5c20a4f9617ed5fa119fce8c87
+Implement property accessors.
+
+* libinterp/parse-tree/oct-parse.in.yy: Prepend "get." or "set." to
+property accessor methods names.
+
+* libinterp/octave-value/ov-classdef.h
+(cdef_property_rep::is_recursive_set): Delete method.
+
+* libinterp/octave-value/ov-classdef.cc
+(cdef_property::cdef_property_rep::is_recursive_set): Delete method.
+(is_method_executing): New static utility function.
+(cdef_property::cdef_property_rep::get_value,
+cdef_property::cdef_property_rep::set)value): Use it to check whether
+the accessor method is already executing for the same object.
+(cdef_class::make_meta_class): Associate property accessors to their
+corresponding properties.
+(make_fcn_handle(octave_value, string)): New static overload.
+
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -126,16 +126,27 @@ make_fcn_handle (octave_builtin::fcn ff,
+ {
+   octave_value fcn (new octave_builtin (ff, nm));
+ 
+   octave_value fcn_handle (new octave_fcn_handle (fcn, nm));
+ 
+   return fcn_handle;
+ }
+ 
++static octave_value
++make_fcn_handle (const octave_value& fcn, const std::string& nm)
++{
++  octave_value retval;
++
++  if (fcn.is_defined ())
++    retval = octave_value (new octave_fcn_handle (fcn, nm));
++
++  return retval;
++}
++
+ inline octave_value_list
+ execute_ov (octave_value val, const octave_value_list& args, int nargout)
+ {
+   std::list<octave_value_list> idx (1, args);
+ 
+   std::string type ("(");
+ 
+   return val.subsref (type, idx, nargout);
+@@ -344,16 +355,61 @@ check_access (const cdef_class& cls, con
+     }
+   else
+     error ("invalid property/method access in class `%s'",
+            cls.get_name ().c_str ());
+   
+   return false;
+ }
+ 
++bool
++is_method_executing (const octave_value& ov, const cdef_object& obj)
++{
++  octave_function* stack_fcn = octave_call_stack::current ();
++
++  octave_function* method_fcn = ov.function_value (true);
++
++  // Does the top of the call stack match our target function?
++
++  if (stack_fcn && stack_fcn == method_fcn)
++    {
++      octave_user_function* uf = method_fcn->user_function_value (true);
++
++      // We can only check the context object for user-function (not builtin),
++      // where we have access to the parameters (arguments and return values).
++      // That's ok as there's no need to call this function for builtin
++      // methods.
++
++      if (uf)
++        {
++          // At this point, the method is executing, but we still need to
++          // check the context object for which the method is executing. For
++          // methods, it's the first argument of the function; for ctors, it
++          // is the first return value.
++
++          tree_parameter_list* pl = uf->is_classdef_constructor ()
++            ? uf->return_list () : uf->parameter_list ();
++
++          if (pl && pl->size () > 0)
++            {
++              octave_value arg0 = pl->front ()->lvalue ().value ();
++
++              if (arg0.is_defined () && arg0.type_name () == "object")
++                {
++                  cdef_object arg0_obj = to_cdef (arg0);
++
++                  return obj.is (arg0_obj);
++                }
++            }
++        }
++    }
++
++  return false;
++}
++
+ static octave_value_list
+ class_get_methods (const octave_value_list& args, int /* nargout */)
+ {
+   octave_value_list retval;
+ 
+   if (args.length () == 1 && args(0).type_name () == "object")
+     {
+       cdef_class cls (to_cdef (args(0)));
+@@ -2473,16 +2529,22 @@ cdef_class::make_meta_class (tree_classd
+           retval.put (aname, avalue);
+         }
+     }
+ 
+   tree_classdef_body* b = t->body ();
+ 
+   if (b)
+     {
++      // Keep track of the get/set accessor methods. They will be used
++      // later on when creating properties.
++
++      std::map<std::string, octave_value> get_methods;
++      std::map<std::string, octave_value> set_methods;
++
+       // Method blocks
+ 
+       std::list<tree_classdef_methods_block *> mb_list = b->methods_list ();
+ 
+       for (tree_classdef_body::methods_list_iterator it = mb_list.begin ();
+            it != mb_list.end (); ++it)
+         {
+           std::map<std::string, octave_value> amap;
+@@ -2494,38 +2556,49 @@ cdef_class::make_meta_class (tree_classd
+             {
+               for (tree_classdef_attribute_list::iterator ait = (*it)->attribute_list ()->begin ();
+                    ait != (*it)->attribute_list ()->end (); ++ait)
+                 {
+                   std::string aname = (*ait)->ident ()->name ();
+                   octave_value avalue = compute_attribute_value (*ait);
+ 
+                   gnulib::printf ("method attribute: %s = %s\n", aname.c_str (),
+-                          attribute_value_to_string (*ait, avalue).c_str ());
++                                  attribute_value_to_string (*ait, avalue).c_str ());
+                   amap[aname] = avalue;
+                 }
+             }
+ 
+           // Methods
+ 
+           if ((*it)->element_list ())
+             {
+               for (tree_classdef_methods_list::iterator mit = (*it)->element_list ()->begin ();
+                    mit != (*it)->element_list ()->end (); ++mit)
+                 {
+                   std::string mname = mit->function_value ()->name ();
+-                  cdef_method meth = make_method (retval, mname, *mit);
+-
+-                  gnulib::printf ("%s: %s\n", (mname == class_name ? "constructor" : "method"),
+-                          mname.c_str ());
+-                  for (std::map<std::string, octave_value>::iterator ait = amap.begin ();
+-                       ait != amap.end (); ++ait)
+-                    meth.put (ait->first, ait->second);
+-
+-                  retval.install_method (meth);
++                  std::string mprefix = mname.substr (0, 4);
++
++                  if (mprefix == "get.")
++                    get_methods[mname.substr (4)] =
++                      make_fcn_handle (*mit, full_class_name + ">" + mname);
++                  else if (mprefix == "set.")
++                    set_methods[mname.substr (4)] =
++                      make_fcn_handle (*mit, full_class_name + ">" + mname);
++                  else
++                    {
++                      cdef_method meth = make_method (retval, mname, *mit);
++
++                      gnulib::printf ("%s: %s\n", (mname == class_name ? "constructor" : "method"),
++                                      mname.c_str ());
++                      for (std::map<std::string, octave_value>::iterator ait = amap.begin ();
++                           ait != amap.end (); ++ait)
++                        meth.put (ait->first, ait->second);
++
++                      retval.install_method (meth);
++                    }
+                 }
+             }
+         }
+ 
+       // Property blocks
+ 
+       // FIXME: default property expression should be able to call static
+       //        methods of the class being constructed. A restricted CLASSNAME
+@@ -2564,32 +2637,60 @@ cdef_class::make_meta_class (tree_classd
+ 
+           // Properties
+ 
+           if ((*it)->element_list ())
+             {
+               for (tree_classdef_property_list::iterator pit = (*it)->element_list ()->begin ();
+                    pit != (*it)->element_list ()->end (); ++pit)
+                 {
+-                  cdef_property prop = ::make_property (retval, (*pit)->ident ()->name ());
++                  std::string prop_name = (*pit)->ident ()->name ();
++
++                  cdef_property prop = ::make_property (retval, prop_name);
+ 
+                   gnulib::printf ("property: %s\n", (*pit)->ident ()->name ().c_str ());
+                   if ((*pit)->expression ())
+                     {
+                       octave_value pvalue = (*pit)->expression ()->rvalue1 ();
+ 
+                       gnulib::printf ("property default: %s\n",
+                               attribute_value_to_string (*pit, pvalue).c_str ());
+                       prop.put ("DefaultValue", pvalue);
+                     }
+ 
++                  // Install property attributes. This is done before assigning the
++                  // property accessors so we can do validationby using cdef_property
++                  // methods.
++
+                   for (std::map<std::string, octave_value>::iterator ait = amap.begin ();
+                        ait != amap.end (); ++ait)
+                     prop.put (ait->first, ait->second);
+ 
++                  // Install property access methods, if any. Remove the accessor
++                  // methods from the temporary storage map, so we can detect which
++                  // ones are invalid and do not correspond to a defined property.
++
++                  std::map<std::string, octave_value>::iterator git =
++                    get_methods.find (prop_name);
++
++                  if (git != get_methods.end ())
++                    {
++                      prop.put ("GetMethod", git->second);
++                      get_methods.erase (git);
++                    }
++
++                  std::map<std::string, octave_value>::iterator sit =
++                    set_methods.find (prop_name);
++
++                  if (sit != set_methods.end ())
++                    {
++                      prop.put ("SetMethod", sit->second);
++                      set_methods.erase (sit);
++                    }
++
+                   retval.install_property (prop);
+                 }
+             }
+         }
+     }
+ 
+   return retval;
+ }
+@@ -2627,17 +2728,17 @@ cdef_property::cdef_property_rep::get_va
+           return retval;
+         }
+     }
+  
+   octave_value get_fcn = get ("GetMethod");
+ 
+   // FIXME: should check whether we're already in get accessor method
+ 
+-  if (get_fcn.is_empty ())
++  if (get_fcn.is_empty () || is_method_executing (get_fcn, obj))
+     retval = obj.get (get ("Name").string_value ());
+   else
+     {
+       octave_value_list args;
+ 
+       args(0) = to_ov (obj);
+       
+       args = execute_ov (get_fcn, args, 1);
+@@ -2692,20 +2793,18 @@ cdef_property::cdef_property_rep::set_va
+           ::error ("cannot reference properties of class `%s' for non-constructed object",
+                    cls.get_name ().c_str ());
+           return;
+         }
+     }
+  
+   octave_value set_fcn = get ("SetMethod");
+ 
+-  if (set_fcn.is_empty () || is_recursive_set (obj))
+-    {
+-      obj.put (get ("Name").string_value (), val);
+-    }
++  if (set_fcn.is_empty () || is_method_executing (set_fcn, obj))
++    obj.put (get ("Name").string_value (), val);
+   else
+     {
+       octave_value_list args;
+ 
+       args(0) = to_ov (obj);
+       args(1) = val;
+ 
+       args = execute_ov (set_fcn, args, 1);
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -938,17 +938,17 @@ private:
+ 
+     bool check_set_access (void) const;
+ 
+   private:
+     cdef_property_rep (const cdef_property_rep& p)
+       : cdef_meta_object_rep (p) { }
+ 
+     bool is_recursive_set (const cdef_object& obj) const;
+-
++    
+     cdef_property wrap (void)
+       {
+         refcount++;
+         return cdef_property (this);
+       }
+   };
+ 
+ public:
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -1229,16 +1229,21 @@ fcn_name        : identifier
+                 ;
+ 
+ function1       : fcn_name function2
+                   {
+                     std::string fname = $1->name ();
+ 
+                     delete $1;
+ 
++                    if (lexer.parsing_classdef_get_method)
++                      fname.insert (0, "get.");
++                    else if (lexer.parsing_classdef_set_method)
++                      fname.insert (0, "set.");
++
+                     if (! ($$ = parser.frob_function (fname, $2)))
+                       ABORT_PARSE;
+                   }
+                 ;
+ 
+ function2       : param_list opt_sep opt_list function_end
+                   { $$ = parser.start_function ($1, $3, $4); }
+                 | opt_sep opt_list function_end

@@ -1,0 +1,1000 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1322925582 0
+#      Sat Dec 03 15:19:42 2011 +0000
+# Node ID 43cc49c7abd19d256c3baa06fa00e54a78157260
+# Parent  1126c29078787c0b4842cd3a94e145fa4a5e7713
+Use thread-safe atomic reference counting (GCC and MSVC).
+
+* configure.ac: New --enable-atomic-refcount argument.
+(octave_allocator): Fix USE_OCTAVE_ALLOCATOR variable assignment.
+(OCTAVE_CONFIG_INCLUDED): New macro in config.h.
+
+* oct-refcount.h (OCTREFCOUNT_ATOMIC_INCREMENT,
+OCTREFCOUNT_ATOMIC_INCREMENT_POST, OCTREFCOUNT_ATOMIC_DECREMENT,
+OCTREFCOUNT_ATOMIC_DECREMENT_POST): New macro, defined for MSVC and GCC
+when USE_ATOMIC_REFCOUNT is defined.
+(octave_refcount:operator++, octave_refcount::operator--): Use them.
+(octave_refcount::operator count_type): Cast returned value to volatile.
+(octave_refcount::direct): Remove unsafe member.
+* Array.h (Array::make_unique): Delete rep if refcount reaches 0.
+* Sparse.h (Sparse::make_unique): Delete rep if refcount reaches 0.
+* Array.h (Array:~Array, Array::operator=): Delete rep only when refcount is
+excatly 0.
+* Array.cc (Array::clear): Likewise.
+* Sparse.cc (Sparse::~Sparse, Sparse::operator=): Likewise.
+* SparseCmplxQR.h (SparseCmplxQR::~SparseCmplxQR, SparseCmplxQR::operator=):
+Likewise.
+* SparseQR.h (SparseQR::~SparseQR, SparseQR::operator=): Likewise.
+* sparse-base-chol.h (sparse_base_chol::~sparse_base_chol,
+sparse_base_chol::operator): Likewise.
+* dim-vector.h (oct-refcount.h): New included header.
+(dim_vector::make_unique, dim_vector::resize): Use OCTREFCOUNT_ATOMIC_DECREMENT
+macro and delete rep when refcount reaches 0.
+(dim_vector::dim_vector): Use OCTREFCOUNT_ATOMIC_INCREMENT.
+(dim_vector::operator=): Use OCTREFCOUNT_ATOMIC_INCREMENT and
+OCTREFCOUNT_ATOMIC_DECREMENT.
+(dim_vector::~dim_vector): Use OCTREFCOUNT_ATOMIC_DECREMENT.
+* oct-mutex.h (oct-refcount.h): New included header.
+(octave_base_mutex::count): Use octave_refcount class.
+
+* gl-render.cc (oct-refcount.h): New included header.
+* graphics.h.in (oct-refcount.h): Likewise.
+(base_property::count, base_graphics_toolkit::count,
+base_graphics_object::count, base_graphics_event::count): Use octave_refcount.
+(property::~property, property::operator=): Delete rep only when refcountn is
+excatly 0.
+* oct-map.h (octave_fields::make_unique): Delete rep when refcount reaches 0.
+* oct-stream.h (oct-refcount.h): New included header.
+(octave_base_stream::count): Use octave_refcount class.
+* ov.h (octave_value::make_unique): Delete rep when refcount reaches 0.
+* symtab.h (oct-refcount.h): New included header.
+(symbol_record_rep::count, fcn_info_rep::count): Use octave_refcount class.
+
+* DLD-FUNCTIONS/urlwrite.cc (oct-refcount.h): New included header.
+(curl_handle_rep::count): Use octave_refcount class.
+
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -166,21 +166,30 @@ AC_ARG_ENABLE(bounds-check,
+ if $BOUNDS_CHECKING; then
+   AC_DEFINE(BOUNDS_CHECKING, 1, [Define to use internal bounds checking.])
+ fi
+ 
+ USE_OCTAVE_ALLOCATOR=false
+ AC_ARG_ENABLE(octave-allocator,
+   [AS_HELP_STRING([--enable-octave-allocator],
+      [use the obsolete octave_allocator class for many of Octave's objects (mostly octave_value types).  You probably do NOT want to enable this feature.  (default is no)])],
+-  [if test "$enableval" = yes; then USE_ALLOCATOR=true; fi], [])
++  [if test "$enableval" = yes; then USE_OCTAVE_ALLOCATOR=true; fi], [])
+ if $USE_OCTAVE_ALLOCATOR; then
+   AC_DEFINE(USE_OCTAVE_ALLOCATOR, 1, [Define to use octave_allocator class.])
+ fi
+ 
++USE_ATOMIC_REFCOUNT=false
++AC_ARG_ENABLE(atomic-refcount,
++  [AS_HELP_STRING([--enable-atomic-refcount],
++     [use atomic operations for internal reference counting. This is required for thread-safe behavior.  (default is no)])],
++  [if test "$enableval" = yes; then USE_ATOMIC_REFCOUNT=true; fi], [])
++if $USE_ATOMIC_REFCOUNT; then
++  AC_DEFINE(USE_ATOMIC_REFCOUNT, 1, [Define to use atomic operations for reference counting.])
++fi
++
+ ### Make it possible to disable running Make in the doc directory.
+ ### Useful for building on systems without TeX, for example.
+ DOCDIR=doc
+ AC_ARG_ENABLE(docs,
+   [AS_HELP_STRING([--enable-docs], [build documentation (default is yes)])],
+   [if test "$enableval" = no; then
+      DOCDIR=
+      warn_docs="building documentation disabled; make dist will fail"
+@@ -2084,16 +2093,19 @@ typedef unsigned long ino_t;
+ #define OCTGRAPHICS_API OCTAVE_IMPORT
+ #endif
+ 
+ /* oct-types.h */
+ 
+ typedef OCTAVE_IDX_TYPE octave_idx_type;
+ 
+ #include <stdint.h>
++
++/* Tag indicating octave config.h has been included */
++#define OCTAVE_CONFIG_INCLUDED 1
+ ])
+ 
+ ### Do the substitutions in all the Makefiles.
+ 
+ AC_SUBST(ac_config_files)
+ AC_SUBST(ac_config_headers)
+ 
+ AC_CONFIG_FILES([
+@@ -2460,15 +2472,31 @@ if test -n "$warn_gnuplot"; then
+   AC_MSG_WARN([at the Octave prompt.])
+   AC_MSG_WARN([])
+   AC_MSG_WARN([Setting default value to $GNUPLOT])
+   AC_MSG_WARN([])
+ 
+   warn_msg_printed=true
+ fi
+ 
++if $USE_ATOMIC_REFCOUNT; then
++  AC_MSG_WARN([])
++  AC_MSG_WARN([Using atomic reference counting.])
++  AC_MSG_WARN([This feature allows to access octave data safely from])
++  AC_MSG_WARN([another thread, for instance from a GUI. However this])
++  AC_MSG_WARN([results in a small performance penalty in the octave])
++  AC_MSG_WARN([interpreter.])
++  AC_MSG_WARN([])
++  if $USE_OCTAVE_ALLOCATOR; then
++    AC_MSG_WARN([Thread-safe behavior is not guaranteed unless you also])
++    AC_MSG_WARN([disable the use of the octave_allocator class.])
++    AC_MSG_WARN([])
++  fi
++  warn_msg_printed=true
++fi
++
+ if $warn_msg_printed; then
+   AC_MSG_NOTICE([])
+   AC_MSG_NOTICE([NOTE: libraries may be skipped if a library is not found OR])
+   AC_MSG_NOTICE([NOTE: if the library on your system is missing required features.])
+ fi
+ 
+ ### End of configure.
+diff --git a/liboctave/Array.cc b/liboctave/Array.cc
+--- a/liboctave/Array.cc
++++ b/liboctave/Array.cc
+@@ -79,32 +79,32 @@ Array<T>::fill (const T& val)
+   else
+     fill_or_memset (slice_len, val, slice_data);
+ }
+ 
+ template <class T>
+ void
+ Array<T>::clear (void)
+ {
+-  if (--rep->count <= 0)
++  if (--rep->count == 0)
+     delete rep;
+ 
+   rep = nil_rep ();
+   rep->count++;
+   slice_data = rep->data;
+   slice_len = rep->len;
+ 
+   dimensions = dim_vector ();
+ }
+ 
+ template <class T>
+ void
+ Array<T>::clear (const dim_vector& dv)
+ {
+-  if (--rep->count <= 0)
++  if (--rep->count == 0)
+     delete rep;
+ 
+   rep = new ArrayRep (dv.safe_numel ());
+   slice_data = rep->data;
+   slice_len = rep->len;
+ 
+   dimensions = dv;
+   dimensions.chop_trailing_singletons ();
+diff --git a/liboctave/Array.h b/liboctave/Array.h
+--- a/liboctave/Array.h
++++ b/liboctave/Array.h
+@@ -105,18 +105,22 @@ protected:
+   //--------------------------------------------------------------------
+ 
+ public:
+ 
+   void make_unique (void)
+     {
+       if (rep->count > 1)
+         {
+-          --rep->count;
+-          rep = new ArrayRep (slice_data, slice_len);
++          ArrayRep *r = new ArrayRep (slice_data, slice_len);
++
++          if (--rep->count == 0)
++            delete rep;
++          
++          rep = r;
+           slice_data = rep->data;
+         }
+     }
+ 
+   typedef T element_type;
+ 
+   typedef typename ref_param<T>::type crefT;
+ 
+@@ -220,25 +224,25 @@ public:
+     {
+       rep->count++;
+     }
+ 
+ public:
+ 
+   ~Array (void)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   Array<T>& operator = (const Array<T>& a)
+     {
+       if (this != &a)
+         {
+-          if (--rep->count <= 0)
++          if (--rep->count == 0)
+             delete rep;
+ 
+           rep = a.rep;
+           rep->count++;
+ 
+           dimensions = a.dimensions;
+           slice_data = a.slice_data;
+           slice_len = a.slice_len;
+diff --git a/liboctave/Sparse.cc b/liboctave/Sparse.cc
+--- a/liboctave/Sparse.cc
++++ b/liboctave/Sparse.cc
+@@ -662,27 +662,27 @@ Sparse<T>::Sparse (const Array<T>& a)
+           xcidx(j+1) = ii;
+         }
+     }
+ }
+ 
+ template <class T>
+ Sparse<T>::~Sparse (void)
+ {
+-  if (--rep->count <= 0)
++  if (--rep->count == 0)
+     delete rep;
+ }
+ 
+ template <class T>
+ Sparse<T>&
+ Sparse<T>::operator = (const Sparse<T>& a)
+ {
+   if (this != &a)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+ 
+       rep = a.rep;
+       rep->count++;
+ 
+       dimensions = a.dimensions;
+     }
+ 
+diff --git a/liboctave/Sparse.h b/liboctave/Sparse.h
+--- a/liboctave/Sparse.h
++++ b/liboctave/Sparse.h
+@@ -142,18 +142,22 @@ protected:
+   };
+ 
+   //--------------------------------------------------------------------
+ 
+   void make_unique (void)
+     {
+       if (rep->count > 1)
+         {
+-          --rep->count;
+-          rep = new SparseRep (*rep);
++          SparseRep *r = new SparseRep (*rep);
++
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = r;
+         }
+     }
+ 
+ public:
+ 
+   // !!! WARNING !!! -- these should be protected, not public.  You
+   // should not access these data members directly!
+ 
+diff --git a/liboctave/SparseCmplxQR.h b/liboctave/SparseCmplxQR.h
+--- a/liboctave/SparseCmplxQR.h
++++ b/liboctave/SparseCmplxQR.h
+@@ -91,25 +91,25 @@ public:
+ 
+   SparseComplexQR (const SparseComplexMatrix& a, int order = 0) :
+     rep (new SparseComplexQR_rep (a, order)) { }
+ 
+   SparseComplexQR (const SparseComplexQR& a) : rep (a.rep) { rep->count++; }
+ 
+   ~SparseComplexQR (void)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   SparseComplexQR& operator = (const SparseComplexQR& a)
+     {
+       if (this != &a)
+         {
+-          if (--rep->count <= 0)
++          if (--rep->count == 0)
+             delete rep;
+ 
+           rep = a.rep;
+           rep->count++;
+         }
+       return *this;
+     }
+ 
+diff --git a/liboctave/SparseQR.h b/liboctave/SparseQR.h
+--- a/liboctave/SparseQR.h
++++ b/liboctave/SparseQR.h
+@@ -93,25 +93,25 @@ public:
+ 
+   SparseQR (const SparseMatrix& a, int order = 0) :
+     rep (new SparseQR_rep (a, order)) { }
+ 
+   SparseQR (const SparseQR& a) : rep (a.rep) { rep->count++; }
+ 
+   ~SparseQR (void)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   SparseQR& operator = (const SparseQR& a)
+     {
+       if (this != &a)
+         {
+-          if (--rep->count <= 0)
++          if (--rep->count == 0)
+             delete rep;
+ 
+           rep = a.rep;
+           rep->count++;
+         }
+       return *this;
+     }
+ 
+diff --git a/liboctave/dim-vector.h b/liboctave/dim-vector.h
+--- a/liboctave/dim-vector.h
++++ b/liboctave/dim-vector.h
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <cassert>
+ #include <limits>
+ 
+ #include <sstream>
+ #include <string>
+ 
+ #include "lo-error.h"
+ #include "lo-macros.h"
++#include "oct-refcount.h"
+ 
+ // Rationale: This implementation is more tricky than Array, but the
+ // big plus is that dim_vector requires only one allocation instead of
+ // two.  It is (slightly) patterned after GCC's basic_string
+ // implementation.  rep is a pointer to an array of memory, comprising
+ // count, length, and the data:
+ //
+ //          <count>
+@@ -123,18 +124,22 @@ private:
+     assert (count () == 0);
+     delete [] (rep - 2);
+   }
+ 
+   void make_unique (void)
+   {
+     if (count () > 1)
+       {
+-        --count();
+-        rep = clonerep ();
++	octave_idx_type *new_rep = clonerep ();
++
++	if (OCTREFCOUNT_ATOMIC_DECREMENT(&(count())) == 0)
++	  freerep ();
++
++        rep = new_rep;
+       }
+   }
+ 
+ public:
+ 
+   // The constructor
+   //
+   //   dim_vector (n)
+@@ -217,42 +222,44 @@ private:
+ 
+   explicit dim_vector (octave_idx_type *r)
+     : rep (r) { }
+ 
+ public:
+ 
+   static octave_idx_type dim_max (void);
+ 
+-  explicit dim_vector (void) : rep (nil_rep ()) { count()++; }
++  explicit dim_vector (void) : rep (nil_rep ())
++  { OCTREFCOUNT_ATOMIC_INCREMENT (&(count())); }
+ 
+-  dim_vector (const dim_vector& dv) : rep (dv.rep) { count()++; }
++  dim_vector (const dim_vector& dv) : rep (dv.rep)
++  { OCTREFCOUNT_ATOMIC_INCREMENT (&(count())); }
+ 
+   static dim_vector alloc (int n)
+   {
+     return dim_vector (newrep (n < 2 ? 2 : n));
+   }
+ 
+   dim_vector& operator = (const dim_vector& dv)
+   {
+     if (&dv != this)
+       {
+-        if (--count() <= 0)
++        if (OCTREFCOUNT_ATOMIC_DECREMENT (&(count())) == 0)
+           freerep ();
+ 
+         rep = dv.rep;
+-        count()++;
++        OCTREFCOUNT_ATOMIC_INCREMENT (&(count()));
+       }
+ 
+     return *this;
+   }
+ 
+   ~dim_vector (void)
+   {
+-    if (--count() <= 0)
++    if (OCTREFCOUNT_ATOMIC_DECREMENT (&(count())) == 0)
+       freerep ();
+   }
+ 
+   int length (void) const { return ndims (); }
+ 
+   octave_idx_type& operator () (int i) { return elem (i); }
+ 
+   octave_idx_type operator () (int i) const { return elem (i); }
+@@ -260,17 +267,17 @@ public:
+   void resize (int n, int fill_value = 0)
+   {
+     int len = length ();
+ 
+     if (n != len)
+       {
+         octave_idx_type *r = resizerep (n, fill_value);
+ 
+-        if (--count() <= 0)
++        if (OCTREFCOUNT_ATOMIC_DECREMENT (&(count())) == 0)
+           freerep ();
+ 
+         rep = r;
+       }
+   }
+ 
+   std::string str (char sep = 'x') const;
+ 
+diff --git a/liboctave/oct-mutex.h b/liboctave/oct-mutex.h
+--- a/liboctave/oct-mutex.h
++++ b/liboctave/oct-mutex.h
+@@ -18,16 +18,18 @@ You should have received a copy of the G
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_octave_mutex_h)
+ #define octave_octave_mutex_h 1
+ 
++#include "oct-refcount.h"
++
+ class octave_mutex;
+ 
+ class
+ octave_base_mutex
+ {
+ public:
+   friend class octave_mutex;
+ 
+@@ -37,17 +39,17 @@ public:
+ 
+   virtual void lock (void);
+ 
+   virtual void unlock (void);
+ 
+   virtual bool try_lock (void);
+ 
+ private:
+-  int count;
++  octave_refcount<int> count;
+ };
+ 
+ class
+ OCTAVE_API
+ octave_mutex
+ {
+ public:
+   octave_mutex (void);
+diff --git a/liboctave/oct-refcount.h b/liboctave/oct-refcount.h
+--- a/liboctave/oct-refcount.h
++++ b/liboctave/oct-refcount.h
+@@ -18,48 +18,72 @@ You should have received a copy of the G
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_refcount_h)
+ #define octave_refcount_h 1
+ 
++#ifndef OCTAVE_CONFIG_INCLUDED
++# error "The file <octave/config.h> must be included before oct-refcount.h."
++#endif
++
++#if defined (USE_ATOMIC_REFCOUNT) && (defined (_MSC_VER) || defined (__GNUC__))
++# if defined (_MSC_VER)
++#  include <intrin.h>
++#  define OCTREFCOUNT_ATOMIC_INCREMENT(x) _InterlockedIncrement((long*)x)
++#  define OCTREFCOUNT_ATOMIC_DECREMENT(x) _InterlockedDecrement((long*)x)
++#  define OCTREFCOUNT_ATOMIC_INCREMENT_POST(x) _InterlockedExchangeAdd((long*)x,  1)
++#  define OCTREFCOUNT_ATOMIC_DECREMENT_POST(x) _InterlockedExchangeAdd((long*)x, -1)
++# elif defined (__GNUC__)
++#  define OCTREFCOUNT_ATOMIC_INCREMENT(x) __sync_add_and_fetch(x,  1)
++#  define OCTREFCOUNT_ATOMIC_DECREMENT(x) __sync_add_and_fetch(x, -1)
++#  define OCTREFCOUNT_ATOMIC_INCREMENT_POST(x) __sync_fetch_and_add(x,  1)
++#  define OCTREFCOUNT_ATOMIC_DECREMENT_POST(x) __sync_fetch_and_add(x, -1)
++# endif
++#else // Generic non-locking versions
++# define OCTREFCOUNT_ATOMIC_INCREMENT(x) ++(*(x))
++# define OCTREFCOUNT_ATOMIC_DECREMENT(x) --(*(x))
++# define OCTREFCOUNT_ATOMIC_INCREMENT_POST(x) (*(x))++
++# define OCTREFCOUNT_ATOMIC_DECREMENT_POST(x) (*(x))--
++#endif
++
+ // Encapsulates a reference counter.
+ template <class T>
+ class octave_refcount
+ {
+ public:
+   typedef T count_type;
+ 
+   octave_refcount(count_type initial_count) : count(initial_count) {}
+ 
+   // Increment/Decrement. int is postfix.
+   count_type operator++(void)
+     {
+-      return ++count;
++      return OCTREFCOUNT_ATOMIC_INCREMENT (&count);
+     }
+ 
+   count_type operator++(int)
+     {
+-      return count++;
++      return OCTREFCOUNT_ATOMIC_INCREMENT_POST (&count);
+     }
+ 
+   count_type operator--(void)
+     {
+-      return --count;
++      return OCTREFCOUNT_ATOMIC_DECREMENT (&count);
+     }
+ 
+   count_type operator--(int)
+     {
+-      return count--;
++      return OCTREFCOUNT_ATOMIC_DECREMENT_POST (&count);
+     }
+ 
+-  operator count_type (void) const { return count; }
+-
+-  // For low-level optimizations only.
+-  count_type& direct (void) const { return count; }
++  operator count_type (void) const
++    {
++      return static_cast<count_type const volatile&> (count);
++    }
+ 
+ private:
+   count_type count;
+ };
+ 
+ #endif
+diff --git a/liboctave/sparse-base-chol.h b/liboctave/sparse-base-chol.h
+--- a/liboctave/sparse-base-chol.h
++++ b/liboctave/sparse-base-chol.h
+@@ -173,25 +173,25 @@ public:
+     { }
+ 
+   sparse_base_chol (const sparse_base_chol<chol_type, chol_elt, p_type>& a)
+     : rep (a.rep)
+     { rep->count++; }
+ 
+   virtual ~sparse_base_chol (void)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   sparse_base_chol& operator = (const sparse_base_chol& a)
+     {
+       if (this != &a)
+         {
+-          if (--rep->count <= 0)
++          if (--rep->count == 0)
+             delete rep;
+ 
+           rep = a.rep;
+           rep->count++;
+         }
+ 
+       return *this;
+     }
+diff --git a/src/DLD-FUNCTIONS/urlwrite.cc b/src/DLD-FUNCTIONS/urlwrite.cc
+--- a/src/DLD-FUNCTIONS/urlwrite.cc
++++ b/src/DLD-FUNCTIONS/urlwrite.cc
+@@ -41,16 +41,17 @@ along with Octave; see the file COPYING.
+ #include "glob-match.h"
+ 
+ #include "defun-dld.h"
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "ov-cell.h"
+ #include "pager.h"
+ #include "oct-map.h"
++#include "oct-refcount.h"
+ #include "unwind-prot.h"
+ 
+ #ifdef HAVE_CURL
+ 
+ #include <curl/curl.h>
+ #include <curl/curlver.h>
+ #include <curl/easy.h>
+ 
+@@ -136,17 +137,17 @@ private:
+         return ascii;
+       }
+ 
+     bool is_binary (void) const
+       {
+         return !ascii;
+       }
+ 
+-    size_t count;
++    octave_refcount<size_t> count;
+     std::string host;
+     bool valid;
+     bool ascii;
+     mutable CURLcode errnum;
+ 
+   private:
+     CURL *curl;
+ 
+diff --git a/src/gl-render.cc b/src/gl-render.cc
+--- a/src/gl-render.cc
++++ b/src/gl-render.cc
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #if defined (HAVE_OPENGL)
+ 
+ #include <iostream>
+ 
+ #include <lo-mappers.h>
+ #include "oct-locbuf.h"
++#include "oct-refcount.h"
+ #include "gl-render.h"
+ #include "txt-eng.h"
+ #include "txt-eng-ft.h"
+ 
+ #define LIGHT_MODE GL_FRONT_AND_BACK
+ 
+ // Win32 API requires the CALLBACK attributes for
+ // GLU callback functions. Define it to empty on
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include "caseless-str.h"
+ #include "lo-ieee.h"
+ 
+ #include "gripes.h"
+ #include "oct-map.h"
+ #include "oct-mutex.h"
++#include "oct-refcount.h"
+ #include "ov.h"
+ #include "txt-eng-ft.h"
+ 
+ // FIXME -- maybe this should be a configure option?
+ // Matlab defaults to "Helvetica", but that causes problems for many
+ // gnuplot users.
+ #if !defined (OCTAVE_DEFAULT_FONTNAME)
+ #define OCTAVE_DEFAULT_FONTNAME "*"
+@@ -477,17 +478,17 @@ protected:
+ 
+ private:
+   typedef std::map<listener_mode, octave_value_list> listener_map;
+   typedef std::map<listener_mode, octave_value_list>::iterator listener_map_iterator;
+   typedef std::map<listener_mode, octave_value_list>::const_iterator listener_map_const_iterator;
+ 
+ private:
+   int id;
+-  int count;
++  octave_refcount<int> count;
+   std::string name;
+   graphics_handle parent;
+   bool hidden;
+   listener_map listeners;
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+@@ -1905,17 +1906,17 @@ public:
+ 
+   property (const property& p) : rep (p.rep)
+     {
+       rep->count++;
+     }
+ 
+   ~property (void)
+     {
+-      if (--rep->count <= 0)
++      if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   bool ok (void) const
+     { return rep->ok (); }
+ 
+   std::string get_name (void) const
+     { return rep->get_name (); }
+@@ -1960,17 +1961,17 @@ public:
+   property& operator = (const octave_value& val)
+     {
+       *rep = val;
+       return *this;
+     }
+ 
+   property& operator = (const property& p)
+     {
+-      if (rep && --rep->count <= 0)
++      if (rep && --rep->count == 0)
+         delete rep;
+ 
+       rep = p.rep;
+       rep->count++;
+ 
+       return *this;
+     }
+ 
+@@ -2128,17 +2129,17 @@ public:
+   // toolkit-specific cleanup operations before an object is deleted.
+   virtual void finalize (const graphics_object&)
+     { gripe_invalid ("base_graphics_toolkit::finalize"); }
+ 
+   void finalize (const graphics_handle&);
+ 
+ private:
+   std::string name;
+-  int count;
++  octave_refcount<int> count;
+ 
+ private:
+   void gripe_invalid (const std::string& fname) const
+     {
+       if (! is_valid ())
+         error ("%s: invalid graphics toolkit", fname.c_str ());
+     }
+ };
+@@ -2734,17 +2735,17 @@ protected:
+   virtual void update (const graphics_object& go, int id)
+     {
+       if (toolkit_flag)
+         get_toolkit ().update (go, id);
+     }
+ 
+ protected:
+   // A reference count.
+-  int count;
++  octave_refcount<int> count;
+ 
+   // A flag telling whether this object is a valid object
+   // in the backend context.
+   bool toolkit_flag;
+ 
+   // No copying!
+ 
+   base_graphics_object (const base_graphics_object&) : count (0) { }
+@@ -5092,17 +5093,17 @@ public:
+ 
+   base_graphics_event (void) : count (1) { }
+ 
+   virtual ~base_graphics_event (void) { }
+ 
+   virtual void execute (void) = 0;
+ 
+ private:
+-  int count;
++  octave_refcount<int> count;
+ };
+ 
+ class
+ graphics_event
+ {
+ public:
+   typedef void (*event_fcn) (void*);
+ 
+diff --git a/src/oct-map.h b/src/oct-map.h
+--- a/src/oct-map.h
++++ b/src/oct-map.h
+@@ -68,18 +68,22 @@ public:
+       if (--rep->count == 0)
+         delete rep;
+     }
+ 
+   void make_unique (void)
+     {
+       if (rep->count > 1)
+         {
+-          --rep->count;
+-          rep = new fields_rep (*rep);
++          fields_rep *r = new fields_rep (*rep);
++
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = r;
+         }
+     }
+ 
+   octave_fields (const octave_fields& o) : rep (o.rep) { rep->count++; }
+ 
+   octave_fields&
+   operator = (const octave_fields& o)
+     {
+diff --git a/src/oct-stream.h b/src/oct-stream.h
+--- a/src/oct-stream.h
++++ b/src/oct-stream.h
+@@ -32,16 +32,17 @@ class octave_value_list;
+ #include <sstream>
+ #include <string>
+ #include <map>
+ 
+ #include "Array.h"
+ #include "data-conv.h"
+ #include "lo-utils.h"
+ #include "mach-info.h"
++#include "oct-refcount.h"
+ 
+ class
+ OCTINTERP_API
+ scanf_format_elt
+ {
+ public:
+ 
+   enum special_conversion
+@@ -422,17 +423,17 @@ protected:
+ 
+   // Clear stream state.
+ 
+   void clearerr (void);
+ 
+ private:
+ 
+   // A reference count.
+-  octave_idx_type count;
++  octave_refcount<octave_idx_type> count;
+ 
+   // The permission bits for the file.  Should be some combination of
+   // std::ios::open_mode bits.
+   int md;
+ 
+   // Data format.
+   oct_mach_info::float_format flt_fmt;
+ 
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -310,30 +310,38 @@ public:
+     if (--rep->count == 0)
+       delete rep;
+   }
+ 
+   void make_unique (void)
+     {
+       if (rep->count > 1)
+         {
+-          --rep->count;
+-          rep = rep->unique_clone ();
++	  octave_base_value *r = rep->unique_clone ();
++
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = r;
+         }
+     }
+ 
+   // This uniquifies the value if it is referenced by more than a certain
+   // number of shallow copies. This is useful for optimizations where we
+   // know a certain copy, typically within a cell array, to be obsolete.
+   void make_unique (int obsolete_copies)
+     {
+       if (rep->count > obsolete_copies + 1)
+         {
+-          --rep->count;
+-          rep = rep->unique_clone ();
++          octave_base_value *r = rep->unique_clone ();
++
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = r;
+         }
+     }
+ 
+   // Simple assignment.
+ 
+   octave_value& operator = (const octave_value& a)
+     {
+       if (rep != a.rep)
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -32,16 +32,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "glob-match.h"
+ #include "regex-match.h"
+ 
+ class tree_argument_list;
+ class octave_user_function;
+ 
+ #include "oct-obj.h"
++#include "oct-refcount.h"
+ #include "ov.h"
+ 
+ class
+ OCTINTERP_API
+ symbol_table
+ {
+ public:
+ 
+@@ -382,17 +383,17 @@ public:
+       std::string name;
+ 
+       std::deque<octave_value> value_stack;
+ 
+       unsigned int storage_class;
+ 
+       fcn_info *finfo;
+ 
+-      size_t count;
++      octave_refcount<size_t> count;
+ 
+     private:
+ 
+       // No copying!
+ 
+       symbol_record_rep (const symbol_record_rep& ov);
+ 
+       symbol_record_rep& operator = (const symbol_record_rep&);
+@@ -723,17 +724,17 @@ public:
+       octave_value cmdline_function;
+ 
+       octave_value autoload_function;
+ 
+       octave_value function_on_path;
+ 
+       octave_value built_in_function;
+ 
+-      size_t count;
++      octave_refcount<size_t> count;
+ 
+     private:
+ 
+       octave_value xfind (const octave_value_list& args, bool local_funcs);
+ 
+       octave_value x_builtin_find (void);
+ 
+       // No copying!

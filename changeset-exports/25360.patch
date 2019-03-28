@@ -1,0 +1,1832 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1525794814 14400
+#      Tue May 08 11:53:34 2018 -0400
+# Node ID bc5f225bc5783240d02acc81fb59738edfa578a8
+# Parent  b93522e36446f85e99f3e15dbd559d0420a79b72
+eliminate some global accesses to the breakpoint table
+
+* pt-eval.h, pt-eval.cc (tree_evaluator::m_bp_table): Store breakpoint
+table in evaluator, not interpreter.  Change all uses.
+(tree_evaluator::get_user_code): Move here from interpreter.
+(tree_evaluator::m_dbstep_flag, tree_evaluator::m_in_loop_command):
+Now a member variables instead of static.  Change all uses.
+(tree_evaluator::reset_debug_state): Now a member function instead of
+static.  Change all uses.  New overload that accepts mode directly.
+(tree_evaluator::final_index_error): Now a member function instead of
+static.  Change all uses.
+
+* bp-table.h, bp-table.cc (bp_table::m_evaluator): Store reference to
+the evaluator in bp_table instead of a reference to the interpreter.
+Change all uses.
+
+* debug.cc (Fdbstep, Fdbcont, Fdbquit): Define with DEFMETHOD.
+
+* octave-cmd.h, octave-cmd.cc (octave_cmd_exec::execute,
+octave_cmd_eval::execute, octave_cmd_debug::execute): Accept reference
+to interpreter as argument.
+(octave_command_queue::execute_command_callback): Pass interpreter to
+execute functions.
+
+diff --git a/libgui/src/octave-cmd.cc b/libgui/src/octave-cmd.cc
+--- a/libgui/src/octave-cmd.cc
++++ b/libgui/src/octave-cmd.cc
+@@ -23,34 +23,36 @@ along with Octave; see the file COPYING.
+ // Author: Torsten <ttl@justmail.de>
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "octave-cmd.h"
+ 
+-#include "octave-qt-link.h"
++#include "builtin-defun-decls.h"
+ #include "cmd-edit.h"
+-#include "builtin-defun-decls.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "octave-qt-link.h"
+ #include "utils.h"
+ 
+ namespace octave
+ {
+-  void octave_cmd_exec::execute (void)
++  void octave_cmd_exec::execute (interpreter&)
+   {
+     std::string pending_input = command_editor::get_current_line ();
+ 
+     command_editor::set_initial_input (pending_input);
+     command_editor::replace_line (m_cmd.toStdString ());
+     command_editor::redisplay ();
+     command_editor::accept_line ();
+   }
+ 
+-  void octave_cmd_eval::execute (void)
++  void octave_cmd_eval::execute (interpreter&)
+   {
+     QString function_name = m_info.fileName ();
+     function_name.chop (m_info.suffix ().length () + 1);
+     std::string file_path = m_info.absoluteFilePath ().toStdString ();
+ 
+     std::string pending_input = command_editor::get_current_line ();
+ 
+     if (valid_identifier (function_name.toStdString ()))
+@@ -68,34 +70,34 @@ namespace octave
+       }
+ 
+     command_editor::set_initial_input (pending_input);
+     command_editor::redisplay ();
+ 
+     command_editor::accept_line ();
+   }
+ 
+-  void octave_cmd_debug::execute (void)
++  void octave_cmd_debug::execute (interpreter& interp)
+   {
+     if (m_cmd == "step")
+       {
+         F__db_next_breakpoint_quiet__ (ovl (m_suppress_dbg_location));
+-        Fdbstep ();
++        Fdbstep (interp);
+       }
+     else if (m_cmd == "cont")
+       {
+         F__db_next_breakpoint_quiet__ (ovl (m_suppress_dbg_location));
+-        Fdbcont ();
++        Fdbcont (interp);
+       }
+     else if (m_cmd == "quit")
+-      Fdbquit ();
++      Fdbquit (interp);
+     else
+       {
+         F__db_next_breakpoint_quiet__ (ovl (m_suppress_dbg_location));
+-        Fdbstep (ovl (m_cmd.toStdString ()));
++        Fdbstep (interp, ovl (m_cmd.toStdString ()));
+       }
+ 
+     command_editor::interrupt (true);
+   }
+ 
+   // add a command to the queue
+ 
+   void octave_command_queue::add_cmd (octave_cmd *cmd)
+@@ -121,17 +123,23 @@ namespace octave
+         octave_cmd *cmd = m_queue.takeFirst ();
+ 
+         if (m_queue.isEmpty ())
+           m_processing.release (); // cmd queue empty, processing will stop
+         else
+           repost = true;          // not empty, repost at end
+         m_queue_mutex.unlock ();
+ 
+-        cmd->execute ();
++        // FIXME: Could we store a reference to the interpreter in the
++        // octave_command_queue object?  If so, where is the proper
++        // place to initialize that?
++
++        interpreter& interp = __get_interpreter__ ("octave_command_queue::execute_command_callback");
++
++        cmd->execute (interp);
+ 
+         delete cmd;
+       }
+ 
+     if (repost)  // queue not empty, so repost event for further processing
+       octave_link::post_event (this, &octave_command_queue::execute_command_callback);
+   }
+ }
+diff --git a/libgui/src/octave-cmd.h b/libgui/src/octave-cmd.h
+--- a/libgui/src/octave-cmd.h
++++ b/libgui/src/octave-cmd.h
+@@ -29,61 +29,63 @@ along with Octave; see the file COPYING.
+ #include <QMutex>
+ #include <QString>
+ #include <QFileInfo>
+ 
+ #include "octave-qt-link.h"
+ 
+ namespace octave
+ {
++  class interpreter;
++
+   class octave_cmd
+   {
+   public:
+ 
+     octave_cmd (void) = default;
+ 
+     virtual ~octave_cmd (void) = default;
+ 
+-    virtual void execute (void) { }
++    virtual void execute (interpreter&) { }
+   };
+ 
+   class octave_cmd_exec : public octave_cmd
+   {
+   public:
+ 
+     octave_cmd_exec (const QString& cmd) : octave_cmd () { m_cmd = cmd; }
+ 
+-    void execute (void);
++    void execute (interpreter& interp);
+ 
+   protected:
+ 
+     QString m_cmd;
+   };
+ 
+   class octave_cmd_eval : public octave_cmd
+   {
+   public:
+ 
+     octave_cmd_eval (const QFileInfo& info) : octave_cmd () { m_info = info; }
+ 
+-    void execute (void);
++    void execute (interpreter& interp);
+ 
+   protected:
+ 
+     QFileInfo m_info;
+   };
+ 
+   class octave_cmd_debug : public octave_cmd_exec
+   {
+   public:
+ 
+     octave_cmd_debug (const QString& cmd, bool suppress_location)
+       : octave_cmd_exec (cmd), m_suppress_dbg_location (suppress_location) { }
+ 
+-    void execute (void);
++    void execute (interpreter& interp);
+ 
+   protected:
+ 
+     bool m_suppress_dbg_location;
+   };
+ 
+   //! Queuing octave commands from the GUI for the worker thread.
+ 
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -171,17 +171,19 @@ all breakpoints within the file are clea
+ @end deftypefn */)
+ {
+   octave::bp_table::intmap retmap;
+   std::string symbol_name = "";  // stays empty for "dbstop if error" etc
+   octave::bp_table::intmap lines;
+   std::string condition = "";
+   octave_value retval;
+ 
+-  octave::bp_table& bptab = interp.get_bp_table ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  octave::bp_table& bptab = tw.get_bp_table ();
+ 
+   if (args.length() >= 1 && ! args(0).isstruct ())
+     {
+       // explicit function / line / condition
+       bptab.parse_dbfunction_params ("dbstop", args, symbol_name,
+                                      lines, condition);
+ 
+       if (lines.size () == 0)
+@@ -297,17 +299,19 @@ files.
+ @end deftypefn */)
+ {
+   std::string symbol_name = "";  // stays empty for "dbclear if error" etc
+   octave::bp_table::intmap lines;
+   std::string dummy;             // "if" condition -- only used for dbstop
+ 
+   int nargin = args.length ();
+ 
+-  octave::bp_table& bptab = interp.get_bp_table ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  octave::bp_table& bptab = tw.get_bp_table ();
+ 
+   bptab.parse_dbfunction_params ("dbclear", args, symbol_name, lines, dummy);
+ 
+   if (nargin == 1 && symbol_name == "all")
+     {
+       bptab.remove_all_breakpoints ();
+       bptab.dbclear_all_signals ();
+     }
+@@ -369,33 +373,35 @@ The @qcode{"warn"} field is set similarl
+ 
+   if (nargin != 0 && nargin != 1)
+     error ("dbstatus: only zero or one arguments accepted\n");
+ 
+   octave_value_list fcn_list;
+   octave::bp_table::fname_bp_map bp_list;
+   std::string symbol_name;
+ 
+-  octave::bp_table& bptab = interp.get_bp_table ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  octave::bp_table& bptab = tw.get_bp_table ();
+ 
+   if (nargin == 1)
+     {
+       if (! args(0).is_string ())
+         err_wrong_type_arg ("dbstatus", args(0));
+ 
+       symbol_name = args(0).string_value ();
+       fcn_list(0) = symbol_name;
+       bp_list = bptab.get_breakpoint_list (fcn_list);
+     }
+   else
+     {
+ /*
+       if (Vdebugging)
+         {
+-          octave_user_code *dbg_fcn = interp.get_user_code ();
++          octave_user_code *dbg_fcn = tw.get_user_code ();
+           if (dbg_fcn)
+             {
+               symbol_name = dbg_fcn->name ();
+               fcn_list(0) = symbol_name;
+             }
+         }
+ */
+ 
+@@ -533,17 +539,19 @@ The @qcode{"warn"} field is set similarl
+ DEFMETHOD (dbwhere, interp, , ,
+            doc: /* -*- texinfo -*-
+ @deftypefn {} {} dbwhere
+ In debugging mode, report the current file and line number where execution
+ is stopped.
+ @seealso{dbstack, dblist, dbstatus, dbcont, dbstep, dbup, dbdown}
+ @end deftypefn */)
+ {
+-  octave_user_code *dbg_fcn = interp.get_user_code ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  octave_user_code *dbg_fcn = tw.get_user_code ();
+ 
+   if (! dbg_fcn)
+     {
+       octave_stdout << "stopped at top level" << std::endl;
+       return ovl ();
+     }
+ 
+   octave_stdout << "stopped in " << dbg_fcn->name () << " at ";
+@@ -630,20 +638,22 @@ When called with the name of a function,
+ numbers.
+ @seealso{dblist, dbwhere, dbstatus, dbstop}
+ @end deftypefn */)
+ {
+   octave_user_code *dbg_fcn;
+ 
+   string_vector argv = args.make_argv ("dbtype");
+ 
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
+   switch (args.length ())
+     {
+     case 0:  // dbtype
+-      dbg_fcn = interp.get_user_code ();
++      dbg_fcn = tw.get_user_code ();
+ 
+       if (! dbg_fcn)
+         error ("dbtype: must be inside a user function to give no arguments to dbtype\n");
+ 
+       do_dbtype (octave_stdout, dbg_fcn->fcn_file_name (),
+                  0, std::numeric_limits<int>::max ());
+ 
+       break;
+@@ -651,17 +661,17 @@ numbers.
+     case 1:  // (dbtype start:end) || (dbtype func) || (dbtype lineno)
+       {
+         std::string arg = argv[1];
+ 
+         size_t ind = arg.find (':');
+ 
+         if (ind != std::string::npos)  // (dbtype start:end)
+           {
+-            dbg_fcn = interp.get_user_code ();
++            dbg_fcn = tw.get_user_code ();
+ 
+             if (dbg_fcn)
+               {
+                 std::string start_str = arg.substr (0, ind);
+                 std::string end_str = arg.substr (ind + 1);
+ 
+                 int start, end;
+                 start = atoi (start_str.c_str ());
+@@ -681,42 +691,42 @@ numbers.
+               }
+           }
+         else  // (dbtype func) || (dbtype lineno)
+           {
+             int line = atoi (arg.c_str ());
+ 
+             if (line == 0)  // (dbtype func)
+               {
+-                dbg_fcn = interp.get_user_code (arg);
++                dbg_fcn = tw.get_user_code (arg);
+ 
+                 if (! dbg_fcn)
+                   error ("dbtype: function <%s> not found\n", arg.c_str ());
+ 
+                 do_dbtype (octave_stdout, dbg_fcn->fcn_file_name (),
+                            0, std::numeric_limits<int>::max ());
+               }
+             else  // (dbtype lineno)
+               {
+                 if (line <= 0)
+                   error ("dbtype: start and end lines must be >= 1\n");
+ 
+-                dbg_fcn = interp.get_user_code ();
++                dbg_fcn = tw.get_user_code ();
+ 
+                 if (dbg_fcn)
+                   do_dbtype (octave_stdout, dbg_fcn->fcn_file_name (),
+                              line, line);
+               }
+           }
+       }
+       break;
+ 
+     case 2:  // (dbtype func start:end) || (dbtype func start)
+       {
+-        dbg_fcn = interp.get_user_code (argv[1]);
++        dbg_fcn = tw.get_user_code (argv[1]);
+ 
+         if (! dbg_fcn)
+           error ("dbtype: function <%s> not found\n", argv[1].c_str ());
+ 
+         std::string arg = argv[2];
+         int start, end;
+         size_t ind = arg.find (':');
+ 
+@@ -779,17 +789,19 @@ If unspecified @var{n} defaults to 10 (+
+         }
+       else
+         n = args(0).int_value ();
+ 
+       if (n < 0)
+         error ("dblist: N must be a non-negative integer");
+     }
+ 
+-  octave_user_code *dbg_fcn = interp.get_user_code ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  octave_user_code *dbg_fcn = tw.get_user_code ();
+ 
+   if (! dbg_fcn)
+     error ("dblist: must be inside a user function to use dblist\n");
+ 
+   bool have_file = true;
+ 
+   std::string name = dbg_fcn->fcn_file_name ();
+ 
+@@ -1045,18 +1057,18 @@ If @var{n} is omitted, move down one fra
+ @seealso{dbstack, dbup}
+ @end deftypefn */)
+ {
+   do_dbupdown (interp, args, "dbdown");
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (dbstep, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbstep, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbstep
+ @deftypefnx {} {} dbstep @var{n}
+ @deftypefnx {} {} dbstep in
+ @deftypefnx {} {} dbstep out
+ @deftypefnx {} {} dbnext @dots{}
+ In debugging mode, execute the next @var{n} lines of code.
+ 
+ If @var{n} is omitted, execute the next single line of code.  If the next
+@@ -1076,101 +1088,106 @@ function returns.
+   if (! Vdebugging)
+     error ("dbstep: can only be called in debug mode");
+ 
+   int nargin = args.length ();
+ 
+   if (nargin > 1)
+     print_usage ();
+ 
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
+   if (nargin == 1)
+     {
+       std::string arg = args(0).xstring_value ("dbstep: input argument must be a string");
+ 
+       if (arg == "in")
+         {
+           Vdebugging = false;
+           Vtrack_line_num = true;
+ 
+-          octave::tree_evaluator::dbstep_flag = -1;
++          tw.set_dbstep_flag (-1);
+         }
+       else if (arg == "out")
+         {
+           Vdebugging = false;
+           Vtrack_line_num = true;
+ 
+-          octave::tree_evaluator::dbstep_flag = -2;
++          tw.set_dbstep_flag (-2);
+         }
+       else
+         {
+           int n = atoi (arg.c_str ());
+ 
+           if (n < 1)
+             error ("dbstep: invalid argument");
+ 
+           Vdebugging = false;
+           Vtrack_line_num = true;
+ 
+-          octave::tree_evaluator::dbstep_flag = n;
++          tw.set_dbstep_flag (n);
+         }
+     }
+   else
+     {
+       Vdebugging = false;
+       Vtrack_line_num = true;
+ 
+-      octave::tree_evaluator::dbstep_flag = 1;
++      tw.set_dbstep_flag (1);
+     }
+ 
+   return ovl ();
+ }
+ 
+ DEFALIAS (dbnext, dbstep);
+ 
+-DEFUN (dbcont, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbcont, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} dbcont
+ Leave command-line debugging mode and continue code execution normally.
+ @seealso{dbstep, dbquit}
+ @end deftypefn */)
+ {
+   if (! Vdebugging)
+     error ("dbcont: can only be called in debug mode");
+ 
+   if (args.length () != 0)
+     print_usage ();
+ 
+   Vdebugging = false;
+   Vtrack_line_num = true;
+ 
+-  octave::tree_evaluator::reset_debug_state ();
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  tw.reset_debug_state ();
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (dbquit, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbquit, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} dbquit
+ Quit debugging mode immediately without further code execution and return to
+ the Octave prompt.
+ @seealso{dbcont, dbstep}
+ @end deftypefn */)
+ {
+   if (! Vdebugging)
+     error ("dbquit: can only be called in debug mode");
+ 
+   if (args.length () != 0)
+     print_usage ();
+ 
+   // FIXME: there are too many debug mode flags!
+ 
+   Vdebugging = false;
+ 
+-  octave::tree_evaluator::reset_debug_state ();
+-  octave::tree_evaluator::debug_mode = false;
++  octave::tree_evaluator& tw = interp.get_evaluator ();
++
++  tw.reset_debug_state (false);
+ 
+   throw octave::interrupt_exception ();
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (isdebugmode, args, ,
+        doc: /* -*- texinfo -*-
+diff --git a/libinterp/corefcn/interpreter-private.cc b/libinterp/corefcn/interpreter-private.cc
+--- a/libinterp/corefcn/interpreter-private.cc
++++ b/libinterp/corefcn/interpreter-private.cc
+@@ -109,19 +109,19 @@ namespace octave
+   {
+     interpreter& interp = __get_interpreter__ (who);
+ 
+     return interp.get_evaluator ();
+   }
+ 
+   bp_table& __get_bp_table__ (const std::string& who)
+   {
+-    interpreter& interp = __get_interpreter__ (who);
++    tree_evaluator& tw = __get_evaluator__ (who);
+ 
+-    return interp.get_bp_table ();
++    return tw.get_bp_table ();
+   }
+ 
+   call_stack& __get_call_stack__ (const std::string& who)
+   {
+     interpreter& interp = __get_interpreter__ (who);
+ 
+     return interp.get_call_stack ();
+   }
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -24,17 +24,16 @@ along with Octave; see the file COPYING.
+ #  include "config.h"
+ #endif
+ 
+ #include <string>
+ #include <iostream>
+ 
+ #include "cmd-edit.h"
+ #include "cmd-hist.h"
+-#include "file-ops.h"
+ #include "file-stat.h"
+ #include "fpucw-wrappers.h"
+ #include "lo-blas-proto.h"
+ #include "lo-error.h"
+ #include "oct-env.h"
+ #include "str-vec.h"
+ #include "signal-wrappers.h"
+ #include "unistd-wrappers.h"
+@@ -327,17 +326,16 @@ namespace octave
+     : m_app_context (app_context),
+       m_environment (),
+       m_help_system (*this),
+       m_dynamic_loader (*this),
+       m_load_path (),
+       m_type_info (),
+       m_symbol_table (),
+       m_evaluator (*this),
+-      m_bp_table (*this),
+       m_stream_list (*this),
+       m_child_list (),
+       m_url_handle_manager (),
+       m_cdef_manager (*this),
+       m_gtk_manager (),
+       m_interactive (false),
+       m_read_site_files (true),
+       m_read_init_files (m_app_context != nullptr),
+@@ -936,17 +934,17 @@ namespace octave
+       {
+         try
+           {
+             reset_error_handler ();
+ 
+             parser.reset ();
+ 
+             if (m_symbol_table.at_top_level ())
+-              tree_evaluator::reset_debug_state ();
++              m_evaluator.reset_debug_state ();
+ 
+             retval = parser.run ();
+ 
+             if (retval == 0)
+               {
+                 if (parser.m_stmt_list)
+                   {
+                     parser.m_stmt_list->accept (m_evaluator);
+@@ -1177,56 +1175,16 @@ namespace octave
+     return m_evaluator.get_call_stack ();
+   }
+ 
+   profiler& interpreter::get_profiler (void)
+   {
+     return m_evaluator.get_profiler ();
+   }
+ 
+-  // Return a pointer to the user-defined function FNAME.  If FNAME is empty,
+-  // search backward for the first user-defined function in the
+-  // current call stack.
+-
+-  octave_user_code *
+-  interpreter::get_user_code (const std::string& fname)
+-  {
+-    octave_user_code *user_code = nullptr;
+-
+-    if (fname.empty ())
+-      {
+-        call_stack& cs = get_call_stack ();
+-
+-        user_code = cs.debug_user_code ();
+-      }
+-    else
+-      {
+-        std::string name = fname;
+-
+-        if (sys::file_ops::dir_sep_char () != '/' && name[0] == '@')
+-          {
+-            auto beg = name.begin () + 2;  // never have @/method
+-            auto end = name.end () - 1;    // never have trailing '/'
+-            std::replace (beg, end, '/', sys::file_ops::dir_sep_char ());
+-          }
+-
+-        size_t name_len = name.length ();
+-
+-        if (name_len > 2 && name.substr (name_len-2) == ".m")
+-          name = name.substr (0, name_len-2);
+-
+-        octave_value fcn = m_symbol_table.find_function (name);
+-
+-        if (fcn.is_defined () && fcn.is_user_code ())
+-          user_code = fcn.user_code_value ();
+-      }
+-
+-    return user_code;
+-  }
+-
+   void interpreter::mlock (void)
+   {
+     call_stack& cs = get_call_stack ();
+ 
+     octave_function *fcn = cs.current ();
+ 
+     if (! fcn)
+       error ("mlock: invalid use outside a function");
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -26,17 +26,16 @@ along with Octave; see the file COPYING.
+ #include "octave-config.h"
+ 
+ #include <string>
+ 
+ #include "child-list.h"
+ #include "quit.h"
+ #include "str-vec.h"
+ 
+-#include "bp-table.h"
+ #include "dynamic-ld.h"
+ #include "environment.h"
+ #include "gtk-manager.h"
+ #include "help.h"
+ #include "load-path.h"
+ #include "oct-stream.h"
+ #include "ov-classdef.h"
+ #include "ov-typeinfo.h"
+@@ -48,18 +47,16 @@ extern OCTINTERP_API bool quit_allowed;
+ 
+ // TRUE means we are ready to interpret commands, but not everything
+ // is ready for interactive use.
+ extern OCTINTERP_API bool octave_interpreter_ready;
+ 
+ // TRUE means we've processed all the init code and we are good to go.
+ extern OCTINTERP_API bool octave_initialized;
+ 
+-class octave_user_code;
+-
+ namespace octave
+ {
+   class profiler;
+   class call_stack;
+   class child_list;
+   class tree_evaluator;
+ 
+   // The application object contains a pointer to the current
+@@ -176,21 +173,16 @@ namespace octave
+     type_info& get_type_info (void)
+     {
+       return m_type_info;
+     }
+ 
+     symbol_scope get_current_scope (void);
+     symbol_scope require_current_scope (const std::string& who);
+ 
+-    bp_table& get_bp_table (void)
+-    {
+-      return m_bp_table;
+-    }
+-
+     call_stack& get_call_stack (void);
+ 
+     profiler& get_profiler (void);
+ 
+     tree_evaluator& get_evaluator (void);
+ 
+     stream_list& get_stream_list (void);
+ 
+@@ -206,18 +198,16 @@ namespace octave
+       return m_cdef_manager;
+     }
+ 
+     gtk_manager& get_gtk_manager (void)
+     {
+       return m_gtk_manager;
+     }
+ 
+-    octave_user_code * get_user_code (const std::string& fname = "");
+-
+     void mlock (void);
+ 
+     void munlock (const std::string& nm);
+ 
+     bool mislocked (const std::string& nm);
+ 
+     static void recover_from_exception (void);
+ 
+@@ -264,18 +254,16 @@ namespace octave
+     load_path m_load_path;
+ 
+     type_info m_type_info;
+ 
+     symbol_table m_symbol_table;
+ 
+     tree_evaluator m_evaluator;
+ 
+-    bp_table m_bp_table;
+-
+     stream_list m_stream_list;
+ 
+     child_list m_child_list;
+ 
+     url_handle_manager m_url_handle_manager;
+ 
+     cdef_manager m_cdef_manager;
+ 
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -1134,17 +1134,17 @@ public:
+ 
+   ~octave_classdef_superclass_ref (void) = default;
+ 
+   bool is_classdef_superclass_ref (void) const { return true; }
+ 
+   octave_function * function_value (bool = false) { return this; }
+ 
+   octave_value_list
+-  call (octave::tree_evaluator&, int nargout, const octave_value_list& idx)
++  call (octave::tree_evaluator& tw, int nargout, const octave_value_list& idx)
+   {
+     octave_value_list retval;
+ 
+     std::string meth_name;
+     bool in_constructor;
+     cdef_class ctx;
+ 
+     ctx = get_class_context (meth_name, in_constructor);
+@@ -1158,22 +1158,21 @@ public:
+     cdef_class cls = lookup_class (cname);
+ 
+     if (in_constructor)
+       {
+         if (! is_direct_superclass (cls, ctx))
+           error ("`%s' is not a direct superclass of `%s'",
+                  cname.c_str (), ctx.get_name ().c_str ());
+ 
+-        if (! is_constructed_object (mname))
++        if (! is_constructed_object (tw, mname))
+           error ("cannot call superclass constructor with variable `%s'",
+                  mname.c_str ());
+ 
+-        octave::symbol_scope scope
+-          = octave::__require_current_scope__ ("octave_classdef_superclass_ref::call");
++        octave::symbol_scope scope = tw.get_current_scope ();
+ 
+         octave_value sym = scope.varval (mname);
+ 
+         cls.run_constructor (to_cdef_ref (sym), idx);
+ 
+         retval(0) = sym;
+       }
+     else
+@@ -1206,20 +1205,20 @@ public:
+         retval = meth.execute (idx, nargout, true,
+                                meth_name);
+       }
+ 
+     return retval;
+   }
+ 
+ private:
+-  bool is_constructed_object (const std::string nm)
++  bool is_constructed_object (octave::tree_evaluator& tw,
++                              const std::string& nm)
+   {
+-    octave::call_stack& cs
+-      = octave::__get_call_stack__ ("octave_classdef_superclass_ref::is_constructed_object");
++    octave::call_stack& cs = tw.get_call_stack ();
+ 
+     octave_function *of = cs.current ();
+ 
+     if (of->is_classdef_constructor ())
+       {
+         octave_user_function *uf = of->user_function_value (true);
+ 
+         if (uf)
+@@ -3768,18 +3767,17 @@ cdef_manager::find_class (const std::str
+       if (load_if_not_found)
+         {
+           octave_value ov_cls;
+ 
+           size_t pos = name.rfind ('.');
+ 
+           if (pos == std::string::npos)
+             {
+-              octave::symbol_table& symtab
+-                = octave::__get_symbol_table__ ("cdef_manager::find_class");
++              octave::symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+               ov_cls = symtab.find (name);
+             }
+           else
+             {
+               std::string pack_name = name.substr (0, pos);
+ 
+               cdef_package pack = find_package (pack_name, false, true);
+@@ -3846,18 +3844,17 @@ cdef_manager::find_package (const std::s
+     {
+       retval = it->second;
+ 
+       if (! retval.ok ())
+         error ("invalid package `%s'", name.c_str ());
+     }
+   else
+     {
+-      octave::load_path& lp
+-        = octave::__get_load_path__ ("cdef_manager::find_package");
++      octave::load_path& lp = m_interpreter.get_load_path ();
+ 
+       if (load_if_not_found && lp.find_package (name))
+         {
+           size_t pos = name.find ('.');
+ 
+           if (pos == std::string::npos)
+             retval = make_package (name, "");
+           else
+diff --git a/libinterp/parse-tree/bp-table.cc b/libinterp/parse-tree/bp-table.cc
+--- a/libinterp/parse-tree/bp-table.cc
++++ b/libinterp/parse-tree/bp-table.cc
+@@ -336,18 +336,17 @@ namespace octave
+             else if (seen_if)
+               error ("%s: line number must come before 'if' clause\n");
+             seen_at = true;
+ 
+             if (! seen_in)
+               {
+                 // It was a line number.  Get function name from debugger.
+                 if (Vdebugging)
+-                  symbol_name
+-                    = m_interpreter.get_user_code ()->profiler_name ();
++                  symbol_name = m_evaluator.get_user_code ()->profiler_name ();
+                 else
+                   error ("%s: function name must come before line number "
+                          "and 'if'", who);
+                 seen_in = true;
+               }
+             else if (seen_if)
+               error ("%s: line number must come before 'if' clause\n");
+ 
+@@ -556,17 +555,17 @@ namespace octave
+   }
+ 
+   // Given file name fname, find the subfunction at line and create
+   // a breakpoint there.  Put the system into debug_mode.
+   bp_table::intmap bp_table::add_breakpoint (const std::string& fname,
+                                              const bp_table::intmap& line,
+                                              const std::string& condition)
+   {
+-    octave_user_code *main_fcn = m_interpreter.get_user_code (fname);
++    octave_user_code *main_fcn = m_evaluator.get_user_code (fname);
+ 
+     if (! main_fcn)
+       error ("add_breakpoint: unable to find function '%s'\n", fname.c_str ());
+ 
+     condition_valid (condition);  // Throw error if condition not valid.
+ 
+     intmap retval;
+ 
+@@ -654,17 +653,17 @@ namespace octave
+ 
+     if (len == 0)
+       {
+         intmap results = remove_all_breakpoints_in_file (fname);
+         retval = results.size ();
+       }
+     else
+       {
+-        octave_user_code *dbg_fcn = m_interpreter.get_user_code (fname);
++        octave_user_code *dbg_fcn = m_evaluator.get_user_code (fname);
+ 
+         if (! dbg_fcn)
+           error ("remove_breakpoint: unable to find function %s\n",
+                  fname.c_str ());
+ 
+         retval = remove_breakpoint_1 (dbg_fcn, fname, line);
+ 
+         // Search subfunctions in the order they appear in the file.
+@@ -696,17 +695,17 @@ namespace octave
+   // Remove all breakpoints from a file, including those in subfunctions.
+ 
+   bp_table::intmap
+   bp_table::remove_all_breakpoints_in_file (const std::string& fname,
+                                             bool silent)
+   {
+     intmap retval;
+ 
+-    octave_user_code *dbg_fcn = m_interpreter.get_user_code (fname);
++    octave_user_code *dbg_fcn = m_evaluator.get_user_code (fname);
+ 
+     if (dbg_fcn)
+       {
+         std::string file = dbg_fcn->fcn_file_name ();
+ 
+         tree_statement_list *cmds = dbg_fcn->body ();
+ 
+         if (cmds)
+@@ -766,17 +765,17 @@ namespace octave
+     // make copy since changes may invalidate iters of m_bp_set.
+     std::set<std::string> tmp_bp_set = m_bp_set;
+ 
+     for (auto& bp_fname : tmp_bp_set)
+       {
+         if (fname_list.empty ()
+             || find_bkpt_list (fname_list, bp_fname) != "")
+           {
+-            octave_user_code *dbg_fcn = m_interpreter.get_user_code (bp_fname);
++            octave_user_code *dbg_fcn = m_evaluator.get_user_code (bp_fname);
+ 
+             if (dbg_fcn)
+               {
+                 tree_statement_list *cmds = dbg_fcn->body ();
+ 
+                 // FIXME: move the operation on cmds to the
+                 //        tree_statement_list class?
+                 if (cmds)
+@@ -929,13 +928,13 @@ namespace octave
+       }
+ 
+     return retval;
+   }
+ 
+   octave_user_code *
+   get_user_code (const std::string& fname)
+   {
+-    interpreter& interp = __get_interpreter__ ("get_user_code");
++    tree_evaluator& tw = __get_evaluator__ ("get_user_code");
+ 
+-    return interp.get_user_code (fname);
++    return tw.get_user_code (fname);
+   }
+ }
+diff --git a/libinterp/parse-tree/bp-table.h b/libinterp/parse-tree/bp-table.h
+--- a/libinterp/parse-tree/bp-table.h
++++ b/libinterp/parse-tree/bp-table.h
+@@ -31,33 +31,33 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ class octave_map;
+ class octave_user_code;
+ class octave_value_list;
+ 
+ namespace octave
+ {
+-  class interpreter;
++  class tree_evaluator;
+ 
+   struct bp_type
+   {
+     int line;
+     std::string cond;
+ 
+     bp_type (int l, const std::string& c) : line (l), cond (c) { }
+   };
+ 
+   // Interface to breakpoints.
+   class OCTINTERP_API bp_table
+   {
+   public:
+ 
+-    bp_table (interpreter& interp)
+-      : m_interpreter (interp), m_bp_set (), m_errors_that_stop (),
++    bp_table (tree_evaluator& tw)
++      : m_evaluator (tw), m_bp_set (), m_errors_that_stop (),
+         m_caught_that_stop (), m_warnings_that_stop ()
+     { }
+ 
+     ~bp_table (void) = default;
+ 
+     // mapping from (FIXME: arbitrary index??) to line number of breakpoint
+     typedef std::map<int, int> intmap;
+ 
+@@ -125,17 +125,17 @@ namespace octave
+                                   std::string&, bp_table::intmap&,
+                                   std::string&);
+ 
+   private:
+ 
+     typedef std::set<std::string>::const_iterator const_bp_set_iterator;
+     typedef std::set<std::string>::iterator bp_set_iterator;
+ 
+-    interpreter& m_interpreter;
++    tree_evaluator& m_evaluator;
+ 
+     // Set of function (.m file) names containing at least one breakpoint.
+     std::set<std::string> m_bp_set;
+ 
+     // Set of error and warning message IDs that cause us to stop
+     // *if* Vdebug_on_error / Vdebug_on_caught / Vdebug_on_warning is set.
+     // Empty means stop on any error / caught error / warning.
+     std::set<std::string> m_errors_that_stop;
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <cctype>
+ 
+ #include <iostream>
+ 
+ #include <fstream>
+ #include <typeinfo>
+ 
+ #include "cmd-edit.h"
++#include "file-ops.h"
+ #include "oct-env.h"
+ 
+ #include "bp-table.h"
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "input.h"
+@@ -55,29 +56,25 @@ along with Octave; see the file COPYING.
+ #include "utils.h"
+ #include "variables.h"
+ 
+ //FIXME: This should be part of tree_evaluator
+ #include "pt-jit.h"
+ 
+ namespace octave
+ {
+-  int tree_evaluator::dbstep_flag = 0;
+-
+   size_t tree_evaluator::current_frame = 0;
+ 
+   bool tree_evaluator::debug_mode = false;
+ 
+   bool tree_evaluator::quiet_breakpoint_flag = false;
+ 
+   tree_evaluator::stmt_list_type tree_evaluator::statement_context
+     = tree_evaluator::other;
+ 
+-  bool tree_evaluator::in_loop_command = false;
+-
+   // Normal evaluator.
+ 
+   void
+   tree_evaluator::reset (void)
+   {
+     m_result_type = RT_UNDEFINED;
+     m_expr_result_value = octave_value ();
+     m_expr_result_value_list = octave_value_list ();
+@@ -337,17 +334,17 @@ namespace octave
+         size_t line = cmd.line ();
+         echo_code (line);
+         m_echo_file_pos = line + 1;
+       }
+ 
+     if (debug_mode)
+       do_breakpoint (cmd.is_breakpoint (true));
+ 
+-    if (in_loop_command)
++    if (m_in_loop_command)
+       tree_break_command::breaking = 1;
+     else
+       error ("break must appear in a loop in the same file as loop command");
+   }
+ 
+   void
+   tree_evaluator::visit_colon_expression (tree_colon_expression& expr)
+   {
+@@ -419,35 +416,41 @@ namespace octave
+         size_t line = cmd.line ();
+         echo_code (line);
+         m_echo_file_pos = line + 1;
+       }
+ 
+     if (debug_mode)
+       do_breakpoint (cmd.is_breakpoint (true));
+ 
+-    if (in_loop_command)
++    if (m_in_loop_command)
+       tree_continue_command::continuing = 1;
+   }
+ 
+   bool
+   tree_evaluator::statement_printing_enabled (void)
+   {
+     return ! (m_silent_functions && (statement_context == function
+                                      || statement_context == script));
+   }
+ 
+   void
+   tree_evaluator::reset_debug_state (void)
+   {
+-    bp_table& bptab = __get_bp_table__ ("tree_evaluator::reset_debug_state");
+-
+-    debug_mode = bptab.have_breakpoints () || Vdebugging;
+-
+-    dbstep_flag = 0;
++    debug_mode = m_bp_table.have_breakpoints () || Vdebugging;
++
++    m_dbstep_flag = 0;
++  }
++
++  void
++  tree_evaluator::reset_debug_state (bool mode)
++  {
++    debug_mode = mode;
++
++    m_dbstep_flag = 0;
+   }
+ 
+   Matrix
+   tree_evaluator::ignored_fcn_outputs (void) const
+   {
+     Matrix retval;
+ 
+     const std::list<octave_lvalue> *lvalues = lvalue_list ();
+@@ -687,16 +690,54 @@ namespace octave
+   symbol_scope
+   tree_evaluator::get_current_scope (void)
+   {
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+     return symtab.current_scope ();
+   }
+ 
++  // Return a pointer to the user-defined function FNAME.  If FNAME is empty,
++  // search backward for the first user-defined function in the
++  // current call stack.
++
++  octave_user_code *
++  tree_evaluator::get_user_code (const std::string& fname)
++  {
++    octave_user_code *user_code = nullptr;
++
++    if (fname.empty ())
++      user_code = m_call_stack.debug_user_code ();
++    else
++      {
++        std::string name = fname;
++
++        if (sys::file_ops::dir_sep_char () != '/' && name[0] == '@')
++          {
++            auto beg = name.begin () + 2;  // never have @/method
++            auto end = name.end () - 1;    // never have trailing '/'
++            std::replace (beg, end, '/', sys::file_ops::dir_sep_char ());
++          }
++
++        size_t name_len = name.length ();
++
++        if (name_len > 2 && name.substr (name_len-2) == ".m")
++          name = name.substr (0, name_len-2);
++
++        symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++        octave_value fcn = symtab.find_function (name);
++
++        if (fcn.is_defined () && fcn.is_user_code ())
++          user_code = fcn.user_code_value ();
++      }
++
++    return user_code;
++  }
++
+   void
+   tree_evaluator::visit_decl_command (tree_decl_command& cmd)
+   {
+     if (m_echo_state)
+       {
+         size_t line = cmd.line ();
+         echo_code (line);
+         m_echo_file_pos = line + 1;
+@@ -791,19 +832,19 @@ namespace octave
+     if (debug_mode)
+       do_breakpoint (cmd.is_breakpoint (true));
+ 
+     // FIXME: need to handle PARFOR loops here using cmd.in_parallel ()
+     // and cmd.maxproc_expr ();
+ 
+     unwind_protect frame;
+ 
+-    frame.protect_var (in_loop_command);
+-
+-    in_loop_command = true;
++    frame.protect_var (m_in_loop_command);
++
++    m_in_loop_command = true;
+ 
+     tree_expression *expr = cmd.control_expr ();
+ 
+     octave_value rhs = evaluate (expr);
+ 
+ #if defined (HAVE_LLVM)
+     if (tree_jit::execute (cmd, rhs))
+       return;
+@@ -926,19 +967,19 @@ namespace octave
+         line++;
+       }
+ 
+     if (debug_mode)
+       do_breakpoint (cmd.is_breakpoint (true));
+ 
+     unwind_protect frame;
+ 
+-    frame.protect_var (in_loop_command);
+-
+-    in_loop_command = true;
++    frame.protect_var (m_in_loop_command);
++
++    m_in_loop_command = true;
+ 
+     tree_expression *expr = cmd.control_expr ();
+ 
+     octave_value rhs = evaluate (expr);
+ 
+     if (rhs.is_undefined ())
+       return;
+ 
+@@ -1146,59 +1187,16 @@ namespace octave
+             if (stmt_lst)
+               stmt_lst->accept (*this);
+ 
+             break;
+           }
+       }
+   }
+ 
+-  // Final step of processing an indexing error.  Add the name of the
+-  // variable being indexed, if any, then issue an error.  (Will this also
+-  // be needed by pt-lvalue, which calls subsref?)
+-
+-  static void
+-  final_index_error (index_exception& e,
+-                     const tree_expression *expr)
+-  {
+-    std::string extra_message;
+-
+-    // FIXME: make this a member function for direct access to symbol
+-    // table and scope?
+-
+-    symbol_scope scope
+-      = __require_current_scope__ ("final_index_error");
+-
+-    symbol_record::context_id context = scope.current_context ();
+-
+-    if (expr->is_identifier ()
+-        && dynamic_cast<const tree_identifier *> (expr)->is_variable (context))
+-      {
+-        std::string var = expr->name ();
+-
+-        e.set_var (var);
+-
+-        symbol_table& symtab = __get_symbol_table__ ("final_index_error");
+-
+-        octave_value fcn = symtab.find_function (var);
+-
+-        if (fcn.is_function ())
+-          {
+-            octave_function *fp = fcn.function_value ();
+-
+-            if (fp && fp->name () == var)
+-              extra_message = " (note: variable '" + var + "' shadows function)";
+-          }
+-      }
+-
+-    std::string msg = e.message () + extra_message;
+-
+-    error_with_id (e.err_id (), msg.c_str ());
+-  }
+-
+   // Unlike Matlab, which does not allow the result of a function call
+   // or array indexing expression to be further indexed, Octave attempts
+   // to handle arbitrary index expressions.  For example, Octave allows
+   // expressions like
+   //
+   //   svd (rand (10))(1:5)
+   //
+   // Although octave_value objects may contain function objects, no
+@@ -2151,17 +2149,17 @@ namespace octave
+ 
+     if (Vdebugging && m_call_stack.current_frame () == current_frame)
+       {
+         Vdebugging = false;
+ 
+         reset_debug_state ();
+       }
+     else if (statement_context == function || statement_context == script
+-             || in_loop_command)
++             || m_in_loop_command)
+       tree_return_command::returning = 1;
+   }
+ 
+   void
+   tree_evaluator::visit_return_list (tree_return_list&)
+   {
+     panic_impossible ();
+   }
+@@ -2660,19 +2658,19 @@ namespace octave
+ 
+ #if defined (HAVE_LLVM)
+     if (tree_jit::execute (cmd))
+       return;
+ #endif
+ 
+     unwind_protect frame;
+ 
+-    frame.protect_var (in_loop_command);
+-
+-    in_loop_command = true;
++    frame.protect_var (m_in_loop_command);
++
++    m_in_loop_command = true;
+ 
+     tree_expression *expr = cmd.condition ();
+ 
+     if (! expr)
+       panic_impossible ();
+ 
+     for (;;)
+       {
+@@ -2710,19 +2708,19 @@ namespace octave
+ 
+ #if defined (HAVE_LLVM)
+     if (tree_jit::execute (cmd))
+       return;
+ #endif
+ 
+     unwind_protect frame;
+ 
+-    frame.protect_var (in_loop_command);
+-
+-    in_loop_command = true;
++    frame.protect_var (m_in_loop_command);
++
++    m_in_loop_command = true;
+ 
+     tree_expression *expr = cmd.condition ();
+     int until_line = cmd.line ();
+     int until_column = cmd.column ();
+ 
+     if (! expr)
+       panic_impossible ();
+ 
+@@ -2774,100 +2772,100 @@ namespace octave
+                 args.stash_name_tags (string_vector (ans));
+                 feval ("display", args);
+               }
+           }
+       }
+   }
+ 
+   void
+-  tree_evaluator::do_breakpoint (tree_statement& stmt) const
++  tree_evaluator::do_breakpoint (tree_statement& stmt)
+   {
+     do_breakpoint (stmt.is_breakpoint (true), stmt.is_end_of_fcn_or_script ());
+   }
+ 
+   void
+   tree_evaluator::do_breakpoint (bool is_breakpoint,
+-                                 bool is_end_of_fcn_or_script) const
++                                 bool is_end_of_fcn_or_script)
+   {
+     bool break_on_this_statement = false;
+ 
+     if (octave_debug_on_interrupt_state)
+       {
+         break_on_this_statement = true;
+ 
+         octave_debug_on_interrupt_state = false;
+ 
+         current_frame = m_call_stack.current_frame ();
+       }
+     else if (is_breakpoint)
+       {
+         break_on_this_statement = true;
+ 
+-        dbstep_flag = 0;
++        m_dbstep_flag = 0;
+ 
+         current_frame = m_call_stack.current_frame ();
+       }
+-    else if (dbstep_flag > 0)
++    else if (m_dbstep_flag > 0)
+       {
+         if (m_call_stack.current_frame () == current_frame)
+           {
+-            if (dbstep_flag == 1 || is_end_of_fcn_or_script)
++            if (m_dbstep_flag == 1 || is_end_of_fcn_or_script)
+               {
+                 // We get here if we are doing a "dbstep" or a "dbstep N" and the
+                 // count has reached 1 so that we must stop and return to debug
+                 // prompt.  Alternatively, "dbstep N" has been used but the end
+                 // of the frame has been reached so we stop at the last line and
+                 // return to prompt.
+ 
+                 break_on_this_statement = true;
+ 
+-                dbstep_flag = 0;
++                m_dbstep_flag = 0;
+               }
+             else
+               {
+                 // Executing "dbstep N".  Decrease N by one and continue.
+ 
+-                dbstep_flag--;
++                m_dbstep_flag--;
+               }
+ 
+           }
+-        else if (dbstep_flag == 1
++        else if (m_dbstep_flag == 1
+                  && m_call_stack.current_frame () < current_frame)
+           {
+             // We stepped out from the end of a function.
+ 
+             current_frame = m_call_stack.current_frame ();
+ 
+             break_on_this_statement = true;
+ 
+-            dbstep_flag = 0;
++            m_dbstep_flag = 0;
+           }
+       }
+-    else if (dbstep_flag == -1)
++    else if (m_dbstep_flag == -1)
+       {
+         // We get here if we are doing a "dbstep in".
+ 
+         break_on_this_statement = true;
+ 
+-        dbstep_flag = 0;
++        m_dbstep_flag = 0;
+ 
+         current_frame = m_call_stack.current_frame ();
+       }
+-    else if (dbstep_flag == -2)
++    else if (m_dbstep_flag == -2)
+       {
+         // We get here if we are doing a "dbstep out".  Check for end of
+         // function and whether the current frame is the same as the
+         // cached value because we want to step out from the frame where
+         // "dbstep out" was evaluated, not from any functions called from
+         // that frame.
+ 
+         if (is_end_of_fcn_or_script
+             && m_call_stack.current_frame () == current_frame)
+-          dbstep_flag = -1;
++          m_dbstep_flag = -1;
+       }
+ 
+     if (break_on_this_statement)
+       do_keyboard ();
+ 
+   }
+ 
+   // ARGS is currently unused, but since the do_keyboard function in
+@@ -3221,16 +3219,55 @@ namespace octave
+ 
+         std::deque<std::string> lines
+           = code->get_code_lines (m_echo_file_pos, num_lines);
+ 
+         for (auto& elt : lines)
+           octave_stdout << prefix << elt << std::endl;
+       }
+   }
++
++  // Final step of processing an indexing error.  Add the name of the
++  // variable being indexed, if any, then issue an error.  (Will this also
++  // be needed by pt-lvalue, which calls subsref?)
++
++  void tree_evaluator::final_index_error (index_exception& e,
++                                          const tree_expression *expr)
++  {
++    std::string extra_message;
++
++    symbol_scope scope = get_current_scope ();
++
++    symbol_record::context_id ctxt = scope.current_context ();
++
++    if (expr->is_identifier ()
++        && dynamic_cast<const tree_identifier *> (expr)->is_variable (ctxt))
++      {
++        std::string var = expr->name ();
++
++        e.set_var (var);
++
++        symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++        octave_value fcn = symtab.find_function (var);
++
++        if (fcn.is_function ())
++          {
++            octave_function *fp = fcn.function_value ();
++
++            if (fp && fp->name () == var)
++              extra_message
++                = " (note: variable '" + var + "' shadows function)";
++          }
++      }
++
++    std::string msg = e.message () + extra_message;
++
++    error_with_id (e.err_id (), msg.c_str ());
++  }
+ }
+ 
+ DEFMETHOD (max_recursion_depth, interp, args, nargout,
+            doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} max_recursion_depth ()
+ @deftypefnx {} {@var{old_val} =} max_recursion_depth (@var{new_val})
+ @deftypefnx {} {} max_recursion_depth (@var{new_val}, "local")
+ Query or set the internal limit on the number of times a function may
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -25,23 +25,26 @@ along with Octave; see the file COPYING.
+ 
+ #include "octave-config.h"
+ 
+ #include <list>
+ #include <set>
+ #include <stack>
+ #include <string>
+ 
++#include "bp-table.h"
+ #include "call-stack.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "profiler.h"
+ #include "pt-exp.h"
+ #include "pt-walk.h"
+ 
++class octave_user_code;
++
+ namespace octave
+ {
+   class symbol_scope;
+   class tree_decl_elt;
+   class tree_expression;
+ 
+   class interpreter;
+   class unwind_protect;
+@@ -121,21 +124,21 @@ namespace octave
+     };
+ 
+     typedef void (*decl_elt_init_fcn) (tree_decl_elt&);
+ 
+     tree_evaluator (interpreter& interp)
+       : m_interpreter (interp), m_result_type (RT_UNDEFINED),
+         m_expr_result_value (), m_expr_result_value_list (),
+         m_lvalue_list_stack (), m_nargout_stack (),
+-        m_call_stack (interp), m_profiler (),
++        m_bp_table (*this), m_call_stack (interp), m_profiler (),
+         m_max_recursion_depth (256), m_silent_functions (false),
+-        m_string_fill_char (' '), m_PS4 ("+ "), m_echo (ECHO_OFF),
+-        m_echo_state (false), m_echo_file_name (), m_echo_file_pos (1),
+-        m_echo_files ()
++        m_string_fill_char (' '), m_PS4 ("+ "), m_dbstep_flag (0),
++        m_echo (ECHO_OFF), m_echo_state (false), m_echo_file_name (),
++        m_echo_file_pos (1), m_echo_files (), m_in_loop_command (false)
+     { }
+ 
+     // No copying!
+ 
+     tree_evaluator (const tree_evaluator&) = delete;
+ 
+     tree_evaluator& operator = (const tree_evaluator&) = delete;
+ 
+@@ -233,23 +236,21 @@ namespace octave
+ 
+     void visit_while_command (tree_while_command&);
+     void visit_do_until_command (tree_do_until_command&);
+ 
+     void bind_ans (const octave_value& val, bool print);
+ 
+     bool statement_printing_enabled (void);
+ 
+-    static void reset_debug_state (void);
++    void reset_debug_state (void);
+ 
+-    // If > 0, stop executing at the (N-1)th stopping point, counting
+-    //         from the the current execution point in the current frame.
+-    //
+-    // If < 0, stop executing at the next possible stopping point.
+-    static int dbstep_flag;
++    void reset_debug_state (bool mode);
++
++    void set_dbstep_flag (int step) { m_dbstep_flag = step; }
+ 
+     // The number of the stack frame we are currently debugging.
+     static size_t current_frame;
+ 
+     static bool debug_mode;
+ 
+     static bool quiet_breakpoint_flag;
+ 
+@@ -259,19 +260,16 @@ namespace octave
+       function,  // function body
+       script,    // script file
+       other      // command-line input or eval string
+     };
+ 
+     // The context for the current evaluation.
+     static stmt_list_type statement_context;
+ 
+-    // TRUE means we are evaluating some kind of looping construct.
+-    static bool in_loop_command;
+-
+     Matrix ignored_fcn_outputs (void) const;
+ 
+     bool isargout (int nargout, int iout) const;
+ 
+     void isargout (int nargout, int nout, bool *isargout) const;
+ 
+     const std::list<octave_lvalue> * lvalue_list (void) const
+     {
+@@ -363,22 +361,28 @@ namespace octave
+     convert_return_list_to_const_vector
+       (tree_parameter_list *ret_list, int nargout, const Cell& varargout);
+ 
+     bool eval_decl_elt (tree_decl_elt *elt);
+ 
+     bool switch_case_label_matches (tree_switch_case *expr,
+                                     const octave_value& val);
+ 
++    interpreter& get_interpreter (void) { return m_interpreter; }
++
++    bp_table& get_bp_table (void) { return m_bp_table; }
++
+     call_stack& get_call_stack (void) { return m_call_stack; }
+ 
+     profiler& get_profiler (void) { return m_profiler; }
+ 
+     symbol_scope get_current_scope (void);
+ 
++    octave_user_code * get_user_code (const std::string& fname = "");
++
+     int max_recursion_depth (void) const { return m_max_recursion_depth; }
+ 
+     int max_recursion_depth (int n)
+     {
+       int val = m_max_recursion_depth;
+       m_max_recursion_depth = n;
+       return val;
+     }
+@@ -440,20 +444,20 @@ namespace octave
+     void set_echo_state (int type, const std::string& file_name, size_t pos);
+ 
+     void maybe_set_echo_state (void);
+ 
+     void push_echo_state_cleanup (unwind_protect& frame);
+ 
+     bool maybe_push_echo_state_cleanup (void);
+ 
+-    void do_breakpoint (tree_statement& stmt) const;
++    void do_breakpoint (tree_statement& stmt);
+ 
+     void do_breakpoint (bool is_breakpoint,
+-                        bool is_end_of_fcn_or_script = false) const;
++                        bool is_end_of_fcn_or_script = false);
+ 
+     virtual octave_value
+     do_keyboard (const octave_value_list& args = octave_value_list ()) const;
+ 
+     bool is_logically_true (tree_expression *expr, const char *warn_for);
+ 
+     octave_value_list
+     make_value_list (tree_argument_list *args,
+@@ -476,26 +480,30 @@ namespace octave
+     {
+       m_echo_file_pos = file_pos;
+     }
+ 
+     bool echo_this_file (const std::string& file, int type) const;
+ 
+     void echo_code (size_t line);
+ 
++    void final_index_error (index_exception& e, const tree_expression *expr);
++
+     interpreter& m_interpreter;
+ 
+     result_type m_result_type;
+     octave_value m_expr_result_value;
+     octave_value_list m_expr_result_value_list;
+ 
+     value_stack<const std::list<octave_lvalue>*> m_lvalue_list_stack;
+ 
+     value_stack<int> m_nargout_stack;
+ 
++    bp_table m_bp_table;
++
+     call_stack m_call_stack;
+ 
+     profiler m_profiler;
+ 
+     // Maximum nesting level for functions, scripts, or sourced files
+     // called recursively.
+     int m_max_recursion_depth;
+ 
+@@ -504,16 +512,22 @@ namespace octave
+     bool m_silent_functions;
+ 
+     // The character to fill with when creating string arrays.
+     char m_string_fill_char;
+ 
+     // String printed before echoed commands (enabled by --echo-commands).
+     std::string m_PS4;
+ 
++    // If > 0, stop executing at the (N-1)th stopping point, counting
++    //         from the the current execution point in the current frame.
++    //
++    // If < 0, stop executing at the next possible stopping point.
++    int m_dbstep_flag;
++
+     // Echo commands as they are executed?
+     //
+     //   1  ==>  echo commands read from script files
+     //   2  ==>  echo commands from functions
+     //
+     // more than one state can be active at once.
+     int m_echo;
+ 
+@@ -522,16 +536,19 @@ namespace octave
+     bool m_echo_state;
+ 
+     std::string m_echo_file_name;
+ 
+     // Next line to echo, counting from 1.
+     size_t m_echo_file_pos;
+ 
+     std::map<std::string, bool> m_echo_files;
++
++    // TRUE means we are evaluating some kind of looping construct.
++    bool m_in_loop_command;
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+ OCTAVE_DEPRECATED (4.4, "use 'octave::tree_evaluator' instead")
+ typedef octave::tree_evaluator tree_evaluator;
+ 

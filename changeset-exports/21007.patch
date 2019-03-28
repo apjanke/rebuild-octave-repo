@@ -1,0 +1,1276 @@
+# HG changeset patch
+# User Daniel J Sebald <daniel.sebald@ieee.org>
+# Date 1451408792 -3600
+#      Tue Dec 29 18:06:32 2015 +0100
+# Node ID 0a09c3cae800262c8ea077ea9fffef42bf4ce338
+# Parent  ea779f11deaeb29debc75e3a04be2f99c5cd1377
+New marker class for modified file breakpoint and position maintenance.
+
+* file-editor-tab.cc
+(file_editor_tab): Use class prefix marker:: on all
+marker enumeration uses. New markerDefine for unsure_breakpoint and
+unsure_debugger_position.
+(~file_editor_tab): Signal to remove all breakpoint and position objects.
+(message_cannot_breakpoint_changed_file) New message.
+(handle_margin_clicked) Emit signal to remove marker via editor line number.
+Display error message for modified file.
+(handle_request_add_breakpoint): Rename. Do not add 1 to line number.
+(handle_request_remove_breakpoint): Rename. Do not add 1 to line number.
+(toggle_breakpoint): Change line to editor_linenr.
+Display error message for modified file.  Add 1 to editor_linenr.
+(load_file): Add prototype code for getting dbstatus.
+(handle_octave_result): New method. Prototype code for processing Octave result.
+(save_file): Record list of breakpoints. Save file. Restore breakpoints if
+instructed after save.
+(notice_settings): Configure _breakpoint_filesave_behavior and uncertain marker
+icon set.
+(insert_debugger_pointer): Compute best guess at debugger position in modified
+file. Connect signals/slots to pointer marker.
+(delete_debugger_pointer): Remove direct editor marker setting. Emit signal to
+marker.
+(do_breakpoint_marker): If breakpoint does not already exist, construct marker
+object, connect signals. If exists, emit delete signal to breakpoint marker.
+
+* file-editor-tab.h: Multitude of signal and slot declarations as described
+above. Add _breakpoint_filesave_behavior setting member variable.
+(header): Move editor_markers enumeration to marker.h. Include marker.h.
+
+* marker.cc, marker.h: New files. New marker class
+comprised of brief slots to interact with QsciScintalla object and brief signal
+for Octave removal request. New unsure_breakpoint and unsure_debugger_position
+marker enumeration definitions.
+
+* module.mk: Add marker.h, marker.cc
+
+* settings-dialog.cc (settings_dialog): Show options and settings for
+debugger/breakpoint_filesave_behavior.
+(write_changed_settings): Write settings for debugger/breakpoint_filesave_
+behavior.
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -35,30 +35,37 @@ along with Octave; see the file COPYING.
+ #include <Qsci/qscilexermatlab.h>
+ #endif
+ #include <Qsci/qscilexercpp.h>
+ #include <Qsci/qscilexerbash.h>
+ #include <Qsci/qscilexerperl.h>
+ #include <Qsci/qscilexerbatch.h>
+ #include <Qsci/qscilexerdiff.h>
+ #include <Qsci/qsciprinter.h>
+-#include "resource-manager.h"
+ #include <QApplication>
+ #include <QFileDialog>
+ #include <QMessageBox>
+ #include <QTextStream>
+ #include <QVBoxLayout>
+ #include <QInputDialog>
+ #include <QPrintDialog>
+ #include <QDateTime>
+ #include <QTextCodec>
++#include <QStyle>
++#include <QTextBlock>
++#include <QLabel>
++#include <QCheckBox>
++#include <QDialogButtonBox>
++#include <QPushButton>
+ 
++#include "resource-manager.h"
+ #include "file-editor-tab.h"
+ #include "file-editor.h"
+ #include "octave-txt-lexer.h"
++#include "marker.h"
+ 
+ #include "file-ops.h"
+ 
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ #include "version.h"
+ #include "utils.h"
+ #include "defaults.h"
+@@ -124,22 +131,25 @@ file_editor_tab::file_editor_tab (const 
+ 
+   // Leave the find dialog box out of memory until requested.
+   _find_dialog = 0;
+   _find_dialog_is_visible = false;
+ 
+   // symbols
+   _edit_area->setMarginType (1, QsciScintilla::SymbolMargin);
+   _edit_area->setMarginSensitivity (1, true);
+-  _edit_area->markerDefine (QsciScintilla::RightTriangle, bookmark);
+-  _edit_area->setMarkerBackgroundColor (QColor (0,0,232), bookmark);
+-  _edit_area->markerDefine (QsciScintilla::Circle, breakpoint);
+-  _edit_area->setMarkerBackgroundColor (QColor (192,0,0), breakpoint);
+-  _edit_area->markerDefine (QsciScintilla::RightTriangle, debugger_position);
+-  _edit_area->setMarkerBackgroundColor (QColor (255,255,0), debugger_position);
++  _edit_area->markerDefine (QsciScintilla::RightTriangle, marker::bookmark);
++  _edit_area->setMarkerBackgroundColor (QColor (0,0,232), marker::bookmark);
++  _edit_area->markerDefine (QsciScintilla::Circle, marker::breakpoint);
++  _edit_area->setMarkerBackgroundColor (QColor (192,0,0), marker::breakpoint);
++  _edit_area->markerDefine (QsciScintilla::RightTriangle, marker::debugger_position);
++  _edit_area->setMarkerBackgroundColor (QColor (255,255,0), marker::debugger_position);
++  _edit_area->markerDefine (QsciScintilla::RightTriangle,
++                            marker::unsure_debugger_position);
++  _edit_area->setMarkerBackgroundColor (QColor (192,192,192), marker::unsure_debugger_position);
+ 
+   connect (_edit_area, SIGNAL (marginClicked (int, int,
+                                               Qt::KeyboardModifiers)),
+            this, SLOT (handle_margin_clicked (int, int,
+                                               Qt::KeyboardModifiers)));
+ 
+   // line numbers
+   _edit_area->setMarginsForegroundColor (QColor (96, 96, 96));
+@@ -189,16 +199,20 @@ file_editor_tab::file_editor_tab (const 
+ #endif
+   _enc_indicator->setText (_encoding);
+   // no changes in encoding yet
+   _new_encoding = _encoding;
+ }
+ 
+ file_editor_tab::~file_editor_tab (void)
+ {
++  // Tell all connected markers to self-destruct.
++  emit remove_all_breakpoints ();
++  emit remove_all_positions ();
++
+   // Destroy items attached to _edit_area.
+   QsciLexer *lexer = _edit_area->lexer ();
+   if (lexer)
+     {
+       delete lexer;
+       _edit_area->setLexer (0);
+     }
+   if (_find_dialog)
+@@ -321,36 +335,57 @@ file_editor_tab::valid_file_name (const 
+       else
+         return true;
+     }
+ 
+   return true;
+ }
+ 
+ void
+-file_editor_tab::handle_margin_clicked (int margin, int line,
++file_editor_tab::message_cannot_breakpoint_changed_file (void)
++{
++  // Cannot create a breakpoint when the file is modified
++  // because the line number the editor is providing might
++  // not match what Octave core is interpretting in the
++  // file on disk.
++  QMessageBox* msgBox = new QMessageBox (QMessageBox::Critical,
++                                         tr ("Octave Editor"),
++                                         tr ("Cannot add breakpoint to modified file."),
++                                         QMessageBox::Ok, 0);
++  msgBox->setWindowModality (Qt::ApplicationModal);
++  msgBox->exec ();
++  delete msgBox;
++}
++
++void
++file_editor_tab::handle_margin_clicked (int margin, int editor_linenr,
+                                         Qt::KeyboardModifiers state)
+ {
+   if (margin == 1)
+     {
+-      unsigned int markers_mask = _edit_area->markersAtLine (line);
++      unsigned int markers_mask = _edit_area->markersAtLine (editor_linenr);
+ 
+       if (state & Qt::ControlModifier)
+         {
+-          if (markers_mask && (1 << bookmark))
+-            _edit_area->markerDelete (line, bookmark);
++          if (markers_mask && (1 << marker::bookmark))
++            _edit_area->markerDelete (editor_linenr, marker::bookmark);
+           else
+-            _edit_area->markerAdd (line, bookmark);
++            _edit_area->markerAdd (editor_linenr, marker::bookmark);
+         }
+       else
+         {
+-          if (markers_mask && (1 << breakpoint))
+-            request_remove_breakpoint (line);
++          if (markers_mask && (1 << marker::breakpoint))
++            handle_request_remove_breakpoint (editor_linenr);
+           else
+-            request_add_breakpoint (line);
++            {
++              if (_edit_area->isModified ())
++                message_cannot_breakpoint_changed_file ();
++              else
++                handle_request_add_breakpoint (editor_linenr + 1);
++            }
+         }
+     }
+ }
+ 
+ void
+ file_editor_tab::update_lexer ()
+ {
+   if (_lexer_apis)
+@@ -717,63 +752,63 @@ void
+ file_editor_tab::toggle_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << bookmark))
+-    _edit_area->markerDelete (line, bookmark);
++  if (_edit_area->markersAtLine (line) && (1 << marker::bookmark))
++    _edit_area->markerDelete (line, marker::bookmark);
+   else
+-    _edit_area->markerAdd (line, bookmark);
++    _edit_area->markerAdd (line, marker::bookmark);
+ }
+ 
+ void
+ file_editor_tab::next_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << bookmark))
++  if (_edit_area->markersAtLine (line) && (1 << marker::bookmark))
+     line++; // we have a breakpoint here, so start search from next line
+ 
+-  int nextline = _edit_area->markerFindNext (line, (1 << bookmark));
++  int nextline = _edit_area->markerFindNext (line, (1 << marker::bookmark));
+ 
+   _edit_area->setCursorPosition (nextline, 0);
+ }
+ 
+ void
+ file_editor_tab::previous_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << bookmark))
++  if (_edit_area->markersAtLine (line) && (1 << marker::bookmark))
+     line--; // we have a breakpoint here, so start search from prev line
+ 
+-  int prevline = _edit_area->markerFindPrevious (line, (1 << bookmark));
++  int prevline = _edit_area->markerFindPrevious (line, (1 << marker::bookmark));
+ 
+   _edit_area->setCursorPosition (prevline, 0);
+ }
+ 
+ void
+ file_editor_tab::remove_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+-  _edit_area->markerDeleteAll (bookmark);
++  _edit_area->markerDeleteAll (marker::bookmark);
+ }
+ 
+ void
+ file_editor_tab::add_breakpoint_callback (const bp_info& info)
+ {
+   bp_table::intmap line_info;
+   line_info[0] = info.line;
+ 
+@@ -824,78 +859,83 @@ file_editor_tab::bp_info::bp_info (const
+           function_name = file_ops::concat (dir.substr (pos+1), function_name);
+ 
+           dir = dir.substr (0, pos);
+         }
+     }
+ }
+ 
+ void
+-file_editor_tab::request_add_breakpoint (int line)
++file_editor_tab::handle_request_add_breakpoint (int line)
+ {
+-  bp_info info (_file_name, line+1);
++  bp_info info (_file_name, line);
+ 
+   octave_link::post_event
+     (this, &file_editor_tab::add_breakpoint_callback, info);
+ }
+ 
+ void
+-file_editor_tab::request_remove_breakpoint (int line)
++file_editor_tab::handle_request_remove_breakpoint (int line)
+ {
+-  bp_info info (_file_name, line+1);
++  bp_info info (_file_name, line);
+ 
+   octave_link::post_event
+     (this, &file_editor_tab::remove_breakpoint_callback, info);
+ }
+ 
+ void
+ file_editor_tab::toggle_breakpoint (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+-  int line, cur;
+-  _edit_area->getCursorPosition (&line, &cur);
++  int editor_linenr, cur;
++  _edit_area->getCursorPosition (&editor_linenr, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << breakpoint))
+-    request_remove_breakpoint (line);
++  if (_edit_area->markersAtLine (editor_linenr) && (1 << marker::breakpoint))
++    request_remove_breakpoint_via_editor_linenr (editor_linenr);
+   else
+-    request_add_breakpoint (line);
++    {
++      if (_edit_area->isModified ())
++        message_cannot_breakpoint_changed_file ();
++      else
++        handle_request_add_breakpoint (editor_linenr + 1);
++    }
+ }
+ 
+ void
+ file_editor_tab::next_breakpoint (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << breakpoint))
++  if (_edit_area->markersAtLine (line) && (1 << marker::breakpoint))
+     line++; // we have a breakpoint here, so start search from next line
+ 
+-  int nextline = _edit_area->markerFindNext (line, (1 << breakpoint));
++  int nextline = _edit_area->markerFindNext (line, (1 << marker::breakpoint));
+ 
+   _edit_area->setCursorPosition (nextline, 0);
+ }
+ 
+ void
+ file_editor_tab::previous_breakpoint (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur, prevline;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+-  if (_edit_area->markersAtLine (line) && (1 << breakpoint))
++  if (_edit_area->markersAtLine (line) && (1 << marker::breakpoint))
+     line--; // we have a breakpoint here, so start search from prev line
+ 
+-  prevline = _edit_area->markerFindPrevious (line, (1 << breakpoint));
++  prevline = _edit_area->markerFindPrevious (line, (1 << marker::breakpoint));
+ 
+   _edit_area->setCursorPosition (prevline, 0);
+ }
+ 
+ void
+ file_editor_tab::remove_all_breakpoints (const QWidget *ID)
+ {
+   if (ID != this)
+@@ -1344,16 +1384,34 @@ file_editor_tab::load_file (const QStrin
+ 
+   _copy_available = false;     // no selection yet available
+   set_file_name (file_to_load);
+   update_window_title (false); // window title (no modification)
+   _edit_area->setModified (false); // loaded file is not modified yet
+ 
+   update_eol_indicator ();
+ 
++  // TODO: (BREAKPOINTS) At this point it would be nice to put any set
++  // breakpoints on the margin.  In order to do this, somehow the
++  // "dbstatus" command needs to be accessed.  All it would require is a
++  // routine that does "res = feval("dbstatus") and signals that result
++  // to some slot.
++  //
++  // See patch #8016 for a general way to get Octave results from
++  // commands processed in the background.
++
++/*
++  connect (octave_link, SIGNAL (fileSelected (QObject *, const QString&, const octave_value_list&)),
++           this, SLOT (handle_feval_result (QObject *, const QString&, const octave_value_list&)));
++  connect (this, SIGNAL (evaluate_octave_command (const QString&)),
++           octave_link, SLOT (queue_octave_command (const QString&)));
++
++  emit evaluate_octave_command ("dbstatus");
++*/
++
+   return QString ();
+ }
+ 
+ QsciScintilla::EolMode
+ file_editor_tab::detect_eol_mode ()
+ {
+   QByteArray text = _edit_area->text ().toAscii ();
+ 
+@@ -1411,16 +1469,43 @@ file_editor_tab::update_eol_indicator ()
+         _eol_indicator->setText ("CR");
+         break;
+       case QsciScintilla::EolUnix:
+         _eol_indicator->setText ("LF");
+         break;
+     }
+ }
+ 
++// TODO: See patch #8016 for a general way to get Octave results from
++// commands processed in the background, e.g., dbstatus.
++void
++file_editor_tab::handle_octave_result (QObject *requester, QString& command,
++                                       octave_value_list&)
++{
++  // Check if this object initiated the command.
++  if (requester == this)
++    {
++      if (command == "dbstatus")
++        {
++          // Should be installing breakpoints in this file
++/*
++octave:1> result = dbstatus
++result =
++
++  0x1 struct array containing the fields:
++
++    name
++    file
++    line
++*/
++          // Check for results that match "file".
++        }
++    }
++}
++
+ void
+ file_editor_tab::new_file (const QString &commands)
+ {
+   update_window_title (false); // window title (no modification)
+ 
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   // set the eol mode from the settings or depending on the OS if the entry is
+@@ -1458,16 +1543,25 @@ file_editor_tab::save_file (const QStrin
+   QFileInfo file_info = QFileInfo (saveFileName);
+   QString file_to_save;
+   if (file_info.exists ())
+     file_to_save = file_info.canonicalFilePath ();
+   else
+     file_to_save = saveFileName;
+   QFile file (file_to_save);
+ 
++  // Get a list of all the breakpoint line numbers.
++  QIntList list;
++  emit report_editor_linenr (list);
++  if (! list.isEmpty ())
++    {
++      // At least one breakpoint is present.  Get rid of breakpoints.
++      remove_all_breakpoints (this);
++    }
++
+   // stop watching file
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (trackedFiles.contains (file_to_save))
+     _file_system_watcher.removePath (file_to_save);
+ 
+   // open the file for writing
+   if (! file.open (QIODevice::WriteOnly))
+     {
+@@ -1526,16 +1620,97 @@ file_editor_tab::save_file (const QStrin
+   _edit_area->setModified (false);
+   _enc_indicator->setText (_encoding);
+ 
+   if (remove_on_success)
+     {
+       emit tab_remove_request ();
+       return;  // Don't touch member variables after removal
+     }
++
++  // Attempt to restore the breakpoints if that is desired.
++  if (! list.isEmpty ())
++    {
++      bool restore_breakpoints;
++      if (_breakpoint_filesave_behavior == "RESTORE")
++        restore_breakpoints = true;
++      else if (_breakpoint_filesave_behavior == "DISCARD")
++        restore_breakpoints = false;
++      else
++        {
++          QDialog* dlgBox = new QDialog ();
++
++          QStyle *mbstyle = dlgBox->style ();
++          QIcon tmpIcon = mbstyle->standardIcon (QStyle::SP_MessageBoxQuestion,
++                                                 0, dlgBox);
++          int iconSize = mbstyle->pixelMetric(QStyle::PM_MessageBoxIconSize,
++                                              0, dlgBox);
++          QLabel *questImage = new QLabel ();
++          questImage->setPixmap (tmpIcon.pixmap (iconSize, iconSize));
++          QLabel *questText = new QLabel ("Would you like to restore adjusted breakpoints?");
++          QHBoxLayout *horizontalLayout = new QHBoxLayout;
++          horizontalLayout->addWidget (questImage);
++          horizontalLayout->addWidget (questText);
++
++          QCheckBox *checkBox = new QCheckBox ("Don't ask again.");
++          checkBox->setCheckState (Qt::Unchecked);
++
++          QDialogButtonBox *buttonBox = new QDialogButtonBox ();
++          QPushButton *noButton = buttonBox->addButton (QDialogButtonBox::No);
++          noButton->setAutoDefault (false);
++          buttonBox->addButton (QDialogButtonBox::Yes);
++          QHBoxLayout *buttonsLayout = new QHBoxLayout;
++          buttonsLayout->addStretch (1);
++          buttonsLayout->addWidget (buttonBox);
++
++          QVBoxLayout *mainLayout = new QVBoxLayout;
++          mainLayout->addLayout (horizontalLayout);
++          mainLayout->addSpacing(12);
++          mainLayout->addWidget (checkBox);
++          mainLayout->addSpacing(12);
++          mainLayout->addLayout (buttonsLayout);
++
++          dlgBox->setLayout (mainLayout);
++
++          connect(buttonBox, SIGNAL(accepted()), dlgBox, SLOT(accept()));
++          connect(buttonBox, SIGNAL(rejected()), dlgBox, SLOT(reject()));
++          dlgBox->setWindowModality (Qt::NonModal);
++          dlgBox->exec ();
++
++          restore_breakpoints = (dlgBox->result () == QDialog::Accepted);
++
++          if (checkBox->checkState () == Qt::Checked)
++            {
++              // User no longer wants to be asked so save the setting for
++              // this object...
++              if (restore_breakpoints)
++                _breakpoint_filesave_behavior = "RESTORE";
++              else
++                _breakpoint_filesave_behavior = "DISCARD";
++
++              // ...and on disc (and Preferences...)
++              QSettings *settings = resource_manager::get_settings ();
++              if (settings)
++                {
++                  settings->setValue ("debugger/breakpoint_filesave_behavior",
++                                      _breakpoint_filesave_behavior);
++                  settings->sync ();
++                }
++            }
++
++          delete dlgBox;
++
++        }
++
++      if (restore_breakpoints)
++        {
++          for (int i = 0; i < list.length (); i++)
++            handle_request_add_breakpoint (list.value (i) + 1);
++        }
++    }
+ }
+ 
+ void
+ file_editor_tab::save_file_as (bool remove_on_success)
+ {
+   // Simply put up the file chooser dialog box with a slot connection
+   // then return control to the system waiting for a file selection.
+ 
+@@ -1936,16 +2111,19 @@ file_editor_tab::notice_settings (const 
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETHSCROLLBAR,
+         settings->value ("editor/show_hscroll_bar",true).toBool ());
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTH,-1);
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTHTRACKING,true);
+ 
+   _long_title = settings->value ("editor/longWindowTitle", false).toBool ();
+   update_window_title (_edit_area->isModified ());
+ 
++  _breakpoint_filesave_behavior = settings->value ("debugger/breakpoint_filesave_behavior", "ASK").
++                                                    toString ();
++
+   _edit_area->setEdgeColumn (
+               settings->value ("editor/long_line_column",80).toInt ());
+   if (settings->value ("editor/long_line_marker",true).toBool ())
+     _edit_area->setEdgeMode (QsciScintilla::EdgeLine);
+   else
+     _edit_area->setEdgeMode (QsciScintilla::EdgeNone);
+ 
+   // reload changed files
+@@ -2047,45 +2225,120 @@ file_editor_tab::handle_file_resave_answ
+ }
+ 
+ void
+ file_editor_tab::insert_debugger_pointer (const QWidget *ID, int line)
+ {
+   if (ID != this || ID == 0)
+     return;
+ 
++  emit remove_all_positions ();  // remove all positions
++
+   if (line > 0)
+     {
+-      _edit_area->markerAdd (line-1, debugger_position);
++      marker *dp;
++
++      if (_edit_area->isModified ())
++        {
++          // The best that can be done if the editor contents has been
++          // modified is to see if there is a match with the original
++          // line number of any existing breakpoints.  We can put a normal
++          // debugger pointer at that breakpoint position.  Otherwise, it
++          // isn't certain whether the original line number and current line
++          // number match.
++          int editor_linenr = -1;
++          emit find_translated_line_number (line, editor_linenr);
++          if (editor_linenr != -1)
++            {
++              // Match with an existing breakpoint.
++              dp = new marker (_edit_area, line,
++                               marker::debugger_position, editor_linenr);
++            }
++          else
++            {
++              int original_linenr = -1;
++              editor_linenr = -1;
++              emit find_linenr_just_before (line, original_linenr, editor_linenr);
++              if (original_linenr >= 0)
++                {
++                  // Make a guess by using an offset from the breakpoint.
++                  int linenr_guess = editor_linenr + line - original_linenr;
++                  dp = new marker (_edit_area, line,
++                                   marker::unsure_debugger_position,
++                                   linenr_guess);
++                }
++              else
++                {
++                  // Can't make a very good guess, so just use the debugger
++                  // line number.
++                  dp = new marker (_edit_area, line,
++                                   marker::unsure_debugger_position);
++                }
++            }
++        }
++      else
++        dp = new marker (_edit_area, line, marker::debugger_position);
++
++      connect (this, SIGNAL (remove_position_via_debugger_linenr (int)),
++               dp,   SLOT (handle_remove_via_original_linenr (int)));
++      connect (this, SIGNAL (remove_all_positions (void)),
++               dp,   SLOT (handle_remove (void)));
++
+       center_current_line ();
+     }
+ }
+ 
+ void
+ file_editor_tab::delete_debugger_pointer (const QWidget *ID, int line)
+ {
+   if (ID != this || ID == 0)
+     return;
+ 
+   if (line > 0)
+-    _edit_area->markerDelete (line-1, debugger_position);
++    _edit_area->markerDelete (line-1, marker::debugger_position);
+ }
+ 
+ void
+ file_editor_tab::do_breakpoint_marker (bool insert, const QWidget *ID, int line)
+ {
+   if (ID != this || ID == 0)
+     return;
+ 
+   if (line > 0)
+     {
+       if (insert)
+-        _edit_area->markerAdd (line-1, breakpoint);
++        {
++          int editor_linenr = -1;
++
++          // If comes back indicating a modified editor line number
++          // then there is already a breakpoint marker associated
++          // with this debugger line.
++          emit find_translated_line_number (line, editor_linenr);
++
++          if (editor_linenr == -1)
++            {
++              marker *bp = new marker (_edit_area, line, marker::breakpoint);
++              connect (this, SIGNAL (remove_breakpoint_via_debugger_linenr (int)),
++                       bp,   SLOT (handle_remove_via_original_linenr (int)));
++              connect (this, SIGNAL (request_remove_breakpoint_via_editor_linenr (int)),
++                       bp,   SLOT (handle_request_remove_via_editor_linenr (int)));
++              connect (this, SIGNAL (remove_all_breakpoints (void)),
++                       bp,   SLOT (handle_remove (void)));
++              connect (this, SIGNAL (find_translated_line_number (int, int&)),
++                       bp,   SLOT (handle_find_translation (int, int&)));
++              connect (this, SIGNAL (find_linenr_just_before (int, int&, int&)),
++                       bp,   SLOT (handle_find_just_before (int, int&, int&)));
++              connect (this, SIGNAL (report_editor_linenr (QIntList&)),
++                       bp,   SLOT (handle_report_editor_linenr (QIntList&)));
++              connect (bp,   SIGNAL (request_remove (int)),
++                       this, SLOT (handle_request_remove_breakpoint (int)));
++            }
++        }
+       else
+-        _edit_area->markerDelete (line-1, breakpoint);
++        emit remove_breakpoint_via_debugger_linenr (line);
+     }
+ }
+ 
+ 
+ void
+ file_editor_tab::center_current_line ()
+ {
+   long int visible_lines
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -28,20 +28,31 @@ along with Octave; see the file COPYING.
+ #include <QFileSystemWatcher>
+ #include <QSettings>
+ #include <QFileInfo>
+ #include <Qsci/qsciapis.h>
+ #include <QStatusBar>
+ #include <QLabel>
+ #include <QComboBox>
+ 
++// FIXME -- we should not be including config.h in header files.
++// Only needed for octave_value_list type.
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#include "ov.h"
++#endif
++
+ #include "find-dialog.h"
+ #include "octave-qscintilla.h"
+ #include "builtin-defun-decls.h"
+ 
++#include "marker.h" /* Only needed for typedef of "QIntList", which may be
++                       typedefed elsewhere.  Could use common location. */
++
++
+ class file_editor;
+ 
+ class file_editor_tab : public QWidget
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+@@ -125,30 +136,48 @@ public slots:
+   QString load_file (const QString& fileName);
+ 
+   void new_file (const QString& commands = QString ());
+ 
+   void file_has_changed (const QString& fileName);
+ 
+   void handle_context_menu_edit (const QString&);
+ 
++  void handle_request_add_breakpoint (int line);
++  void handle_request_remove_breakpoint (int line);
++
++  void handle_octave_result (QObject *requester, QString& command, octave_value_list &result);
++
+ signals:
+ 
+   void file_name_changed (const QString& fileName, const QString& toolTip);
+   void editor_state_changed (bool copy_available, bool is_octave_file);
+   void tab_remove_request ();
+   void add_filename_to_list (const QString&, const QString&, QWidget *);
+   void mru_add_file (const QString& file_name, const QString& encoding);
+   void editor_check_conflict_save (const QString& saveFileName,
+                                    bool remove_on_success);
+   void run_file_signal (const QFileInfo& info);
+   void request_open_file (const QString&);
+   void  edit_mfile_request (const QString&, const QString&,
+                             const QString&, int);
+ 
++  void remove_breakpoint_via_debugger_linenr (int debugger_linenr);
++  void request_remove_breakpoint_via_editor_linenr (int editor_linenr);
++  void remove_all_breakpoints (void);
++  void find_translated_line_number (int original_linenr, int& translated_linenr);
++  void find_linenr_just_before (int linenr, int& original_linenr, int& editor_linenr);
++  void report_editor_linenr (QIntList& int_list);
++  void remove_position_via_debugger_linenr (int debugger_linenr);
++  void remove_all_positions (void);
++  // TODO: The following is similar to "process_octave_code" signal.  However,
++  // currently that signal is connected to something that simply focuses a
++  // window and not actually communicate with Octave.
++  // void evaluate_octave_command (const QString& command);
++
+ protected:
+ 
+   void closeEvent (QCloseEvent *event);
+   void set_file_name (const QString& fileName);
+ 
+ private slots:
+ 
+   // When user closes message box for reload question.
+@@ -177,42 +206,35 @@ private slots:
+   // When the numer of lines changes -> adapt width of margin
+   void auto_margin_width ();
+ 
+   void handle_cursor_moved (int line, int col);
+   void handle_lines_changed (void);
+ 
+ private:
+ 
+-  enum editor_markers
+-  {
+-    bookmark,
+-    breakpoint,
+-    debugger_position
+-  };
+-
+   struct bp_info
+   {
+     bp_info (const QString& fname, int l = 0);
+ 
+     int line;
+     std::string file;
+     std::string dir;
+     std::string function_name;
+   };
+ 
+   bool valid_file_name (const QString& file=QString ());
+   void save_file (const QString& saveFileName, bool remove_on_success = false);
+   void save_file_as (bool remove_on_success = false);
+   bool check_valid_identifier (QString file_name);
+   bool check_valid_codec (QTextCodec *codec);
+ 
++  void message_cannot_breakpoint_changed_file (void);
++
+   void update_lexer ();
+-  void request_add_breakpoint (int line);
+-  void request_remove_breakpoint (int line);
+ 
+   void show_dialog (QDialog *dlg, bool modal);
+   int check_file_modified ();
+   void do_comment_selected_text (bool comment);
+   QString comment_string (const QString&);
+   void do_indent_selected_text (bool indent);
+ 
+   void add_breakpoint_callback (const bp_info& info);
+@@ -245,16 +267,18 @@ private:
+   QString _new_encoding;
+ 
+   bool _long_title;
+   bool _copy_available;
+   bool _is_octave_file;
+   bool _always_reload_changed_files;
+   bool _smart_indent;
+ 
++  QString _breakpoint_filesave_behavior;
++
+   QFileSystemWatcher _file_system_watcher;
+ 
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+   QRect _find_dialog_geometry;
+ 
+   QsciAPIs *_lexer_apis;
+   QString _prep_apis_file;
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -63,17 +63,18 @@ octave_gui_MOC =
+ if AMCOND_HAVE_QSCINTILLA
+ 
+ OCTAVE_GUI_SRC_M_EDITOR_MOC = \
+   libgui/src/m-editor/moc-file-editor-interface.cc \
+   libgui/src/m-editor/moc-file-editor-tab.cc \
+   libgui/src/m-editor/moc-file-editor.cc \
+   libgui/src/m-editor/moc-find-dialog.cc \
+   libgui/src/m-editor/moc-octave-qscintilla.cc \
+-  libgui/src/m-editor/moc-octave-txt-lexer.cc
++  libgui/src/m-editor/moc-octave-txt-lexer.cc \
++  libgui/src/m-editor/moc-marker.cc
+ 
+ $(OCTAVE_GUI_SRC_M_EDITOR_MOC): | libgui/src/m-editor/$(octave_dirstamp)
+ 
+ octave_gui_MOC += \
+   $(OCTAVE_GUI_SRC_M_EDITOR_MOC)
+ 
+ DIRSTAMP_FILES += \
+   libgui/src/m-editor/$(octave_dirstamp)
+@@ -129,16 +130,17 @@ noinst_HEADERS += \
+   libgui/src/files-dock-widget.h \
+   libgui/src/history-dock-widget.h \
+   libgui/src/m-editor/file-editor-interface.h \
+   libgui/src/m-editor/file-editor-tab.h \
+   libgui/src/m-editor/file-editor.h \
+   libgui/src/m-editor/find-dialog.h \
+   libgui/src/m-editor/octave-qscintilla.h \
+   libgui/src/m-editor/octave-txt-lexer.h \
++  libgui/src/m-editor/marker.h \
+   libgui/src/main-window.h \
+   libgui/src/octave-gui.h \
+   libgui/src/octave-cmd.h \
+   libgui/src/octave-interpreter.h \
+   libgui/src/octave-qt-link.h \
+   libgui/src/qtinfo/parser.h \
+   libgui/src/qtinfo/webinfo.h \
+   libgui/src/resource-manager.h \
+@@ -158,16 +160,17 @@ libgui_src_libgui_src_la_SOURCES = \
+   libgui/src/documentation-dock-widget.cc \
+   libgui/src/files-dock-widget.cc \
+   libgui/src/history-dock-widget.cc \
+   libgui/src/m-editor/file-editor-tab.cc \
+   libgui/src/m-editor/file-editor.cc \
+   libgui/src/m-editor/find-dialog.cc \
+   libgui/src/m-editor/octave-qscintilla.cc \
+   libgui/src/m-editor/octave-txt-lexer.cc \
++  libgui/src/m-editor/marker.cc \
+   libgui/src/main-window.cc \
+   libgui/src/octave-cmd.cc \
+   libgui/src/octave-dock-widget.cc \
+   libgui/src/octave-gui.cc \
+   libgui/src/octave-interpreter.cc \
+   libgui/src/octave-qt-link.cc \
+   libgui/src/qtinfo/parser.cc \
+   libgui/src/qtinfo/webinfo.cc \
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -303,16 +303,24 @@ settings_dialog::settings_dialog (QWidge
+   icon_group->addButton (ui->general_icon_letter);
+   QString widget_icon_set =
+     settings->value ("DockWidgets/widget_icon_set","NONE").toString ();
+   ui->general_icon_octave-> setChecked (true);  // the default (if invalid set)
+   ui->general_icon_octave-> setChecked (widget_icon_set == "NONE");
+   ui->general_icon_graphic-> setChecked (widget_icon_set == "GRAPHIC");
+   ui->general_icon_letter-> setChecked (widget_icon_set == "LETTER");
+ 
++  // how breakpoints should behave when file is saved
++  QString breakpoint_filesave_behavior =
++      settings->value ("debugger/breakpoint_filesave_behavior", "ASK").toString ();
++  ui->debugger_filesave_ask->setChecked (true);  // the default (if invalid set)
++  ui->debugger_filesave_ask->setChecked (breakpoint_filesave_behavior == "ASK");
++  ui->debugger_filesave_restore->setChecked (breakpoint_filesave_behavior == "RESTORE");
++  ui->debugger_filesave_discard->setChecked (breakpoint_filesave_behavior == "DISCARD");
++
+   // custom title bar of dock widget
+   QVariant default_var = QColor (255,255,255);
+   QColor bg_color = settings->value ("Dockwidgets/title_bg_color",
+                                      default_var).value<QColor> ();
+   _widget_title_bg_color = new color_picker (bg_color);
+   _widget_title_bg_color->setEnabled (false);
+   ui->layout_widget_bgtitle->addWidget (_widget_title_bg_color,0);
+   connect (ui->cb_widget_custom_style, SIGNAL (toggled (bool)),
+@@ -709,16 +717,24 @@ settings_dialog::read_terminal_colors (Q
+ }
+ 
+ void
+ settings_dialog::write_changed_settings (bool closing)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+   // FIXME: what should happen if settings is 0?
+ 
++  // how breakpoints should be treated when file is saved
++  QString breakpoint_filesave_behavior = "ASK";
++  if (ui->debugger_filesave_restore->isChecked ())
++    breakpoint_filesave_behavior = "RESTORE";
++  else if (ui->debugger_filesave_discard->isChecked ())
++    breakpoint_filesave_behavior = "DISCARD";
++  settings->setValue ("debugger/breakpoint_filesave_behavior", breakpoint_filesave_behavior);
++
+   // the icon set
+   QString widget_icon_set = "NONE";
+   if (ui->general_icon_letter->isChecked ())
+     widget_icon_set = "LETTER";
+   else if (ui->general_icon_graphic->isChecked ())
+     widget_icon_set = "GRAPHIC";
+   settings->setValue ("DockWidgets/widget_icon_set",widget_icon_set);
+ 
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -27,17 +27,17 @@
+     <widget class="QTabWidget" name="tabWidget">
+      <property name="minimumSize">
+       <size>
+        <width>0</width>
+        <height>0</height>
+       </size>
+      </property>
+      <property name="currentIndex">
+-      <number>1</number>
++      <number>3</number>
+      </property>
+      <widget class="QWidget" name="tab_general">
+       <property name="enabled">
+        <bool>true</bool>
+       </property>
+       <attribute name="title">
+        <string>General</string>
+       </attribute>
+@@ -47,18 +47,18 @@
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_2">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>570</width>
++            <height>382</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_17">
+            <item>
+             <widget class="QGroupBox" name="groupBox">
+              <property name="title">
+               <string>Interface</string>
+              </property>
+@@ -493,18 +493,18 @@
+         <widget class="QScrollArea" name="scrollArea">
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+-            <y>-237</y>
+-            <width>642</width>
++            <y>0</y>
++            <width>586</width>
+             <height>813</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_16">
+            <item>
+             <widget class="QGroupBox" name="groupBox_5">
+              <property name="title">
+               <string>General</string>
+@@ -1494,33 +1494,138 @@
+             </sizepolicy>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+       </layout>
+      </widget>
++     <widget class="QWidget" name="tab_debugger">
++      <attribute name="title">
++       <string>Debugger</string>
++      </attribute>
++      <layout class="QVBoxLayout" name="verticalLayout_30">
++       <item>
++        <widget class="QScrollArea" name="scrollArea_8">
++         <property name="maximumSize">
++          <size>
++           <width>16777215</width>
++           <height>16777215</height>
++          </size>
++         </property>
++         <property name="widgetResizable">
++          <bool>true</bool>
++         </property>
++         <widget class="QWidget" name="scrollAreaWidgetContents_9">
++          <property name="geometry">
++           <rect>
++            <x>0</x>
++            <y>0</y>
++            <width>658</width>
++            <height>571</height>
++           </rect>
++          </property>
++          <layout class="QVBoxLayout" name="verticalLayout_28">
++           <item>
++            <layout class="QVBoxLayout" name="verticalLayout_13">
++             <item>
++              <layout class="QGridLayout" name="gridLayout_15">
++               <item row="4" column="0">
++                <widget class="QGroupBox" name="groupBox_6">
++                 <property name="sizePolicy">
++                  <sizepolicy hsizetype="Expanding" vsizetype="Expanding">
++                   <horstretch>0</horstretch>
++                   <verstretch>0</verstretch>
++                  </sizepolicy>
++                 </property>
++                 <property name="title">
++                  <string>Breakpoint Retention Upon Saving File</string>
++                 </property>
++                 <widget class="QRadioButton" name="debugger_filesave_ask">
++                  <property name="geometry">
++                   <rect>
++                    <x>10</x>
++                    <y>20</y>
++                    <width>273</width>
++                    <height>21</height>
++                   </rect>
++                  </property>
++                  <property name="text">
++                   <string>Ask whether breakpoints should be restored</string>
++                  </property>
++                 </widget>
++                 <widget class="QRadioButton" name="debugger_filesave_restore">
++                  <property name="geometry">
++                   <rect>
++                    <x>10</x>
++                    <y>40</y>
++                    <width>231</width>
++                    <height>21</height>
++                   </rect>
++                  </property>
++                  <property name="text">
++                   <string>Automatically restore breakpoints</string>
++                  </property>
++                 </widget>
++                 <widget class="QRadioButton" name="debugger_filesave_discard">
++                  <property name="geometry">
++                   <rect>
++                    <x>10</x>
++                    <y>60</y>
++                    <width>231</width>
++                    <height>21</height>
++                   </rect>
++                  </property>
++                  <property name="text">
++                   <string>Discard breakpoints</string>
++                  </property>
++                 </widget>
++                </widget>
++               </item>
++              </layout>
++             </item>
++            </layout>
++           </item>
++           <item>
++            <spacer name="verticalSpacer_7">
++             <property name="orientation">
++              <enum>Qt::Vertical</enum>
++             </property>
++             <property name="sizeHint" stdset="0">
++              <size>
++               <width>20</width>
++               <height>40</height>
++              </size>
++             </property>
++            </spacer>
++           </item>
++          </layout>
++         </widget>
++        </widget>
++       </item>
++      </layout>
++     </widget>
+      <widget class="QWidget" name="tab_terminal">
+       <attribute name="title">
+        <string>Terminal</string>
+       </attribute>
+       <layout class="QVBoxLayout" name="verticalLayout_14">
+        <item>
+         <widget class="QScrollArea" name="scrollArea_3">
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_4">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>488</width>
++            <height>236</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_7">
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_8">
+              <item>
+               <layout class="QGridLayout" name="gridLayout_7">
+                <property name="sizeHint" stdset="0">
+@@ -1797,18 +1902,18 @@
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_5">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>474</width>
++            <height>199</height>
+            </rect>
+           </property>
+           <layout class="QGridLayout" name="gridLayout_8">
+            <item row="0" column="0">
+             <widget class="QGroupBox" name="groupBox_4">
+              <property name="title">
+               <string>Behavior</string>
+              </property>
+@@ -1941,18 +2046,18 @@
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_6">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>200</width>
++            <height>79</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_19">
+            <item>
+             <layout class="QGridLayout" name="gridLayout_14">
+              <property name="topMargin">
+               <number>0</number>
+              </property>
+@@ -2010,18 +2115,18 @@
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_8">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>364</width>
++            <height>212</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_25">
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout_26">
+              <property name="sizeConstraint">
+               <enum>QLayout::SetDefaultConstraint</enum>
+              </property>
+@@ -2209,18 +2314,18 @@
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents_7">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+-            <width>658</width>
+-            <height>571</height>
++            <width>529</width>
++            <height>204</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_20">
+            <item>
+             <layout class="QVBoxLayout" name="verticalLayout">
+              <item>
+               <widget class="QCheckBox" name="checkbox_allow_web_connect">
+                <property name="text">

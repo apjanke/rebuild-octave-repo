@@ -1,0 +1,516 @@
+# HG changeset patch
+# User jwe
+# Date 1201033920 0
+#      Tue Jan 22 20:32:00 2008 +0000
+# Node ID 73036cdd855d8769dfecee1447d33b47d00f6a4a
+# Parent  246f905cb98459d8566596ac267ee28d34db4f0a
+[project @ 2008-01-22 20:31:59 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,26 @@
++2008-01-22  John W. Eaton  <jwe@octave.org>
++
++	* graphics.cc (clear_drawnow_request): New function.
++	(Fdrawnow): Add it to the unwind_protect stack.
++
++	* input.cc (Vdrawnow_requested): No longer static.
++	* input.h: Provide decl.
++	* graphics.cc (Fdrawnow, Fset, make_graphics_object):
++	Use Vdrawnow_requested directly.
++
++	* toplev.cc (octave_add_atexit_function,
++	octave_remove_atexit_function): New functions.
++	(Fatexit): Use them.
++	* graphics.cc (Fdrawnow): Call octave_add_atexit_function instead
++	of using eval.
++	* toplev.h (octave_add_atexit_function,
++	octave_remove_atexit_function): Provide decls.
++
+ 2008-01-22  Michael Goffioul  <michael.goffioul@gmail.com>
+ 
+ 	* graphics.h.in (base_properties::is_visible,
+ 	base_properties::set_modified): New accessors.
+ 	(class base_graphics_backend, class graphics_backend): New classes
+ 	for handling octave/backend interaction.
+ 	(figure::properties::close): Add "pop" argument controlling
+ 	whether the figure should be popped from the list of existing figures.
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -29,27 +29,30 @@ along with Octave; see the file COPYING.
+ #include <cstdlib>
+ 
+ #include <algorithm>
+ #include <list>
+ #include <map>
+ #include <set>
+ #include <string>
+ 
++#include "file-ops.h"
++#include "file-stat.h"
++
+ #include "defun.h"
+ #include "error.h"
+ #include "graphics.h"
++#include "input.h"
+ #include "ov.h"
+ #include "oct-obj.h"
+ #include "oct-map.h"
+ #include "ov-fcn-handle.h"
+ #include "parse.h"
++#include "toplev.h"
+ #include "unwind-prot.h"
+-#include "file-ops.h"
+-#include "file-stat.h"
+ 
+ static void
+ gripe_set_invalid (const std::string& pname)
+ {
+   error ("set: invalid value for %s property", pname.c_str ());
+ }
+ 
+ static Matrix
+@@ -1179,27 +1182,26 @@ public:
+       feval ("gnuplot_drawnow", args);
+     }
+ 
+   void print_figure (const graphics_handle& fh, const std::string& term,
+ 		     const std::string& file, bool mono,
+ 		     const std::string& debug_file) const
+     {
+       octave_value_list args;
+-      args.resize (4);
+-      args(0) = fh.as_octave_value ();
+-      args(1) = term;
+-      args(2) = file;
+-      args(3) = mono;
+       if (! debug_file.empty ())
+ 	args(4) = debug_file;
++      args(3) = mono;
++      args(2) = file;
++      args(1) = term;
++      args(0) = fh.as_octave_value ();
+       feval ("gnuplot_drawnow", args);
+     }
+ 
+-  Matrix get_canvas_size (const graphics_handle& fh) const
++  Matrix get_canvas_size (const graphics_handle&) const
+     { return Matrix (1, 2, 0.0); }
+ };
+ 
+ graphics_backend
+ graphics_backend::default_backend (void)
+ {
+   if (available_backends.size () == 0)
+     register_backend (new gnuplot_backend ());
+@@ -1950,17 +1952,17 @@ for the graphics handle @var{h}.\n\
+               else
+ 		{
+ 		  error ("set: invalid handle (= %g)", hcv(n));
+ 		  break;
+ 		}
+             }
+ 
+ 	  if (! error_state && request_drawnow)
+-	    feval ("__request_drawnow__");
++	    Vdrawnow_requested = true;
+         }
+       else
+         error ("set: expecting graphics handle as first argument");
+     }
+   else
+     print_usage ();
+ 
+   return retval;
+@@ -2114,17 +2116,17 @@ make_graphics_object (const std::string&
+ 	      adopt (parent, h);
+ 
+ 	      xset (h, args.splice (0, 1));
+ 	      xcreatefcn (h);
+ 
+ 	      retval = h.value ();
+ 
+ 	      if (! error_state)
+-		feval ("__request_drawnow__");
++		Vdrawnow_requested = true;
+ 	    }
+ 	  else
+ 	    error ("__go%s__: unable to create graphics handle",
+ 		   go_name.c_str ());
+ 	}
+       else
+ 	error ("__go_%s__: invalid parent", go_name.c_str ());
+     }
+@@ -2360,136 +2362,140 @@ DEFUN (__go_figure_handles__, , ,
+    "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} __go_figure_handles__ ()\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   return octave_value (gh_manager::figure_handle_list ());
+ }
+ 
++static void
++clear_drawnow_request (void *)
++{
++  Vdrawnow_requested = false;
++}
++
+ DEFUN (drawnow, args, ,
+    "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} __go_drawnow__ ()\n\
+ @deftypefnx {Built-in Function} {} __go_drawnow__ (@var{term}, @var{file}, @var{mono}, @var{debug_file})\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+   static int drawnow_executing = 0;
+   static bool __go_close_all_registered__ = false;
+ 
+   octave_value retval;
+ 
+-  if (drawnow_executing >= 1)
+-    return retval;
+-
+-  if (! __go_close_all_registered__)
++  unwind_protect::begin_frame ("Fdrawnow");
++  unwind_protect::add (clear_drawnow_request);
++
++  unwind_protect_int (drawnow_executing);
++
++  if (++drawnow_executing <= 1)
+     {
+-      // FIXME: is there a C++ way to do this?
+-      int parse_status;
+-      eval_string ("atexit (\"__go_close_all__\")", true, parse_status);
+-      __go_close_all_registered__ = true;
+-    }
+-
+-  ++drawnow_executing;
+-
+-  if (args.length () == 0)
+-    {
+-      Matrix hlist = gh_manager::figure_handle_list ();
+-
+-      for (int i = 0; ! error_state && i < hlist.length (); i++)
++      if (! __go_close_all_registered__)
++	{
++	  octave_add_atexit_function ("__go_close_all__");
++
++	  __go_close_all_registered__ = true;
++	}
++
++      if (args.length () == 0)
+ 	{
+-	  graphics_handle h = gh_manager::lookup (hlist(i));
+-
+-	  if (h.ok () && h != 0)
++	  Matrix hlist = gh_manager::figure_handle_list ();
++
++	  for (int i = 0; ! error_state && i < hlist.length (); i++)
+ 	    {
+-	      graphics_object go = gh_manager::get_object (h);
+-	      figure::properties& fprops = dynamic_cast <figure::properties&> (go.get_properties ());
+-
+-	      if (fprops.is_modified ())
++	      graphics_handle h = gh_manager::lookup (hlist(i));
++
++	      if (h.ok () && h != 0)
+ 		{
+-		  if (fprops.is_visible ())
+-		    fprops.get_backend ().redraw_figure (h);
+-		  else if (! fprops.get___plot_stream__ ().is_empty ())
++		  graphics_object go = gh_manager::get_object (h);
++		  figure::properties& fprops = dynamic_cast <figure::properties&> (go.get_properties ());
++
++		  if (fprops.is_modified ())
+ 		    {
+-		      fprops.close (false);
+-		      fprops.set___plot_stream__ (Matrix ());
+-		      fprops.set___enhanced__ (false);
++		      if (fprops.is_visible ())
++			fprops.get_backend ().redraw_figure (h);
++		      else if (! fprops.get___plot_stream__ ().is_empty ())
++			{
++			  fprops.close (false);
++			  fprops.set___plot_stream__ (Matrix ());
++			  fprops.set___enhanced__ (false);
++			}
++		      fprops.set_modified (false);
+ 		    }
+-		  fprops.set_modified (false);
+ 		}
+ 	    }
+ 	}
+-    }
+-  else if (args.length () >= 2 && args.length () <= 4)
+-    {
+-      std::string term, file, debug_file;
+-      bool mono;
+-
+-      term = args(0).string_value ();
+-
+-      if (! error_state)
++      else if (args.length () >= 2 && args.length () <= 4)
+ 	{
+-	  file = args(1).string_value ();
++	  std::string term, file, debug_file;
++	  bool mono;
++
++	  term = args(0).string_value ();
+ 
+ 	  if (! error_state)
+ 	    {
+-	      int pos = file.find_last_of (file_ops::dir_sep_chars);
+-
+-	      if (pos != NPOS)
+-		{
+-		  file_stat fs (file.substr (0, pos));
+-
+-		  if (! (fs && fs.is_dir ()))
+-		    error ("drawnow: nonexistent directory `%s'",
+-			   file.substr (0, pos).c_str ());
+-		}
+-
+-	      mono = (args.length () >= 3 ? args(2).bool_value () : false);
++	      file = args(1).string_value ();
+ 
+ 	      if (! error_state)
+ 		{
+-		  debug_file = (args.length () > 3 ? args(3).string_value ()
+-				: "");
++		  size_t pos = file.find_last_of (file_ops::dir_sep_chars);
++
++		  if (pos != NPOS)
++		    {
++		      file_stat fs (file.substr (0, pos));
++
++		      if (! (fs && fs.is_dir ()))
++			error ("drawnow: nonexistent directory `%s'",
++			       file.substr (0, pos).c_str ());
++		    }
++
++		  mono = (args.length () >= 3 ? args(2).bool_value () : false);
+ 
+ 		  if (! error_state)
+ 		    {
+-		      graphics_handle h = gcf ();
+-
+-		      if (h.ok ())
++		      debug_file = (args.length () > 3 ? args(3).string_value ()
++				    : "");
++
++		      if (! error_state)
+ 			{
+-			  graphics_object go = gh_manager::get_object (h);
+-			  figure::properties& fprops = dynamic_cast<figure::properties&> (go.get_properties ());
+-
+-			  fprops.get_backend ()
+-			      .print_figure (h, term, file, mono, debug_file);
++			  graphics_handle h = gcf ();
++
++			  if (h.ok ())
++			    {
++			      graphics_object go = gh_manager::get_object (h);
++
++			      figure::properties& fprops = dynamic_cast<figure::properties&> (go.get_properties ());
++
++			      fprops.get_backend ()
++				.print_figure (h, term, file, mono, debug_file);
++			    }
++			  else
++			    error ("drawnow: nothing to draw");
+ 			}
+ 		      else
+-			error ("drawnow: nothing to draw");
++			error ("drawnow: invalid debug_file, expected a string value");
+ 		    }
+ 		  else
+-		    error ("drawnow: invalid debug_file, expected a string value");
++		    error ("drawnow: invalid colormode, expected a boolean value");
+ 		}
+ 	      else
+-		error ("drawnow: invalid colormode, expected a boolean value");
++		error ("drawnow: invalid file, expected a string value");
+ 	    }
+ 	  else
+-	    error ("drawnow: invalid file, expected a string value");
++	    error ("drawnow: invalid terminal, expected a string value");
+ 	}
+       else
+-	error ("drawnow: invalid terminal, expected a string value");
++	print_usage ();
+     }
+-  else
+-    print_usage ();
+-
+-  // FIXME: is there a C++ way to do this?
+-  octave_value_list fargs;
+-  fargs(0) = false;
+-  feval ("__request_drawnow__", fargs);
+-
+-  --drawnow_executing;
++
++  unwind_protect::run_frame ("Fdrawnow");
+ 
+   return retval;
+ }
+ 
+ octave_value
+ get_property_from_handle (double handle, const std::string &property,
+ 			  const std::string &func)
+ {
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -136,17 +136,17 @@ int promptflag = 1;
+ // The current line of input, from wherever.
+ std::string current_input_line;
+ 
+ // TRUE after a call to completion_matches.
+ bool octave_completion_matches_called = false;
+ 
+ // TRUE if the plotting system has requested a call to drawnow at
+ // the next user prompt.
+-static bool Vdrawnow_requested = false;
++bool Vdrawnow_requested = false;
+ 
+ // TRUE if we are running in the Emacs GUD mode.
+ static bool Vgud_mode = false;
+ 
+ static void
+ do_input_echo (const std::string& input_string)
+ {
+   int do_echo = reading_script_file ?
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -79,16 +79,20 @@ extern bool forced_interactive;
+ extern int promptflag;
+ 
+ // A line of input.
+ extern std::string current_input_line;
+ 
+ // TRUE after a call to completion_matches.
+ extern bool octave_completion_matches_called;
+ 
++// TRUE if the plotting system has requested a call to drawnow at
++// the next user prompt.
++extern bool Vdrawnow_requested;
++
+ extern std::string gnu_readline (const std::string& s, bool force_readline = false);
+ 
+ extern void initialize_command_input (void);
+ 
+ extern bool octave_yes_or_no (const std::string& prompt);
+ 
+ extern octave_value do_keyboard (const octave_value_list& args = octave_value_list ());
+ 
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -658,16 +658,42 @@ do_octave_atexit (void)
+ 	  // Yes, we want this to be separate from the call to
+ 	  // flush_octave_stdout above.
+ 
+ 	  flush_octave_stdout ();
+ 	}
+     }
+ }
+ 
++void
++octave_add_atexit_function (const std::string& fname)
++{
++  octave_atexit_functions.push_front (fname);
++}
++
++bool
++octave_remove_atexit_function (const std::string& fname)
++{
++  bool found = false;
++
++  for (std::list<std::string>::iterator p = octave_atexit_functions.begin ();
++       p != octave_atexit_functions.end (); p++)
++    {
++      if (*p == fname)
++	{
++	  octave_atexit_functions.erase (p);
++	  found = true;
++	  break;
++	}
++    }
++
++  return found;
++}
++
++
+ DEFUN (atexit, args, nargout,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} atexit (@var{fcn})\n\
+ Register a function to be called when Octave exits.  For example,\n\
+ \n\
+ @example\n\
+ @group\n\
+ function bye_bye ()\n\
+@@ -718,32 +744,20 @@ multiple times.\n\
+ 
+               if (error_state)
+                 error ("atexit: second argument must be a logical value");
+             }
+ 
+           if (! error_state)
+ 	    {
+ 	      if (add_mode)
+-		octave_atexit_functions.push_front (arg);
++		octave_add_atexit_function (arg);
+ 	      else
+ 		{
+-		  bool found = false;
+-		  std::list<std::string>::iterator it;
+-
+-		  for (std::list<std::string>::iterator p = octave_atexit_functions.begin ();
+-		       p != octave_atexit_functions.end (); p++)
+-		    {
+-		      if (*p == arg)
+-			{
+-			  octave_atexit_functions.erase (p);
+-			  found = true;
+-			  break;
+-			}
+-		    }
++		  bool found = octave_remove_atexit_function (arg);
+ 
+ 		  if (nargout > 0)
+ 		    retval(0) = found;
+ 		}
+ 	    }
+ 	}
+       else
+         error ("atexit: argument must be a string");
+diff --git a/src/toplev.h b/src/toplev.h
+--- a/src/toplev.h
++++ b/src/toplev.h
+@@ -41,16 +41,22 @@ clean_up_and_exit (int) GCC_ATTR_NORETUR
+ 
+ extern OCTINTERP_API void recover_from_exception (void);
+ 
+ extern int main_loop (void);
+ 
+ extern OCTINTERP_API void
+ do_octave_atexit (void);
+ 
++extern OCTINTERP_API void
++octave_add_atexit_function (const std::string& fname);
++
++extern OCTINTERP_API bool
++octave_remove_atexit_function (const std::string& fname);
++
+ // Current command to execute.
+ extern OCTINTERP_API tree_statement_list *global_command;
+ 
+ // Pointer to parent function that is currently being evaluated.
+ extern OCTINTERP_API octave_function *curr_parent_function;
+ 
+ // TRUE means we are ready to interpret commands, but not everything
+ // is ready for interactive use.

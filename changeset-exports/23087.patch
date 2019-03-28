@@ -1,0 +1,650 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1485298805 18000
+#      Tue Jan 24 18:00:05 2017 -0500
+# Node ID 9f406f0b36da994fbac05f12e32f20f9d9ece403
+# Parent  12956e50e508f83fbf72a5cdc8780061611a4257
+rework clean_up_and_exit (bug #50068)
+
+* quit.h, quit.cc (clean_up_and_exit): Deprecate.  Simply exit.
+
+* interperter.h, interpreter.cc (safe_source_file): Return status.
+Simply return 1 if index or other execution exception occurs.  Don't
+catch exit exception here.
+(Fquit): Throw exit exception instead of calling clean_up_and_exit.
+(execute_pkg_add): Don't catch exit exception here.
+(interpreter::cleanup): Rename from clean_up_and_exit.  Perform
+cleanup options but don't exit. Don't call octave_link::process_events.
+(interpreter::~interpreter): Call cleanup.
+(interpreter::execute): Catch exit_exception but not execution
+exceptions when evaluating eval options or executing command line
+file.  Return status instead of calling clean_up_and_exit.
+(interpreter::execute_eval_option_code): Catch exit exception but not
+interrupt exception here.
+(interpreter::execute_command_line_file): Return status.
+(interpreter::main_loop): If exit exception is caught, don't call
+clean_up_and_exit, but do call octave_link::exit.  Return exit status
+if octave_link doesn't terminate the process.
+
+* octave.h, octave.cc (octave_main): Deprecate.  Make application
+objects static so they persist after function returns.  Warn if not
+starting an embedded application.
+(application::init): Warn if application is already initialized.
+(application::~application): Delete interpreter before setting
+instance to 0.
+
+* octave-link.h (octave_link::exit):  New arg, process_events.  If
+process_events is true, disable link and process pending events.
+
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -244,17 +244,17 @@ to run using @code{atexit}.
+   if (args.length () > 0)
+     exit_status = args(0).nint_value ();
+ 
+   // Instead of simply calling exit, we thrown an exception so that no
+   // matter where the call to quit occurs, we will run the
+   // unwind_protect stack, clear the OCTAVE_LOCAL_BUFFER allocations,
+   // etc. before exiting.
+ 
+-  clean_up_and_exit (exit_status);
++  throw octave::exit_exception (exit_status);
+ 
+   return ovl ();
+ }
+ 
+ DEFALIAS (exit, quit);
+ 
+ void
+ octave_add_atexit_function (const std::string& fname)
+@@ -347,49 +347,51 @@ from the list, so if a function was plac
+   return retval;
+ }
+ 
+ // Execute commands from a file and catch potential exceptions in a consistent
+ // way.  This function should be called anywhere we might parse and execute
+ // commands from a file before we have entered the main loop in
+ // toplev.cc.
+ 
+-static void
++static int
+ safe_source_file (const std::string& file_name,
+                   const std::string& context = "",
+                   bool verbose = false, bool require_file = true,
+                   const std::string& warn_for = "")
+ {
+   try
+     {
+       octave::source_file (file_name, context, verbose, require_file, warn_for);
+     }
+   catch (const octave::index_exception& e)
+     {
+       recover_from_exception ();
+ 
+       std::cerr << "error: index exception in " << file_name << ": "
+                 << e.message () << std::endl;
+-    }
+-  catch (const octave::exit_exception& ex)
+-    {
+-      recover_from_exception ();
+ 
+-      clean_up_and_exit (ex.exit_status (), ex.safe_to_return ());
++      return 1;
+     }
+   catch (const octave::interrupt_exception&)
+     {
+       recover_from_exception ();
++
++      return 1;
+     }
+   catch (const octave::execution_exception&)
+     {
+       recover_from_exception ();
+ 
+       std::cerr << "error: execution exception in " << file_name << std::endl;
++
++      return 1;
+     }
++
++  return 0;
+ }
+ 
+ static void
+ execute_pkg_add (const std::string& dir)
+ {
+   std::string file_name = octave::sys::file_ops::concat (dir, "PKG_ADD");
+ 
+   try
+@@ -398,22 +400,16 @@ execute_pkg_add (const std::string& dir)
+     }
+   catch (const octave::index_exception& e)
+     {
+       recover_from_exception ();
+ 
+       std::cerr << "error: index exception in " << file_name << ": "
+                 << e.message () << std::endl;
+     }
+-  catch (const octave::exit_exception& ex)
+-    {
+-      recover_from_exception ();
+-
+-      clean_up_and_exit (ex.exit_status (), ex.safe_to_return ());
+-    }
+   catch (const octave::interrupt_exception&)
+     {
+       recover_from_exception ();
+     }
+   catch (const octave::execution_exception&)
+     {
+       recover_from_exception ();
+ 
+@@ -638,16 +634,18 @@ namespace octave
+ 
+     initialize_load_path (options.set_initial_path ());
+ 
+     initialize_history (options.read_history_file ());
+   }
+ 
+   interpreter::~interpreter (void)
+   {
++    cleanup ();
++
+     current_evaluator = 0;
+ 
+     delete m_evaluator;
+   }
+ 
+   int interpreter::execute (void)
+   {
+     cmdline_options options = m_app_context->options ();
+@@ -666,34 +664,34 @@ namespace octave
+         && reading_startup_message_printed)
+       std::cout << std::endl;
+ 
+     // Execute any code specified with --eval 'CODE'
+     std::string code_to_eval = options.code_to_eval ();
+ 
+     if (! code_to_eval.empty ())
+       {
+-        int parse_status = 0;
++        int exit_status = 0;
+ 
+         try
+           {
+-            parse_status = execute_eval_option_code (code_to_eval);
++            exit_status = execute_eval_option_code (code_to_eval);
+           }
+-        catch (const octave::execution_exception&)
++        catch (const octave::exit_exception& ex)
+           {
+             recover_from_exception ();
+ 
+-            parse_status = 1;
++            return ex.exit_status ();
+           }
+ 
+         if (! options.persist ())
+           {
+             m_quitting_gracefully = true;
+ 
+-            clean_up_and_exit (parse_status);
++            return exit_status;
+           }
+       }
+ 
+     // If there is an extra argument, see if it names a file to read.
+     // Additional arguments are taken as command line options for the script.
+ 
+     if (m_app_context->have_script_file ())
+       {
+@@ -703,33 +701,33 @@ namespace octave
+         int exit_status = 0;
+ 
+         try
+           {
+             string_vector script_args = options.remaining_args ();
+ 
+             m_app_context->intern_argv (script_args);
+ 
+-            execute_command_line_file (script_args[0]);
++            exit_status = execute_command_line_file (script_args[0]);
+           }
+-        catch (const octave::execution_exception&)
++        catch (const octave::exit_exception& ex)
+           {
+             recover_from_exception ();
+ 
+-            exit_status = 1;
++            return ex.exit_status ();
+           }
+ 
+         // Restore full set of args.
+         m_app_context->intern_argv (options.all_args ());
+ 
+         if (! options.persist ())
+           {
+             m_quitting_gracefully = true;
+ 
+-            clean_up_and_exit (exit_status);
++            return exit_status;
+           }
+       }
+ 
+     // Avoid counting commands executed from startup or script files.
+ 
+     octave::command_editor::reset_current_command_number (1);
+ 
+     // Force input to be echoed if not really interactive,
+@@ -751,18 +749,16 @@ namespace octave
+ 
+         return 1;
+       }
+ 
+     int retval = main_loop ();
+ 
+     m_quitting_gracefully = true;
+ 
+-    clean_up_and_exit (retval, true);
+-
+     return retval;
+   }
+ 
+   int interpreter::execute_eval_option_code (const std::string& code)
+   {
+     octave::unwind_protect frame;
+ 
+     octave_save_signal_mask ();
+@@ -782,37 +778,33 @@ namespace octave
+     m_interactive = false;
+ 
+     int parse_status = 0;
+ 
+     try
+       {
+         eval_string (code, false, parse_status, 0);
+       }
+-    catch (const octave::exit_exception& ex)
++    catch (const octave::interrupt_exception&)
+       {
+         recover_from_exception ();
+ 
+-        clean_up_and_exit (ex.exit_status (), ex.safe_to_return ());
+-      }
+-    catch (const octave::interrupt_exception&)
+-      {
+-        recover_from_exception ();
++        return 1;
+       }
+     catch (const octave::execution_exception&)
+       {
+         recover_from_exception ();
+ 
+-        parse_status = 1;
++        return 1;
+       }
+ 
+     return parse_status;
+   }
+ 
+-  void interpreter::execute_command_line_file (const std::string& fname)
++  int interpreter::execute_command_line_file (const std::string& fname)
+   {
+     octave::unwind_protect frame;
+ 
+     octave_save_signal_mask ();
+ 
+     octave::can_interrupt = true;
+ 
+     octave_signal_hook = octave::signal_handler;
+@@ -836,17 +828,17 @@ namespace octave
+     m_interactive = false;
+ 
+     m_app_context->set_program_names (fname);
+ 
+     std::string context;
+     bool verbose = false;
+     bool require_file = true;
+ 
+-    safe_source_file (fname, context, verbose, require_file, "octave");
++    return safe_source_file (fname, context, verbose, require_file, "octave");
+   }
+ 
+   int interpreter::main_loop (void)
+   {
+     octave_save_signal_mask ();
+ 
+     octave::can_interrupt = true;
+ 
+@@ -911,17 +903,21 @@ namespace octave
+                 else if (parser.lexer.end_of_input)
+                   break;
+               }
+           }
+         catch (const octave::exit_exception& ex)
+           {
+             recover_from_exception ();
+ 
+-            clean_up_and_exit (ex.exit_status (), ex.safe_to_return ());
++            // If we are connected to a gui, allow it to manage the exit
++            // process.
++            octave_link::exit (ex.exit_status ());
++
++            return ex.exit_status ();
+           }
+         catch (const octave::interrupt_exception&)
+           {
+             recover_from_exception ();
+ 
+             // Required newline when the user does Ctrl+C at the prompt.
+             if (octave::application::interactive ())
+               octave_stdout << "\n";
+@@ -972,17 +968,17 @@ namespace octave
+       octave_stdout << "\n";
+ 
+     if (retval == EOF)
+       retval = 0;
+ 
+     return retval;
+   }
+ 
+-  void interpreter::clean_up_and_exit (int status, bool safe_to_return)
++  void interpreter::cleanup (void)
+   {
+     static bool deja_vu = false;
+ 
+     OCTAVE_SAFE_CALL (remove_input_event_hook_functions, ());
+ 
+     while (! octave_atexit_functions.empty ())
+       {
+         std::string fcn = octave_atexit_functions.front ();
+@@ -995,21 +991,16 @@ namespace octave
+ 
+         OCTAVE_SAFE_CALL (octave::flush_stdout, ());
+       }
+ 
+     if (! deja_vu)
+       {
+         deja_vu = true;
+ 
+-        // Process pending events and disasble octave_link event
+-        // processing with this call.
+-
+-        octave_link::process_events (true);
+-
+         // Do this explicitly so that destructors for mex file objects
+         // are called, so that functions registered with mexAtExit are
+         // called.
+         OCTAVE_SAFE_CALL (clear_mex_functions, ());
+ 
+         OCTAVE_SAFE_CALL (octave::command_editor::restore_terminal_state, ());
+ 
+         // FIXME: is this needed?  Can it cause any trouble?
+@@ -1055,36 +1046,10 @@ namespace octave
+         // way to force new octave_value_X types that are created in
+         // .oct files to be unregistered when the .oct file shared library
+         // is unloaded.
+         //
+         // OCTAVE_SAFE_CALL (singleton_cleanup_list::cleanup, ());
+ 
+         OCTAVE_SAFE_CALL (octave::chunk_buffer::clear, ());
+       }
+-
+-    if (octave_link::exit (status))
+-      {
+-        if (safe_to_return)
+-          return;
+-        else
+-          {
+-            // What should we do here?  We might be called from some
+-            // location other than the end of octave::interpreter::execute
+-            // so it might not be safe to return.
+-
+-            // We have nothing else to do at this point, and the
+-            // octave_link::exit function is supposed to take care of
+-            // exiting for us.  Hang here forever so we never return.
+-
+-            while (true)
+-              {
+-                octave_sleep (1);
+-              }
+-          }
+-      }
+-    else
+-      {
+-        if (octave_exit)
+-          (*octave_exit) (status);
+-      }
+   }
+ }
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -27,19 +27,16 @@ along with Octave; see the file COPYING.
+ 
+ #include <string>
+ 
+ #include "quit.h"
+ #include "str-vec.h"
+ 
+ #include "pt-eval.h"
+ 
+-typedef void (*octave_exit_func) (int);
+-extern OCTINTERP_API octave_exit_func octave_exit;
+-
+ extern OCTINTERP_API bool quit_allowed;
+ 
+ extern OCTINTERP_API bool quitting_gracefully;
+ 
+ extern OCTINTERP_API void recover_from_exception (void);
+ 
+ extern OCTINTERP_API void
+ octave_add_atexit_function (const std::string& fname);
+@@ -109,26 +106,26 @@ namespace octave
+     interpreter& operator = (const interpreter&) = delete;
+ 
+     ~interpreter (void);
+ 
+     int execute (void);
+ 
+     int execute_eval_option_code (const std::string& code);
+ 
+-    void execute_command_line_file (const std::string& fname);
++    int execute_command_line_file (const std::string& fname);
+ 
+     bool interactive (void) const { return m_interactive; }
+     void interactive (bool arg) { m_interactive = arg; }
+ 
+   private:
+ 
+     int main_loop (void);
+ 
+-    void clean_up_and_exit (int status, bool safe_to_return = false);
++    void cleanup (void);
+ 
+     application *m_app_context;
+ 
+     tree_evaluator *m_evaluator;
+ 
+     bool m_embedded;
+ 
+     // TRUE means this is an interactive interpreter (forced or not).
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -93,22 +93,34 @@ public:
+     bool retval = true;
+ 
+     if (instance_ok ())
+       retval = instance->do_confirm_shutdown ();
+ 
+     return retval;
+   }
+ 
+-  static bool exit (int status)
++  static bool exit (int status, bool process_events = true)
+   {
+     bool retval = false;
+ 
+     if (instance_ok ())
+-      retval = instance->do_exit (status);
++      {
++        if (process_events)
++          {
++            // Disable additional event processing prior to processing
++            // all other pending events.
++
++            instance->link_enabled = false;
++
++            instance->do_process_events ();
++          }
++
++        retval = instance->do_exit (status);
++      }
+ 
+     return retval;
+   }
+ 
+   template <typename T>
+   static void post_event (T *obj, void (T::*method) (void))
+   {
+     if (enabled ())
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -361,38 +361,36 @@ namespace octave
+   {
+     interpreter *interp = instance->m_interpreter;
+ 
+     return interp ? interp->interactive () : false;
+   }
+ 
+   application::~application (void)
+   {
+-    instance = 0;
++    delete m_interpreter;
+ 
+-    delete m_interpreter;
++    instance = 0;
+   }
+ 
+   void application::create_interpreter (void)
+   {
+     if (! m_interpreter)
+       m_interpreter = new interpreter (this);
+   }
+ 
+   int application::execute_interpreter (void)
+   {
+     return m_interpreter ? m_interpreter->execute () : -1;
+   }
+ 
+   void application::init (void)
+   {
+     if (instance)
+-      {
+-        // FIXME: Should this be an error?
+-      }
++      warning ("octave::application: application already initialized");
+     else
+       instance = this;
+ 
+     string_vector all_args = m_options.all_args ();
+ 
+     set_program_names (all_args[0]);
+ 
+     string_vector remaining_args = m_options.remaining_args ();
+@@ -444,22 +442,23 @@ namespace octave
+ 
+ int
+ octave_main (int argc, char **argv, int embedded)
+ {
+   octave::sys::env::set_program_name (argv[0]);
+ 
+   if (embedded)
+     {
+-      octave::embedded_application app (argc, argv);
++      static octave::embedded_application app (argc, argv);
+       return app.execute ();
+     }
+   else
+     {
+-      octave::cli_application app (argc, argv);
++      warning ("octave_main should only be used to create an embedded interpreter");
++      static octave::cli_application app (argc, argv);
+       return app.execute ();
+     }
+ }
+ 
+ DEFUN (isguirunning, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} isguirunning ()
+ Return true if Octave is running in GUI mode and false otherwise.
+diff --git a/libinterp/octave.h b/libinterp/octave.h
+--- a/libinterp/octave.h
++++ b/libinterp/octave.h
+@@ -329,15 +329,16 @@ namespace octave
+ }
+ 
+ #endif
+ 
+ #if defined  (__cplusplus)
+ extern "C" {
+ #endif
+ 
++OCTAVE_DEPRECATED ("see the Octave documentation for other options")
+ extern OCTINTERP_API int octave_main (int argc, char **argv, int embedded);
+ 
+ #if defined  (__cplusplus)
+ }
+ #endif
+ 
+ #endif
+diff --git a/liboctave/cruft/misc/quit.cc b/liboctave/cruft/misc/quit.cc
+--- a/liboctave/cruft/misc/quit.cc
++++ b/liboctave/cruft/misc/quit.cc
+@@ -44,21 +44,19 @@ octave_handle_signal (void)
+   if (octave_interrupt_state > 0)
+     {
+       octave_interrupt_state = -1;
+       octave_throw_interrupt_exception ();
+     }
+ }
+ 
+ extern OCTAVE_API void
+-clean_up_and_exit (int exit_status, bool safe_to_return)
++clean_up_and_exit (int exit_status, bool /* safe_to_return */)
+ {
+-  octave_exception_state = octave_quit_exception;
+-
+-  throw octave::exit_exception (exit_status, safe_to_return);
++  exit (exit_status);
+ }
+ 
+ void
+ octave_throw_interrupt_exception (void)
+ {
+   if (octave_interrupt_hook)
+     octave_interrupt_hook ();
+ 
+diff --git a/liboctave/cruft/misc/quit.h b/liboctave/cruft/misc/quit.h
+--- a/liboctave/cruft/misc/quit.h
++++ b/liboctave/cruft/misc/quit.h
+@@ -188,16 +188,17 @@ OCTAVE_NORETURN OCTAVE_API extern void o
+ OCTAVE_NORETURN OCTAVE_API extern void octave_throw_execution_exception (void);
+ 
+ OCTAVE_NORETURN OCTAVE_API extern void octave_throw_bad_alloc (void);
+ 
+ OCTAVE_API extern void octave_rethrow_exception (void);
+ 
+ #if defined (__cplusplus)
+ 
++OCTAVE_DEPRECATED ("see the Octave documentation for other options")
+ extern OCTAVE_API void
+ clean_up_and_exit (int exit_status, bool safe_to_return = false);
+ 
+ inline void octave_quit (void)
+ {
+   if (octave_signal_caught)
+     {
+       octave_signal_caught = 0;

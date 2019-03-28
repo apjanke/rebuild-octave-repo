@@ -1,0 +1,517 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1352088693 25200
+#      Sun Nov 04 21:11:33 2012 -0700
+# Node ID 44272909d926b77b24ab77d9a5654da90262d823
+# Parent  f3e339aee38f3077245ec4ea6d0d15d293fad577
+Stop JIT on interrupt
+
+* jit-ir.cc (jit_call::needs_release): Move to cc file and do not release
+artificial assigns.
+(jit_error_check::variable_to_strign): New function.
+(jit_error_check::print): Move to cc file and improve output.
+* jit-ir.h (jit_call::needs_release): Move to cc file.
+(jit_error_check::variable): New enum.
+(jit_error_check::variable_to_string): New declaration.
+(jit_error_check::jit_error_check): Add variable argument and new overload.
+(jit_error_check::check_variable, jit_error_check::has_check_for): New function.
+(jit_error_check::check_for): Ensure has_check_for is true.
+(jit_error_check::print): Move to cc file.
+(jit_error_check::check_alive): Always true if has_check_for is false.
+(jit_error_check::mvariable): New variable.
+
+* jit-typeinfo.cc (jit_typeinfo::jit_typeinfo): Initialize
+loctave_interrupt_state and fix name of cast to any.
+(jit_typeinfo::do_insert_interrupt_check): New function.
+* jit-typeinfo.h (jit_typeinfo::insert_interrupt_check): New function.
+(jit_typeinfo::do_insert_interrupt_check): New declaration.
+(jit_typeinfo::loctave_interrupt_state): New variable.
+
+* pt-jit.cc (jit_convert::visit_simple_for_command,
+jit_convert::visit_while_command): Check interrupt state.
+(jit_convert::create_check_impl): Specify var_error_state check.
+(jit_convert_llvm::visit): Generate var_interrupt error check.
+(jit_function_info::execute, jit_info::execute): Call octave_quit.
+
+diff --git a/libinterp/interp-core/jit-ir.cc b/libinterp/interp-core/jit-ir.cc
+--- a/libinterp/interp-core/jit-ir.cc
++++ b/libinterp/interp-core/jit-ir.cc
+@@ -693,16 +693,33 @@ jit_terminator::infer (void)
+ llvm::TerminatorInst *
+ jit_terminator::to_llvm (void) const
+ {
+   return llvm::cast<llvm::TerminatorInst> (jit_value::to_llvm ());
+ }
+ 
+ // -------------------- jit_call --------------------
+ bool
++jit_call::needs_release (void) const
++{
++  if (type () && jit_typeinfo::get_release (type ()).valid ())
++    {
++      for (jit_use *use = first_use (); use; use = use->next ())
++        {
++          jit_assign *assign = dynamic_cast<jit_assign *> (use->user ());
++          if (assign && assign->artificial ())
++            return false;
++        }
++
++      return true;
++    }
++  return false;
++}
++
++bool
+ jit_call::infer (void)
+ {
+   // FIXME: explain algorithm
+   for (size_t i = 0; i < argument_count (); ++i)
+     {
+       already_infered[i] = argument_type (i);
+       if (! already_infered[i])
+         return false;
+@@ -721,16 +738,43 @@ jit_call::infer (void)
+     {
+       stash_type (infered);
+       return true;
+     }
+ 
+   return false;
+ }
+ 
++// -------------------- jit_error_check --------------------
++std::string
++jit_error_check::variable_to_string (variable v)
++{
++  switch (v)
++    {
++    case var_error_state:
++      return "error_state";
++    case var_interrupt:
++      return "interrupt";
++    default:
++      panic_impossible ();
++    }
++}
++
++std::ostream&
++jit_error_check::print (std::ostream& os, size_t indent) const
++{
++  print_indent (os, indent) << "error_check " << variable_to_string (mvariable)
++                            << ", ";
++
++  if (has_check_for ())
++    os << "<for> " << *check_for () << ", ";
++  print_successor (os << "<normal> ", 1) << ", ";
++  return print_successor (os << "<error> ", 0);
++}
++
+ // -------------------- jit_magic_end --------------------
+ jit_magic_end::context::context (jit_factory& factory, jit_value *avalue,
+                                  size_t aindex, size_t acount)
+   : value (avalue), index (factory.create<jit_const_index> (aindex)),
+     count (factory.create<jit_const_index> (acount))
+ {}
+ 
+ jit_magic_end::jit_magic_end (const std::vector<context>& full_context)
+diff --git a/libinterp/interp-core/jit-ir.h b/libinterp/interp-core/jit-ir.h
+--- a/libinterp/interp-core/jit-ir.h
++++ b/libinterp/interp-core/jit-ir.h
+@@ -1171,20 +1171,17 @@ public:
+     return overload ().can_error ();
+   }
+ 
+   const jit_function& overload (void) const
+   {
+     return moperation.overload (argument_types ());
+   }
+ 
+-  virtual bool needs_release (void) const
+-  {
+-    return type () && jit_typeinfo::get_release (type ()).valid ();
+-  }
++  virtual bool needs_release (void) const;
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
+   {
+     print_indent (os, indent);
+ 
+     if (use_count ())
+       short_print (os) << " = ";
+     os << "call " << moperation.name () << " (";
+@@ -1207,37 +1204,57 @@ private:
+ 
+ // FIXME: This is just ugly...
+ // checks error_state, if error_state is false then goto the normal branch,
+ // otherwise goto the error branch
+ class
+ jit_error_check : public jit_terminator
+ {
+ public:
+-  jit_error_check (jit_call *acheck_for, jit_block *normal, jit_block *error)
+-    : jit_terminator (2, error, normal, acheck_for) {}
++  // Which variable is the error check for?
++  enum variable
++    {
++      var_error_state,
++      var_interrupt
++    };
++
++  static std::string variable_to_string (variable v);
++
++  jit_error_check (variable var, jit_call *acheck_for, jit_block *normal,
++                   jit_block *error)
++    : jit_terminator (2, error, normal, acheck_for), mvariable (var) {}
++
++  jit_error_check (variable var, jit_block *normal, jit_block *error)
++    : jit_terminator (2, error, normal), mvariable (var) {}
++
++  variable check_variable (void) const { return mvariable; }
++
++  bool has_check_for (void) const
++  {
++    return argument_count () == 3;
++  }
+ 
+   jit_call *check_for (void) const
+   {
++    assert (has_check_for ());
+     return static_cast<jit_call *> (argument (2));
+   }
+ 
+-  virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
+-  {
+-    print_indent (os, indent) << "error_check " << *check_for () << ", ";
+-    print_successor (os, 1) << ", ";
+-    return print_successor (os, 0);
+-  }
++  virtual std::ostream& print (std::ostream& os, size_t indent = 0) const;
+ 
+   JIT_VALUE_ACCEPT;
+ protected:
+   virtual bool check_alive (size_t idx) const
+   {
++    if (! has_check_for ())
++      return true;
+     return idx == 1 ? true : check_for ()->can_error ();
+   }
++private:
++  variable mvariable;
+ };
+ 
+ // for now only handles the 1D case
+ class
+ jit_magic_end : public jit_instruction
+ {
+ public:
+   class
+diff --git a/libinterp/interp-core/jit-typeinfo.cc b/libinterp/interp-core/jit-typeinfo.cc
+--- a/libinterp/interp-core/jit-typeinfo.cc
++++ b/libinterp/interp-core/jit-typeinfo.cc
+@@ -1105,16 +1105,25 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+ 
+   // bind global variables
+   lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
+                                            llvm::GlobalValue::ExternalLinkage,
+                                            0, "error_state");
+   engine->addGlobalMapping (lerror_state,
+                             reinterpret_cast<void *> (&error_state));
+ 
++  // sig_atomic_type is going to be some sort of integer
++  sig_atomic_type = llvm::Type::getIntNTy (context, sizeof(sig_atomic_t) * 8);
++  loctave_interrupt_state
++    = new llvm::GlobalVariable (*module, sig_atomic_type, false,
++                                llvm::GlobalValue::ExternalLinkage, 0,
++                                "octave_interrupt_state");
++  engine->addGlobalMapping (loctave_interrupt_state,
++                            reinterpret_cast<void *> (&octave_interrupt_state));
++
+   // generic call function
+   {
+     jit_type *int_t = intN (sizeof (octave_builtin::fcn) * 8);
+     any_call = create_function (jit_convention::external, "octave_jit_call",
+                                 any, int_t, int_t, any_ptr, int_t);
+     any_call.add_mapping (engine, &octave_jit_call);
+   }
+ 
+@@ -1794,17 +1803,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   fn = create_function (jit_convention::external, "octave_jit_create_undef",
+                         any);
+   create_undef_fn.add_overload (fn);
+ 
+   casts[any->type_id ()].stash_name ("(any)");
+   casts[scalar->type_id ()].stash_name ("(scalar)");
+   casts[complex->type_id ()].stash_name ("(complex)");
+   casts[matrix->type_id ()].stash_name ("(matrix)");
+-  casts[any->type_id ()].stash_name ("(range)");
++  casts[range->type_id ()].stash_name ("(range)");
+ 
+   // cast any <- matrix
+   fn = create_function (jit_convention::external, "octave_jit_cast_any_matrix",
+                         any, matrix);
+   fn.add_mapping (engine, &octave_jit_cast_any_matrix);
+   casts[any->type_id ()].add_overload (fn);
+ 
+   // cast matrix <- any
+@@ -2073,16 +2082,24 @@ jit_typeinfo::create_identity (jit_type 
+ }
+ 
+ llvm::Value *
+ jit_typeinfo::do_insert_error_check (llvm::IRBuilderD& abuilder)
+ {
+   return abuilder.CreateLoad (lerror_state);
+ }
+ 
++llvm::Value *
++jit_typeinfo::do_insert_interrupt_check (llvm::IRBuilderD& abuilder)
++{
++  llvm::LoadInst *val = abuilder.CreateLoad (loctave_interrupt_state);
++  val->setVolatile (true);
++  return abuilder.CreateICmpSGT (val, abuilder.getInt32 (0));
++}
++
+ void
+ jit_typeinfo::add_builtin (const std::string& name)
+ {
+   jit_type *btype = new_type (name, any, any->to_llvm (), true);
+   builtins[name] = btype;
+ 
+   octave_builtin *ov_builtin = find_builtin (name);
+   if (ov_builtin)
+diff --git a/libinterp/interp-core/jit-typeinfo.h b/libinterp/interp-core/jit-typeinfo.h
+--- a/libinterp/interp-core/jit-typeinfo.h
++++ b/libinterp/interp-core/jit-typeinfo.h
+@@ -561,16 +561,21 @@ public:
+     return instance->do_cast (to, from);
+   }
+ 
+   static llvm::Value *insert_error_check (llvm::IRBuilderD& bld)
+   {
+     return instance->do_insert_error_check (bld);
+   }
+ 
++  static llvm::Value *insert_interrupt_check (llvm::IRBuilderD& bld)
++  {
++    return instance->do_insert_interrupt_check (bld);
++  }
++
+   static const jit_operation& end (void)
+   {
+     return instance->end_fn;
+   }
+ 
+   static const jit_function& end (jit_value *value, jit_value *index,
+                                   jit_value *count)
+   {
+@@ -687,16 +692,18 @@ private:
+ #undef JIT_PARAM_ARGS
+ #undef JIT_PARAMS
+ #undef CREATE_FUNCTION
+ 
+   jit_function create_identity (jit_type *type);
+ 
+   llvm::Value *do_insert_error_check (llvm::IRBuilderD& bld);
+ 
++  llvm::Value *do_insert_interrupt_check (llvm::IRBuilderD& bld);
++
+   void add_builtin (const std::string& name);
+ 
+   void register_intrinsic (const std::string& name, size_t id,
+                            jit_type *result, jit_type *arg0)
+   {
+     std::vector<jit_type *> args (1, arg0);
+     register_intrinsic (name, id, result, args);
+   }
+@@ -742,16 +749,19 @@ private:
+ 
+   static jit_typeinfo *instance;
+ 
+   llvm::Module *module;
+   llvm::ExecutionEngine *engine;
+   int next_id;
+ 
+   llvm::GlobalVariable *lerror_state;
++  llvm::GlobalVariable *loctave_interrupt_state;
++
++  llvm::Type *sig_atomic_type;
+ 
+   std::vector<jit_type*> id_to_type;
+   jit_type *any;
+   jit_type *matrix;
+   jit_type *scalar;
+   jit_type *scalar_ptr; // a fake type for interfacing with C++
+   jit_type *any_ptr; // a fake type for interfacing with C++
+   jit_type *range;
+diff --git a/libinterp/interp-core/pt-jit.cc b/libinterp/interp-core/pt-jit.cc
+--- a/libinterp/interp-core/pt-jit.cc
++++ b/libinterp/interp-core/pt-jit.cc
+@@ -398,29 +398,39 @@ jit_convert::visit_simple_for_command (t
+ 
+       all_breaking = true;
+     }
+ 
+   // check our condition, continues jump to this block
+   jit_block *check_block = factory.create<jit_block> ("for_check");
+   blocks.push_back (check_block);
+ 
++  jit_block *interrupt_check = factory.create<jit_block> ("for_interrupt");
++  blocks.push_back (interrupt_check);
++
+   if (! all_breaking)
+     block->append (factory.create<jit_branch> (check_block));
+   finish_breaks (check_block, continues);
+ 
+   block = check_block;
+   const jit_operation& add_fn = jit_typeinfo::binary_op (octave_value::op_add);
+   jit_value *one = factory.create<jit_const_index> (1);
+   jit_call *iter_inc = factory.create<jit_call> (add_fn, iterator, one);
+   block->append (iter_inc);
+   block->append (factory.create<jit_assign> (iterator, iter_inc));
+   check = block->append (factory.create<jit_call> (jit_typeinfo::for_check,
+                                                    control, iterator));
+-  block->append (factory.create<jit_cond_branch> (check, body, tail));
++  block->append (factory.create<jit_cond_branch> (check, interrupt_check,
++                                                  tail));
++
++  block = interrupt_check;
++  jit_error_check *ec
++    = factory.create<jit_error_check> (jit_error_check::var_interrupt,
++                                       body, final_block);
++  block->append (ec);
+ 
+   // breaks will go to our tail
+   blocks.push_back (tail);
+   finish_breaks (tail, breaks);
+   block = tail;
+ }
+ 
+ void
+@@ -829,20 +839,32 @@ jit_convert::visit_while_command (tree_w
+         }
+       catch (const jit_break_exception&)
+         {
+           all_breaking = true;
+         }
+     }
+ 
+   finish_breaks (tail, breaks);
+-  finish_breaks (cond_check, continues);
+-
+-  if (! all_breaking)
+-    block->append (factory.create<jit_branch> (cond_check));
++
++  if (! all_breaking || continues.size ())
++    {
++      jit_block *interrupt_check
++        = factory.create<jit_block> ("interrupt_check");
++      blocks.push_back (interrupt_check);
++      finish_breaks (interrupt_check, continues);
++      if (! all_breaking)
++        block->append (factory.create<jit_branch> (interrupt_check));
++
++      block = interrupt_check;
++      jit_error_check *ec
++        = factory.create<jit_error_check> (jit_error_check::var_interrupt,
++                                           cond_check, final_block);
++      block->append (ec);
++    }
+ 
+   blocks.push_back (tail);
+   block = tail;
+ }
+ 
+ void
+ jit_convert::visit_do_until_command (tree_do_until_command&)
+ {
+@@ -866,18 +888,19 @@ jit_convert::initialize (symbol_table::s
+ }
+ 
+ jit_call *
+ jit_convert::create_checked_impl (jit_call *ret)
+ {
+   block->append (ret);
+ 
+   jit_block *normal = factory.create<jit_block> (block->name ());
+-  jit_error_check *check = factory.create<jit_error_check> (ret, normal,
+-                                                            final_block);
++  jit_error_check *check
++    = factory.create<jit_error_check> (jit_error_check::var_error_state, ret,
++                                       normal, final_block);
+   block->append (check);
+   blocks.push_back (normal);
+   block = normal;
+ 
+   return ret;
+ }
+ 
+ jit_variable *
+@@ -1360,17 +1383,30 @@ void
+ jit_convert_llvm::visit (jit_variable&)
+ {
+   throw jit_fail_exception ("ERROR: SSA construction should remove all variables");
+ }
+ 
+ void
+ jit_convert_llvm::visit (jit_error_check& check)
+ {
+-  llvm::Value *cond = jit_typeinfo::insert_error_check (builder);
++  llvm::Value *cond;
++
++  switch (check.check_variable ())
++    {
++    case jit_error_check::var_error_state:
++      cond = jit_typeinfo::insert_error_check (builder);
++      break;
++    case jit_error_check::var_interrupt:
++      cond = jit_typeinfo::insert_interrupt_check (builder);
++      break;
++    default:
++      panic_impossible ();
++    }
++
+   llvm::Value *br = builder.CreateCondBr (cond, check.successor_llvm (0),
+                                           check.successor_llvm (1));
+   check.stash_llvm (br);
+ }
+ 
+ void
+ jit_convert_llvm::visit (jit_assign& assign)
+ {
+@@ -2075,16 +2111,18 @@ jit_function_info::execute (const octave
+       obv->grab ();
+       args[i] = obv;
+     }
+ 
+   octave_base_value *ret = function (&args[0]);
+   if (ret)
+     retval(0) = octave_value (ret);
+ 
++  octave_quit ();
++
+   return true;
+ }
+ 
+ bool
+ jit_function_info::match (const octave_value_list& ov_args) const
+ {
+   if (! function)
+     return true;
+@@ -2143,16 +2181,18 @@ jit_info::execute (const vmap& extra_var
+     {
+       const std::string& name = arguments[i].first;
+ 
+       // do not store for loop bounds temporary
+       if (name.size () && name[0] != '#')
+         symbol_table::varref (arguments[i].first) = real_arguments[i];
+     }
+ 
++  octave_quit ();
++
+   return true;
+ }
+ 
+ bool
+ jit_info::match (const vmap& extra_vars) const
+ {
+   if (! function)
+     return true;

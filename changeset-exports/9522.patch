@@ -1,0 +1,1338 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1250171517 -7200
+#      Thu Aug 13 15:51:57 2009 +0200
+# Node ID e79470be3ecb8ba2c26dac2434a30c779cb34011
+# Parent  e08d72bb988e0d288580b11df3803795b69edf8e
+implement subsasgn this-arg optimization
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,41 @@
++2009-08-13  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov-class.h (octave_class): Derive from octave_struct.
++	(octave_class::octave_class): Update all constructors.
++	(octave_class::numeric_conv, octave_class::byte_size, octave_class::numel, octave_class::nfields,
++	octave_class::reshape, octave_class::resize, octave_class::is_defined,
++	octave_class::map_value): Remove methods (inherit).
++	* ov-class.h (octave_class::obsolete_copies): New field.
++	Init to 0 in all constructors.
++	(octave_class::unique_clone): New decl.
++	* ov-class.cc (octave_class::unique_clone): Fake clone if all
++	remaining copies are obsolete.
++	(octave_class::subsref): Share code with octave_struct::subsref.
++	(octave_class::subsref (..., bool auto_add)): New method.
++	(octave_class::subsasgn): If plausible, attempt to
++	optimize the method call by marking appropriate number of copies
++	obsolete. Share code with octave_struct::subsasgn.
++	(octave_class::dotasgn): New method override.
++	* ov-struct.h (octave_struct::dotref): New virtual overload.
++	(octave_struct::dotasgn): New virtual method decl.
++	* ov-struct.cc (octave_struct::dotasgn): New virtual method.
++	* ov-usr-fcn.h (octave_user_function::num_args_passed,
++	octave_user_function::saved_args): Remove fields. Wipe from all
++	constructor lists.
++	(octave_user_function::save_args_passed,
++	octave_user_function::restore_args_passed): Remove methods.
++	(octave_user_function::all_va_args): Update decl.
++	(octave_user_function::subsasgn_optimization_ok): New method decl.
++	* ov-usr-fcn.cc (octave_user_function::all_va_args): Rename from
++	octave_all_va_args, take args as a parameter.
++	(octave_user_function::subsasgn_optimization_ok): New method.
++	(octave_user_function::do_multi_index_op): Simplify.
++
+ 2009-08-12  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* ov-base.h (octave_base_value::count): Declare as octave_idx_type.
+ 	(octave_base_value::octave_base_value (const octave_base_value&)):
+ 	Initialize count to 1.
+ 	(octave_base_value::unique_clone ()): New method.
+ 	(octave_base_value::print_with_name): Declare as non-const.
+ 	* ov-base.cc (octave_base_value::print_with_name): Update.
+diff --git a/src/ov-class.cc b/src/ov-class.cc
+--- a/src/ov-class.cc
++++ b/src/ov-class.cc
+@@ -1,11 +1,12 @@
+ /*
+ 
+ Copyright (C) 2007, 2008, 2009 John W. Eaton
++Copyright (C) 2009 VZLU Prague
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -39,16 +40,17 @@ along with Octave; see the file COPYING.
+ #include "load-path.h"
+ #include "ls-hdf5.h"
+ #include "ls-oct-ascii.h"
+ #include "ls-oct-binary.h"
+ #include "ls-utils.h"
+ #include "oct-lvalue.h"
+ #include "ov-class.h"
+ #include "ov-fcn.h"
++#include "ov-usr-fcn.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pr-output.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ #include "variables.h"
+ 
+ DEFINE_OCTAVE_ALLOCATOR(octave_class);
+@@ -61,17 +63,17 @@ void
+ octave_class::register_type (void)
+ {
+   t_id = octave_value_typeinfo::register_type
+     (octave_class::t_name, "<unknown>", octave_value (new octave_class ()));
+ }
+ 
+ octave_class::octave_class (const Octave_map& m, const std::string& id, 
+ 			    const octave_value_list& parents)
+-  : octave_base_value (), map (m), c_name (id)
++  : octave_struct (m), c_name (id), obsolete_copies (0)
+ {
+   octave_idx_type n = parents.length ();
+ 
+   for (octave_idx_type idx = 0; idx < n; idx++)
+     {
+       octave_value parent = parents(idx);
+ 
+       if (! parent.is_object ())
+@@ -90,16 +92,35 @@ octave_class::octave_class (const Octave
+ 	    }
+ 	}
+     }
+ 
+   if (! error_state)
+     load_path::add_to_parent_map (id, parent_list);
+ }
+ 
++octave_base_value *
++octave_class::unique_clone (void)
++{ 
++  if (count == obsolete_copies)
++    {
++      // All remaining copies are obsolete. We don't actually need to clone.
++      count++;
++      return this;
++    }
++  else
++    { 
++      // In theory, this shouldn't be happening, but it's here just in case.
++      if (count < obsolete_copies)
++        obsolete_copies = 0;
++
++      return clone (); 
++    }
++}
++
+ static std::string
+ get_current_method_class (void)
+ {
+   std::string retval;
+ 
+   octave_function *fcn = octave_call_stack::current ();
+ 
+   std::string my_dir = fcn->dir_name ();
+@@ -112,34 +133,16 @@ get_current_method_class (void)
+ }
+ 
+ static void
+ gripe_invalid_index (void)
+ {
+   error ("invalid index for class");
+ }
+ 
+-static void
+-gripe_invalid_index_for_assignment (void)
+-{
+-  error ("invalid index for class assignment");
+-}
+-
+-static void
+-gripe_invalid_index_type (const std::string& nm, char t)
+-{
+-  error ("%s cannot be indexed with %c", nm.c_str (), t);
+-}
+-
+-static void
+-gripe_failed_assignment (void)
+-{
+-  error ("assignment to class element failed");
+-}
+-
+ static inline octave_value_list
+ sanitize (const octave_value_list& ovl)
+ {
+   octave_value_list retval = ovl;
+ 
+   for (octave_idx_type i = 0; i < ovl.length (); i++)
+     {
+       if (retval(i).is_magic_colon ())
+@@ -363,78 +366,17 @@ octave_class::numel (const octave_value_
+ octave_value_list
+ octave_class::subsref (const std::string& type,
+ 		       const std::list<octave_value_list>& idx,
+ 		       int nargout)
+ {
+   octave_value_list retval;
+ 
+   if (in_class_method () || called_from_builtin ())
+-    {
+-      // FIXME -- this block of code is the same as the body of
+-      // octave_struct::subsref.  Maybe it could be shared instead of
+-      // duplicated.
+-
+-      int skip = 1;
+-
+-      switch (type[0])
+-	{
+-	case '(':
+-	  {
+-	    if (type.length () > 1 && type[1] == '.')
+-	      {
+-		std::list<octave_value_list>::const_iterator p = idx.begin ();
+-		octave_value_list key_idx = *++p;
+-
+-		Cell tmp = dotref (key_idx);
+-
+-		if (! error_state)
+-		  {
+-		    Cell t = tmp.index (idx.front ());
+-
+-		    retval(0) = (t.length () == 1) ? t(0) : octave_value (t, true);
+-
+-		    // We handled two index elements, so tell
+-		    // next_subsref to skip both of them.
+-
+-		    skip++;
+-		  }
+-	      }
+-	    else
+-	      retval(0) = octave_value (map.index (idx.front ()),
+-					class_name ());
+-	  }
+-	  break;
+-
+-	case '.':
+-	  {
+-	    if (map.numel() > 0)
+-	      {
+-		Cell t = dotref (idx.front ());
+-
+-		retval(0) = (t.length () == 1) ? t(0) : octave_value (t, true);
+-	      }
+-	  }
+-	  break;
+-
+-	case '{':
+-	  gripe_invalid_index_type (type_name (), type[0]);
+-	  break;
+-
+-	default:
+-	  panic_impossible ();
+-	}
+-
+-      // FIXME -- perhaps there should be an
+-      // octave_value_list::next_subsref member function?  See also
+-      // octave_user_function::subsref.
+-
+-      if (idx.size () > 1)
+-	retval = retval(0).next_subsref (nargout, type, idx, skip);
+-    }
++    retval = octave_struct::subsref (type, idx, nargout);
+   else
+     {
+       octave_value meth = symbol_table::find_method ("subsref", class_name ());
+ 
+       if (meth.is_defined ())
+ 	{
+ 	  octave_value_list args;
+ 
+@@ -475,47 +417,86 @@ octave_class::subsref (const std::string
+ 	  else
+ 	    gripe_invalid_index ();
+ 	}
+     }
+ 
+   return retval;
+ }
+ 
+-octave_value
+-octave_class::numeric_conv (const Cell& val, const std::string& type)
++octave_value 
++octave_class::subsref (const std::string& type,
++                       const std::list<octave_value_list>& idx,
++                       bool auto_add)
++{
++  if (in_class_method () || called_from_builtin ())
++    return octave_struct::subsref (type, idx, auto_add);
++  else
++    return subsref (type, idx);
++
++}
++
++void
++octave_class::gripe_failed_assignment (void)
++{
++  error ("assignment to class element failed");
++}
++
++octave_value 
++octave_class::dotasgn (const octave_value_list& idx, const octave_value& rhs)
+ {
+   octave_value retval;
+ 
+-  if (val.length () == 1)
++  // Find the class in which this method resides before 
++  // attempting to access the requested field.
++
++  std::string method_class = get_current_method_class ();
++
++  octave_base_value *obvp = find_parent_class (method_class);
++
++  if (obvp)
+     {
+-      retval = val(0);
++      assert (idx.length () == 1);
++
++      std::string key = idx(0).string_value ();
++
++      if (! error_state)
++        {
++          obvp->assign (key, rhs);
+ 
+-      if (type.length () > 0 && type[0] == '.' && ! retval.is_map ())
+-	retval = Octave_map ();
++          if (! error_state)
++            {
++              count++;
++              retval = octave_value (this);
++            }
++          else
++            gripe_failed_assignment ();
++        }
++      else
++        gripe_failed_assignment ();
+     }
+   else
+-    gripe_invalid_index_for_assignment ();
++    error ("malformed class");
+ 
+   return retval;
+ }
+ 
+ octave_value
+ octave_class::subsasgn (const std::string& type,
+ 			const std::list<octave_value_list>& idx,
+ 			const octave_value& rhs)
+ {
+-  octave_value retval;
+-
+   if (! (in_class_method () || called_from_builtin ()))
+     {
+       octave_value meth = symbol_table::find_method ("subsasgn", class_name ());
+ 
+       if (meth.is_defined ())
+ 	{
++          octave_value retval;
++
+ 	  octave_value_list args;
+ 
+           if (rhs.is_cs_list ())
+             {
+               octave_value_list lrhs = rhs.list_value ();
+               args.resize (2 + lrhs.length ());
+               for (octave_idx_type i = 0; i < lrhs.length (); i++)
+                 args(2+i) = lrhs(i);
+@@ -526,262 +507,59 @@ octave_class::subsasgn (const std::strin
+ 	  args(1) = make_idx_args (type, idx, "subsasgn");
+ 
+ 	  if (error_state)
+ 	    return octave_value_list ();
+ 
+ 	  count++;
+ 	  args(0) = octave_value (this);
+ 
+-	  octave_value_list tmp = feval (meth.function_value (), args);
++          // Now comes the magic. Count copies with me:
++          // 1. myself (obsolete)
++          // 2. the copy inside args (obsolete)
++          // 3. the copy in method's symbol table (working)
++          // ... possibly more (not obsolete).
++          //
++          // So we mark 2 copies as obsolete and hold our fingers crossed.
++          // But prior to doing that, check whether the routine is amenable
++          // to the optimization.
++          // It is essential that the handling function doesn't store extra
++          // copies anywhere. If it does, things will not break but the
++          // optimization won't work.
++
++          octave_value_list tmp;
++
++          if (obsolete_copies == 0 && meth.is_user_function ()
++              && meth.user_function_value ()->subsasgn_optimization_ok ())
++            {
++              unwind_protect::protect_var (obsolete_copies);
++              obsolete_copies = 2;
++
++              tmp = feval (meth.function_value (), args);
++
++              unwind_protect::run ();
++            }
++          else
++            tmp = feval (meth.function_value (), args);
+ 
+ 	  // FIXME -- should the subsasgn method be able to return
+ 	  // more than one value?
+ 
+ 	  if (tmp.length () > 1)
+ 	    error ("expecting single return value from @%s/subsasgn",
+ 		   class_name().c_str ());
+ 
+ 	  else
+ 	    retval = tmp(0);
+ 
+ 	  return retval;
+ 	}
+     }
+ 
+-  // FIXME -- this block of code is the same as the body of
+-  // octave_struct::subsasgn.  Maybe it could be shared instead of
+-  // duplicated.
+-
+-  int n = type.length ();
+-
+-  octave_value t_rhs = rhs;
+-
+-  if (n > 1 && ! (type.length () == 2 && type[0] == '(' && type[1] == '.'))
+-    {
+-      switch (type[0])
+-	{
+-	case '(':
+-	  {
+-	    if (type.length () > 1 && type[1] == '.')
+-	      {
+-		std::list<octave_value_list>::const_iterator p = idx.begin ();
+-		octave_value_list t_idx = *p;
+-
+-		octave_value_list key_idx = *++p;
+-
+-		assert (key_idx.length () == 1);
+-
+-		std::string key = key_idx(0).string_value ();
+-
+-		if (! error_state)
+-		  {
+-		    octave_value u;
+-
+-		    if (! map.contains (key))
+-		      u = octave_value::empty_conv (type.substr (2), rhs);
+-		    else
+-		      {
+-			Cell map_val = map.contents (key);
+-
+-			Cell map_elt = map_val.index (idx.front (), true);
+-
+-			u = numeric_conv (map_elt, type.substr (2));
+-		      }
+-
+-		    if (! error_state)
+-		      {
+-			std::list<octave_value_list> next_idx (idx);
+-
+-			// We handled two index elements, so subsasgn to
+-			// needs to skip both of them.
+-
+-			next_idx.erase (next_idx.begin ());
+-			next_idx.erase (next_idx.begin ());
+-
+-			u.make_unique ();
+-
+-			t_rhs = u.subsasgn (type.substr (2), next_idx, rhs);
+-		      }
+-		  }
+-		else
+-		  gripe_invalid_index_for_assignment ();
+-	      }
+-	    else
+-	      gripe_invalid_index_for_assignment ();
+-	  }
+-	  break;
+-
+-	case '.':
+-	  {
+-	    octave_value_list key_idx = idx.front ();
+-
+-	    assert (key_idx.length () == 1);
+-
+-	    std::string key = key_idx(0).string_value ();
+-
+-	    if (! error_state)
+-	      {
+-		octave_value u;
+-
+-		if (! map.contains (key))
+-		  u = octave_value::empty_conv (type.substr (1), rhs);
+-		else
+-		  {
+-		    Cell map_val = map.contents (key);
+-
+-		    u = numeric_conv (map_val, type.substr (1));
+-		  }
+-
+-		if (! error_state)
+-		  {
+-		    std::list<octave_value_list> next_idx (idx);
+-
+-		    next_idx.erase (next_idx.begin ());
+-
+-		    u.make_unique ();
+-
+-		    t_rhs = u.subsasgn (type.substr (1), next_idx, rhs);
+-		  }
+-	      }
+-	    else
+-	      gripe_invalid_index_for_assignment ();
+-	  }
+-	  break;
+-
+-	case '{':
+-	  gripe_invalid_index_type (type_name (), type[0]);
+-	  break;
+-
+-	default:
+-	  panic_impossible ();
+-	}
+-    }
+-
+-  if (! error_state)
+-    {
+-      switch (type[0])
+-	{
+-	case '(':
+-	  {
+-	    if (n > 1 && type[1] == '.')
+-	      {
+-		std::list<octave_value_list>::const_iterator p = idx.begin ();
+-		octave_value_list key_idx = *++p;
+-
+-		assert (key_idx.length () == 1);
+-
+-		std::string key = key_idx(0).string_value ();
+-
+-		if (! error_state)
+-		  {
+-		    map.assign (idx.front (), key, t_rhs);
+-
+-		    if (! error_state)
+-		      {
+-			count++;
+-			retval = octave_value (this);
+-		      }
+-		    else
+-		      gripe_failed_assignment ();
+-		  }
+-		else
+-		  gripe_failed_assignment ();
+-	      }
+-	    else
+-	      {
+-		if (t_rhs.is_object () || t_rhs.is_map ())
+-		  {
+-		    Octave_map rhs_map = t_rhs.map_value ();
+-
+-		    if (! error_state)
+-		      {
+-			map.assign (idx.front (), rhs_map);
+-
+-			if (! error_state)
+-			  {
+-			    count++;
+-			    retval = octave_value (this);
+-			  }
+-			else
+-			  gripe_failed_assignment ();
+-		      }
+-		    else
+-		      error ("invalid class assignment");
+-		  }
+-		else
+-		  {
+-		    if (t_rhs.is_empty ())
+-		      {
+-			map.maybe_delete_elements (idx.front());
+-
+-			if (! error_state)
+-			  {
+-			    count++;
+-			    retval = octave_value (this);
+-			  }
+-			else
+-			  gripe_failed_assignment ();
+-		      }
+-		    else
+-		      error ("invalid class assignment");
+-		  }
+-	      }
+-	  }
+-	  break;
+-
+-	case '.':
+-	  {
+-	    // Find the class in which this method resides before 
+-	    // attempting to access the requested field.
+-
+-	    std::string method_class = get_current_method_class ();
+-
+-	    octave_base_value *obvp = find_parent_class (method_class);
+-
+-	    if (obvp)
+-	      {
+-		octave_value_list key_idx = idx.front ();
+-
+-		assert (key_idx.length () == 1);
+-
+-		std::string key = key_idx(0).string_value ();
+-
+-		if (! error_state)
+-		  {
+-		    obvp->assign (key, t_rhs);
+-
+-		    if (! error_state)
+-		      {
+-			count++;
+-			retval = octave_value (this);
+-		      }
+-		    else
+-		      gripe_failed_assignment ();
+-		  }
+-		else
+-		  gripe_failed_assignment ();
+-	      }
+-	    else
+-	      error ("malformed class");
+-	  }
+-	  break;
+-
+-	case '{':
+-	  gripe_invalid_index_type (type_name (), type[0]);
+-	  break;
+-
+-	default:
+-	  panic_impossible ();
+-	}
+-    }
+-  else
+-    gripe_failed_assignment ();
+-
+-  return retval;
++  return octave_struct::subsasgn (type, idx, rhs);
+ }
+ 
+ idx_vector
+ octave_class::index_vector (void) const
+ {
+   idx_vector retval;
+ 
+   octave_value meth = symbol_table::find_method ("subsindex", class_name ());
+@@ -808,35 +586,16 @@ octave_class::index_vector (void) const
+     }
+   else
+     error ("no subsindex method defined for class %s",
+ 	   class_name().c_str ());
+ 
+   return retval;
+ }
+ 
+-size_t
+-octave_class::byte_size (void) const
+-{
+-  // Neglect the size of the fieldnames.
+-
+-  size_t retval = 0;
+-
+-  for (Octave_map::const_iterator p = map.begin (); p != map.end (); p++)
+-    {
+-      std::string key = map.key (p);
+-
+-      octave_value val = octave_value (map.contents (p));
+-
+-      retval += val.byte_size ();
+-    }
+-
+-  return retval;
+-}
+-
+ string_vector
+ octave_class::map_keys (void) const
+ {
+   string_vector retval;
+   gripe_wrong_type_arg ("octave_class::map_keys()", type_name ());
+   return retval;
+ }
+ 
+diff --git a/src/ov-class.h b/src/ov-class.h
+--- a/src/ov-class.h
++++ b/src/ov-class.h
+@@ -1,11 +1,12 @@
+ /*
+ 
+ Copyright (C) 2007, 2008, 2009 John W. Eaton
++Copyright (C) 2009 VZLU Prague
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -30,110 +31,94 @@ along with Octave; see the file COPYING.
+ 
+ #include "mx-base.h"
+ #include "str-vec.h"
+ 
+ #include "error.h"
+ #include "oct-alloc.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
++#include "ov-struct.h"
+ #include "ov-typeinfo.h"
+ 
+ class octave_value_list;
+ 
+ class tree_walker;
+ 
+ // Data structures.
+ 
+ class
+-octave_class : public octave_base_value
++octave_class : public octave_struct
+ {
+ public:
+ 
+   octave_class (void)
+-    : octave_base_value () { }
++    : octave_struct (), obsolete_copies (0) { }
+ 
+   octave_class (const Octave_map& m, const std::string& id)
+-    : octave_base_value (), map (m), c_name (id) { }
++    : octave_struct (m), c_name (id), obsolete_copies (0) { }
+ 
+   octave_class (const octave_class& s)
+-    : octave_base_value (s), map (s.map), c_name (s.c_name),
+-      parent_list (s.parent_list) { }
++    : octave_struct (s), c_name (s.c_name),
++      parent_list (s.parent_list), obsolete_copies (0) { }
+ 
+   octave_class (const Octave_map& m, const std::string& id, 
+                 const octave_value_list& parents);
+ 
+   ~octave_class (void) { }
+ 
+   octave_base_value *clone (void) const { return new octave_class (*this); }
+ 
++  octave_base_value *unique_clone (void);
++
+   octave_base_value *empty_clone (void) const
+   {
+     return new octave_class (Octave_map (map.keys ()), class_name ());
+   }
+ 
+   Cell dotref (const octave_value_list& idx);
+ 
++  octave_value dotasgn (const octave_value_list& idx, const octave_value& rhs);
++
+   Matrix size (void);
+ 
+   octave_idx_type numel (const octave_value_list&); 
+ 
+   octave_value subsref (const std::string& type,
+ 			const std::list<octave_value_list>& idx)
+     {
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+     }
+ 
++  octave_value subsref (const std::string& type,
++			const std::list<octave_value_list>& idx,
++                        bool auto_add);
++
+   octave_value_list subsref (const std::string& type,
+ 			     const std::list<octave_value_list>& idx,
+ 			     int nargout);
+ 
+-  static octave_value numeric_conv (const Cell& val,
+-				    const std::string& type);
+-
+   void assign(const std::string& k, const octave_value& rhs)
+   { map.assign (k, rhs); };
+ 
+   octave_value subsasgn (const std::string& type,
+ 			 const std::list<octave_value_list>& idx,
+ 			 const octave_value& rhs);
+ 
+   idx_vector index_vector (void) const;
+ 
+   dim_vector dims (void) const { return map.dims (); }
+ 
+-  size_t byte_size (void) const;
+-
+-  // This is the number of elements in each field.  The total number
+-  // of elements is numel () * nfields ().
+-  octave_idx_type numel (void) const
+-  {
+-    dim_vector dv = dims ();
+-    return dv.numel ();
+-  }
+-
+-  octave_idx_type nfields (void) const { return map.nfields (); }
+-
+   size_t nparents (void) const { return parent_list.size (); }
+ 
+-  octave_value reshape (const dim_vector& new_dims) const
+-    { return map.reshape (new_dims); }
+-
+-  octave_value resize (const dim_vector& dv, bool = false) const
+-    { Octave_map tmap = map; tmap.resize (dv); return tmap; }
+-
+-  bool is_defined (void) const { return true; }
+-
+   bool is_map (void) const { return false; }
+ 
+   bool is_object (void) const { return true; }
+ 
+-  Octave_map map_value (void) const { return map; }
+-
+   string_vector map_keys (void) const;
+ 
+   std::list<std::string> parent_class_name_list (void) const
+     { return parent_list; }
+ 
+   string_vector parent_class_names (void) const
+     { return string_vector (parent_list); }
+ 
+@@ -166,19 +151,21 @@ public:
+ #if defined (HAVE_HDF5)
+   bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
+ 
+   bool load_hdf5 (hid_t loc_id, const char *name, bool have_h5giterate_bug);
+ #endif
+ 
+   mxArray *as_mxArray (void) const;
+ 
+-private:
++protected:
+ 
+-  Octave_map map;
++  void gripe_failed_assignment (void);
++
++private:
+ 
+   DECLARE_OCTAVE_ALLOCATOR
+ 
+ public:
+   int type_id (void) const { return t_id; }
+   std::string type_name (void) const { return t_name; }
+   std::string class_name (void) const { return c_name; }
+ 
+@@ -191,16 +178,18 @@ private:
+   static int t_id;
+ 
+   static const std::string t_name;
+   std::string c_name;
+   std::list<std::string> parent_list;
+ 
+   bool in_class_method (void) const;
+ 
++  int obsolete_copies;
++
+ public:
+   // The list of field names and parent classes defines a class.  We
+   // keep track of each class that has been created so that we know
+   class exemplar_info
+   {
+   public:
+ 
+     exemplar_info (void) : field_names (), parent_class_names () { }
+diff --git a/src/ov-struct.cc b/src/ov-struct.cc
+--- a/src/ov-struct.cc
++++ b/src/ov-struct.cc
+@@ -88,18 +88,18 @@ gripe_invalid_index_for_assignment (void
+ }
+ 
+ static void
+ gripe_invalid_index_type (const std::string& nm, char t)
+ {
+   error ("%s cannot be indexed with %c", nm.c_str (), t);
+ }
+ 
+-static void
+-gripe_failed_assignment (void)
++void
++octave_struct::gripe_failed_assignment (void)
+ {
+   error ("assignment to structure element failed");
+ }
+ 
+ octave_value_list
+ octave_struct::subsref (const std::string& type,
+ 			const std::list<octave_value_list>& idx,
+ 			int nargout)
+@@ -249,16 +249,53 @@ octave_struct::numeric_conv (const octav
+     retval = Octave_map ();
+   else
+     retval = val;
+ 
+   return retval;
+ }
+ 
+ octave_value
++octave_struct::dotasgn (const octave_value_list& idx, const octave_value& rhs)
++{
++  octave_value retval;
++
++  assert (idx.length () == 1);
++
++  std::string key = idx(0).string_value ();
++
++  if (rhs.is_cs_list ())
++    {
++      Cell tmp_cell = Cell (rhs.list_value ());
++
++      // The shape of the RHS is irrelevant, we just want
++      // the number of elements to agree and to preserve the
++      // shape of the left hand side of the assignment.
++
++      if (numel () == tmp_cell.numel ())
++        tmp_cell = tmp_cell.reshape (dims ());
++
++      map.assign (key, tmp_cell);
++    }
++  else
++    // Regularize a null matrix if stored into a struct component.
++    map.assign (key, rhs.storable_value ());
++
++  if (! error_state)
++    {
++      count++;
++      retval = octave_value (this);
++    }
++  else
++    gripe_failed_assignment ();
++
++  return retval;
++}
++
++octave_value
+ octave_struct::subsasgn (const std::string& type,
+ 			 const std::list<octave_value_list>& idx,
+ 			 const octave_value& rhs)
+ {
+   octave_value retval;
+ 
+   int n = type.length ();
+ 
+@@ -451,17 +488,18 @@ octave_struct::subsasgn (const std::stri
+                           error ("invalid assignment to cs-list outside multiple assignment.");
+                       }
+ 		  }
+ 		else
+ 		  gripe_failed_assignment ();
+ 	      }
+ 	    else
+ 	      {
+-		if (t_rhs.is_map())
++		if (t_rhs.is_map()
++                    || (is_object () && t_rhs.is_object ()))
+ 		  {
+ 		    Octave_map rhs_map = t_rhs.map_value ();
+ 
+ 		    if (! error_state)
+ 		      {
+ 			map.assign (idx.front (), rhs_map);
+ 
+ 			if (! error_state)
+@@ -493,46 +531,17 @@ octave_struct::subsasgn (const std::stri
+ 		      error ("invalid structure assignment");
+ 		  }
+ 	      }
+ 	  }
+ 	  break;
+ 
+ 	case '.':
+ 	  {
+-	    octave_value_list key_idx = idx.front ();
+-
+-	    assert (key_idx.length () == 1);
+-
+-	    std::string key = key_idx(0).string_value ();
+-
+-	    if (t_rhs.is_cs_list ())
+-	      {
+-		Cell tmp_cell = Cell (t_rhs.list_value ());
+-
+-		// The shape of the RHS is irrelevant, we just want
+-		// the number of elements to agree and to preserve the
+-		// shape of the left hand side of the assignment.
+-
+-		if (numel () == tmp_cell.numel ())
+-		  tmp_cell = tmp_cell.reshape (dims ());
+-
+-		map.assign (key, tmp_cell);
+-	      }
+-	    else
+-              // Regularize a null matrix if stored into a struct component.
+-	      map.assign (key, t_rhs.storable_value ());
+-
+-	    if (! error_state)
+-	      {
+-		count++;
+-		retval = octave_value (this);
+-	      }
+-	    else
+-	      gripe_failed_assignment ();
++            retval = dotasgn (idx.front (), t_rhs);
+ 	  }
+ 	  break;
+ 
+ 	case '{':
+ 	  gripe_invalid_index_type (type_name (), type[0]);
+ 	  break;
+ 
+ 	default:
+diff --git a/src/ov-struct.h b/src/ov-struct.h
+--- a/src/ov-struct.h
++++ b/src/ov-struct.h
+@@ -58,17 +58,23 @@ public:
+   octave_struct (const octave_struct& s)
+     : octave_base_value (), map (s.map) { }
+ 
+   ~octave_struct (void) { }
+ 
+   octave_base_value *clone (void) const { return new octave_struct (*this); }
+   octave_base_value *empty_clone (void) const { return new octave_struct (); }
+ 
+-  Cell dotref (const octave_value_list& idx, bool auto_add = false);
++  virtual Cell dotref (const octave_value_list& idx)
++    { return dotref (idx, false); }
++
++  Cell dotref (const octave_value_list& idx, bool auto_add);
++
++  virtual octave_value dotasgn (const octave_value_list& idx,
++                                const octave_value& rhs);
+ 
+   octave_value subsref (const std::string& type,
+ 			const std::list<octave_value_list>& idx)
+     {
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+     }
+ 
+@@ -144,16 +150,18 @@ public:
+ 
+   bool load_hdf5 (hid_t loc_id, const char *name, bool have_h5giterate_bug);
+ #endif
+ 
+   mxArray *as_mxArray (void) const;
+ 
+ protected:
+ 
++  virtual void gripe_failed_assignment (void);
++
+   // The associative array used to manage the structure data.
+   Octave_map map;
+ 
+ private:
+ 
+   DECLARE_OCTAVE_ALLOCATOR
+ 
+   DECLARE_OV_TYPEID_FUNCTIONS_AND_DATA
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -47,16 +47,19 @@ along with Octave; see the file COPYING.
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "parse.h"
+ #include "variables.h"
+ 
+ // Maximum nesting level for functions called recursively.
+ static int Vmax_recursion_depth = 256;
+ 
++// Whether to optimize subsasgn method calls.
++static bool Voptimize_subsasgn_calls = false;
++
+ // User defined scripts.
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_user_script);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_user_script,
+ 				     "user-defined script",
+ 				     "user-defined script");
+ 
+@@ -178,18 +181,18 @@ octave_user_function::octave_user_functi
+   : octave_user_code (std::string (), std::string ()),
+     param_list (pl), ret_list (rl), cmd_list (cl),
+     lead_comm (), trail_comm (), file_name (),
+     parent_name (), t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     system_fcn_file (false), call_depth (-1),
+     num_named_args (param_list ? param_list->length () : 0),
+     nested_function (false), inline_function (false),
+-    class_constructor (false), class_method (false), args_passed (),
+-    num_args_passed (0), parent_scope (-1), local_scope (sid)
++    class_constructor (false), class_method (false),
++    parent_scope (-1), local_scope (sid)
+ {
+   if (cmd_list)
+     cmd_list->mark_as_function_body ();
+ }
+ 
+ octave_user_function::~octave_user_function (void)
+ {
+   delete param_list;
+@@ -258,24 +261,24 @@ octave_user_function::lock_subfunctions 
+ 
+ void
+ octave_user_function::unlock_subfunctions (void)
+ {
+   symbol_table::unlock_subfunctions (local_scope);
+ }
+ 
+ octave_value_list
+-octave_user_function::octave_all_va_args (void)
++octave_user_function::all_va_args (const octave_value_list& args)
+ {
+   octave_value_list retval;
+ 
+-  octave_idx_type n = num_args_passed - num_named_args;
++  octave_idx_type n = args.length () - num_named_args;
+ 
+   if (n > 0)
+-    retval = args_passed.slice (num_named_args, n);
++    retval = args.slice (num_named_args, n);
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_user_function::subsref (const std::string& type,
+ 			       const std::list<octave_value_list>& idx,
+ 			       int nargout)
+@@ -348,27 +351,18 @@ octave_user_function::do_multi_index_op 
+ 
+   if (call_depth > 0)
+     {
+       symbol_table::push_context ();
+ 
+       unwind_protect::add_fcn (symbol_table::pop_context);
+     }
+ 
+-  // Save and restore args passed for recursive calls.
+-
+-  save_args_passed (args);
+-
+-  unwind_protect::add_method (this, &octave_user_function::restore_args_passed);
+-
+   string_vector arg_names = args.name_tags ();
+ 
+-  unwind_protect::protect_var (num_args_passed);
+-  num_args_passed = nargin;
+-
+   if (param_list && ! param_list->varargs_only ())
+     {
+       param_list->define_from_arg_vector (args);
+       if (error_state)
+ 	goto abort;
+     }
+ 
+   // Force parameter list to be undefined when this function exits.
+@@ -402,17 +396,17 @@ octave_user_function::do_multi_index_op 
+       unwind_protect::add_fcn (symbol_table::clear_variables);
+     }
+ 
+   // The following code is in a separate scope to avoid warnings from
+   // G++ about `goto abort' crossing the initialization of some
+   // variables.
+ 
+   {
+-    bind_automatic_vars (arg_names, nargin, nargout, octave_all_va_args ());
++    bind_automatic_vars (arg_names, nargin, nargout, all_va_args (args));
+ 
+     bool echo_commands = (Vecho_executing_commands & ECHO_FUNCTIONS);
+ 
+     if (echo_commands)
+       print_code_function_header ();
+ 
+     // Evaluate the commands that make up the function.
+ 
+@@ -487,16 +481,32 @@ octave_user_function::do_multi_index_op 
+ }
+ 
+ void
+ octave_user_function::accept (tree_walker& tw)
+ {
+   tw.visit_octave_user_function (*this);
+ }
+ 
++bool
++octave_user_function::subsasgn_optimization_ok (void)
++{
++  bool retval = false;
++  if (Voptimize_subsasgn_calls
++      && param_list->length () > 0 && ! param_list->varargs_only ()
++      && ret_list->length () == 1 && ! ret_list->takes_varargs ())
++    {
++      tree_identifier *par1 = param_list->front ()->ident ();
++      tree_identifier *ret1 = ret_list->front ()->ident ();
++      retval = par1->name () == ret1->name ();
++    }
++
++  return retval;
++}
++
+ #if 0
+ void
+ octave_user_function::print_symtab_info (std::ostream& os) const
+ {
+   symbol_table::print_info (os, local_scope);
+ }
+ #endif
+ 
+@@ -676,13 +686,25 @@ DEFUN (max_recursion_depth, args, nargou
+ Query or set the internal limit on the number of times a function may\n\
+ be called recursively.  If the limit is exceeded, an error message is\n\
+ printed and control returns to the top level.\n\
+ @end deftypefn")
+ {
+   return SET_INTERNAL_VARIABLE (max_recursion_depth);
+ }
+ 
++DEFUN (optimize_subsasgn_calls, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {@var{val} =} optimize_subsasgn_calls ()\n\
++@deftypefnx {Built-in Function} {@var{old_val} =} optimize_subsasgn_calls  (@var{new_val})\n\
++Query or set the internal flag for subsasgn method call optimizations.\n\
++If true, Octave will attempt to eliminate the redundant copying when calling\n\
++subsasgn method of a user-defined class.\n\
++@end deftypefn")
++{
++  return SET_INTERNAL_VARIABLE (optimize_subsasgn_calls);
++}
++
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/ov-usr-fcn.h b/src/ov-usr-fcn.h
+--- a/src/ov-usr-fcn.h
++++ b/src/ov-usr-fcn.h
+@@ -235,17 +235,17 @@ public:
+   bool takes_varargs (void) const;
+ 
+   bool takes_var_return (void) const;
+ 
+   void lock_subfunctions (void);
+ 
+   void unlock_subfunctions (void);
+ 
+-  octave_value_list octave_all_va_args (void);
++  octave_value_list all_va_args (const octave_value_list& args);
+ 
+   void stash_function_name (const std::string& s) { my_name = s; }
+ 
+   void mark_as_nested_function (void) { nested_function = true; }
+ 
+   bool is_nested_function (void) const { return nested_function; }
+ 
+   void mark_as_inline_function (void) { inline_function = true; }
+@@ -255,35 +255,16 @@ public:
+   void mark_as_class_constructor (void) { class_constructor = true; }
+ 
+   bool is_class_constructor (void) const { return class_constructor; }
+ 
+   void mark_as_class_method (void) { class_method = true; }
+ 
+   bool is_class_method (void) const { return class_method; }
+ 
+-  void save_args_passed (const octave_value_list& args)
+-    {
+-      if (call_depth > 0)
+-	saved_args.push (args_passed);
+-
+-      args_passed = args;
+-    }
+-
+-  void restore_args_passed (void)
+-    {
+-      if (saved_args.empty ())
+-	args_passed = octave_value_list ();
+-      else
+-	{
+-	  args_passed = saved_args.top ();
+-	  saved_args.pop ();
+-	}
+-    }
+-
+   octave_value subsref (const std::string& type,
+ 			const std::list<octave_value_list>& idx)
+     {
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+     }
+ 
+   octave_value_list subsref (const std::string& type,
+@@ -298,16 +279,18 @@ public:
+   tree_parameter_list *return_list (void) { return ret_list; }
+ 
+   tree_statement_list *body (void) { return cmd_list; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
++  bool subsasgn_optimization_ok (void);
++
+   void accept (tree_walker& tw);
+ 
+ #if 0
+   void print_symtab_info (std::ostream& os) const;
+ #endif
+ 
+ private:
+ 
+@@ -358,25 +341,16 @@ private:
+   bool inline_function;
+ 
+   // TRUE means this function is the constructor for class object.
+   bool class_constructor;
+ 
+   // TRUE means this function is a method for a class.
+   bool class_method;
+ 
+-  // The values that were passed as arguments.
+-  octave_value_list args_passed;
+-
+-  // A place to store the passed args for recursive calls.
+-  std::stack<octave_value_list> saved_args;
+-
+-  // The number of arguments passed in.
+-  int num_args_passed;
+-
+   // The scope of the parent function, if any.
+   symbol_table::scope_id parent_scope;
+ 
+   symbol_table::scope_id local_scope;
+ 
+ #if 0
+   // The symbol record for argn in the local symbol table.
+   octave_value& argn_varref;

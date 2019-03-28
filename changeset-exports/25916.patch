@@ -1,0 +1,308 @@
+# HG changeset patch
+# User Markus Mützel <markus.muetzel@gmx.de>
+# Date 1538672922 -7200
+#      Thu Oct 04 19:08:42 2018 +0200
+# Node ID 3f2282954600d0b014ade7b3da97cb1e9396c434
+# Parent  20e294a607afaa9d58e1711a13051a9209929121
+Support non-ASCII characters in environment variables on Windows (bug #53922).
+
+* lo-sysdep.[cc/h] (octave::sys::getenv_wrapper, octave::sys::putenv_wrapper):
+Add new functions to call Unicode versions of CRT functions on Windows.
+
+* oct-env.cc (putenv, do_getenv), sysdep.cc (Funsetenv): Use these new
+functions.
+
+* lo-utils.[cc/h] (octave_putenv): Remove function moved to lo-sysdep.
+
+diff --git a/libinterp/corefcn/sysdep.cc b/libinterp/corefcn/sysdep.cc
+--- a/libinterp/corefcn/sysdep.cc
++++ b/libinterp/corefcn/sysdep.cc
+@@ -61,17 +61,16 @@ along with Octave; see the file COPYING.
+ #include "cmd-edit.h"
+ #include "file-ops.h"
+ #include "lo-mappers.h"
+ #include "lo-sysinfo.h"
+ #include "mach-info.h"
+ #include "oct-env.h"
+ #include "uniconv-wrappers.h"
+ #include "unistd-wrappers.h"
+-#include "unsetenv-wrapper.h"
+ 
+ #include "builtin-defun-decls.h"
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "input.h"
+ #include "octave.h"
+@@ -709,17 +708,17 @@ occurred.
+ @seealso{setenv, getenv}
+ @end deftypefn */)
+ {
+   if (args.length () != 1)
+     print_usage ();
+ 
+   std::string tmp = args(0).string_value ();
+ 
+-  return ovl (octave_unsetenv_wrapper (tmp.c_str ()));
++  return ovl (octave::sys::unsetenv_wrapper (tmp));
+ }
+ 
+ /*
+ ## Test for unsetenv is in setenv test
+ */
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+ 
+diff --git a/liboctave/system/lo-sysdep.cc b/liboctave/system/lo-sysdep.cc
+--- a/liboctave/system/lo-sysdep.cc
++++ b/liboctave/system/lo-sysdep.cc
+@@ -25,18 +25,20 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include <string>
+ 
+ #include "dir-ops.h"
+ #include "file-ops.h"
+ #include "lo-error.h"
+ #include "lo-sysdep.h"
++#include "putenv-wrapper.h"
+ #include "uniconv-wrappers.h"
+ #include "unistd-wrappers.h"
++#include "unsetenv-wrapper.h"
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+ #  include <windows.h>
+ #  include <wchar.h>
+ 
+ #  include "lo-hash.h"
+ #endif
+ 
+@@ -148,16 +150,72 @@ namespace octave
+ #if defined (OCTAVE_USE_WINDOWS_API)
+       return _wfopen (u8_to_wstring (filename).c_str (),
+                       u8_to_wstring (mode).c_str ());
+ #else
+       return std::fopen (filename.c_str (), mode.c_str ());
+ #endif
+     }
+ 
++    void
++    putenv_wrapper (const std::string& name, const std::string& value)
++    {
++      // This function was adapted from xputenv from Karl Berry's kpathsearch
++      // library.
++      // FIXME: make this do the right thing if we don't have a SMART_PUTENV.
++
++      int new_len = name.length () + value.length () + 2;
++
++      // FIXME: This leaks memory, but so would a call to setenv.
++      // Short of extreme measures to track memory, altering the environment
++      // always leaks memory, but the saving grace is that the leaks are small.
++
++      char *new_item = static_cast<char *> (std::malloc (new_len));
++
++      sprintf (new_item, "%s=%s", name.c_str (), value.c_str ());
++
++      // As far as I can see there's no way to distinguish between the
++      // various errors; putenv doesn't have errno values.
++
++#if defined (OCTAVE_USE_WINDOWS_API)
++      wchar_t *wnew_item = u8_to_wchar (new_item);
++      std::free (static_cast<void *> (new_item));
++      if (_wputenv (wnew_item) < 0)
++        (*current_liboctave_error_handler) ("putenv (%s) failed", new_item);
++#else
++      if (octave_putenv_wrapper (new_item) < 0)
++        (*current_liboctave_error_handler) ("putenv (%s) failed", new_item);
++#endif
++    }
++
++    std::string
++    getenv_wrapper (const std::string& name)
++    {
++#if defined (OCTAVE_USE_WINDOWS_API)
++      wchar_t *env = _wgetenv (u8_to_wstring (name).c_str ());
++      return env ? u8_from_wstring (env) : "";
++#else
++      char *env = ::getenv (name.c_str ());
++      return env ? env : "";
++#endif
++    }
++
++    int
++    unsetenv_wrapper (const std::string& name)
++    {
++#if defined (OCTAVE_USE_WINDOWS_API)
++      putenv_wrapper (name, "");
++
++      std::wstring wname = u8_to_wstring (name);
++      return (SetEnvironmentVariableW (wname.c_str (), nullptr) ? 0 : -1);
++#else
++      return octave_unsetenv_wrapper (name.c_str ());
++#endif
++    }
++
+     std::wstring
+     u8_to_wstring (const std::string& utf8_string)
+     {
+       size_t srclen = utf8_string.length ();
+       const uint8_t *src = reinterpret_cast<const uint8_t *>
+                            (utf8_string.c_str ());
+ 
+       size_t length = 0;
+diff --git a/liboctave/system/lo-sysdep.h b/liboctave/system/lo-sysdep.h
+--- a/liboctave/system/lo-sysdep.h
++++ b/liboctave/system/lo-sysdep.h
+@@ -41,16 +41,23 @@ namespace octave
+ 
+     extern int chdir (const std::string&);
+ 
+     extern bool get_dirlist (const std::string& dirname, string_vector& dirlist,
+                              std::string& msg);
+ 
+     extern std::FILE * fopen (const std::string& name, const std::string& mode);
+ 
++    extern void putenv_wrapper (const std::string& name,
++                                const std::string& value);
++
++    extern std::string getenv_wrapper (const std::string&);
++
++    extern int unsetenv_wrapper (const std::string&);
++
+     extern std::wstring u8_to_wstring (const std::string&);
+ 
+     extern std::string u8_from_wstring (const std::wstring&);
+ 
+     extern std::string get_ASCII_filename (const std::string& long_file_name);
+   }
+ }
+ 
+diff --git a/liboctave/system/oct-env.cc b/liboctave/system/oct-env.cc
+--- a/liboctave/system/oct-env.cc
++++ b/liboctave/system/oct-env.cc
+@@ -236,17 +236,17 @@ namespace octave
+     {
+       return (instance_ok ())
+         ? instance->do_getenv (name) : "";
+     }
+ 
+     void
+     env::putenv (const std::string& name, const std::string& value)
+     {
+-      octave_putenv (name, value);
++      putenv_wrapper (name, value);
+     }
+ 
+     bool
+     env::have_x11_display (void)
+     {
+       std::string display = getenv ("DISPLAY");
+ 
+       return ! display.empty ();
+@@ -526,19 +526,17 @@ namespace octave
+         }
+ 
+       return host_name;
+     }
+ 
+     std::string
+     env::do_getenv (const std::string& name) const
+     {
+-      char *value = ::getenv (name.c_str ());
+-
+-      return value ? value : "";
++      return getenv_wrapper (name);
+     }
+ 
+     // Do the work of changing to the directory NEWDIR.
+     // Handle symbolic link following, etc.
+ 
+     bool
+     env::do_chdir (const std::string& newdir)
+     {
+diff --git a/liboctave/util/lo-utils.cc b/liboctave/util/lo-utils.cc
+--- a/liboctave/util/lo-utils.cc
++++ b/liboctave/util/lo-utils.cc
+@@ -34,17 +34,16 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include "quit.h"
+ 
+ #include "lo-error.h"
+ #include "lo-ieee.h"
+ #include "lo-mappers.h"
+ #include "lo-utils.h"
+-#include "putenv-wrapper.h"
+ 
+ bool xis_int_or_inf_or_nan (double x)
+ { return octave::math::isnan (x) || octave::math::x_nint (x) == x; }
+ 
+ bool xis_one_or_zero (double x)
+ { return x == 0 || x == 1; }
+ 
+ bool xis_zero (double x)
+@@ -80,40 +79,16 @@ strsave (const char *s)
+     return nullptr;
+ 
+   int len = strlen (s);
+   char *tmp = new char [len+1];
+   tmp = strcpy (tmp, s);
+   return tmp;
+ }
+ 
+-// This function was adapted from xputenv from Karl Berry's kpathsearch
+-// library.
+-
+-// FIXME: make this do the right thing if we don't have a SMART_PUTENV.
+-
+-void
+-octave_putenv (const std::string& name, const std::string& value)
+-{
+-  int new_len = name.length () + value.length () + 2;
+-
+-  // FIXME: This leaks memory, but so would a call to setenv.
+-  // Short of extreme measures to track memory, altering the environment
+-  // always leaks memory, but the saving grace is that the leaks are small.
+-  char *new_item = static_cast<char *> (std::malloc (new_len));
+-
+-  sprintf (new_item, "%s=%s", name.c_str (), value.c_str ());
+-
+-  // As far as I can see there's no way to distinguish between the
+-  // various errors; putenv doesn't have errno values.
+-
+-  if (octave_putenv_wrapper (new_item) < 0)
+-    (*current_liboctave_error_handler) ("putenv (%s) failed", new_item);
+-}
+-
+ std::string
+ octave_fgets (FILE *f)
+ {
+   bool eof;
+   return octave_fgets (f, eof);
+ }
+ 
+ std::string
+diff --git a/liboctave/util/lo-utils.h b/liboctave/util/lo-utils.h
+--- a/liboctave/util/lo-utils.h
++++ b/liboctave/util/lo-utils.h
+@@ -71,19 +71,16 @@ extern OCTAVE_API bool xtoo_large_for_fl
+ 
+ extern OCTAVE_API bool xis_int_or_inf_or_nan (float x);
+ extern OCTAVE_API bool xis_one_or_zero (float x);
+ extern OCTAVE_API bool xis_zero (float x);
+ extern OCTAVE_API bool xtoo_large_for_float (float x);
+ 
+ extern OCTAVE_API char * strsave (const char *);
+ 
+-extern OCTAVE_API void
+-octave_putenv (const std::string&, const std::string&);
+-
+ extern OCTAVE_API std::string octave_fgets (std::FILE *);
+ extern OCTAVE_API std::string octave_fgetl (std::FILE *);
+ 
+ extern OCTAVE_API std::string octave_fgets (std::FILE *, bool& eof);
+ extern OCTAVE_API std::string octave_fgetl (std::FILE *, bool& eof);
+ 
+ template <typename T>
+ T

@@ -1,0 +1,232 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1469490393 14400
+#      Mon Jul 25 19:46:33 2016 -0400
+# Node ID acdd8983d3084e462f319305faeb6d1defdaee56
+# Parent  beaacfca00555f9aa4f9b677063a60a66159d99f
+Force reload of a function after it is saved in the editor (bug #46632)
+
+* file-editor-tab.h, file-editor-tab.cc (exit_debug_and_clear):
+New function.
+Clear function from symbol table.  If currently debugging, prompt
+whether to dbquit or to cancel the save.
+(execute_command_in_terminal_signal): New signal.
+(save_file): Call exit_debug_and_clear.
+(delete_debugger_pointer): Use marker class instead of removing
+QSciScintilla marker directly.
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -1,9 +1,8 @@
+-
+ /*
+ 
+ Copyright (C) 2011-2015 Jacob Dawid
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+@@ -64,21 +63,25 @@ along with Octave; see the file COPYING.
+ #include "resource-manager.h"
+ #include "file-editor-tab.h"
+ #include "file-editor.h"
+ #include "octave-txt-lexer.h"
+ #include "marker.h"
+ 
+ #include "file-ops.h"
+ 
++#include "call-stack.h"
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ #include "version.h"
+ #include "utils.h"
+ #include "defaults.h"
++#include "ov-usr-fcn.h"
++#include "symtab.h"
++#include "interpreter.h"
+ #include "unwind-prot.h"
+ #include <oct-map.h>
+ 
+ bool file_editor_tab::_cancelled = false;
+ 
+ /**
+  A file_editor_tab object consists of a text area and three left margins.
+  The first holds breakpoints, bookmarks, and the debug program counter.
+@@ -1725,39 +1728,112 @@ file_editor_tab::new_file (const QString
+   update_eol_indicator ();
+ 
+   update_lexer ();
+ 
+   _edit_area->setText (commands);
+   _edit_area->setModified (false); // new file is not modified yet
+ }
+ 
++// Force reloading of a file after it is saved.
++// This is needed to get the right line numbers for breakpoints (bug #46632).
++bool
++file_editor_tab::exit_debug_and_clear (const QString& full_name_q,
++                                       const QString& base_name_q)
++{
++  std::string base_name = base_name_q.toStdString ();
++  octave_value sym;
++  try
++    {
++      sym = symbol_table::find (base_name);
++    }
++  catch (const octave_execution_exception& e)
++    {
++      // Ignore syntax error.
++      // It was in the old file on disk; the user may have fixed it already.
++    }
++
++  // Return early if this file is not loaded in the symbol table
++  if (!sym.is_defined () || !sym.is_user_code ())
++    return true;
++
++  octave_user_code *fcn = sym.user_code_value ();
++
++  std::string full_name = full_name_q.toStdString ();
++  if (octave::sys::canonicalize_file_name (full_name.c_str ())
++      != octave::sys::canonicalize_file_name (fcn->fcn_file_name ().c_str ()))
++    return true;
++
++  // If this file is loaded, check that we aren't currently running it
++  bool retval = true;
++  octave_idx_type curr_frame = -1;
++  size_t nskip = 0;
++  octave_map stk = octave_call_stack::backtrace (nskip, curr_frame, false);
++  Cell names = stk.contents ("name");
++  for (octave_idx_type i = names.numel () - 1; i >= 0; i--)
++    {
++      if (names(i).string_value () == base_name)
++        {
++          int ans = QMessageBox::question (0, tr ("Debug or Save"),
++             tr ("This file is currently being executed.\n"
++                          "Quit debugging and save?"),
++              QMessageBox::Save | QMessageBox::Cancel);
++
++          if (ans == QMessageBox::Save)
++            {
++              emit execute_command_in_terminal_signal ("dbquit");
++              // Wait until dbquit has actually occurred
++              while (names.numel () > i)
++                {
++                  octave_sleep (0.01);
++                  stk = octave_call_stack::backtrace (nskip, curr_frame, false);
++                  names = stk.contents ("name");
++                }
++            }
++          else
++            retval = false;
++          break;
++        }
++    }
++
++  // If we aren't currently running it, or have quit above, force a reload.
++  if (retval == true)
++    symbol_table::clear_user_function (base_name);
++  return retval;
++}
++
+ void
+ file_editor_tab::save_file (const QString& saveFileName,
+                             bool remove_on_success, bool restore_breakpoints)
+ {
+   // If it is a new file with no name, signal that saveFileAs
+   // should be performed.
+   if (! valid_file_name (saveFileName))
+     {
+       save_file_as (remove_on_success);
+       return;
+     }
++
++  // Get a list of breakpoint line numbers, before  exit_debug_and_clear().
++  emit report_marker_linenr (_bp_lines, _bp_conditions);
++
+   // get the absolute path (if existing)
+   QFileInfo file_info = QFileInfo (saveFileName);
+   QString file_to_save;
+   if (file_info.exists ())
+-    file_to_save = file_info.canonicalFilePath ();
++    {
++      file_to_save = file_info.canonicalFilePath ();
++      // Force reparse of this function next time it is used (bug #46632)
++      if (!exit_debug_and_clear (file_to_save, file_info.baseName ()))
++        return;
++    }
+   else
+     file_to_save = saveFileName;
+   QFile file (file_to_save);
+ 
+-  // Get a list of all the breakpoint line numbers.
+-  emit report_marker_linenr (_bp_lines, _bp_conditions);
+-
+   // stop watching file
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (trackedFiles.contains (file_to_save))
+     _file_system_watcher.removePath (file_to_save);
+ 
+   // open the file for writing
+   if (! file.open (QIODevice::WriteOnly))
+     {
+@@ -2406,17 +2482,17 @@ file_editor_tab::insert_debugger_pointer
+ 
+ void
+ file_editor_tab::delete_debugger_pointer (const QWidget *ID, int line)
+ {
+   if (ID != this || ID == 0)
+     return;
+ 
+   if (line > 0)
+-    _edit_area->markerDelete (line-1, marker::debugger_position);
++    emit remove_position_via_debugger_linenr (line);
+ }
+ 
+ void
+ file_editor_tab::do_breakpoint_marker (bool insert, const QWidget *ID, int line,
+                                        const QString& cond)
+ {
+   if (ID != this || ID == 0)
+     return;
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -169,16 +169,17 @@ signals:
+   void remove_all_breakpoints (void);
+   void find_translated_line_number (int original_linenr,
+                                     int& translated_linenr, marker*&);
+   void find_linenr_just_before (int linenr, int& original_linenr,
+                                 int& editor_linenr);
+   void report_marker_linenr (QIntList& lines, QStringList& conditions);
+   void remove_position_via_debugger_linenr (int debugger_linenr);
+   void remove_all_positions (void);
++  void execute_command_in_terminal_signal (const QString&);
+   // FIXME: The following is similar to "process_octave_code" signal.  However,
+   // currently that signal is connected to something that simply focuses a
+   // window and not actually communicate with Octave.
+   // void evaluate_octave_command (const QString& command);
+ 
+ protected:
+ 
+   void closeEvent (QCloseEvent *event);
+@@ -224,16 +225,18 @@ private:
+     int line;
+     std::string file;
+     std::string dir;
+     std::string function_name;
+     std::string condition;
+   };
+ 
+   bool valid_file_name (const QString& file=QString ());
++  bool exit_debug_and_clear (const QString& full_name,
++                             const QString& base_name);
+   void save_file (const QString& saveFileName, bool remove_on_success = false,
+                                                bool restore_breakpoints = true);
+   void save_file_as (bool remove_on_success = false);
+   bool check_valid_identifier (QString file_name);
+   bool check_valid_codec (QTextCodec *codec);
+ 
+   bool unchanged_or_saved (void);
+ 

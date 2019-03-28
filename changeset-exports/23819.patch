@@ -1,0 +1,307 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1501613042 14400
+#      Tue Aug 01 14:44:02 2017 -0400
+# Node ID 5d8ef9b859f88b22c1f6d0f219da0ddf11c552e4
+# Parent  784347c1b7e72471cbb6099e567de5d3c099b4c3
+defer execution of user code to interpreter::execute (bug #51631)
+
+* interpreter.cc, interpreter.h (interpreter::execute) Execute startup
+files, eval option code, and command-line scripts here instead of in
+interpreter::initialize.
+(interpreter::initialize): Don't return anything.  Change all uses.
+
+* octave.cc, octave.h (application::ininitialize_interpreter): Don't
+return anything.  Change all uses.
+
+* main-window.cc (octave_interpreter::execute): Don't get exit_status
+from interpreter::initialize.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -98,32 +98,33 @@ octave_interpreter::execute (void)
+   // The application context owns the interpreter.
+ 
+   octave::interpreter& interp = m_app_context->create_interpreter ();
+ 
+   int exit_status = 0;
+ 
+   try
+     {
+-      // Final initialization including executing startup files.  If
+-      // initialization fails, return the last available status from
+-      // that process.
+-
+-      exit_status = interp.initialize ();
++      // Final initialization.
++
++      interp.initialize ();
+ 
+       if (interp.initialized ())
+         {
+           // The interpreter should be completely ready at this point so let
+           // the GUI know.
+ 
+           emit octave_ready_signal ();
+ 
+           // Start executing commands in the command window.
+ 
+ #if defined (HAVE_QT_GRAPHICS)
++          // The qt graphics toolkit must be initialized before startup
++          // files are executed.
++
+           install___init_qt___functions ();
+ 
+           Fregister_graphics_toolkit (interp, ovl ("qt"));
+ #endif
+ 
+           exit_status = interp.execute ();
+         }
+     }
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -610,20 +610,20 @@ namespace octave
+         m_load_path.initialize (set_initial_path);
+ 
+         m_load_path_initialized = true;
+       }
+   }
+ 
+   // This may be called separately from execute
+ 
+-  int interpreter::initialize (void)
++  void interpreter::initialize (void)
+   {
+     if (m_initialized)
+-      return 0;
++      return;
+ 
+     display_startup_message ();
+ 
+     // Wait to read the history file until the interpreter reads input
+     // files and begins evaluating commands.
+ 
+     initialize_history ();
+ 
+@@ -631,73 +631,71 @@ namespace octave
+     // done until the interpreter is ready to execute commands.
+ 
+     // Deferring it to the execute step also allows the path to be
+     // initialized between creating and execute the interpreter, for
+     // example, to set a custom path for an embedded interpreter.
+ 
+     initialize_load_path ();
+ 
+-    // We ignore errors in startup files.
+-
+-    execute_startup_files ();
+-
+-    int exit_status = 0;
+-
+-    if (m_app_context)
+-      {
+-        const cmdline_options& options = m_app_context->options ();
+-
+-        if (m_app_context->have_eval_option_code ())
+-          {
+-            int status = execute_eval_option_code ();
+-
+-            if (status )
+-              exit_status = status;
+-
+-            if (! options.persist ())
+-              return exit_status;
+-          }
++    m_initialized = true;
++  }
+ 
+-        // If there is an extra argument, see if it names a file to
+-        // read.  Additional arguments are taken as command line options
+-        // for the script.
+-
+-        if (m_app_context->have_script_file ())
+-          {
+-            int status = execute_command_line_file ();
+-
+-            if (status)
+-              exit_status = status;
+-
+-            if (! options.persist ())
+-              return exit_status;
+-          }
+-
+-        if (options.forced_interactive ())
+-          command_editor::blink_matching_paren (false);
+-      }
+-
+-    // Avoid counting commands executed from startup or script files.
+-
+-    command_editor::reset_current_command_number (1);
+-
+-    m_initialized = true;
+-
+-    return exit_status;
+-  }
++  // FIXME: this function is intended to be executed only once.  Should
++  // we enforce that restriction?
+ 
+   int interpreter::execute (void)
+   {
+     try
+       {
+-        int status = initialize ();
++        initialize ();
++
++        // We ignore errors in startup files.
++
++        execute_startup_files ();
++
++        int exit_status = 0;
++
++        if (m_app_context)
++          {
++            const cmdline_options& options = m_app_context->options ();
++
++            if (m_app_context->have_eval_option_code ())
++              {
++                int status = execute_eval_option_code ();
++
++                if (status )
++                  exit_status = status;
++
++                if (! options.persist ())
++                  return exit_status;
++              }
+ 
+-        if (! m_initialized)
+-          return status;
++            // If there is an extra argument, see if it names a file to
++            // read.  Additional arguments are taken as command line options
++            // for the script.
++
++            if (m_app_context->have_script_file ())
++              {
++                int status = execute_command_line_file ();
++
++                if (status)
++                  exit_status = status;
++
++                if (! options.persist ())
++                  return exit_status;
++              }
++
++            if (options.forced_interactive ())
++              command_editor::blink_matching_paren (false);
++          }
++
++        // Avoid counting commands executed from startup or script files.
++
++        command_editor::reset_current_command_number (1);
+ 
+         return main_loop ();
+       }
+     catch (const exit_exception& ex)
+       {
+         return ex.exit_status ();
+       }
+   }
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -62,18 +62,17 @@ namespace octave
+   // both) of them...
+ 
+   class application;
+ 
+   class OCTINTERP_API interpreter
+   {
+   public:
+ 
+-    // Create an interpreter object and perform basic initialization
+-    // up to the point of reading history and setting the load path.
++    // Create an interpreter object and perform basic initialization.
+ 
+     interpreter (application *app_context = nullptr);
+ 
+     // No copying, at least not yet...
+ 
+     interpreter (const interpreter&) = delete;
+ 
+     interpreter& operator = (const interpreter&) = delete;
+@@ -93,22 +92,22 @@ namespace octave
+     // If creating an embedded interpreter, you may inhibit setting
+     // the default compiled-in path by calling intialize_load_path
+     // with set_initial_path = false prior calling initialize.  After
+     // that, you can add directories to the load path to set up a
+     // custom path.
+ 
+     void initialize_load_path (bool set_initial_path = true);
+ 
+-    // Load command line history, set the load path and execute
+-    // startup files.  May throw an exit_exception.
++    // Load command line history, set the load path.
+ 
+-    int initialize (void);
++    void initialize (void);
+ 
+-    // Initialize the interpreter and execute --eval option code,
++    // Initialize the interpreter (if not already done by an explicit
++    // call to intialize), execute startup files, --eval option code,
+     // script files, and/or interactive commands.
+ 
+     int execute (void);
+ 
+     bool interactive (void) const
+     {
+       return m_interactive;
+     }
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -318,19 +318,20 @@ namespace octave
+   interpreter& application::create_interpreter (void)
+   {
+     if (! m_interpreter)
+       m_interpreter = new interpreter (this);
+ 
+     return *m_interpreter;
+   }
+ 
+-  int application::initialize_interpreter (void)
++  void application::initialize_interpreter (void)
+   {
+-    return m_interpreter ? m_interpreter->initialize () : -1;
++    if (m_interpreter)
++      m_interpreter->initialize ();
+   }
+ 
+   int application::execute_interpreter (void)
+   {
+     return m_interpreter ? m_interpreter->execute () : -1;
+   }
+ 
+   void application::delete_interpreter (void)
+diff --git a/libinterp/octave.h b/libinterp/octave.h
+--- a/libinterp/octave.h
++++ b/libinterp/octave.h
+@@ -256,17 +256,17 @@ namespace octave
+     bool have_script_file (void) const { return m_have_script_file; }
+ 
+     bool is_octave_program (void) const { return m_is_octave_program; }
+ 
+     bool interpreter_initialized (void);
+ 
+     virtual interpreter& create_interpreter (void);
+ 
+-    virtual int initialize_interpreter (void);
++    virtual void initialize_interpreter (void);
+ 
+     virtual int execute_interpreter (void);
+ 
+     virtual void delete_interpreter (void);
+ 
+     virtual int execute (void) = 0;
+ 
+     virtual bool gui_running (void) const { return false; }

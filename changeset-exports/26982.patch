@@ -1,0 +1,654 @@
+# HG changeset patch
+# User Markus Mützel <markus.muetzel@gmx.de>
+# Date 1552771286 -3600
+#      Sat Mar 16 22:21:26 2019 +0100
+# Branch stable
+# Node ID 8d7265e353a0725c0963651749291ceef396d1f1
+# Parent  222f5ac853c87e7aa1a409cb462ba48cf45cacd1
+Improve performance when closing figures (bug #55908).
+
+* graphics.cc (gh_manager::do_free): Don't execute remove_child when deleting
+  from groot.
+* graphics.[cc,in.h] (delete_children, free): Add optional argument to indicate
+  that an object is deleted from graphics root.
+
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -1769,18 +1769,30 @@ children_property::do_get_children (bool
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ children_property::do_delete_children (bool clear)
+ {
+-  while (! children_list.empty ())
+-    gh_manager::free (children_list.front ());
++  do_delete_children (clear, false);
++}
++
++void
++children_property::do_delete_children (bool clear, bool from_root)
++{
++  for (graphics_handle hchild : children_list)
++    {
++      graphics_object go = gh_manager::get_object (hchild);
++
++      if (hchild.value () > 0 && go.valid_object ()
++          && ! go.get_properties ().is_beingdeleted ())
++        gh_manager::free (hchild, from_root);
++    }
+ 
+   if (clear)
+     children_list.clear ();
+ }
+ 
+ bool
+ callback_property::validate (const octave_value& v) const
+ {
+@@ -2717,52 +2729,62 @@ gh_manager::do_get_handle (bool integer_
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ gh_manager::do_free (const graphics_handle& h)
+ {
++  do_free (h, false);
++}
++
++void
++gh_manager::do_free (const graphics_handle& h, bool from_root)
++{
+   if (h.ok ())
+     {
+       if (h.value () == 0)
+         error ("graphics_handle::free: can't delete root object");
+ 
+       auto p = handle_map.find (h);
+ 
+       if (p == handle_map.end ())
+         error ("graphics_handle::free: invalid object %g", h.value ());
+ 
+       base_properties& bp = p->second.get_properties ();
+ 
+       if (! p->second.valid_object () || bp.is_beingdeleted ())
+         return;
+ 
+       graphics_handle parent_h = p->second.get_parent ();
+-      graphics_object parent_go = gh_manager::get_object (parent_h);
++      graphics_object parent_go = nullptr;
++      if (! from_root)
++        parent_go = gh_manager::get_object (parent_h);
+ 
+       bp.set_beingdeleted (true);
+ 
+       // delete listeners before invalidating object
+       p->second.remove_all_listeners ();
+ 
+       bp.delete_children ();
+ 
+       // NOTE: Call the delete function while the object's state is still valid.
+       octave_value val = bp.get_deletefcn ();
+ 
+       bp.execute_deletefcn ();
+ 
+       // Notify graphics toolkit.
+       p->second.finalize ();
+ 
+-      // NOTE: Call remove_child before erasing the go from the map.
++
++      // NOTE: Call remove_child before erasing the go from the map if not
++      // removing from groot.
+       // A callback function might have already deleted the parent
+-      if (parent_go.valid_object () && h.ok ())
++      if (! from_root && parent_go.valid_object () && h.ok ())
+         parent_go.remove_child (h);
+ 
+       // Note: this will be valid only for first explicitly deleted
+       // object.  All its children will then have an
+       // unknown graphics toolkit.
+ 
+       // Graphics handles for non-figure objects are negative
+       // integers plus some random fractional part.  To avoid
+@@ -2879,54 +2901,54 @@ gca (void)
+ {
+   octave_value val = xget (gcf (), "currentaxes");
+ 
+   return val.isempty () ? octave::numeric_limits<double>::NaN ()
+                         : val.double_value ();
+ }
+ 
+ static void
+-delete_graphics_object (const graphics_handle& h)
++delete_graphics_object (const graphics_handle& h, bool from_root = false)
+ {
+   if (h.ok ())
+     {
+       graphics_object go = gh_manager::get_object (h);
+ 
+       // Don't do recursive deleting, due to callbacks
+       if (! go.get_properties ().is_beingdeleted ())
+         {
+           // NOTE: Freeing the handle also calls any deletefcn.  It also calls
+           //       the parent's delete_child function.
+ 
+-          gh_manager::free (h);
++          gh_manager::free (h, from_root);
+ 
+           Vdrawnow_requested = true;
+         }
+     }
+ }
+ 
+ static void
+-delete_graphics_object (double val)
+-{
+-  delete_graphics_object (gh_manager::lookup (val));
++delete_graphics_object (double val, bool from_root = false)
++{
++  delete_graphics_object (gh_manager::lookup (val), from_root);
+ }
+ 
+ // Flag to stop redraws due to callbacks while deletion is in progress.
+ static bool delete_executing = false;
+ 
+ static void
+-delete_graphics_objects (const NDArray vals)
++delete_graphics_objects (const NDArray vals, bool from_root = false)
+ {
+   // Prevent redraw of partially deleted objects.
+   octave::unwind_protect frame;
+   frame.protect_var (delete_executing);
+   delete_executing = true;
+ 
+   for (octave_idx_type i = 0; i < vals.numel (); i++)
+-    delete_graphics_object (vals.elem (i));
++    delete_graphics_object (vals.elem (i), from_root);
+ }
+ 
+ static void
+ close_figure (const graphics_handle& h)
+ {
+   octave_value closerequestfcn = xget (h, "closerequestfcn");
+ 
+   gh_manager::execute_callback (h, closerequestfcn);
+@@ -2936,17 +2958,17 @@ static void
+ force_close_figure (const graphics_handle& h)
+ {
+   // Remove the deletefcn and closerequestfcn callbacks
+   // and delete the object directly.
+ 
+   xset (h, "deletefcn", Matrix ());
+   xset (h, "closerequestfcn", Matrix ());
+ 
+-  delete_graphics_object (h);
++  delete_graphics_object (h, true);
+ }
+ 
+ void
+ gh_manager::do_close_all_figures (void)
+ {
+   // FIXME: should we process or discard pending events?
+ 
+   event_queue.clear ();
+@@ -3897,23 +3919,29 @@ root_figure::properties::get_boundingbox
+ %! unwind_protect_cleanup
+ %!   set (0, "units", old_units);
+ %! end_unwind_protect
+ */
+ 
+ void
+ root_figure::properties::remove_child (const graphics_handle& h)
+ {
++  remove_child (h, false);
++}
++
++void
++root_figure::properties::remove_child (const graphics_handle& h, bool)
++{
+   gh_manager::pop_figure (h);
+ 
+   graphics_handle cf = gh_manager::current_figure ();
+ 
+   xset (0, "currentfigure", cf.value ());
+ 
+-  base_properties::remove_child (h);
++  base_properties::remove_child (h, true);
+ }
+ 
+ void
+ root_figure::reset_default_properties (void)
+ {
+   // empty list of local defaults
+   default_properties = property_list ();
+ 
+@@ -3933,17 +3961,23 @@ figure::properties::set_currentaxes (con
+     currentaxes = hax;
+   else
+     err_set_invalid ("currentaxes");
+ }
+ 
+ void
+ figure::properties::remove_child (const graphics_handle& h)
+ {
+-  base_properties::remove_child (h);
++  remove_child (h, false);
++}
++
++void
++figure::properties::remove_child (const graphics_handle& h, bool from_root)
++{
++  base_properties::remove_child (h, from_root);
+ 
+   if (h == currentaxes.handle_value ())
+     {
+       graphics_handle new_currentaxes;
+ 
+       Matrix kids = get_children ();
+ 
+       for (octave_idx_type i = 0; i < kids.numel (); i++)
+@@ -5456,24 +5490,30 @@ axes::properties::get_colormap (void) co
+     }
+ 
+   return get___colormap__ ();
+ }
+ 
+ void
+ axes::properties::delete_text_child (handle_property& hp)
+ {
++  delete_text_child (hp, false);
++}
++
++void
++axes::properties::delete_text_child (handle_property& hp, bool from_root)
++{
+   graphics_handle h = hp.handle_value ();
+ 
+   if (h.ok ())
+     {
+       graphics_object go = gh_manager::get_object (h);
+ 
+       if (go.valid_object ())
+-        gh_manager::free (h);
++        gh_manager::free (h, from_root);
+     }
+ 
+   // FIXME: is it necessary to check whether the axes object is
+   // being deleted now?  I think this function is only called when an
+   // individual child object is delete and not when the parent axes
+   // object is deleted.
+ 
+   if (! is_beingdeleted ())
+@@ -5485,44 +5525,50 @@ axes::properties::delete_text_child (han
+ 
+       adopt (hp.handle_value ());
+     }
+ }
+ 
+ void
+ axes::properties::remove_child (const graphics_handle& h)
+ {
++  remove_child (h, false);
++}
++
++void
++axes::properties::remove_child (const graphics_handle& h, bool from_root)
++{
+   graphics_object go = gh_manager::get_object (h);
+ 
+-  if (go.isa ("light") && go.get_properties ().is_visible ())
+-    decrease_num_lights ();
+-
+   if (xlabel.handle_value ().ok () && h == xlabel.handle_value ())
+     {
+-      delete_text_child (xlabel);
++      delete_text_child (xlabel, from_root);
+       update_xlabel_position ();
+     }
+   else if (ylabel.handle_value ().ok () && h == ylabel.handle_value ())
+     {
+-      delete_text_child (ylabel);
++      delete_text_child (ylabel, from_root);
+       update_ylabel_position ();
+     }
+   else if (zlabel.handle_value ().ok () && h == zlabel.handle_value ())
+     {
+-      delete_text_child (zlabel);
++      delete_text_child (zlabel, from_root);
+       update_zlabel_position ();
+     }
+   else if (title.handle_value ().ok () && h == title.handle_value ())
+     {
+-      delete_text_child (title);
++      delete_text_child (title, from_root);
+       update_title_position ();
+     }
++  else if (get_num_lights () > 0 && go.isa ("light")
++           && go.get_properties ().is_visible ())
++    decrease_num_lights ();
+ 
+   if (go.valid_object ())
+-      base_properties::remove_child (h);
++    base_properties::remove_child (h, from_root);
+ 
+ }
+ 
+ void
+ axes::properties::adopt (const graphics_handle& h)
+ {
+   graphics_object go (gh_manager::get_object (h));
+ 
+@@ -10102,25 +10148,31 @@ Update FaceNormals and VertexNormals of 
+ %! end_unwind_protect
+ */
+ 
+ // ---------------------------------------------------------------------
+ 
+ void
+ hggroup::properties::remove_child (const graphics_handle& h)
+ {
++  remove_child (h, false);
++}
++
++void
++hggroup::properties::remove_child (const graphics_handle& h, bool from_root)
++{
+   graphics_object go = gh_manager::get_object (h);
+-  if (go.isa ("light") && go.get_properties ().is_visible ())
++  if (! from_root && go.isa ("light") && go.get_properties ().is_visible ())
+     {
+       axes::properties& ax_props =
+         dynamic_cast<axes::properties&>
+         (go.get_ancestor ("axes").get_properties ());
+       ax_props.decrease_num_lights ();
+     }
+-  base_properties::remove_child (h);
++  base_properties::remove_child (h, from_root);
+   update_limits ();
+ }
+ 
+ void
+ hggroup::properties::adopt (const graphics_handle& h)
+ {
+   graphics_object go = gh_manager::get_object (h);
+   if (go.isa ("light") && go.get_properties ().is_visible ())
+diff --git a/libinterp/corefcn/graphics.in.h b/libinterp/corefcn/graphics.in.h
+--- a/libinterp/corefcn/graphics.in.h
++++ b/libinterp/corefcn/graphics.in.h
+@@ -1759,16 +1759,21 @@ public:
+     return octave_value (get_children ());
+   }
+ 
+   void delete_children (bool clear = false)
+   {
+     do_delete_children (clear);
+   }
+ 
++  void delete_children (bool clear, bool from_root)
++  {
++    do_delete_children (clear, from_root);
++  }
++
+   void renumber (graphics_handle old_gh, graphics_handle new_gh)
+   {
+     for (auto& hchild : children_list)
+       {
+         if (hchild == old_gh)
+           {
+             hchild = new_gh.value ();
+             return;
+@@ -1881,16 +1886,18 @@ private:
+   }
+ 
+   void do_adopt_child (double val)
+   {
+     children_list.push_front (val);
+   }
+ 
+   void do_delete_children (bool clear);
++
++  void do_delete_children (bool clear, bool from_root);
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class callback_property : public base_property
+ {
+ public:
+   callback_property (const std::string& nm, const graphics_handle& h,
+@@ -2238,16 +2245,25 @@ public:
+   {
+     if (children.remove_child (h.value ()))
+       {
+         children.run_listeners ();
+         mark_modified ();
+       }
+   }
+ 
++  virtual void remove_child (const graphics_handle& h, bool)
++  {
++    if (children.remove_child (h.value ()))
++      {
++        children.run_listeners ();
++        mark_modified ();
++      }
++  }
++
+   virtual void adopt (const graphics_handle& h)
+   {
+     children.adopt (h.value ());
+     children.run_listeners ();
+     mark_modified ();
+   }
+ 
+   virtual graphics_toolkit get_toolkit (void) const;
+@@ -2306,16 +2322,21 @@ public:
+ 
+   virtual void update_uicontextmenu (void) const;
+ 
+   virtual void delete_children (bool clear = false)
+   {
+     children.delete_children (clear);
+   }
+ 
++  virtual void delete_children (bool clear, bool from_root)
++  {
++    children.delete_children (clear, from_root);
++  }
++
+   void renumber_child (graphics_handle old_gh, graphics_handle new_gh)
+   {
+     children.renumber (old_gh, new_gh);
+   }
+ 
+   void renumber_parent (graphics_handle new_gh)
+   {
+     parent = new_gh;
+@@ -2541,16 +2562,24 @@ public:
+   virtual void remove_child (const graphics_handle& h)
+   {
+     if (! valid_object ())
+       error ("base_graphics_object::remove_child: invalid graphics object");
+ 
+     get_properties ().remove_child (h);
+   }
+ 
++  virtual void remove_child (const graphics_handle& h, bool from_root)
++  {
++    if (! valid_object ())
++      error ("base_graphics_object::remove_child: invalid graphics object");
++
++    get_properties ().remove_child (h, from_root);
++  }
++
+   virtual void adopt (const graphics_handle& h)
+   {
+     if (! valid_object ())
+       error ("base_graphics_object::adopt: invalid graphics object");
+ 
+     get_properties ().adopt (h);
+   }
+ 
+@@ -2889,16 +2918,18 @@ public:
+ 
+   friend class gh_manager;
+ 
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     void remove_child (const graphics_handle& h);
+ 
++    void remove_child (const graphics_handle& h, bool from_root);
++
+     Matrix get_boundingbox (bool internal = false,
+                             const Matrix& parent_pix_size = Matrix ()) const;
+ 
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+ 
+     // FIXME: Properties that still don't have callbacks are:
+     // monitorpositions, pointerlocation, pointerwindow.
+@@ -3070,16 +3101,18 @@ public:
+   public:
+     void init_integerhandle (const octave_value& val)
+     {
+       integerhandle = val;
+     }
+ 
+     void remove_child (const graphics_handle& h);
+ 
++    void remove_child (const graphics_handle& h, bool from_root);
++
+     void set_visible (const octave_value& val);
+ 
+     graphics_toolkit get_toolkit (void) const;
+ 
+     void set_toolkit (const graphics_toolkit& b);
+ 
+     void set___graphics_toolkit__ (const octave_value& val);
+ 
+@@ -3405,16 +3438,18 @@ class OCTINTERP_API axes : public base_g
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     void set_defaults (base_graphics_object& obj, const std::string& mode);
+ 
+     void remove_child (const graphics_handle& h);
+ 
++    void remove_child (const graphics_handle& h, bool from_root);
++
+     void adopt (const graphics_handle& h);
+ 
+     const scaler& get_x_scaler (void) const { return sx; }
+     const scaler& get_y_scaler (void) const { return sy; }
+     const scaler& get_z_scaler (void) const { return sz; }
+ 
+     Matrix get_boundingbox (bool internal = false,
+                             const Matrix& parent_pix_size = Matrix ()) const;
+@@ -3603,16 +3638,18 @@ public:
+     // Text renderer, used for calculation of text (tick labels) size
+     octave::text_renderer txt_renderer;
+ 
+     void set_text_child (handle_property& h, const std::string& who,
+                          const octave_value& v);
+ 
+     void delete_text_child (handle_property& h);
+ 
++    void delete_text_child (handle_property& h, bool from_root);
++
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+     // Programming note: Keep property list sorted if new ones are added.
+ 
+     BEGIN_PROPERTIES (axes)
+       radio_property activepositionproperty , "{outerposition}|position"
+       row_vector_property alim m , default_lim ()
+       radio_property alimmode , "{auto}|manual"
+@@ -5228,16 +5265,18 @@ public:
+ class OCTINTERP_API hggroup : public base_graphics_object
+ {
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     void remove_child (const graphics_handle& h);
+ 
++    void remove_child (const graphics_handle& h, bool from_root);
++
+     void adopt (const graphics_handle& h);
+ 
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+     // Programming note: Keep property list sorted if new ones are added.
+ 
+     BEGIN_PROPERTIES (hggroup)
+       string_property displayname , ""
+@@ -5305,16 +5344,21 @@ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     void remove_child (const graphics_handle& h)
+     {
+       base_properties::remove_child (h);
+     }
+ 
++    void remove_child (const graphics_handle& h, bool from_root)
++    {
++      base_properties::remove_child (h, from_root);
++    }
++
+     void adopt (const graphics_handle& h)
+     {
+       base_properties::adopt (h);
+     }
+ 
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+     // Programming note: Keep property list sorted if new ones are added.
+@@ -6209,16 +6253,22 @@ public:
+   }
+ 
+   static void free (const graphics_handle& h)
+   {
+     if (instance_ok ())
+       instance->do_free (h);
+   }
+ 
++  static void free (const graphics_handle& h, bool from_root)
++  {
++    if (instance_ok ())
++      instance->do_free (h, from_root);
++  }
++
+   static void renumber_figure (const graphics_handle& old_gh,
+                                const graphics_handle& new_gh)
+   {
+     if (instance_ok ())
+       instance->do_renumber_figure (old_gh, new_gh);
+   }
+ 
+   static graphics_handle lookup (double val)
+@@ -6460,16 +6510,18 @@ private:
+ 
+   // A flag telling whether event processing must be constantly on.
+   int event_processing;
+ 
+   graphics_handle do_get_handle (bool integer_figure_handle);
+ 
+   void do_free (const graphics_handle& h);
+ 
++  void do_free (const graphics_handle& h, bool from_root);
++
+   void do_renumber_figure (const graphics_handle& old_gh,
+                            const graphics_handle& new_gh);
+ 
+   graphics_handle do_lookup (double val)
+   {
+     iterator p = (octave::math::isnan (val) ? handle_map.end ()
+                                             : handle_map.find (val));
+ 

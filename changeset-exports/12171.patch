@@ -1,0 +1,262 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1296092355 18000
+#      Wed Jan 26 20:39:15 2011 -0500
+# Node ID d08901c05c1bef06cf6e3d975920e503a7155aee
+# Parent  037f8b7608f33c4d96bf524df83d45973addf799
+fix bug in class assignment to undefined object with index
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,22 @@
+ 2011-01-26  John W. Eaton  <jwe@octave.org>
+ 
++	Bug #32242.
++
++	* ov.h, ov.cc (octave_value::undef_subsasgn): New function.
++	* ov-class.h, ov-class.cc (octave_class::undef_subsasgn,
++	octave_class::subsasgn_common): New functions.
++	* ov-base.h, ov-base.cc (octave_base_value::subsasgn): If
++	undefined, undef_subsasgn on object returned by
++	octave_value::empty_conv.
++	(octave_base_value::undef_subsasgn): New virtual function.
++	(octave_base_value::subsasgn): Only handle case of undefined
++	values here.
++
+ 2011-01-26  Pascal Dupuis  <Pascal.Dupuis@worldonline.be>
+ 	    John W. Eaton  <jwe@octave.org>
+ 
+ 	* graphics.h.in (scaler::scaler (const std::string&)): New constructor.
+ 	(graphics_handle::operator++, graphics_hanlde::operator--):
+ 	Implement as recommended by Effective C++.
+ 
+ 	* graphics.h.in (class base_property, class array_property,
+diff --git a/src/ov-base.cc b/src/ov-base.cc
+--- a/src/ov-base.cc
++++ b/src/ov-base.cc
+@@ -273,26 +273,37 @@ octave_base_value::subsasgn (const std::
+         {
+           std::string nm = type_name ();
+           error ("can't perform indexed assignment for %s type", nm.c_str ());
+         }
+     }
+   else
+     {
+       // Create new object of appropriate type for given index and rhs
+-      // types and then call subsasgn again for that object.
++      // types and then call undef_subsasgn for that object.
+ 
+       octave_value tmp = octave_value::empty_conv (type, rhs);
+ 
+-      retval = tmp.subsasgn (type, idx, rhs);
++      retval = tmp.undef_subsasgn (type, idx, rhs);
+     }
+ 
+   return retval;
+ }
+ 
++octave_value
++octave_base_value::undef_subsasgn (const std::string& type,
++                                   const std::list<octave_value_list>& idx,
++                                   const octave_value& rhs)
++{
++  // In most cases, undef_subsasgn is handled the sams as subsasgn.  One
++  // exception is octave_class objects.
++
++  return subsasgn (type, idx, rhs);
++}
++
+ octave_idx_type
+ octave_base_value::nnz (void) const
+ {
+   gripe_wrong_type_arg ("octave_base_value::nnz ()", type_name ());
+   return -1;
+ }
+ 
+ octave_idx_type
+diff --git a/src/ov-base.h b/src/ov-base.h
+--- a/src/ov-base.h
++++ b/src/ov-base.h
+@@ -276,16 +276,21 @@ public:
+ 
+   virtual void assign (const std::string&, const octave_value&) { }
+ 
+   virtual octave_value
+   subsasgn (const std::string& type,
+             const std::list<octave_value_list>& idx,
+             const octave_value& rhs);
+ 
++  virtual octave_value
++  undef_subsasgn (const std::string& type,
++                  const std::list<octave_value_list>& idx,
++                  const octave_value& rhs);
++
+   virtual idx_vector index_vector (void) const;
+ 
+   virtual dim_vector dims (void) const { return dim_vector (); }
+ 
+   octave_idx_type rows (void) const
+     {
+       const dim_vector dv = dims ();
+ 
+diff --git a/src/ov-class.cc b/src/ov-class.cc
+--- a/src/ov-class.cc
++++ b/src/ov-class.cc
+@@ -499,16 +499,38 @@ octave_class::numeric_conv (const Cell& 
+   return retval;
+ }
+ 
+ octave_value
+ octave_class::subsasgn (const std::string& type,
+                         const std::list<octave_value_list>& idx,
+                         const octave_value& rhs)
+ {
++  count++;
++  return subsasgn_common (octave_value (this), type, idx, rhs);
++}
++
++octave_value
++octave_class::undef_subsasgn (const std::string& type,
++                              const std::list<octave_value_list>& idx,
++                              const octave_value& rhs)
++{
++  // For compatibility with Matlab, pass [] as the first argument to the
++  // the subsasgn function when the LHS of an indexed assignment is
++  // undefined.
++
++  return subsasgn_common (Matrix (), type, idx, rhs);
++}
++
++octave_value
++octave_class::subsasgn_common (const octave_value& obj,
++                               const std::string& type,
++                               const std::list<octave_value_list>& idx,
++                               const octave_value& rhs)
++{
+   octave_value retval;
+ 
+   if (! (in_class_method () || called_from_builtin ()))
+     {
+       octave_value meth = symbol_table::find_method ("subsasgn", class_name ());
+ 
+       if (meth.is_defined ())
+         {
+@@ -524,18 +546,17 @@ octave_class::subsasgn (const std::strin
+           else
+             args(2) = rhs;
+ 
+           args(1) = make_idx_args (type, idx, "subsasgn");
+ 
+           if (error_state)
+             return octave_value_list ();
+ 
+-          count++;
+-          args(0) = octave_value (this);
++          args(0) = obj;
+ 
+           // Now comes the magic. Count copies with me:
+           // 1. myself (obsolete)
+           // 2. the copy inside args (obsolete)
+           // 3. the copy in method's symbol table (working)
+           // ... possibly more (not obsolete).
+           //
+           // So we mark 2 copies as obsolete and hold our fingers crossed.
+diff --git a/src/ov-class.h b/src/ov-class.h
+--- a/src/ov-class.h
++++ b/src/ov-class.h
+@@ -99,16 +99,20 @@ public:
+ 
+   void assign(const std::string& k, const octave_value& rhs)
+   { map.assign (k, rhs); };
+ 
+   octave_value subsasgn (const std::string& type,
+                          const std::list<octave_value_list>& idx,
+                          const octave_value& rhs);
+ 
++  octave_value undef_subsasgn (const std::string& type,
++                               const std::list<octave_value_list>& idx,
++                               const octave_value& rhs);
++
+   idx_vector index_vector (void) const;
+ 
+   dim_vector dims (void) const { return map.dims (); }
+ 
+   size_t byte_size (void) const;
+ 
+   // This is the number of elements in each field.  The total number
+   // of elements is numel () * nfields ().
+@@ -201,16 +205,21 @@ private:
+ 
+   static const std::string t_name;
+   std::string c_name;
+   std::list<std::string> parent_list;
+ 
+   bool in_class_method (void);
+   std::string get_current_method_class (void);
+ 
++  octave_value subsasgn_common (const octave_value& obj,
++                                const std::string& type,
++                                const std::list<octave_value_list>& idx,
++                                const octave_value& rhs);
++
+   int obsolete_copies;
+ 
+ public:
+   // The list of field names and parent classes defines a class.  We
+   // keep track of each class that has been created so that we know
+   class exemplar_info
+   {
+   public:
+diff --git a/src/ov.cc b/src/ov.cc
+--- a/src/ov.cc
++++ b/src/ov.cc
+@@ -1295,16 +1295,24 @@ gripe_assign_failed_or_no_method (const 
+ octave_value
+ octave_value::subsasgn (const std::string& type,
+                         const std::list<octave_value_list>& idx,
+                         const octave_value& rhs)
+ {
+   return rep->subsasgn (type, idx, rhs);
+ }
+ 
++octave_value
++octave_value::undef_subsasgn (const std::string& type,
++                              const std::list<octave_value_list>& idx,
++                              const octave_value& rhs)
++{
++  return rep->undef_subsasgn (type, idx, rhs);
++}
++
+ octave_value&
+ octave_value::assign (assign_op op, const std::string& type,
+                       const std::list<octave_value_list>& idx,
+                       const octave_value& rhs)
+ {
+   octave_value retval;
+ 
+   make_unique ();
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -418,16 +418,20 @@ public:
+   octave_value_list
+   do_multi_index_op (int nargout, const octave_value_list& idx,
+                      const std::list<octave_lvalue> *lvalue_list);
+ 
+   octave_value subsasgn (const std::string& type,
+                                  const std::list<octave_value_list>& idx,
+                                  const octave_value& rhs);
+ 
++  octave_value undef_subsasgn (const std::string& type,
++                               const std::list<octave_value_list>& idx,
++                               const octave_value& rhs);
++
+   octave_value& assign (assign_op op, const std::string& type,
+                        const std::list<octave_value_list>& idx,
+                        const octave_value& rhs);
+ 
+   octave_value& assign (assign_op, const octave_value& rhs);
+ 
+   idx_vector index_vector (void) const
+     { return rep->index_vector (); }

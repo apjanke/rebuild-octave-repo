@@ -1,0 +1,680 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1363026491 14400
+#      Mon Mar 11 14:28:11 2013 -0400
+# Node ID 9acb86e6ac90acac6d7bb90366784e142a602964
+# Parent  b45a90cdb0aeb72e5f917a8a85e78b2e5a032f22
+4/10 commits reworking the lexer
+
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -583,16 +583,25 @@ public:
+ 
+   int handle_op (const char *pattern, int tok, bool convert = false,
+                  bool bos = false, bool qit = false);
+ 
+   int handle_incompatible_op (const char *pattern, int tok,
+                               bool convert = false, bool bos = false,
+                               bool qit = false);
+ 
++  bool maybe_unput_comma_before_unary_op (int tok);
++
++  int handle_unary_op (const char *pattern, int tok, bool convert = false,
++                       bool bos = false, bool qit = false);
++
++  int handle_incompatible_unary_op (const char *pattern, int tok,
++                                    bool convert = false, bool bos = false,
++                                    bool qit = false);
++
+   int handle_assign_op (const char *pattern, int tok);
+ 
+   int handle_incompatible_assign_op (const char *pattern, int tok);
+ 
+   int handle_op_internal (const char *pattern, int tok, bool convert,
+                           bool bos, bool qit, bool compat);
+ 
+   int handle_token (const std::string& name, int tok);
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -239,18 +239,18 @@ ANY_INCLUDING_NL (.|{NL})
+     curr_lexer->mark_previous_token_trailing_space ();
+   }
+ 
+ <MATRIX_START>{NL} {
+     curr_lexer->lexer_debug ("<MATRIX_START>{NL}");
+ 
+     int tok = curr_lexer->previous_token_value ();
+ 
+-    if (! (tok == ',' || tok == ';' || tok == '[' || tok == '{'))
+-      curr_lexer->xunput (',');
++    if (! (tok == ';' || tok == '[' || tok == '{'))
++      curr_lexer->xunput (';');
+   }
+ 
+ <KLUGE>@ {
+     curr_lexer->lexer_debug ("<KLUGE>@");
+     curr_lexer->pop_start_state ();
+     return curr_lexer->count_token (CHOOSE_ASSIGNMENT);
+   }
+ 
+@@ -296,37 +296,57 @@ ANY_INCLUDING_NL (.|{NL})
+     int tok_to_return = curr_lexer->handle_close_bracket ('}');
+ 
+     return curr_lexer->count_token ('}');
+   }
+ 
+ \[ {
+     curr_lexer->lexer_debug ("\\[");
+ 
+-    curr_lexer->nesting_level.bracket ();
+-
+-    curr_lexer->looking_at_object_index.push_front (false);
+-
+-    curr_lexer->current_input_column += yyleng;
+-    curr_lexer->looking_for_object_index = false;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    if (curr_lexer->defining_func
+-        && ! curr_lexer->parsed_function_name.top ())
+-      curr_lexer->looking_at_return_list = true;
++    bool unput_comma = false;
++
++    if (curr_lexer->whitespace_is_significant ()
++        && curr_lexer->space_follows_previous_token ())
++      {
++        int tok = curr_lexer->previous_token_value ();
++
++        if (! (tok == ';' || tok == ',' || tok == '[' || tok == '{'
++               || curr_lexer->previous_token_is_binop ()))
++          unput_comma = true;
++      }
++
++    if (unput_comma)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
+     else
+-      curr_lexer->looking_at_matrix_or_assign_lhs = true;
+-
+-    curr_lexer->decrement_promptflag ();
+-
+-    curr_lexer->bracketflag++;
+-
+-    curr_lexer->push_start_state (MATRIX_START);
+-
+-    return curr_lexer->count_token ('[');
++      {
++        curr_lexer->nesting_level.bracket ();
++
++        curr_lexer->looking_at_object_index.push_front (false);
++
++        curr_lexer->current_input_column += yyleng;
++        curr_lexer->looking_for_object_index = false;
++        curr_lexer->at_beginning_of_statement = false;
++
++        if (curr_lexer->defining_func
++            && ! curr_lexer->parsed_function_name.top ())
++          curr_lexer->looking_at_return_list = true;
++        else
++          curr_lexer->looking_at_matrix_or_assign_lhs = true;
++
++        curr_lexer->decrement_promptflag ();
++
++        curr_lexer->bracketflag++;
++
++        curr_lexer->push_start_state (MATRIX_START);
++
++        return curr_lexer->count_token ('[');
++      }
+   }
+ 
+ \] {
+     curr_lexer->lexer_debug ("\\]");
+ 
+     curr_lexer->nesting_level.remove ();
+ 
+     curr_lexer->looking_at_object_index.pop_front ();
+@@ -480,19 +500,22 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+ %{
+ // Imaginary numbers.
+ %}
+ 
+ {NUMBER}{Im} {
+     curr_lexer->lexer_debug ("{NUMBER}{Im}");
+ 
++    int tok = curr_lexer->previous_token_value ();
++
+     if (curr_lexer->whitespace_is_significant ()
+         && curr_lexer->space_follows_previous_token ()
+-        && ! curr_lexer->previous_token_is_binop ())
++        && ! (tok == '[' || tok == '{'
++              || curr_lexer->previous_token_is_binop ()))
+       {
+         yyless (0);
+         unput (',');
+       }
+     else
+       {
+         curr_lexer->handle_number ();
+         return curr_lexer->count_token_internal (IMAG_NUM);
+@@ -503,19 +526,22 @@ ANY_INCLUDING_NL (.|{NL})
+ // Real numbers.  Don't grab the '.' part of a dot operator as part of
+ // the constant.
+ %}
+ 
+ {D}+/\.[\*/\\^\'] |
+ {NUMBER} {
+     curr_lexer->lexer_debug ("{D}+/\\.[\\*/\\^\\']|{NUMBER}");
+ 
++    int tok = curr_lexer->previous_token_value ();
++
+     if (curr_lexer->whitespace_is_significant ()
+         && curr_lexer->space_follows_previous_token ()
+-        && ! curr_lexer->previous_token_is_binop ())
++        && ! (tok == '[' || tok == '{'
++              || curr_lexer->previous_token_is_binop ()))
+       {
+         yyless (0);
+         unput (',');
+       }
+     else
+       {
+         curr_lexer->handle_number ();
+         return curr_lexer->count_token_internal (NUM);
+@@ -566,17 +592,18 @@ ANY_INCLUDING_NL (.|{NL})
+         && ! (tok == '[' || tok == '{'
+               || curr_lexer->previous_token_is_binop ()))
+       {
+         yyless (0);
+         unput (',');
+       }
+     else
+       {
+-        if (curr_lexer->previous_token_may_be_command ())
++        if (! curr_lexer->looking_at_decl_list
++            && curr_lexer->previous_token_may_be_command ())
+           {
+             yyless (0);
+             curr_lexer->push_start_state (COMMAND_START);
+           }
+         else
+           {
+             int id_tok = curr_lexer->handle_identifier ();
+ 
+@@ -691,17 +718,17 @@ ANY_INCLUDING_NL (.|{NL})
+             else
+               {
+                 yyless (0);
+                 curr_lexer->xunput (',');
+               }
+           }
+         else
+           {
+-            if (tok == ',' || tok == ';'
++            if (tok == ',' || tok == ';' || tok == '[' || tok == '{'
+                 || curr_lexer->previous_token_is_binop ())
+               {
+                 curr_lexer->current_input_column++;
+                 int retval = curr_lexer->handle_string ('\'');
+                 return curr_lexer->count_token_internal (retval);
+               }
+             else
+               return curr_lexer->count_token (QUOTE);
+@@ -731,17 +758,17 @@ ANY_INCLUDING_NL (.|{NL})
+     int tok = curr_lexer->previous_token_value ();
+ 
+     bool transpose = false;
+ 
+     if (curr_lexer->whitespace_is_significant ())
+       {
+         if (curr_lexer->space_follows_previous_token ())
+           {
+-            if (tok == '[' || tok == '{'
++            if (tok == ',' || tok == ';' || tok == '[' || tok == '{'
+                 || curr_lexer->previous_token_is_binop ())
+               {
+                 curr_lexer->current_input_column++;
+                 int retval = curr_lexer->handle_string ('"');
+                 return curr_lexer->count_token_internal (retval);
+               }
+             else
+               {
+@@ -780,70 +807,164 @@ ANY_INCLUDING_NL (.|{NL})
+ "=="    { return curr_lexer->handle_op ("==", EXPR_EQ); }
+ "~="    { return curr_lexer->handle_op ("~=", EXPR_NE); }
+ "!="    { return curr_lexer->handle_incompatible_op ("!=", EXPR_NE); }
+ ">="    { return curr_lexer->handle_op (">=", EXPR_GE); }
+ "&"     { return curr_lexer->handle_op ("&", EXPR_AND); }
+ "|"     { return curr_lexer->handle_op ("|", EXPR_OR); }
+ "<"     { return curr_lexer->handle_op ("<", EXPR_LT); }
+ ">"     { return curr_lexer->handle_op (">", EXPR_GT); }
+-"+"     { return curr_lexer->handle_op ("+", '+'); }
+-"-"     { return curr_lexer->handle_op ("-", '-'); }
+ "*"     { return curr_lexer->handle_op ("*", '*'); }
+ "/"     { return curr_lexer->handle_op ("/", '/'); }
+ "\\"    { return curr_lexer->handle_op ("\\", LEFTDIV); }
+ "^"     { return curr_lexer->handle_op ("^", POW); }
+ "**"    { return curr_lexer->handle_incompatible_op ("**", POW); }
+ "&&"    { return curr_lexer->handle_op ("&&", EXPR_AND_AND); }
+ "||"    { return curr_lexer->handle_op ("||", EXPR_OR_OR); }
+ "<<"    { return curr_lexer->handle_incompatible_op ("<<", LSHIFT); }
+ ">>"    { return curr_lexer->handle_incompatible_op (">>", RSHIFT); }
+-"~"     { return curr_lexer->handle_op ("~", EXPR_NOT); }
+-"!"     { return curr_lexer->handle_incompatible_op ("!", EXPR_NOT); }
+ ";"     { return curr_lexer->handle_op (";", ';', true, true); }
+ 
++"+" {
++   int tok = curr_lexer->handle_unary_op ("+", '+');
++
++    if (tok < 0)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      return tok;
++  }
++
++"-" {
++    int prev_tok = curr_lexer->previous_token_value ();
++    bool space_before = curr_lexer->space_follows_previous_token ();
++    int c = curr_lexer->text_yyinput ();
++    curr_lexer->xunput (c);
++    bool space_after = (c == ' ' || c == '\t');
++
++    if (space_before && ! space_after
++        && curr_lexer->previous_token_may_be_command ())
++      {
++        yyless (0);
++        curr_lexer->push_start_state (COMMAND_START);
++      }
++    else
++      {
++        int tok = curr_lexer->handle_unary_op ("-", '-');
++
++        if (tok < 0)
++          {
++            yyless (0);
++            curr_lexer->xunput (',');
++          }
++        else
++          return tok;
++      }
++  }
++
++"~" {
++    int tok = curr_lexer->handle_unary_op ("~", EXPR_NOT);
++
++    if (tok < 0)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      return tok;
++  }
++
++"!" {
++    int tok = curr_lexer->handle_incompatible_unary_op ("!", EXPR_NOT);
++
++    if (tok < 0)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      return tok;
++  }
++
+ "," {
+     return curr_lexer->handle_op
+       (",", ',', true, ! curr_lexer->looking_at_object_index.front ());
+   }
+ 
+ ".'" {
+     return curr_lexer->handle_op (".'", TRANSPOSE, true, false);
+   }
+ 
+ "++" {
+-    return curr_lexer->handle_incompatible_op
+-      ("++", PLUS_PLUS, true, false, true);
++    int tok = curr_lexer->handle_incompatible_unary_op
++                ("++", PLUS_PLUS, true, false, true);
++
++    if (tok < 0)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      return tok;
+   }
+ 
+ "--" {
+-    ;
+-    return curr_lexer->handle_incompatible_op
+-      ("--", MINUS_MINUS, true, false, true);
++    int tok = curr_lexer->handle_incompatible_unary_op
++                ("--", MINUS_MINUS, true, false, true);
++
++    if (tok < 0)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      return tok;
+   }
+ 
+ "(" {
+     curr_lexer->lexer_debug ("(");
+ 
+-    // If we are looking for an object index, then push TRUE for
+-    // looking_at_object_index.  Otherwise, just push whatever state
+-    // is current (so that we can pop it off the stack when we find
+-    // the matching close paren).
+-
+-    curr_lexer->looking_at_object_index.push_front
+-      (curr_lexer->looking_for_object_index);
+-
+-    curr_lexer->looking_at_indirect_ref = false;
+-    curr_lexer->looking_for_object_index = false;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    curr_lexer->nesting_level.paren ();
+-    curr_lexer->decrement_promptflag ();
+-
+-    return curr_lexer->handle_token ('(');
++    bool unput_comma = false;
++
++    if (curr_lexer->whitespace_is_significant ()
++        && curr_lexer->space_follows_previous_token ())
++      {
++        int tok = curr_lexer->previous_token_value ();
++
++        if (! (tok == ';' || tok == ',' || tok == '[' || tok == '{'
++               || curr_lexer->previous_token_is_binop ()))
++          unput_comma = true;
++      }
++
++    if (unput_comma)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      {
++        // If we are looking for an object index, then push TRUE for
++        // looking_at_object_index.  Otherwise, just push whatever state
++        // is current (so that we can pop it off the stack when we find
++        // the matching close paren).
++
++        curr_lexer->looking_at_object_index.push_front
++          (curr_lexer->looking_for_object_index);
++
++        curr_lexer->looking_at_indirect_ref = false;
++        curr_lexer->looking_for_object_index = false;
++        curr_lexer->at_beginning_of_statement = false;
++
++        curr_lexer->nesting_level.paren ();
++        curr_lexer->decrement_promptflag ();
++
++        return curr_lexer->handle_token ('(');
++      }
+   }
+ 
+ ")" {
+     curr_lexer->lexer_debug (")");
+ 
+     curr_lexer->nesting_level.remove ();
+     curr_lexer->current_input_column++;
+ 
+@@ -1097,32 +1218,52 @@ ANY_INCLUDING_NL (.|{NL})
+       }
+     else
+       return tok;
+   }
+ 
+ "{" {
+     curr_lexer->lexer_debug ("{");
+ 
+-    curr_lexer->nesting_level.brace ();
+-
+-    curr_lexer->looking_at_object_index.push_front
+-      (curr_lexer->looking_for_object_index);
+-
+-    curr_lexer->current_input_column += yyleng;
+-    curr_lexer->looking_for_object_index = false;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    curr_lexer->decrement_promptflag ();
+-
+-    curr_lexer->braceflag++;
+-
+-    curr_lexer->push_start_state (MATRIX_START);
+-
+-    return curr_lexer->count_token ('{');
++    bool unput_comma = false;
++
++    if (curr_lexer->whitespace_is_significant ()
++        && curr_lexer->space_follows_previous_token ())
++      {
++        int tok = curr_lexer->previous_token_value ();
++
++        if (! (tok == ';' || tok == ',' || tok == '[' || tok == '{'
++               || curr_lexer->previous_token_is_binop ()))
++          unput_comma = true;
++      }
++
++    if (unput_comma)
++      {
++        yyless (0);
++        curr_lexer->xunput (',');
++      }
++    else
++      {
++        curr_lexer->nesting_level.brace ();
++
++        curr_lexer->looking_at_object_index.push_front
++          (curr_lexer->looking_for_object_index);
++
++        curr_lexer->current_input_column += yyleng;
++        curr_lexer->looking_for_object_index = false;
++        curr_lexer->at_beginning_of_statement = false;
++
++        curr_lexer->decrement_promptflag ();
++
++        curr_lexer->braceflag++;
++
++        curr_lexer->push_start_state (MATRIX_START);
++
++        return curr_lexer->count_token ('{');
++      }
+   }
+ 
+ "}" {
+     curr_lexer->lexer_debug ("}");
+ 
+     curr_lexer->looking_at_object_index.pop_front ();
+ 
+     curr_lexer->looking_for_object_index = true;
+@@ -1897,21 +2038,22 @@ octave_lexer::is_keyword_token (const st
+                              fcn_file_full_name.c_str ());
+           else
+             warning_with_id ("Octave:deprecated-keyword",
+                              "the 'static' keyword is obsolete and will be removed from a future version of Octave; please use 'persistent' instead; near line %d",
+                              input_line_number);
+           // fall through ...
+ 
+         case persistent_kw:
++        case global_kw:
++          looking_at_decl_list = true;
+           break;
+ 
+         case case_kw:
+         case elseif_kw:
+-        case global_kw:
+         case until_kw:
+           break;
+ 
+         case end_kw:
+           if (inside_any_object_index ()
+               || (! reading_classdef_file
+                   && (defining_func
+                       && ! (looking_at_return_list
+@@ -3254,26 +3396,74 @@ octave_lexer::display_start_state (void)
+       break;
+     }
+ }
+ 
+ int
+ octave_lexer::handle_op (const char *pattern, int tok, bool convert,
+                          bool bos, bool qit)
+ {
++  lexer_debug (pattern);
++
+   return handle_op_internal (pattern, tok, convert, bos, qit, true);
+ }
+ 
+ int
+ octave_lexer::handle_incompatible_op (const char *pattern, int tok,
+                                       bool convert, bool bos, bool qit)
+ {
++  lexer_debug (pattern);
++
+   return handle_op_internal (pattern, tok, convert, bos, qit, false);
+ }
+ 
++bool
++octave_lexer::maybe_unput_comma_before_unary_op (int tok)
++{
++  int prev_tok = previous_token_value ();
++
++  bool unput_comma = false;
++
++  if (whitespace_is_significant () && space_follows_previous_token ())
++    {
++      int c = text_yyinput ();
++      xunput (c);
++
++      bool space_after = (c == ' ' || c == '\t');
++
++      if (! (prev_tok == ';' || prev_tok == ','
++             || prev_tok == '[' || prev_tok == '{'
++             || previous_token_is_binop ()
++             || ((tok == '+' || tok == '-') && space_after)))
++        unput_comma = true;
++    }
++
++  return unput_comma;
++}
++
++int
++octave_lexer::handle_unary_op (const char *pattern, int tok, bool convert,
++                               bool bos, bool qit)
++{
++  lexer_debug (pattern);
++
++  return maybe_unput_comma_before_unary_op (tok)
++    ? -1 : handle_op_internal (pattern, tok, convert, bos, qit, true);
++}
++
++int
++octave_lexer::handle_incompatible_unary_op (const char *pattern, int tok,
++                                            bool convert, bool bos, bool qit)
++{
++  lexer_debug (pattern);
++
++  return maybe_unput_comma_before_unary_op (tok)
++    ? -1 : handle_op_internal (pattern, tok, convert, bos, qit, false);
++}
++
+ int
+ octave_lexer::handle_assign_op (const char *pattern, int tok)
+ {
+   lexer_debug (pattern);
+ 
+   return (previous_token_value_is (']') && looking_at_matrix_or_assign_lhs)
+     ? -1 : handle_op_internal (pattern, tok, false, false, false, true);
+ }
+@@ -3286,18 +3476,16 @@ octave_lexer::handle_incompatible_assign
+   return (previous_token_value_is (']') && looking_at_matrix_or_assign_lhs)
+     ? -1 : handle_op_internal (pattern, tok, false, false, false, false);
+ }
+ 
+ int
+ octave_lexer::handle_op_internal (const char *pattern, int tok, bool convert,
+                                   bool bos, bool qit, bool compat)
+ {
+-  lexer_debug (pattern);
+-
+   if (! compat)
+     gripe_matlab_incompatible_operator (flex_yytext ());
+ 
+   push_token (new token (tok, input_line_number, current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+   looking_for_object_index = false;
+   at_beginning_of_statement = bos;
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -746,28 +746,24 @@ command         : declaration
+                 | classdef
+                   { $$ = $1; }
+                 ;
+ 
+ // =====================
+ // Declaration statemnts
+ // =====================
+ 
+-parsing_decl_list
+-                : // empty
+-                  { curr_lexer->looking_at_decl_list = true; }
+-
+-declaration     : GLOBAL parsing_decl_list decl1
++declaration     : GLOBAL decl1
+                   {
+-                    $$ = curr_parser.make_decl_command (GLOBAL, $1, $3);
++                    $$ = curr_parser.make_decl_command (GLOBAL, $1, $2);
+                     curr_lexer->looking_at_decl_list = false;
+                   }
+-                | PERSISTENT parsing_decl_list decl1
++                | PERSISTENT decl1
+                   {
+-                    $$ = curr_parser.make_decl_command (PERSISTENT, $1, $3);
++                    $$ = curr_parser.make_decl_command (PERSISTENT, $1, $2);
+                     curr_lexer->looking_at_decl_list = false;
+                   }
+                 ;
+ 
+ decl1           : decl2
+                   { $$ = new tree_decl_init_list ($1); }
+                 | decl1 decl2
+                   {
+diff --git a/test/fntests.m b/test/fntests.m
+--- a/test/fntests.m
++++ b/test/fntests.m
+@@ -20,16 +20,18 @@ clear all;
+ 
+ global files_with_no_tests = {};
+ global files_with_tests = {};
+ global topsrcdir;
+ global topbuilddir;
+ 
+ currdir = canonicalize_file_name (".");
+ 
++debug_on_error (true);
++
+ if (nargin == 1)
+   xdir = argv (){1};
+ else
+   xdir = ".";
+ endif
+ 
+ srcdir = canonicalize_file_name (xdir);
+ topsrcdir = canonicalize_file_name (fullfile (xdir, ".."));

@@ -1,0 +1,227 @@
+# HG changeset patch
+# User Ken Marek <gm.kmarek@gmail.com>
+# Date 1427306694 18000
+#      Wed Mar 25 13:04:54 2015 -0500
+# Node ID 34cc6edf204148d27e5df11c6cc1d6f091253b0d
+# Parent  73512571d85af59900b43f063b9e42bed2e4a668
+sqp.m: Eliminate redundant objective function calls (patch #8073).
+Reduces calls to objective function by ~50% without change in functionality.
+
+* sqp.m: New variable have_grd to indicate whether a user-supplied gradient
+function was given.  When using the built-in numerical gradient, call gradient function
+with an extra input containing the value of the objective function evaluated at
+x (which is already known).
+* sqp.m (fdgrd): Change prototype to accept additional input y0 (objective
+function evaluated at x).  Delete calculation of y0 within function.
+* sqp.m (fd_ob_grd): Change prototype to accept additional input y0 (objective
+function evaluated at x).
+
+diff --git a/scripts/optimization/sqp.m b/scripts/optimization/sqp.m
+--- a/scripts/optimization/sqp.m
++++ b/scripts/optimization/sqp.m
+@@ -197,36 +197,39 @@ function [x, obj, info, iter, nf, lambda
+ 
+   if (! isvector (x0))
+     error ("sqp: X0 must be a vector");
+   endif
+   if (rows (x0) == 1)
+     x0 = x0';
+   endif
+ 
++  have_grd = 0;
+   have_hess = 0;
+   if (iscell (objf))
+     switch (numel (objf))
+       case 1
+         obj_fun = objf{1};
+-        obj_grd = @(x) fd_obj_grd (x, obj_fun);
++        obj_grd = @(x, obj) fd_obj_grd (x, obj, obj_fun);
+       case 2
+         obj_fun = objf{1};
+         obj_grd = objf{2};
++        have_grd = 1;
+       case 3
+         obj_fun = objf{1};
+         obj_grd = objf{2};
+         obj_hess = objf{3};
++        have_grd = 1;
+         have_hess = 1;
+       otherwise
+         error ("sqp: invalid objective function specification");
+     endswitch
+   else
+     obj_fun = objf;   # No cell array, only obj_fun set
+-    obj_grd = @(x) fd_obj_grd (x, obj_fun);
++    obj_grd = @(x, obj) fd_obj_grd (x, obj, obj_fun);
+   endif
+ 
+   ce_fun = @empty_cf;
+   ce_grd = @empty_jac;
+   if (nargin > 2)
+     if (iscell (cef))
+       switch (numel (cef))
+         case 1
+@@ -346,17 +349,21 @@ function [x, obj, info, iter, nf, lambda
+   ## ce_fun    -- equality constraint functions
+   ## ci_fun    -- inequality constraint functions
+   ## A == [grad_{x_1} cx_fun, grad_{x_2} cx_fun, ..., grad_{x_n} cx_fun]^T
+   x = x0;
+ 
+   obj = feval (obj_fun, x0);
+   globals.nfun = 1;
+ 
+-  c = feval (obj_grd, x0);
++  if (have_grd)
++    c = feval (obj_grd, x0);
++  else
++    c = feval (obj_grd, x0, obj);
++  endif
+ 
+   ## Choose an initial NxN symmetric positive definite Hessian approximation B.
+   n = length (x0);
+   if (have_hess)
+     B = feval (obj_hess, x0);
+   else
+     B = eye (n, n);
+   endif
+@@ -428,20 +435,32 @@ function [x, obj, info, iter, nf, lambda
+         warning (id, "sqp: QP subproblem is infeasible");
+         lambda = old_lambda;  # The return value was size 0x0 in this case.
+     endswitch
+ 
+     ## Choose mu such that p is a descent direction for the chosen
+     ## merit function phi.
+     [x_new, alpha, obj_new, globals] = ...
+         linesearch_L1 (x, p, obj_fun, obj_grd, ce_fun, ci_fun, lambda, ...
+-                       obj, globals);
++                       obj, c, globals);
++    
++    delx = x_new - x;
++
++    ## Check if step size has become too small (indicates lack of progress).
++    if (norm (delx) < tol * norm (x))
++      info = 104;
++      break;
++    endif
+ 
+     ## Evaluate objective function, constraints, and gradients at x_new.
+-    c_new = feval (obj_grd, x_new);
++    if (have_grd)
++      c_new = feval (obj_grd, x_new);
++    else
++      c_new = feval (obj_grd, x_new, obj_new);
++    endif
+ 
+     ce_new = feval (ce_fun, x_new);
+     F_new = feval (ce_grd, x_new);
+ 
+     ci_new = feval (ci_fun, x_new);
+     C_new = feval (ci_grd, x_new);
+ 
+     A_new = [F_new; C_new];
+@@ -453,24 +472,16 @@ function [x, obj, info, iter, nf, lambda
+ 
+     y = c_new - c;
+ 
+     if (! isempty (A))
+       t = ((A_new - A)'*lambda);
+       y -= t;
+     endif
+ 
+-    delx = x_new - x;
+-
+-    ## Check if step size has become too small (indicates lack of progress).
+-    if (norm (delx) < tol * norm (x))
+-      info = 104;
+-      break;
+-    endif
+-
+     if (have_hess)
+ 
+       B = feval (obj_hess, x);
+ 
+     else
+       ## Update B using a quasi-Newton formula.
+       delxt = delx';
+ 
+@@ -551,17 +562,17 @@ function [merit, obj, globals] = phi_L1 
+   if (! isempty (t))
+     merit += t;
+   endif
+ 
+ endfunction
+ 
+ 
+ function [x_new, alpha, obj, globals] = ...
+-   linesearch_L1 (x, p, obj_fun, obj_grd, ce_fun, ci_fun, lambda, obj, globals)
++   linesearch_L1 (x, p, obj_fun, obj_grd, ce_fun, ci_fun, lambda, obj, c, globals)
+ 
+   ## Choose parameters
+   ##
+   ## eta in the range (0, 0.5)
+   ## tau in the range (0, 1)
+ 
+   eta = 0.25;
+   tau = 0.5;
+@@ -571,17 +582,16 @@ function [x_new, alpha, obj, globals] = 
+   if (isempty (lambda))
+     mu = 1 / delta_bar;
+   else
+     mu = 1 / (norm (lambda, Inf) + delta_bar);
+   endif
+ 
+   alpha = 1;
+ 
+-  c = feval (obj_grd, x);
+   ce = feval (ce_fun, x);
+ 
+   [phi_x_mu, obj, globals] = phi_L1 (obj, obj_fun, ce_fun, ci_fun, x, ...
+                                      mu, globals);
+ 
+   D_phi_x_mu = c' * p;
+   d = feval (ci_fun, x);
+   ## only those elements of d corresponding
+@@ -606,20 +616,19 @@ function [x_new, alpha, obj, globals] = 
+     endif
+   endwhile
+ 
+   x_new = x + alpha * p;
+ 
+ endfunction
+ 
+ 
+-function grd = fdgrd (f, x)
++function grd = fdgrd (f, x, y0)
+ 
+   if (! isempty (f))
+-    y0 = feval (f, x);
+     nx = length (x);
+     grd = zeros (nx, 1);
+     deltax = sqrt (eps);
+     for i = 1:nx
+       t = x(i);
+       x(i) += deltax;
+       grd(i) = (feval (f, x) - y0) / deltax;
+       x(i) = t;
+@@ -648,19 +657,19 @@ function jac = fdjac (f, x)
+     endfor
+   else
+     jac = zeros  (0, nx);
+   endif
+ 
+ endfunction
+ 
+ 
+-function grd = fd_obj_grd (x, obj_fun)
++function grd = fd_obj_grd (x, obj, obj_fun)
+ 
+-  grd = fdgrd (obj_fun, x);
++  grd = fdgrd (obj_fun, x, obj);
+ 
+ endfunction
+ 
+ 
+ function res = empty_cf (x)
+ 
+   res = zeros (0, 1);
+ 

@@ -1,0 +1,374 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1366736236 14400
+#      Tue Apr 23 12:57:16 2013 -0400
+# Node ID 04fb96f4bea1900a9388e585b69a36afc920ce29
+# Parent  03a28487fa9d9cbcab5926b9a380f3fdaf9c3ad0
+allow double-click in file browser to load data files
+
+* files-dock-widget.cc (files_dock_widget::display_directory): If file
+looks like Octave data file, load it instead of opening with editor.
+* ls-mat-ascii.h, ls-mat-ascii.cc (get_lines_and_columns): New option
+to supress error messages.  New option to check for numeric values.
+(looks_like_mat_ascii_file): New function.
+* load-save.h load-save.cc (is_octave_data_file): New function.
+(get_file_format): Don't return LS_MAT_ASCII unless the file really
+looks like it is a numeric data file.
+
+diff --git a/libgui/src/files-dock-widget.cc b/libgui/src/files-dock-widget.cc
+--- a/libgui/src/files-dock-widget.cc
++++ b/libgui/src/files-dock-widget.cc
+@@ -36,16 +36,18 @@ along with Octave; see the file COPYING.
+ #include <QHeaderView>
+ #include <QLineEdit>
+ #include <QSizePolicy>
+ #include <QMenu>
+ #include <QInputDialog>
+ #include <QMessageBox>
+ #include <QToolButton>
+ 
++#include "load-save.h"
++
+ files_dock_widget::files_dock_widget (QWidget *p)
+   : octave_dock_widget (p)
+ {
+   setObjectName ("FilesDockWidget");
+   setWindowIcon (QIcon(":/actions/icons/logo.png"));
+   setWindowTitle (tr ("File Browser"));
+   setToolTip (tr ("Browse your files."));
+ 
+@@ -275,18 +277,25 @@ files_dock_widget::display_directory (co
+           {
+              _current_directory->removeItem(index);
+           }
+           _current_directory->insertItem(0, fileInfo.absoluteFilePath ());
+           _current_directory->setCurrentIndex(0);
+         }
+       else
+         {
+-          if (QFile::exists (fileInfo.absoluteFilePath ()))
+-            emit open_file (fileInfo.absoluteFilePath ());
++          QString abs_fname = fileInfo.absoluteFilePath ();
++
++          if (QFile::exists (abs_fname))
++            {
++              if (is_octave_data_file (abs_fname.toStdString ()))
++                emit load_file_signal (abs_fname);
++              else
++                emit open_file (fileInfo.absoluteFilePath ());
++            }
+         }
+     }
+ }
+ 
+ void 
+ files_dock_widget::contextmenu_requested (const QPoint& mpos)
+ {
+ 
+diff --git a/libinterp/interp-core/ls-mat-ascii.cc b/libinterp/interp-core/ls-mat-ascii.cc
+--- a/libinterp/interp-core/ls-mat-ascii.cc
++++ b/libinterp/interp-core/ls-mat-ascii.cc
+@@ -102,17 +102,20 @@ get_mat_data_input_line (std::istream& i
+         }
+     }
+   while (! (have_data || is.eof ()));
+ 
+   return retval;
+ }
+ 
+ static void
+-get_lines_and_columns (std::istream& is, const std::string& filename, octave_idx_type& nr, octave_idx_type& nc)
++get_lines_and_columns (std::istream& is, 
++                       octave_idx_type& nr, octave_idx_type& nc,
++                       const std::string& filename = std::string (),
++                       bool quiet = false, bool check_numeric = false)
+ {
+   std::streampos pos = is.tellg ();
+ 
+   int file_line_number = 0;
+ 
+   nr = 0;
+   nc = 0;
+ 
+@@ -142,16 +145,35 @@ get_lines_and_columns (std::istream& is,
+       while (beg != std::string::npos)
+         {
+           tmp_nc++;
+ 
+           size_t end = buf.find_first_of (", \t", beg);
+ 
+           if (end != std::string::npos)
+             {
++              if (check_numeric)
++                {
++                  std::istringstream tmp_stream (buf.substr (beg, end-beg));
++
++                  octave_read_double (tmp_stream);
++
++                  if (tmp_stream.fail ())
++                    {
++                      if (! quiet)
++                        error ("load: %s: non-numeric data found near line %d",
++                               filename.c_str (), file_line_number);
++
++                      nr = 0;
++                      nc = 0;
++
++                      goto done;
++                    }
++                }
++
+               beg = buf.find_first_not_of (", \t", end);
+ 
+               if (beg == std::string::npos || (buf[beg] == '\r' &&
+                                   beg == buf.length () - 1))
+                 {
+                   // We had a line with trailing spaces and
+                   // ending with a CRLF, so this should look like EOL,
+                   // not a new colum.
+@@ -167,24 +189,34 @@ get_lines_and_columns (std::istream& is,
+           if (nc == 0)
+             {
+               nc = tmp_nc;
+               nr++;
+             }
+           else if (nc == tmp_nc)
+             nr++;
+           else
+-            error ("load: %s: inconsistent number of columns near line %d",
+-                   filename.c_str (), file_line_number);
++            {
++              if (! quiet)
++                error ("load: %s: inconsistent number of columns near line %d",
++                       filename.c_str (), file_line_number);
++
++              nr = 0;
++              nc = 0;
++
++              goto done;
++            }
+         }
+     }
+ 
+-  if (nr == 0 || nc == 0)
++  if (! quiet && (nr == 0 || nc == 0))
+     error ("load: file '%s' seems to be empty!", filename.c_str ());
+ 
++ done:
++
+   is.clear ();
+   is.seekg (pos);
+ }
+ 
+ // Extract a matrix from a file of numbers only.
+ //
+ // Comments are not allowed.  The file should only have numeric values.
+ //
+@@ -228,17 +260,17 @@ read_mat_ascii_data (std::istream& is, c
+ 
+   if (valid_identifier (varname))
+     {
+       octave_idx_type nr = 0;
+       octave_idx_type nc = 0;
+ 
+       int total_count = 0;
+ 
+-      get_lines_and_columns (is, filename, nr, nc);
++      get_lines_and_columns (is, nr, nc, filename);
+ 
+       octave_quit ();
+ 
+       if (! error_state && nr > 0 && nc > 0)
+         {
+           Matrix tmp (nr, nc);
+ 
+           if (nr < 1 || nc < 1)
+@@ -371,8 +403,28 @@ save_mat_ascii_data (std::ostream& os, c
+ 
+       os.flags (oflags);
+ 
+       os.precision (old_precision);
+     }
+ 
+   return (os && success);
+ }
++
++bool
++looks_like_mat_ascii_file (const std::string& filename)
++{
++  bool retval = false;
++
++  std::ifstream is (filename.c_str ());
++
++  if (is)
++    {
++      int nr = 0;
++      int nc = 0;
++
++      get_lines_and_columns (is, nr, nc, filename, true, true);
++
++      retval = (nr != 0 && nc != 0);
++    }
++
++  return retval;
++}
+diff --git a/libinterp/interp-core/ls-mat-ascii.h b/libinterp/interp-core/ls-mat-ascii.h
+--- a/libinterp/interp-core/ls-mat-ascii.h
++++ b/libinterp/interp-core/ls-mat-ascii.h
+@@ -26,9 +26,11 @@ along with Octave; see the file COPYING.
+ extern std::string
+ read_mat_ascii_data (std::istream& is, const std::string& filename,
+                      octave_value& tc);
+ 
+ extern bool
+ save_mat_ascii_data (std::ostream& os, const octave_value& val_arg,
+                      int precision, bool tabs = false);
+ 
++extern bool looks_like_mat_ascii_file (const std::string& filename);
++
+ #endif
+diff --git a/libinterp/interpfcn/load-save.cc b/libinterp/interpfcn/load-save.cc
+--- a/libinterp/interpfcn/load-save.cc
++++ b/libinterp/interpfcn/load-save.cc
+@@ -237,17 +237,18 @@ get_file_format (std::istream& file, con
+     retval = LS_BINARY;
+   else
+     {
+       file.clear ();
+       file.seekg (0, std::ios::beg);
+ 
+       int32_t mopt, nr, nc, imag, len;
+ 
+-      int err = read_mat_file_header (file, swap, mopt, nr, nc, imag, len, 1);
++      int err = read_mat_file_header (file, swap, mopt, nr, nc, imag, len,
++                                      true);
+ 
+       if (! err)
+         retval = LS_MAT_BINARY;
+       else
+         {
+           file.clear ();
+           file.seekg (0, std::ios::beg);
+ 
+@@ -272,17 +273,17 @@ get_file_format (std::istream& file, con
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ static load_save_format
+ get_file_format (const std::string& fname, const std::string& orig_fname,
+-                 bool &use_zlib)
++                 bool &use_zlib, bool quiet = false)
+ {
+   load_save_format retval = LS_UNKNOWN;
+ 
+ #ifdef HAVE_HDF5
+   // check this before we open the file
+   if (H5Fis_hdf5 (fname.c_str ()) > 0)
+     return LS_HDF5;
+ #endif /* HAVE_HDF5 */
+@@ -304,29 +305,26 @@ get_file_format (const std::string& fnam
+           if (gzfile)
+             {
+               retval = get_file_format (gzfile, orig_fname);
+               gzfile.close ();
+             }
+         }
+ #endif
+ 
+-      if (retval == LS_UNKNOWN)
+-        {
+-          // Try reading the file as numbers only, determining the
+-          // number of rows and columns from the data.  We don't
+-          // even bother to check to see if the first item in the
+-          // file is a number, so that get_complete_line() can
+-          // skip any comments that might appear at the top of the
+-          // file.
++      // FIXME -- looks_like_mat_ascii_file does not check to see
++      // whether the file contains numbers.  It just skips comments and
++      // checks for the same number of words on each line.  We may need
++      // a better check here.  The best way to do that might be just
++      // to try to read the file and see if it works.
+ 
+-          retval = LS_MAT_ASCII;
+-        }
++      if (retval == LS_UNKNOWN && looks_like_mat_ascii_file (fname))
++        retval = LS_MAT_ASCII;
+     }
+-  else
++  else if (! quiet)
+     gripe_file_open ("load", orig_fname);
+ 
+   return retval;
+ }
+ 
+ octave_value
+ do_load (std::istream& stream, const std::string& orig_fname,
+          load_save_format format, oct_mach_info::float_format flt_fmt,
+@@ -532,16 +530,22 @@ find_file_to_load (const std::string& na
+ 
+           error ("load: unable to find file %s", orig_name.c_str ());
+         }
+     }
+ 
+   return fname;
+ }
+ 
++bool
++is_octave_data_file (const std::string& fname)
++{
++  bool use_zlib = false;
++  return get_file_format (fname, fname, use_zlib, true) != LS_UNKNOWN;
++}
+ 
+ DEFUN (load, args, nargout,
+   "-*- texinfo -*-\n\
+ @deftypefn  {Command} {} load file\n\
+ @deftypefnx {Command} {} load options file\n\
+ @deftypefnx {Command} {} load options file v1 v2 @dots{}\n\
+ @deftypefnx {Command} {S =} load (\"options\", \"file\", \"v1\", \"v2\", @dots{})\n\
+ @deftypefnx {Command} {} load file options\n\
+diff --git a/libinterp/interpfcn/load-save.h b/libinterp/interpfcn/load-save.h
+--- a/libinterp/interpfcn/load-save.h
++++ b/libinterp/interpfcn/load-save.h
+@@ -21,16 +21,19 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if !defined (octave_load_save_h)
+ #define octave_load_save_h 1
+ 
+ #include <iosfwd>
+ #include <string>
+ 
++#include "mach-info.h"
++#include "symtab.h"
++
+ class octave_value;
+ 
+ // FIXME: maybe MAT5 and MAT7 should be options to MAT_BINARY.
+ // Similarly, save_as_floats may be an option for LS_BINARY, LS_HDF5 etc.
+ enum load_save_format_type
+   {
+     LS_ASCII,
+     LS_BINARY,
+@@ -75,16 +78,18 @@ read_binary_file_header (std::istream& i
+                          bool quiet = false);
+ 
+ extern octave_value
+ do_load (std::istream& stream, const std::string& orig_fname,
+          load_save_format format, oct_mach_info::float_format flt_fmt,
+          bool list_only, bool swap, bool verbose,
+          const string_vector& argv, int argv_idx, int argc, int nargout);
+ 
++extern bool is_octave_data_file (const std::string& file);
++
+ extern void
+ do_save (std::ostream& os, const symbol_table::symbol_record& sr,
+          load_save_format fmt, bool save_as_floats);
+ 
+ extern void
+ write_header (std::ostream& os, load_save_format format);
+ 
+ #endif

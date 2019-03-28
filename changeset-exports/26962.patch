@@ -1,0 +1,401 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1553368827 18000
+#      Sat Mar 23 14:20:27 2019 -0500
+# Node ID b033cf0210485c3174c3bc3d5af83e69cb787a01
+# Parent  1a79f289ca33386b0355ab2881164c50675a884b
+allow @obj.meth to work (bug #51709)
+
+* ov-fcn-handle.cc (octave_fcn_handle::call): Allow obj.meth to work
+for both static and ordinary classdef methods.
+(octave_fcn_handle::m_obj): New data member.
+(octave_fcn_handle::octave_fcn_handle): Also store m_obj if the first
+element of a fully-qualified name is defined as an object when
+creating the function handle object.
+
+* test/fcn-handle/bug51709_c.m, test/fcn-handle/object-method.tst:
+New files.
+* test/fcn-handle/module.mk: Update.
+
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -78,19 +78,52 @@ along with Octave; see the file COPYING.
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_fcn_handle,
+                                      "function handle",
+                                      "function_handle");
+ 
+ const std::string octave_fcn_handle::anonymous ("@<anonymous>");
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave::symbol_scope& scope,
++                                      const std::string& n)
++  : m_fcn (), m_obj (), m_name (n), m_scope (scope), m_is_nested (false),
++    m_closure_frames (nullptr)
++{
++  if (! m_name.empty () && m_name[0] == '@')
++    m_name = m_name.substr (1);
++
++  size_t pos = m_name.find ('.');
++
++  if (pos != std::string::npos)
++    {
++      // If we are looking at
++      //
++      //   obj . meth
++      //
++      // Store the object so that calling METH for OBJ will work even if
++      // it is done outside of the scope whre OBJ was initially defined
++      // or if OBJ is cleared before the method call is made through the
++      // function handle.
++
++      std::string obj_name = m_name.substr (0, pos);
++
++      octave::interpreter& interp
++        = octave::__get_interpreter__ ("octave_fcn_handle::octave_fcn_handle");
++
++      octave_value val = interp.varval (obj_name);
++
++      if (val.is_classdef_object ())
++        m_obj = val;
++    }
++}
++
++octave_fcn_handle::octave_fcn_handle (const octave::symbol_scope& scope,
+                                       const octave_value& f,
+                                       const std::string& n)
+-  : m_fcn (f), m_name (n), m_scope (scope), m_is_nested (false),
++  : m_fcn (f), m_obj (), m_name (n), m_scope (scope), m_is_nested (false),
+     m_closure_frames (nullptr)
+ {
+   octave_user_function *uf = m_fcn.user_function_value (true);
+ 
+   if (uf && m_name != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+@@ -99,17 +132,17 @@ octave_fcn_handle::octave_fcn_handle (co
+     }
+ 
+   if (uf && uf->is_nested_function () && ! uf->is_subfunction ())
+     m_is_nested = true;
+ }
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave_value& f,
+                                       const std::string& n)
+-  : m_fcn (f), m_name (n), m_scope (), m_is_nested (false),
++  : m_fcn (f), m_obj (), m_name (n), m_scope (), m_is_nested (false),
+     m_closure_frames (nullptr)
+ {
+   octave_user_function *uf = m_fcn.user_function_value (true);
+ 
+   if (uf && m_name != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+@@ -193,32 +226,35 @@ octave_fcn_handle::call (int nargout, co
+   octave_value fcn_to_call = m_fcn;
+ 
+   if (! fcn_to_call.is_defined ())
+     {
+       // The following code is similar to part of
+       // tree_evaluator::visit_index_expression but simpler because it
+       // handles a more restricted case.
+ 
+-      octave::symbol_table& symtab
+-        = octave::__get_symbol_table__ ("octave_fcn_handle::call");
++      octave::interpreter& interp
++        = octave::__get_interpreter__ ("octave_fcn_handle::call");
++
++      octave::symbol_table& symtab = interp.get_symbol_table ();
+ 
+       size_t pos = m_name.find ('.');
+ 
+       if (pos != std::string::npos)
+         {
+           // We can have one of
+           //
+           //   pkg-list . fcn  (args)
+           //   pkg-list . cls . meth (args)
+           //   cls . meth  (args)
+ 
+-          // Evaluate package elements until we find a function or a
+-          // classdef_meta object that is not a package.
+-          // subsref call.
++          // Evaluate package elements until we find a function,
++          // classdef object, or classdef_meta object that is not a
++          // package.  An object may only appear as the first element,
++          // then it must be followed directly by a function name.
+ 
+           size_t beg = 0;
+           size_t end = pos;
+ 
+           std::vector<std::string> idx_elts;
+ 
+           while (true)
+             {
+@@ -227,28 +263,65 @@ octave_fcn_handle::call (int nargout, co
+               idx_elts.push_back (m_name.substr (beg, end-beg));
+ 
+               if (end == std::string::npos)
+                 break;
+ 
+               beg = end+1;
+             }
+ 
+-          octave_value partial_expr_val
+-            = symtab.find_function (idx_elts[0], ovl (), m_scope);
++          size_t n_elts = idx_elts.size ();
++
++          bool have_object = false;
++          octave_value partial_expr_val;
++
++          if (m_obj.is_defined ())
++            {
++              // The first element was already defined elsewhere,
++              // possibly in the scope where the function handle was
++              // created.
++
++              partial_expr_val = m_obj;
++
++              if (m_obj.is_classdef_object ())
++                have_object = true;
++              else
++                err_invalid_fcn_handle (m_name);
++            }
++          else
++            {
++              // Lazy evaluation.  The first element was not known to be
++              // defined as an object in the scope where the handle was
++              // created.  See if there is a definition in the current
++              // scope.
++
++              partial_expr_val = interp.varval (idx_elts[0]);
++            }
++
++          if (partial_expr_val.is_defined ())
++            {
++              if (! partial_expr_val.is_classdef_object () || n_elts != 2)
++                err_invalid_fcn_handle (m_name);
++
++              have_object = true;
++            }
++          else
++            partial_expr_val
++              = symtab.find_function (idx_elts[0], ovl (), m_scope);
+ 
+           std::string type;
+           std::list<octave_value_list> arg_list;
+ 
+-          size_t n_elts = idx_elts.size ();
+-
+           for (size_t i = 1; i < n_elts; i++)
+             {
+               if (partial_expr_val.is_package ())
+                 {
++                  if (have_object)
++                    err_invalid_fcn_handle (m_name);
++
+                   type = ".";
+                   arg_list.push_back (ovl (idx_elts[i]));
+ 
+                   try
+                     {
+                       // Silently ignore extra output values.
+ 
+                       octave_value_list tmp_list
+@@ -262,23 +335,23 @@ octave_fcn_handle::call (int nargout, co
+ 
+                       arg_list.clear ();
+                     }
+                   catch (octave::index_exception&)
+                     {
+                       err_invalid_fcn_handle (m_name);
+                     }
+                 }
+-              else if (partial_expr_val.is_classdef_meta ())
++              else if (have_object || partial_expr_val.is_classdef_meta ())
+                 {
+-                  // Class name must be the next to the last element (it
+-                  // was the previous one, so if this is the final
+-                  // element, it should be as static classdef method,
+-                  // but we'll let the classdef_meta subsref function
+-                  // sort that out.
++                  // Object or class name must be the next to the last
++                  // element (it was the previous one, so if this is the
++                  // final element, it should be a classdef method,
++                  // but we'll let the classdef or classdef_meta subsref
++                  // function sort that out.
+ 
+                   if (i != n_elts-1)
+                     err_invalid_fcn_handle (m_name);
+ 
+                   type = ".(";
+                   arg_list.push_back (ovl (idx_elts[i]));
+                   arg_list.push_back (args);
+ 
+diff --git a/libinterp/octave-value/ov-fcn-handle.h b/libinterp/octave-value/ov-fcn-handle.h
+--- a/libinterp/octave-value/ov-fcn-handle.h
++++ b/libinterp/octave-value/ov-fcn-handle.h
+@@ -52,27 +52,21 @@ private:
+ 
+   typedef std::map<std::string, octave_value> str_ov_map;
+ 
+ public:
+ 
+   static const std::string anonymous;
+ 
+   octave_fcn_handle (void)
+-    : m_fcn (), m_name (), m_scope (), m_is_nested (false),
++    : m_fcn (), m_obj (), m_name (), m_scope (), m_is_nested (false),
+       m_closure_frames (nullptr)
+   { }
+ 
+-  octave_fcn_handle (const octave::symbol_scope& scope, const std::string& n)
+-    : m_fcn (), m_name (n), m_scope (scope), m_is_nested (false),
+-      m_closure_frames (nullptr)
+-  {
+-    if (! m_name.empty () && m_name[0] == '@')
+-      m_name = m_name.substr (1);
+-  }
++  octave_fcn_handle (const octave::symbol_scope& scope, const std::string& n);
+ 
+   octave_fcn_handle (const octave::symbol_scope& scope,
+                      const octave_value& f,
+                      const std::string& n = anonymous);
+ 
+   octave_fcn_handle (const octave_value& f,
+                      const std::string& n = anonymous);
+ 
+@@ -154,19 +148,23 @@ private:
+ 
+   DECLARE_OV_TYPEID_FUNCTIONS_AND_DATA
+ 
+ protected:
+ 
+   // The function we are handling (this should be valid for handles to
+   // anonymous functions and some other special cases).  Otherwise, we
+   // perform dynamic lookup based on the name of the function we are
+-  // handling and the scope where the funtion handle object was created.
++  // handling and the scope where the function handle object was created.
+   octave_value m_fcn;
+ 
++  // If defined, this is the classdef object corresponding to the
++  // classdef method we are handling.
++  octave_value m_obj;
++
+   // The function we would find without considering argument types.  We
+   // cache this value so that the function_value and user_function_value
+   // methods may continue to work.
+   octave_value m_generic_fcn;
+ 
+   // The name of the handle, not including the "@".
+   std::string m_name;
+ 
+diff --git a/test/fcn-handle/bug51709_c.m b/test/fcn-handle/bug51709_c.m
+new file mode 100644
+--- /dev/null
++++ b/test/fcn-handle/bug51709_c.m
+@@ -0,0 +1,12 @@
++classdef bug51709_c
++  methods
++    function out = meth (varargin)
++      out = {"meth", varargin};
++    endfunction
++  endmethods
++  methods (Static)
++    function out = smeth (varargin)
++      out = {"smeth", varargin};
++    endfunction
++  endmethods
++endclassdef
+diff --git a/test/fcn-handle/module.mk b/test/fcn-handle/module.mk
+--- a/test/fcn-handle/module.mk
++++ b/test/fcn-handle/module.mk
+@@ -6,14 +6,16 @@ fcn_handle_TEST_FILES = \
+   %reldir%/@fhdr_derived/fhdr_derived.m \
+   %reldir%/@fhdr_other/fhdr_other.m \
+   %reldir%/@fhdr_other/getsize_arrayfun.m \
+   %reldir%/@fhdr_other/getsize_cellfun.m \
+   %reldir%/@fhdr_other/getsize_loop.m \
+   %reldir%/@fhdr_parent/fhdr_parent.m \
+   %reldir%/@fhdr_parent/numel.m \
+   %reldir%/bug51709_a.m \
++  %reldir%/bug51709_c.m \
+   %reldir%/derived-resolution.tst \
+   %reldir%/f1.m \
++  %reldir%/object-method.tst \
+   %reldir%/package-function.tst \
+   %reldir%/static-method.tst
+ 
+ TEST_FILES += $(fcn_handle_TEST_FILES)
+diff --git a/test/fcn-handle/object-method.tst b/test/fcn-handle/object-method.tst
+new file mode 100644
+--- /dev/null
++++ b/test/fcn-handle/object-method.tst
+@@ -0,0 +1,65 @@
++## Copyright (C) 2019 John W. Eaton
++##
++## This file is part of Octave.
++##
++## Octave is free software: you can redistribute it and/or modify it
++## under the terms of the GNU General Public License as published by
++## the Free Software Foundation, either version 3 of the License, or
++## (at your option) any later version.
++##
++## Octave is distributed in the hope that it will be useful, but
++## WITHOUT ANY WARRANTY; without even the implied warranty of
++## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++## GNU General Public License for more details.
++##
++## You should have received a copy of the GNU General Public License
++## along with Octave; see the file COPYING.  If not, see
++## <https://www.gnu.org/licenses/>.
++
++%!function [fhm, fhsm] = foo ()
++%!  obj = bug51709_c ();
++%!  fhm = @obj.meth;
++%!  fhsm = @obj.smeth;
++%!endfunction
++
++%!test <51709>
++%! [fhm, fhsm] = foo ();
++%!
++%! out = fhm (42);
++%! assert (out{1}, "meth");
++%! tmp = out{2};
++%! assert (numel (tmp), 2);
++%! assert (isobject (tmp{1}));
++%! assert (tmp{2}, 42);
++
++%!test <51709>
++%! [fhm, fhsm] = foo ();
++%!
++%! out = fhsm (42);
++%! assert (out{1}, "smeth");
++%! tmp = out{2};
++%! assert (numel (tmp), 1);
++%! assert (tmp{1}, 42);
++
++%!test <51709>
++%! fhm = @obj.meth;
++%!
++%! obj = bug51709_c ();
++%!
++%! out = fhm (42);
++%! assert (out{1}, "meth");
++%! tmp = out{2};
++%! assert (numel (tmp), 2);
++%! assert (isobject (tmp{1}));
++%! assert (tmp{2}, 42);
++
++%!test <51709>
++%! fhsm = @obj.smeth;
++%!
++%! obj = bug51709_c ();
++%!
++%! out = fhsm (42);
++%! assert (out{1}, "smeth");
++%! tmp = out{2};
++%! assert (numel (tmp), 1);
++%! assert (tmp{1}, 42);

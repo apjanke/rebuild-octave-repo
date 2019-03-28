@@ -1,0 +1,158 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1518465166 28800
+#      Mon Feb 12 11:52:46 2018 -0800
+# Node ID 00dfa167c1fecc026fac0ddc9b04298262d02228
+# Parent  d85470c4f09c321db5bd11a4371637cff26d63cb
+Fix handling of NULL character in regular expressions for Matlab compatibility.
+
+* regexp.cc (Fregexp): Add BIST tests for null characters in single- and
+double-quoted patterns.  Add BIST tests for returning NULL values in
+matches, tokens, and named tokens.
+
+* lo-regexp.cc (regexp::compile_internal): Replace NULLs in pattern with
+escaped octal sequence '\000' so that c_str() conversion of std::string
+does not truncated pattern.
+* lo-regexp.cc (regexp::match): Use constructor
+std::string (const char* s, size_t n) with explicitly specified length
+so that embedded NULLs in character buffers do not result in a truncated
+length string.  Use for construction of match, tokens, and named_tokens.
+
+diff --git a/libinterp/corefcn/regexp.cc b/libinterp/corefcn/regexp.cc
+--- a/libinterp/corefcn/regexp.cc
++++ b/libinterp/corefcn/regexp.cc
+@@ -980,20 +980,46 @@ size) with successive @code{regexp} sear
+ %! assert (t{2}{1}, "Rogers");
+ %! assert (t{2}{2}, "James");
+ %! assert (size (nm), [1, 2]);
+ %! assert (nm(1).first, "John");
+ %! assert (nm(1).last, "Davis");
+ %! assert (nm(2).first, "James");
+ %! assert (nm(2).last, "Rogers");
+ 
++## Tests for nulls in strings properly matching
++%!test
++%! str = "A\0B\0\0C";
++%! ptn = '(\0+)';  # also test null in single-quote pattern
++%! M = regexp (str, ptn, "match");
++%! assert (size (M), [1, 2]);
++%! assert (double (M{1}), [0]);
++%! assert (double (M{2}), [0, 0]);
++
++%!test
++%! str = "A\0B\0\0C";
++%! ptn = "(\0+)";  # also test null in double-quote pattern
++%! T = regexp (str, ptn, "tokens");
++%! assert (size (T), [1, 2]);
++%! assert (double (T{1}{1}), [0]);
++%! assert (double (T{2}{1}), [0, 0]);
++
++%!test
++%! str = "A\0B\0\0C";
++%! ptn = '(?<namedtoken>\0+)';
++%! NT = regexp (str, ptn, "names");
++%! assert (size (NT), [1, 2]);
++%! assert (double (NT(1).namedtoken), [0]);
++%! assert (double (NT(2).namedtoken), [0, 0]);
++
+ ## Tests for named tokens
+ %!test
+ %! ## Parenthesis in named token (ie (int)) causes a problem
+-%! assert (regexp ('qwe int asd', ['(?<typestr>(int))'], 'names'), struct ('typestr', 'int'));
++%! assert (regexp ('qwe int asd', ['(?<typestr>(int))'], 'names'),
++%!         struct ('typestr', 'int'));
+ 
+ %!test <*35683>
+ %! ## Mix of named and unnamed tokens can cause segfault
+ %! str = "abcde";
+ %! ptn = '(?<T1>a)(\w+)(?<T2>d\w+)';
+ %! tokens = regexp (str, ptn, "names");
+ %! assert (isstruct (tokens) && numel (tokens) == 1);
+ %! assert (tokens.T1, "a");
+diff --git a/liboctave/util/lo-regexp.cc b/liboctave/util/lo-regexp.cc
+--- a/liboctave/util/lo-regexp.cc
++++ b/liboctave/util/lo-regexp.cc
+@@ -215,19 +215,24 @@ namespace octave
+             buf << pattern.substr (pos, new_pos - pos) << "(?";
+             pos = new_pos + 2;
+           }
+ 
+       }
+ 
+     buf << pattern.substr (pos);
+ 
++    // Replace NULLs with escape sequence because conversion function c_str() 
++    // will terminate string early at embedded NULLs.
++    std::string buf_str = buf.str ();
++    while ((pos = buf_str.find ('\0')) != std::string::npos)
++      buf_str.replace (pos, 1, "\\000");
++
+     const char *err;
+     int erroffset;
+-    std::string buf_str = buf.str ();
+ 
+     int pcre_options
+       = (  (options.case_insensitive () ? PCRE_CASELESS : 0)
+          | (options.dotexceptnewline () ? 0 : PCRE_DOTALL)
+          | (options.lineanchors () ? PCRE_MULTILINE : 0)
+          | (options.freespacing () ? PCRE_EXTENDED : 0));
+ 
+     data = pcre_compile (buf_str.c_str (), pcre_options,
+@@ -348,16 +353,19 @@ namespace octave
+             int status = pcre_get_substring_list (buffer.c_str (), ovector,
+                                                   matches, &listptr);
+ 
+             if (status == PCRE_ERROR_NOMEMORY)
+               (*current_liboctave_error_handler)
+                 ("%s: cannot allocate memory in pcre_get_substring_list",
+                  who.c_str ());
+ 
++            // Must use explicit length constructor as match can contain '\0'.
++            std::string match_string = std::string (*listptr, end - start + 1);
++
+             string_vector tokens (pos_match);
+             string_vector named_tokens (nnames);
+             int pos_offset = 0;
+             pos_match = 0;
+ 
+             for (int i = 1; i < matches; i++)
+               {
+                 if (ovector[2*i] >= 0 && ovector[2*i+1] > 0)
+@@ -370,32 +378,33 @@ namespace octave
+                             // FIXME: Should probably do this with a map()
+                             //        rather than a linear search.  However,
+                             //        the number of captured, named expressions
+                             //        is usually pretty small (< 4)
+                             for (int j = 0; j < namecount; j++)
+                               {
+                                 if (nidx[j] == i)
+                                   {
++                                    size_t len = ovector[2*i+1] - ovector[2*i];
+                                     named_tokens(named_idx(j)) =
+-                                      std::string (*(listptr+i-pos_offset));
++                                      std::string (*(listptr+i-pos_offset),
++                                                   len);
+                                     break;
+                                   }
+                               }
+                           }
+ 
+-                        tokens(pos_match++) = std::string (*(listptr+i));
++                        size_t len = ovector[2*i+1] - ovector[2*i];
++                        tokens(pos_match++) = std::string (*(listptr+i), len);
+                       }
+                     else
+                       pos_offset++;
+                   }
+               }
+ 
+-            std::string match_string = std::string (*listptr);
+-
+             pcre_free_substring_list (listptr);
+ 
+             regexp::match_element new_elem (named_tokens, tokens, match_string,
+                                             token_extents, start, end);
+             lst.push_back (new_elem);
+ 
+             if (ovector[1] <= ovector[0])
+               {

@@ -1,0 +1,813 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1551825009 0
+#      Tue Mar 05 22:30:09 2019 +0000
+# Node ID 8bd9fd99c12a7ecccd16bdcfec541e7aeb13a6dd
+# Parent  4ff25d9b1eec8ec7a16b8e4e1662cd95a41f85e3
+lazily evaluate fcn handles; fix overload resolution (bug #29447, bug #31821, bug #48802)
+
+* ov-fcn-handle.h, ov-fcn-handle.cc (octave_fcn_handle::has_overloads,
+octave_fcn_handle::builtin_overloads, octave_fcn_handle::overloads):
+Delete member variables and all uses.
+
+(octave_fcn_handle::set_overload, octave_fcn_handle::set_overload,
+octave_fcn_handle::builtin_type, octave_fcn_handle::is_overloaded):
+Delete.
+
+(octave_fcn_handle::m_scope): New member variable.  Store scop where
+handle is created along with function name to allow proper lookup and
+overload resolution.
+
+(octave_fcn_handle::m_generic_fcn): New member variable.
+(octave_fcn_handle::function_value, octave_fcn_handle::user_function_value):
+Store octave_value object containing discovered function in
+m_generic_fcn so we can safely return a pointer to the underlying
+function object.
+
+(make_fcn_handle, octave_fcn_handle::subsref): Greatly simplify.
+
+* pt-eval.cc (tree_evaluator::execute_user_function): Push closure
+context for any handle created inside a nested function or parent of a
+nested function.
+
+* cellfun.cc (Fcellfun): Eliminate special checks for "overloaded"
+function handles.
+
+* graphics.cc (gh_manager::do_execute_callback): If callback is a
+function handle, pass it directly to feval instead of extracting
+function value from it first.
+
+* cdef-class.cc (make_fcn_handle): Accept interpreter as argument.
+Change all uses.  Create octave_fcn_handle object with current scope.
+
+diff --git a/libinterp/corefcn/cellfun.cc b/libinterp/corefcn/cellfun.cc
+--- a/libinterp/corefcn/cellfun.cc
++++ b/libinterp/corefcn/cellfun.cc
+@@ -456,23 +456,29 @@ v = cellfun (@@det, a); # faster
+   get_mapper_fun_options (symtab, args, nargin, uniform_output, error_handler);
+ 
+   // The following is an optimization because the symbol table can give a
+   // more specific function class, so this can result in fewer polymorphic
+   // function calls as the function gets called for each value of the array.
+   {
+     if (func.is_function_handle ())
+       {
++        // We can't check for overloads now.  Is there something else we
++        // should be doing instead?
++        goto nevermind;
++
++#if 0
+         octave_fcn_handle *f = func.fcn_handle_value ();
+ 
+         // Overloaded function handles need to check the type of the
+         // arguments for each element of the array, so they cannot be
+         // optimized this way.
+         if (f -> is_overloaded ())
+           goto nevermind;
++#endif
+       }
+ 
+     std::string name = func.function_value () -> name ();
+     octave_value f = symtab.find_function (name);
+ 
+     if (f.is_defined ())
+       {
+         // Except for these two which are special cases...
+@@ -1171,24 +1177,31 @@ arrayfun (@@str2num, [1234],
+       // The following is an optimization because the symbol table can give a
+       // more specific function class, so this can result in fewer polymorphic
+       // function calls as the function gets called for each value of the array.
+ 
+       if (! symbol_table_lookup)
+         {
+           if (func.is_function_handle ())
+             {
++              // We can't check for overloads now.  Is there something
++              // else we should be doing instead?
++              goto nevermind;
++
++#if 0
+               octave_fcn_handle *f = func.fcn_handle_value ();
+ 
+               // Overloaded function handles need to check the type of the
+               // arguments for each element of the array, so they cannot be
+               // optimized this way.
+               if (f -> is_overloaded ())
+                 goto nevermind;
++#endif
+             }
++
+           octave_value f
+             = symtab.find_function (func.function_value () -> name ());
+ 
+           if (f.is_defined ())
+             func = f;
+         }
+ 
+     nevermind:
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -11611,16 +11611,17 @@ gh_manager::do_execute_listener (const g
+ void
+ gh_manager::do_execute_callback (const graphics_handle& h,
+                                  const octave_value& cb_arg,
+                                  const octave_value& data)
+ {
+   if (cb_arg.is_defined () && ! cb_arg.isempty ())
+     {
+       octave_value_list args;
++      octave_value ov_fcn;
+       octave_function *fcn = nullptr;
+ 
+       args(0) = h.as_octave_value ();
+       if (data.is_defined ())
+         args(1) = data;
+       else
+         args(1) = Matrix ();
+ 
+@@ -11635,18 +11636,20 @@ gh_manager::do_execute_callback (const g
+           gh_manager::auto_lock guard;
+           callback_objects.push_front (go);
+           xset_gcbo (h);
+         }
+ 
+       // Copy CB because "function_value" method is non-const.
+       octave_value cb = cb_arg;
+ 
+-      if (cb.is_function () || cb.is_function_handle ())
++      if (cb.is_function ())
+         fcn = cb.function_value ();
++      else if (cb.is_function_handle ())
++        ov_fcn = cb;
+       else if (cb.is_string ())
+         {
+           int status;
+           std::string s = cb.string_value ();
+ 
+           try
+             {
+               octave::interpreter& interp
+@@ -11664,32 +11667,35 @@ gh_manager::do_execute_callback (const g
+         }
+       else if (cb.iscell () && cb.length () > 0
+                && (cb.rows () == 1 || cb.columns () == 1)
+                && (cb.cell_value ()(0).is_function ()
+                    || cb.cell_value ()(0).is_function_handle ()))
+         {
+           Cell c = cb.cell_value ();
+ 
+-          fcn = c(0).function_value ();
++          ov_fcn = c(0);
+ 
+           for (int i = 1; i < c.numel () ; i++)
+             args(1+i) = c(i);
+         }
+       else
+         {
+           std::string nm = cb.class_name ();
+           error ("trying to execute non-executable object (class = %s)",
+                  nm.c_str ());
+         }
+ 
+-      if (fcn)
++      if (fcn || ov_fcn.is_defined ())
+         try
+           {
+-            octave::feval (fcn, args);
++            if (ov_fcn.is_defined ())
++              octave::feval (ov_fcn, args);
++            else
++              octave::feval (fcn, args);
+           }
+         catch (octave::execution_exception&)
+           {
+             std::cerr << "execution error in graphics callback function"
+                       << std::endl;
+             Flasterr (ovl ("execution error in graphics callback function"));
+             octave::interpreter::recover_from_exception ();
+           }
+diff --git a/libinterp/octave-value/cdef-class.cc b/libinterp/octave-value/cdef-class.cc
+--- a/libinterp/octave-value/cdef-class.cc
++++ b/libinterp/octave-value/cdef-class.cc
+@@ -51,22 +51,29 @@ along with Octave; see the file COPYING.
+ #include "pt-walk.h"
+ 
+ // Define to 1 to enable debugging statements.
+ #define DEBUG_TRACE 0
+ 
+ namespace octave
+ {
+   static octave_value
+-  make_fcn_handle (const octave_value& fcn, const std::string& nm)
++  make_fcn_handle (interpreter& interp, const octave_value& fcn,
++                   const std::string& nm)
+   {
+     octave_value retval;
+ 
+     if (fcn.is_defined ())
+-      retval = octave_value (new octave_fcn_handle (fcn, nm));
++      {
++        tree_evaluator& tw = interp.get_evaluator ();
++
++        symbol_scope curr_scope = tw.get_current_scope ();
++
++        retval = octave_value (new octave_fcn_handle (curr_scope, fcn, nm));
++      }
+ 
+     return retval;
+   }
+ 
+   cdef_class::cdef_class_rep::cdef_class_rep (const std::list<cdef_class>& superclasses)
+     : cdef_meta_object_rep (), member_count (0), handle_class (false),
+       object_count (0), meta (false)
+   {
+@@ -941,20 +948,22 @@ namespace octave
+               {
+                 for (auto& mtd : *mb_p->element_list ())
+                   {
+                     std::string mname = mtd.function_value ()->name ();
+                     std::string mprefix = mname.substr (0, 4);
+ 
+                     if (mprefix == "get.")
+                       get_methods[mname.substr (4)] =
+-                        make_fcn_handle (mtd, full_class_name + '>' + mname);
++                        make_fcn_handle (interp, mtd,
++                                         full_class_name + '>' + mname);
+                     else if (mprefix == "set.")
+                       set_methods[mname.substr (4)] =
+-                        make_fcn_handle (mtd, full_class_name + '>' + mname);
++                        make_fcn_handle (interp, mtd,
++                                         full_class_name + '>' + mname);
+                     else
+                       {
+                         cdef_method meth = cdm.make_method (retval, mname, mtd);
+ 
+ #if DEBUG_TRACE
+                         std::cerr << (mname == class_name ? "constructor"
+                                       : "method")
+                                   << ": " << mname << std::endl;
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -77,20 +77,40 @@ along with Octave; see the file COPYING.
+ 
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_fcn_handle,
+                                      "function handle",
+                                      "function_handle");
+ 
+ const std::string octave_fcn_handle::anonymous ("@<anonymous>");
+ 
++octave_fcn_handle::octave_fcn_handle (const octave::symbol_scope& scope,
++                                      const octave_value& f,
++                                      const std::string& n)
++  : fcn (f), nm (n), m_scope (scope), m_is_nested (false),
++    m_closure_frames (nullptr)
++{
++  octave_user_function *uf = fcn.user_function_value (true);
++
++  if (uf && nm != anonymous)
++    {
++      octave::symbol_scope uf_scope = uf->scope ();
++
++      if (uf_scope)
++        uf_scope.cache_name (nm);
++    }
++
++  if (uf && uf->is_nested_function () && ! uf->is_subfunction ())
++    m_is_nested = true;
++}
++
+ octave_fcn_handle::octave_fcn_handle (const octave_value& f,
+                                       const std::string& n)
+-  : fcn (f), nm (n), has_overloads (false), overloads (),
+-    m_is_nested (false), m_closure_frames (nullptr)
++  : fcn (f), nm (n), m_scope (), m_is_nested (false),
++    m_closure_frames (nullptr)
+ {
+   octave_user_function *uf = fcn.user_function_value (true);
+ 
+   if (uf && nm != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+       if (uf_scope)
+@@ -155,82 +175,27 @@ octave_fcn_handle::subsref (const std::s
+     retval = retval(0).next_subsref (nargout, type, idx);
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_fcn_handle::call (int nargout, const octave_value_list& args)
+ {
+-  octave::out_of_date_check (fcn, "", false);
+-
+-  // Possibly overloaded function.
+   octave_value fcn_to_call = fcn;
+ 
+-  if (has_overloads)
++  if (! fcn_to_call.is_defined ())
+     {
+-      // Compute dispatch type.
+-      builtin_type_t btyp;
+-      std::string dispatch_type = octave::get_dispatch_type (args, btyp);
+-
+-      // Retrieve overload.
+-      if (btyp != btyp_unknown)
+-        {
+-          octave::out_of_date_check (builtin_overloads[btyp], dispatch_type, false);
+-          fcn_to_call = builtin_overloads[btyp];
+-        }
+-      else
+-        {
+-          auto it = overloads.find (dispatch_type);
+-
+-          if (it == overloads.end ())
+-            {
+-              // Try parent classes too.
+-
+-              octave::symbol_table& symtab
+-                = octave::__get_symbol_table__ ("octave_fcn_handle::call");
+-
+-              const std::list<std::string> plist
+-                = symtab.parent_classes (dispatch_type);
+-
+-              auto pit = plist.begin ();
++      octave::symbol_table& symtab
++        = octave::__get_symbol_table__ ("octave_fcn_handle::call");
+ 
+-              while (pit != plist.end ())
+-                {
+-                  std::string pname = *pit;
+-
+-                  std::string fnm = fcn_name ();
+-
+-                  octave_value ftmp = symtab.find_method (fnm, pname);
+-
+-                  if (ftmp.is_defined ())
+-                    {
+-                      set_overload (pname, ftmp);
+-
+-                      octave::out_of_date_check (ftmp, pname, false);
+-                      fcn_to_call = ftmp;
++      fcn_to_call = symtab.find_function (nm, args, m_scope);
++    }
+ 
+-                      break;
+-                    }
+-
+-                  pit++;
+-                }
+-            }
+-          else
+-            {
+-              octave::out_of_date_check (it->second, dispatch_type, false);
+-              fcn_to_call = it->second;
+-            }
+-        }
+-
+-      if (! fcn_to_call.is_defined ())
+-        error ("%s: no method for class %s",
+-               nm.c_str (), dispatch_type.c_str ());
+-    }
+-  else if (! fcn_to_call.is_defined ())
++  if (! fcn_to_call.is_defined ())
+     error ("%s: no longer valid function handle", nm.c_str ());
+ 
+   octave::stack_frame *closure_context = nullptr;
+ 
+   if (m_closure_frames && m_closure_frames->size () > 0)
+     closure_context = m_closure_frames->front ();
+ 
+   octave::tree_evaluator& tw
+@@ -243,16 +208,50 @@ octave_fcn_handle::call (int nargout, co
+ 
+ dim_vector
+ octave_fcn_handle::dims (void) const
+ {
+   static dim_vector dv (1, 1);
+   return dv;
+ }
+ 
++octave_function * octave_fcn_handle::function_value (bool)
++{
++  if (fcn.is_defined ())
++    return fcn.function_value ();
++
++  octave::symbol_table& symtab
++    = octave::__get_symbol_table__ ("octave_fcn_handle::set_fcn");
++
++  // Cache this value so that the pointer will be valid as long as the
++  // function handle object is valid.
++
++  m_generic_fcn = symtab.find_function (nm, octave_value_list (), m_scope);
++
++  return (m_generic_fcn.is_defined ()
++          ? m_generic_fcn.function_value () : nullptr);
++}
++
++octave_user_function * octave_fcn_handle::user_function_value (bool)
++{
++  if (fcn.is_defined ())
++    return fcn.user_function_value ();
++
++  octave::symbol_table& symtab
++    = octave::__get_symbol_table__ ("octave_fcn_handle::set_fcn");
++
++  // Cache this value so that the pointer will be valid as long as the
++  // function handle object is valid.
++
++  m_generic_fcn = symtab.find_user_function (nm);
++
++  return (m_generic_fcn.is_defined ()
++          ? m_generic_fcn.user_function_value () : nullptr);
++}
++
+ // Save call stack frames for handles to nested functions.
+ 
+ void
+ octave_fcn_handle::push_closure_context (octave::tree_evaluator& tw)
+ {
+   if (! m_closure_frames)
+     m_closure_frames = new std::list<octave::stack_frame *> ();
+ 
+@@ -323,32 +322,22 @@ octave_fcn_handle::workspace (void) cons
+     }
+ 
+   return Cell ();
+ }
+ 
+ bool
+ octave_fcn_handle::is_equal_to (const octave_fcn_handle& h) const
+ {
+-  bool retval = fcn.is_copy_of (h.fcn) && (has_overloads == h.has_overloads);
+-  retval = retval && (overloads.size () == h.overloads.size ());
+-
+-  if (retval && has_overloads)
+-    {
+-      for (int i = 0; i < btyp_num_types && retval; i++)
+-        retval = builtin_overloads[i].is_copy_of (h.builtin_overloads[i]);
+-
+-      auto iter = overloads.cbegin ();
+-      auto hiter = h.overloads.cbegin ();
+-      for (; iter != overloads.cend () && retval; iter++, hiter++)
+-        retval = (iter->first == hiter->first)
+-                 && (iter->second.is_copy_of (hiter->second));
+-    }
+-
+-  return retval;
++  if (fcn.is_defined () && h.fcn.is_defined ())
++    return fcn.is_copy_of (h.fcn);
++  else if (fcn.is_undefined () && h.fcn.is_undefined ())
++    return nm == h.nm;
++  else
++    return false;
+ }
+ 
+ bool
+ octave_fcn_handle::set_fcn (const std::string& octaveroot,
+                             const std::string& fpath)
+ {
+   if (octaveroot.length () != 0
+       && fpath.length () >= octaveroot.length ()
+@@ -1653,85 +1642,21 @@ namespace octave
+             break;
+ 
+           case '|':
+             tnm = "or";
+             break;
+           }
+       }
+ 
+-    octave::call_stack& cs = interp.get_call_stack();
+-
+-    std::string dispatch_class;
+-    bool is_method_or_ctor_executing
+-      = (cs.is_class_method_executing (dispatch_class)
+-         || cs.is_class_constructor_executing (dispatch_class));
+-
+-    octave::symbol_table& symtab = interp.get_symbol_table ();
+-
+-    octave_value f;
+-
+-    if (is_method_or_ctor_executing)
+-      f = symtab.find_method (tnm, dispatch_class);
+-
+-    if (f.is_undefined ())
+-      f = symtab.find_function (tnm, octave_value_list ());
+-
+-    octave_function *fptr = f.function_value (true);
+-
+-    // Here we are just looking to see if FCN is a method or constructor
+-    // for any class.
+-    if (fptr && (fptr->is_subfunction () || fptr->is_private_function ()
+-                 || fptr->is_class_constructor ()
+-                 || fptr->is_classdef_constructor ()))
+-      {
+-        // Locally visible function.
+-        retval = octave_value (new octave_fcn_handle (f, tnm));
+-      }
+-    else
+-      {
+-        octave::load_path& lp = interp.get_load_path ();
++    octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+-        // Globally visible (or no match yet).  Query overloads.
+-        std::list<std::string> classes = lp.overloads (tnm);
+-        bool any_match = fptr != nullptr || classes.size () > 0;
+-        if (! any_match)
+-          {
+-            // No match found, try updating load_path and query classes again.
+-            lp.update ();
+-            classes = lp.overloads (tnm);
+-            any_match = classes.size () > 0;
+-          }
+-
+-        if (! any_match)
+-          error ("@%s: no function and no method found", tnm.c_str ());
+-
+-        octave_fcn_handle *fh = new octave_fcn_handle (f, tnm);
+-        retval = fh;
++    octave::symbol_scope curr_scope = tw.get_current_scope ();
+ 
+-        for (auto& cls : classes)
+-          {
+-            std::string class_name = cls;
+-            octave_value fmeth = symtab.find_method (tnm, class_name);
+-
+-            bool is_builtin = false;
+-            for (int i = 0; i < btyp_num_types; i++)
+-              {
+-                // FIXME: Too slow? Maybe binary lookup?
+-                if (class_name == btyp_class_name[i])
+-                  {
+-                    is_builtin = true;
+-                    fh->set_overload (static_cast<builtin_type_t> (i), fmeth);
+-                  }
+-              }
+-
+-            if (! is_builtin)
+-              fh->set_overload (class_name, fmeth);
+-          }
+-      }
++    return new octave_fcn_handle (curr_scope, tnm);
+ 
+     return retval;
+   }
+ }
+ 
+ /*
+ %!test
+ %! x = {".**", "power";
+@@ -1850,18 +1775,16 @@ particular output format.
+           parentage.elem (0) = fh_nm;
+           parentage.elem (1) = fcn->parent_fcn_name ();
+           m.setfield ("parentage", octave_value (parentage));
+         }
+       else if (fcn->is_private_function ())
+         m.setfield ("type", "private");
+       else if (fh->is_nested ())
+         m.setfield ("type", "nested");
+-      else if (fh->is_overloaded ())
+-        m.setfield ("type", "overloaded");
+       else
+         m.setfield ("type", "simple");
+     }
+ 
+   std::string nm = fcn->fcn_file_name ();
+ 
+   if (fh_nm == octave_fcn_handle::anonymous)
+     {
+diff --git a/libinterp/octave-value/ov-fcn-handle.h b/libinterp/octave-value/ov-fcn-handle.h
+--- a/libinterp/octave-value/ov-fcn-handle.h
++++ b/libinterp/octave-value/ov-fcn-handle.h
+@@ -28,16 +28,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <iosfwd>
+ #include <list>
+ #include <string>
+ 
+ #include "ov-base.h"
+ #include "ov-fcn.h"
+ #include "ov-typeinfo.h"
++#include "symscope.h"
+ 
+ namespace octave
+ {
+   class interpreter;
+   class stack_frame;
+   class tree_evaluator;
+ }
+ 
+@@ -51,37 +52,36 @@ private:
+ 
+   typedef std::map<std::string, octave_value> str_ov_map;
+ 
+ public:
+ 
+   static const std::string anonymous;
+ 
+   octave_fcn_handle (void)
+-    : fcn (), nm (), has_overloads (false), overloads (),
+-      m_is_nested (false), m_closure_frames (nullptr)
+-  { }
+-
+-  octave_fcn_handle (const std::string& n)
+-    : fcn (), nm (n), has_overloads (false), overloads (),
+-      m_is_nested (false), m_closure_frames (nullptr)
++    : fcn (), nm (), m_scope (), m_is_nested (false),
++      m_closure_frames (nullptr)
+   { }
+ 
+-  octave_fcn_handle (const octave_value& f,  const std::string& n = anonymous);
++  octave_fcn_handle (const octave::symbol_scope& scope, const std::string& n)
++    : fcn (), nm (n), m_scope (scope), m_is_nested (false),
++      m_closure_frames (nullptr)
++  {
++    if (! nm.empty () && nm[0] == '@')
++      nm = nm.substr (1);
++  }
+ 
+-  octave_fcn_handle (const octave_fcn_handle& fh)
+-    : octave_base_value (fh), fcn (fh.fcn), nm (fh.nm),
+-      has_overloads (fh.has_overloads), overloads (),
+-      m_is_nested (fh.m_is_nested), m_closure_frames (fh.m_closure_frames)
+-  {
+-    for (int i = 0; i < btyp_num_types; i++)
+-      builtin_overloads[i] = fh.builtin_overloads[i];
++  octave_fcn_handle (const octave::symbol_scope& scope,
++                     const octave_value& f,
++                     const std::string& n = anonymous);
+ 
+-    overloads = fh.overloads;
+-  }
++  octave_fcn_handle (const octave_value& f,
++                     const std::string& n = anonymous);
++
++  octave_fcn_handle (const octave_fcn_handle& fh) = default;
+ 
+   ~octave_fcn_handle (void);
+ 
+   octave_base_value * clone (void) const
+   { return new octave_fcn_handle (*this); }
+   octave_base_value * empty_clone (void) const
+   { return new octave_fcn_handle (); }
+ 
+@@ -95,61 +95,35 @@ public:
+   octave_value_list subsref (const std::string& type,
+                              const std::list<octave_value_list>& idx,
+                              int nargout);
+ 
+   bool is_defined (void) const { return true; }
+ 
+   bool is_function_handle (void) const { return true; }
+ 
+-  builtin_type_t builtin_type (void) const { return btyp_func_handle; }
+-
+-  bool is_overloaded (void) const { return has_overloads; }
+-
+   bool is_nested (void) const { return m_is_nested; }
+ 
+   dim_vector dims (void) const;
+ 
+-  octave_function * function_value (bool = false)
+-  {
+-    return fcn.function_value ();
+-  }
+-
+-  octave_user_function * user_function_value (bool = false)
+-  {
+-    return fcn.user_function_value ();
+-  }
++  // FIXME: These must go away.  They don't do the right thing for
++  // scoping or overloads.
++  octave_function * function_value (bool = false);
++  octave_user_function * user_function_value (bool = false);
+ 
+   octave_fcn_handle * fcn_handle_value (bool = false) { return this; }
+ 
+   octave_value fcn_val (void) const { return fcn; }
+ 
+   std::string fcn_name (void) const { return nm; }
+ 
+   void push_closure_context (octave::tree_evaluator& tw);
+ 
+   octave_value workspace (void) const;
+ 
+-  void set_overload (builtin_type_t btyp, const octave_value& ov_fcn)
+-  {
+-    if (btyp != btyp_unknown)
+-      {
+-        has_overloads = true;
+-        builtin_overloads[btyp] = ov_fcn;
+-      }
+-
+-  }
+-
+-  void set_overload (const std::string& dispatch_type,
+-                     const octave_value& ov_fcn)
+-  {
+-    has_overloads = true;
+-    overloads[dispatch_type] = ov_fcn;
+-  }
+-
+   bool is_equal_to (const octave_fcn_handle&) const;
+ 
+   octave_value convert_to_str_internal (bool pad, bool force, char type) const;
+ 
+   bool save_ascii (std::ostream& os);
+ 
+   bool load_ascii (std::istream& is);
+ 
+@@ -172,30 +146,32 @@ public:
+ private:
+ 
+   bool set_fcn (const std::string& octaveroot, const std::string& fpath);
+ 
+   DECLARE_OV_TYPEID_FUNCTIONS_AND_DATA
+ 
+ protected:
+ 
+-  // The function we are handling.
++  // The function we are handling (this should be valid for handles to
++  // anonymous functions and some other special cases).  Otherwise, we
++  // perform dynamic lookup based on the name of the function we are
++  // handling and the scope where the funtion handle object was created.
+   octave_value fcn;
+ 
+-  // The name of the handle, including the "@".
++  // The function we would find without considering argument types.  We
++  // cache this value so that the function_value and user_function_value
++  // methods may continue to work.
++  octave_value m_generic_fcn;
++
++  // The name of the handle, not including the "@".
+   std::string nm;
+ 
+-  // Whether the function is overloaded at all.
+-  bool has_overloads;
+-
+-  // Overloads for builtin types.  We use array to make lookup faster.
+-  octave_value builtin_overloads[btyp_num_types];
+-
+-  // Overloads for other classes.
+-  str_ov_map overloads;
++  // The scope where this object was defined.
++  octave::symbol_scope m_scope;
+ 
+   // TRUE means this is a handle to a nested function.
+   bool m_is_nested;
+ 
+   // Saved stack frames for handles to nested functions.  This allows us
+   // to access non-locals and other context info when calling nested
+   // functions indirectly through handles.
+   std::list<octave::stack_frame *> *m_closure_frames;
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -1799,19 +1799,16 @@ namespace octave
+     unwind_protect frame;
+ 
+     if (m_call_stack.size () >= static_cast<size_t> (m_max_recursion_depth))
+       error ("max_recursion_depth exceeded");
+ 
+     // Save old and set current symbol table context, for
+     // eval_undefined_error().
+ 
+-    //    std::cerr << "eval: " << user_function.name ()
+-    //              << " with closure_frames: " << closure_frames << std::endl;
+-
+     m_call_stack.push (&user_function, &frame, closure_frames);
+ 
+     frame.protect_var (Vtrack_line_num);
+     // update source line numbers, even if debugging
+     Vtrack_line_num = true;
+ 
+     frame.add_method (m_call_stack, &call_stack::pop);
+ 
+@@ -1925,21 +1922,18 @@ namespace octave
+         for (octave_idx_type i = 0; i < retval.length (); i++)
+           {
+             octave_value val = retval(i);
+ 
+             if (val.is_function_handle ())
+               {
+                 octave_fcn_handle *fh = val.fcn_handle_value ();
+ 
+-                if (fh && fh->is_nested ())
+-                  {
+-                    // std::cerr << "pushing closure context" << std::endl;
+-                    fh->push_closure_context (*this);
+-                  }
++                if (fh)
++                  fh->push_closure_context (*this);
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   void

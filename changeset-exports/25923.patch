@@ -1,0 +1,423 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1539024091 -7200
+#      Mon Oct 08 20:41:31 2018 +0200
+# Node ID a7511a1489b82ad714bb57bffbb69fe78f91481e
+# Parent  34e82a829fddd4964dec7fc3f75c7849fed44cc4
+call octave functions with return value from GUI (bug #47585)
+
+* file-editor-tab.cc (update_breakpoints): new function using
+  octave_cmd_builtin for calling dbstatus;
+  (update_breakpoints_handler) slot for the signal from the worker thread
+  going through the list of returned breakpoints and update the markers
+  of the breakpoints which are related to the current file;
+  (handle_octave_result): removed this stub
+
+* file-editor-tab.h: new  method update_breakpoints,
+  new slot update_breakpoints_handler
+
+* file-editor.cc (request_open_file): call update_breakpoints for the new
+  editor tab after the file contents has been loaded
+
+* main-window.cc (main_window): register octave_value_list as meta type
+  allowing to send this data type via queued signal/slot connections;
+  (handle_load_workspace_request): update usage of octave_cmd_builtin
+  according to its new parameter list
+
+* octave-cmd.cc (octave_cmd_builtin::execute): call builtin function with
+  return value list, if nargout is not zero, emit the signal with the returned
+  list;
+  (octave_cmd_builtin::init_cmd_retval): method for connecting the return
+  value signal with the slot given by the caller
+
+* octave-cmd.h: (octave_cmd_builtin): add nargout as well as receiver and
+  handler of the return value signals slot to the parameter list, call
+  method for connecting the signal with the given slot;
+  (argout_signal): new signal for passing the return values to the caller
+  thread
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -1928,40 +1928,44 @@ namespace octave
+         _eol_indicator->setText ("CR");
+         break;
+       case QsciScintilla::EolUnix:
+         _eol_indicator->setText ("LF");
+         break;
+       }
+   }
+ 
+-  // FIXME: See patch #8016 for a general way to get Octave results from
+-  // commands processed in the background, e.g., dbstatus.
+-  void file_editor_tab::handle_octave_result (QObject *requester,
+-                                              QString& command,
+-                                              octave_value_list&)
++  void file_editor_tab::update_breakpoints ()
+   {
+-    // Check if this object initiated the command.
+-    if (requester == this)
++    if (_file_name.isEmpty ())
++      return;
++
++    octave_value_list argout = ovl ();
++
++    // Create and queue the command object
++    octave_cmd_builtin *cmd = new octave_cmd_builtin (&Fdbstatus, ovl (), 1,
++        this, SLOT (update_breakpoints_handler (const octave_value_list&)));
++
++    emit request_queue_cmd (cmd);
++  }
++
++  void file_editor_tab::update_breakpoints_handler (const octave_value_list& argout)
++  {
++    octave_map dbg = argout(0).map_value ();
++    octave_idx_type n_dbg = dbg.numel ();
++
++    Cell file = dbg.contents ("file");
++    Cell line = dbg.contents ("line");
++    Cell cond = dbg.contents ("cond");
++
++    for (octave_idx_type i = 0; i < n_dbg; i++)
+       {
+-        if (command == "dbstatus")
+-          {
+-            // Should be installing breakpoints in this file
+-            /*
+-              octave:1> result = dbstatus
+-              result =
+-
+-              0x1 struct array containing the fields:
+-
+-              name
+-              file
+-              line
+-            */
+-            // Check for results that match "file".
+-          }
++        if (file (i).string_value () == _file_name.toStdString ())
++          do_breakpoint_marker (true, this, line (i).int_value (),
++                                QString::fromStdString (cond (i).string_value ()));
+       }
+   }
+ 
+   void file_editor_tab::new_file (const QString& commands)
+   {
+     update_window_title (false); // window title (no modification)
+ 
+     QSettings *settings = resource_manager::get_settings ();
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -61,16 +61,18 @@ namespace octave
+     octave_qscintilla * qsci_edit_area (void) { return _edit_area; }
+ 
+     // Will initiate close if associated with the identifier tag.
+     bool conditional_close (void);
+ 
+     static void reset_cancel (void) {_cancelled = false;}
+     static bool was_cancelled (void) {return _cancelled;}
+ 
++    void update_breakpoints ();
++
+   public slots:
+ 
+     void update_window_title (bool modified);
+     void handle_copy_available (bool enableCopy);
+     void handle_margin_clicked (int line, int margin,
+                                 Qt::KeyboardModifiers state);
+ 
+     // Tells the editor tab to react on changed settings.
+@@ -143,18 +145,17 @@ namespace octave
+     void file_has_changed (const QString& path, bool do_close = false);
+ 
+     void handle_context_menu_edit (const QString&);
+     void handle_context_menu_break_condition (int linenr);
+ 
+     void handle_request_add_breakpoint (int line, const QString& cond);
+     void handle_request_remove_breakpoint (int line);
+ 
+-    void handle_octave_result (QObject *requester, QString& command,
+-                               octave_value_list& result);
++    void update_breakpoints_handler (const octave_value_list& argout);
+ 
+   signals:
+ 
+     void file_name_changed (const QString& fileName, const QString& toolTip);
+     void editor_state_changed (bool copy_available, bool is_octave_file);
+     void set_focus_editor_signal (QWidget *);
+     void tab_remove_request (void);
+     void add_filename_to_list (const QString&, const QString&, QWidget *);
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -1428,17 +1428,19 @@ namespace octave
+                               }
+                           }
+                       }
+                   }
+               }
+ 
+             if (! ((breakpoint_marker || debug_pointer) && is_editor_console_tabbed ()))
+               {
+-                // really show editor and the current editor tab
++                // update breakpoint pointers, really show editor
++                // and the current editor tab
++                fileEditorTab->update_breakpoints ();
+                 focus ();
+                 emit file_loaded_signal ();
+               }
+           }
+       }
+   }
+ 
+   void file_editor::request_preferences (bool)
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -185,16 +185,19 @@ namespace octave
+     // Initialize global Qt application metadata
+     QCoreApplication::setApplicationName ("GNU Octave");
+     QCoreApplication::setApplicationVersion (OCTAVE_VERSION);
+ #if defined (HAVE_QGUIAPPLICATION_SETDESKTOPFILENAME)
+     if (m_start_gui)
+       QGuiApplication::setDesktopFileName ("org.octave.Octave.desktop");
+ #endif
+ 
++    // Register octave_value_list for connecting thread crossing signals
++    qRegisterMetaType<octave_value_list> ("octave_value_list");
++
+     m_external_editor = new external_editor_interface (this);
+     m_active_editor = m_editor_window;  // for connecting signals
+     if (! m_editor_window)
+       m_active_editor = m_external_editor;
+ 
+     QSettings *settings = resource_manager::get_settings ();
+ 
+     bool connect_to_web = true;
+@@ -390,17 +393,17 @@ namespace octave
+     if (file.isEmpty ())
+       file = QFileDialog::getOpenFileName (this, tr ("Load Workspace"), ".",
+                                            nullptr, nullptr);
+ 
+     if (! file.isEmpty ())
+       {
+         octave_cmd_builtin *cmd
+             = new octave_cmd_builtin (&Fload, ovl (file.toStdString ()),
+-                                      0, octave_cmd_builtin::CMD_UPD_WORKSPACE);
++                                      octave_cmd_builtin::CMD_UPD_WORKSPACE);
+         queue_cmd (cmd);
+       }
+   }
+ 
+   void main_window::handle_open_any_request (const QString& file_arg)
+   {
+     if (! file_arg.isEmpty ())
+       octave_link::post_event (this, &main_window::open_any_callback,
+diff --git a/libgui/src/octave-cmd.cc b/libgui/src/octave-cmd.cc
+--- a/libgui/src/octave-cmd.cc
++++ b/libgui/src/octave-cmd.cc
+@@ -72,36 +72,46 @@ namespace octave
+     command_editor::set_initial_input (pending_input);
+     command_editor::redisplay ();
+ 
+     command_editor::accept_line ();
+   }
+ 
+   void octave_cmd_builtin::execute (interpreter& interp)
+   {
++    octave_value_list argout;
+     if (m_callback_fi)
+-      m_callback_fi (interp, m_argin, m_nargout);
++      argout = m_callback_fi (interp, m_argin, m_nargout);
+     else if (m_callback_f)
+-      m_callback_f (m_argin, m_nargout);
++      argout = m_callback_f (m_argin, m_nargout);
+ 
+     switch (m_update)
+       {
+         case CMD_UPD_WORKSPACE:
+           {
+             symbol_scope scope
+                 = __get_current_scope__ ("octave_cmd_builtin::execute");
+             if (scope)
+               octave_link::set_workspace (true, scope);
+             break;
+           }
+ 
+         default:
+           break;
+       }
+ 
++    if (m_nargout)    // Return value expected: connect the related value
++      emit argout_signal (argout);
++  }
++
++  void octave_cmd_builtin::init_cmd_retval ()
++  {
++    if (m_nargout)
++      connect (this, SIGNAL (argout_signal (const octave_value_list&)),
++               m_argout_receiver, m_argout_handler, Qt::QueuedConnection);
+   }
+ 
+   void octave_cmd_debug::execute (interpreter& interp)
+   {
+     if (m_cmd == "step")
+       {
+         F__db_next_breakpoint_quiet__ (interp, ovl (m_suppress_dbg_location));
+         Fdbstep (interp);
+diff --git a/libgui/src/octave-cmd.h b/libgui/src/octave-cmd.h
+--- a/libgui/src/octave-cmd.h
++++ b/libgui/src/octave-cmd.h
+@@ -15,17 +15,17 @@ MERCHANTABILITY or FITNESS FOR A PARTICU
+ GNU General Public License for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+ <https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+-// Author: Torsten <ttl@justmail.de>
++// Author: Torsten <mttl@mailbox.org>
+ 
+ #if ! defined (octave_octave_cmd_h)
+ #define octave_octave_cmd_h 1
+ 
+ #include <QSemaphore>
+ #include <QMutex>
+ #include <QPointer>
+ #include <QString>
+@@ -75,55 +75,116 @@ namespace octave
+ 
+   protected:
+ 
+     QFileInfo m_info;
+   };
+ 
+   class octave_cmd_builtin : public octave_cmd
+   {
+-    public:
++    Q_OBJECT;
++
++  public:
+ 
+     enum cmd_upd {
+       CMD_UPD_NO        = 0,
+       CMD_UPD_WORKSPACE = 1
+     };
+ 
+-    // C'tor for Fxxx requiring the interpreter
++    //! Command using built in functions requiring interpreter, no return values
++    /*! Command calling a built in function, which uses an interpreter and does
++     *  not have any return values
++     * @param Ff Pointer to the builtin function
++     * @param argin Input parameters for Ff as octave value list (default empty)
++     * @param update A memeber of cmd_upd for possibly required updates after
++     *               the executing Ff
++     */
+     octave_cmd_builtin (
+-          octave_value_list (*Ff) (octave::interpreter&,
+-                                   const octave_value_list&, int),
+-          octave_value_list argin = ovl (), int nargout = 0,
+-          cmd_upd update = CMD_UPD_NO, octave_qt_link *oct_qt_link = nullptr)
++          octave_value_list (*Ff) (octave::interpreter&, const octave_value_list&, int),
++          octave_value_list argin = ovl (), cmd_upd update = CMD_UPD_NO)
+       : octave_cmd (), m_callback_fi (Ff), m_callback_f (nullptr),
+-        m_argin (argin), m_nargout (nargout), m_update (update),
+-        m_octave_qt_link (oct_qt_link)
+-    { };
++        m_argin (argin), m_nargout (0), m_argout_receiver (nullptr),
++        m_argout_handler (nullptr), m_update (update)
++    {  }
+ 
+-    // C'tor for Fxxx not requiring the interpreter
++    //! Command using built in functions not requiring interpreter, no return values
+     octave_cmd_builtin (
+           octave_value_list (*Ff) (const octave_value_list&, int),
+-          octave_value_list argin = ovl (), int nargout = 0,
+-          cmd_upd update = CMD_UPD_NO, octave_qt_link *oct_qt_link = nullptr)
++          octave_value_list argin = ovl (), cmd_upd update = CMD_UPD_NO)
+       : octave_cmd (), m_callback_fi (nullptr), m_callback_f (Ff),
+-        m_argin (argin), m_nargout (nargout), m_update (update),
+-        m_octave_qt_link (oct_qt_link)
+-    { };
++        m_argin (argin), m_nargout (0), m_argout_receiver (nullptr),
++        m_argout_handler (nullptr), m_update (update)
++    {  }
++
++    //! Command using built in functions requiring interpreter, with return values
++    /*! Command calling a built in function, which uses an interpreter and
++     *  has return values
++     * @param Ff Pointer to the builtin function
++     * @param argin Input parameters for Ff as octave value list
++     * @param argout Number of output values
++     * @param argout_receiver Receiver of the the signal containing the return values
++     * @param argout_handler  Slot for the signal containing the return values
++     * @param update A member of cmd_upd for possibly required updates after
++     *               the executing Ff
++     * argout_receiver and argout_handler live in the GUI thread. Using a thread
++     * crossing signal/slot mechanism, the GUI thread is not blocked if the
++     * worker thread is busy and can not execute the desired command immediately.
++     */
++    octave_cmd_builtin (
++          octave_value_list (*Ff) (octave::interpreter&, const octave_value_list&, int),
++          octave_value_list argin, int nargout, QObject *argout_receiver,
++          const char *argout_handler = nullptr, cmd_upd update = CMD_UPD_NO)
++      : octave_cmd (), m_callback_fi (Ff), m_callback_f (nullptr),
++        m_argin (argin), m_nargout (nargout), m_argout_receiver (argout_receiver),
++        m_argout_handler (argout_handler), m_update (update)
++    {
++      init_cmd_retval ();
++    }
++
++    //! Command using built in functions not requiring interpreter, with return values
++    octave_cmd_builtin (
++          octave_value_list (*Ff) (const octave_value_list&, int),
++          octave_value_list argin, int nargout, QObject *argout_receiver,
++          const char *argout_handler = nullptr, cmd_upd update = CMD_UPD_NO)
++      : octave_cmd (), m_callback_fi (nullptr), m_callback_f (Ff),
++        m_argin (argin), m_nargout (nargout), m_argout_receiver (argout_receiver),
++        m_argout_handler (argout_handler), m_update (update)
++    {
++      init_cmd_retval ();
++    }
+ 
+     void execute (interpreter& interp);
+ 
++  signals:
++
++    //! Signal for sending the return values to the GUI thread
++    void argout_signal (const octave_value_list&);
++
+   protected:
+ 
+     octave_value_list (*m_callback_fi) (octave::interpreter&,
+                                         const octave_value_list&, int);
+     octave_value_list (*m_callback_f) (const octave_value_list&, int);
++
+     octave_value_list m_argin;
++
+     int m_nargout;
++    QObject *m_argout_receiver;
++    const char *m_argout_handler;
++
+     cmd_upd m_update;
+-    octave_qt_link *m_octave_qt_link;
++
++  private:
++
++    //! Internal method connecting the signal for the return values
++    /*! Internal method for connecting the signal for later sending the return
++     * values to the caller. The connection has to be queued ensuring that
++     * the receiver's slot is actually executed in the GUI thread
++     */
++    void init_cmd_retval (void);
+   };
+ 
+   class octave_cmd_debug : public octave_cmd_exec
+   {
+   public:
+ 
+     octave_cmd_debug (const QString& cmd, bool suppress_location)
+       : octave_cmd_exec (cmd), m_suppress_dbg_location (suppress_location) { }

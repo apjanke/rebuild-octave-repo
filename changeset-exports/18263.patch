@@ -1,0 +1,486 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1389560084 18000
+#      Sun Jan 12 15:54:44 2014 -0500
+# Node ID b5be1a2aa5ab6a8ffaf92597cec4ed286226c1c9
+# Parent  69990d5edcc2143e1844edcf95fe1fdd864d7478
+Initial implementation for classdef methods in separate files.
+
+* libinterp/octave-value/ov-classdef.h (cdef_class::make_meta_class):
+New argument to tell whether the class is loaded from a @-folder.
+(cdef_method::cdef_method_rep::dispatch_type): New member used for
+external methods.
+(cdef_method::cdef_method_rep::cdef_method_rep): Initialize it.
+(cdef_method::cdef_method_rep::is_external,
+cdef_method::cdef_method_rep::mark_as_external): New methods, use it.
+(cdef_method::is_external, cdef_method::mark_as_external): Likewise.
+* libinterp/octave-value/ov-classdef.cc (is_dummy_method): New static
+method.
+(make_method): Use it to initialize "external" state of created method.
+(cdef_class::make_meta_class): New argument to know whether we're
+loading from a @-folder. Scan existing methods from load-path and
+create corresponding method entries in the class definition.
+(cdef_method::cdef_method_rep::check_method): Load external method if
+required.
+(cdef_method::cdef_method_rep::execute): Check error_state after calling
+check_method.
+* libinterp/parse-tree/pt-classdef.h (tree_classdef::make_meta_class):
+New argument to tell whether the class is loaded from a @-folder.
+* libinterp/parse-tree/pt-classdef.cc (tree_classdef::make_meta_class):
+Likewise. Pass new argument to cdef_class::make_meta_class.
+* libinterp/parse-tree/oct-parse.in.yy (parse_fcn_file): Pass new
+is_at_folder argument.
+
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <algorithm>
+ 
+ #include "defun.h"
+ #include "load-path.h"
+ #include "ov-builtin.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-typeinfo.h"
++#include "ov-usr-fcn.h"
+ #include "pt-assign.h"
+ #include "pt-classdef.h"
+ #include "pt-funcall.h"
+ #include "pt-misc.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "singleton-cleanup.h"
+ #include "symtab.h"
+@@ -355,16 +356,37 @@ check_access (const cdef_class& cls, con
+     }
+   else
+     error ("invalid property/method access in class `%s'",
+            cls.get_name ().c_str ());
+   
+   return false;
+ }
+ 
++static bool
++is_dummy_method (const octave_value& fcn)
++{
++  bool retval = false;
++
++  if (fcn.is_defined ())
++    {
++      if (fcn.is_user_function ())
++        {
++          octave_user_function *uf = fcn.user_function_value (true);
++
++          if (! uf || ! uf->body ())
++            retval = true;
++        }
++    }
++  else
++    retval = true;
++
++  return retval;
++}
++
+ bool
+ is_method_executing (const octave_value& ov, const cdef_object& obj)
+ {
+   octave_function* stack_fcn = octave_call_stack::current ();
+ 
+   octave_function* method_fcn = ov.function_value (true);
+ 
+   // Does the top of the call stack match our target function?
+@@ -758,16 +780,19 @@ make_method (const cdef_class& cls, cons
+   meth.put ("Sealed", true);
+   meth.put ("Static", is_static);
+ 
+   if (fcn.is_defined ())
+     make_function_of_class (cls, fcn);
+ 
+   meth.set_function (fcn);
+ 
++  if (is_dummy_method (fcn))
++    meth.mark_as_external (cls.get_name ());
++
+   return meth;
+ }
+ 
+ inline cdef_method
+ make_method (const cdef_class& cls, const std::string& name,
+              octave_builtin::fcn ff, const std::string& m_access = "public",
+              bool is_static = false)
+ {
+@@ -2450,17 +2475,17 @@ attribute_value_to_string (T* t, octave_
+     return v.string_value ();
+   else if (t->expression ())
+     return t->expression ()->original_text ();
+   else
+     return std::string ("true");
+ }
+ 
+ cdef_class
+-cdef_class::make_meta_class (tree_classdef* t)
++cdef_class::make_meta_class (tree_classdef* t, bool is_at_folder)
+ {
+   cdef_class retval;
+   std::string class_name, full_class_name;
+ 
+   // Class creation
+ 
+   class_name = full_class_name = t->ident ()->name ();
+   if (! t->package_name ().empty ())
+@@ -2593,16 +2618,53 @@ cdef_class::make_meta_class (tree_classd
+                         meth.put (ait->first, ait->second);
+ 
+                       retval.install_method (meth);
+                     }
+                 }
+             }
+         }
+ 
++      if (is_at_folder)
++        {
++          // Look for all external methods visible on octave path at the
++          // time of loading of the class.
++          //
++          // TODO: This is an "extension" to Matlab behavior, which only
++          // looks in the @-folder containing the original classdef
++          // file. However, this is easier to implement it that way at
++          // the moment.
++
++          std::list<std::string> external_methods =
++            load_path::methods (full_class_name);
++
++          for (std::list<std::string>::const_iterator it = external_methods.begin ();
++               it != external_methods.end (); ++it)
++            {
++              // TODO: should we issue a warning if the method is already
++              // defined in the classdef file?
++
++              if (*it != class_name
++                  && ! retval.find_method (*it, true).ok ())
++                {
++                  // Create a dummy method that is used until the actual
++                  // method is loaded.
++
++                  octave_user_function *fcn = new octave_user_function ();
++
++                  fcn->stash_function_name (*it);
++
++                  cdef_method meth = make_method (retval, *it,
++                                                  octave_value (fcn));
++
++                  retval.install_method (meth);
++                }
++            }
++        }
++
+       // Property blocks
+ 
+       // FIXME: default property expression should be able to call static
+       //        methods of the class being constructed. A restricted CLASSNAME
+       //        symbol should be added to the scope before evaluating default
+       //        value expressions.
+ 
+       std::list<tree_classdef_properties_block *> pb_list = b->properties_list ();
+@@ -2842,17 +2904,59 @@ cdef_property::cdef_property_rep::check_
+     return ::check_access (cls, get ("SetAccess"));
+ 
+   return false;
+ }
+ 
+ void
+ cdef_method::cdef_method_rep::check_method (void)
+ {
+-  // FIXME: check whether re-load is needed
++  if (is_external ())
++    {
++      if (is_dummy_method (function))
++        {
++          std::string name = get_name ();
++          std::string cls_name = dispatch_type;
++          std::string pack_name;
++
++          size_t pos = cls_name.rfind ('.');
++
++          if (pos != std::string::npos)
++            {
++              pack_name = cls_name.substr (0, pos);
++              cls_name = cls_name.substr (pos + 1);
++            }
++
++          std::string dir_name;
++          std::string file_name = load_path::find_method (cls_name, name,
++                                                          dir_name, pack_name);
++
++          if (! file_name.empty ())
++            {
++              octave_function *fcn = load_fcn_from_file (file_name, dir_name,
++                                                         dispatch_type,
++                                                         pack_name);
++
++              if (fcn)
++                {
++                  function = octave_value (fcn);
++
++                  make_function_of_class (dispatch_type, function);
++                }
++            }
++        }
++      else
++        {
++          // FIXME: check out-of-date status
++        }
++
++      if (is_dummy_method (function))
++        ::error ("no definition found for method `%s' of class `%s'",
++                 get_name ().c_str (), dispatch_type.c_str ());
++    }
+ }
+ 
+ octave_value_list
+ cdef_method::cdef_method_rep::execute (const octave_value_list& args,
+ 				       int nargout, bool do_check_access,
+                                        const std::string& who)
+ {
+   octave_value_list retval;
+@@ -2863,17 +2967,17 @@ cdef_method::cdef_method_rep::execute (c
+ 
+       return retval;
+     }
+ 
+   if (! get ("Abstract").bool_value ())
+     {
+       check_method ();
+ 
+-      if (function.is_defined ())
++      if (! error_state && function.is_defined ())
+ 	{
+ 	  retval = execute_ov (function, args, nargout);
+ 	}
+     }
+   else
+     error ("%s: cannot execute abstract method",
+ 	   get ("Name").string_value ().c_str ());
+ 
+@@ -2894,20 +2998,20 @@ cdef_method::cdef_method_rep::execute (c
+ 
+       return retval;
+     }
+ 
+   if (! get ("Abstract").bool_value ())
+     {
+       check_method ();
+ 
+-      octave_value_list new_args;
+-
+-      if (function.is_defined ())
++      if (! error_state && function.is_defined ())
+ 	{
++          octave_value_list new_args;
++
+ 	  new_args.resize (args.length () + 1);
+ 
+ 	  new_args(0) = to_ov (obj);
+ 	  for (int i = 0; i < args.length (); i++)
+ 	    new_args(i+1) = args(i);
+ 
+ 	  retval = execute_ov (function, new_args, nargout);
+ 	}
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -822,17 +822,18 @@ public:
+     { return get_rep ()->get_name (); }
+ 
+   bool is_builtin (void) const
+     { return get_directory ().empty (); }
+ 
+   void delete_object (cdef_object obj)
+     { get_rep ()->delete_object (obj); }
+ 
+-  static cdef_class make_meta_class (tree_classdef* t);
++  static cdef_class make_meta_class (tree_classdef* t,
++                                     bool is_at_folder = false);
+ 
+   octave_function* get_method_function (const std::string& nm);
+ 
+   octave_function* get_constructor_function (void)
+     { return get_method_function (get_name ()); }
+ 
+   octave_value construct (const octave_value_list& args)
+     { return get_rep ()->construct (args); }
+@@ -1014,17 +1015,19 @@ cdef_method : public cdef_meta_object
+   friend class cdef_class;
+ 
+ private:
+ 
+   class
+   cdef_method_rep : public cdef_meta_object_rep
+   {
+   public:
+-    cdef_method_rep (void) : cdef_meta_object_rep () { }
++    cdef_method_rep (void)
++      : cdef_meta_object_rep (), function (), dispatch_type ()
++      { }
+ 
+     cdef_object_rep* copy (void) const { return new cdef_method_rep(*this); }
+ 
+     bool is_method (void) const { return true; }
+ 
+     std::string get_name (void) const { return get("Name").string_value (); }
+ 
+     void set_name (const std::string& nm) { put ("Name", nm); }
+@@ -1032,16 +1035,21 @@ private:
+     bool is_static (void) const { return get("Static").bool_value (); }
+ 
+     octave_value get_function (void) const { return function; }
+ 
+     void set_function (const octave_value& fcn) { function = fcn; }
+ 
+     bool check_access (void) const;
+ 
++    bool is_external (void) const { return ! dispatch_type.empty (); }
++
++    void mark_as_external (const std::string& dtype)
++      { dispatch_type = dtype; }
++
+     octave_value_list execute (const octave_value_list& args, int nargout,
+                                bool do_check_access = true,
+                                const std::string& who = std::string ());
+ 
+     octave_value_list execute (const cdef_object& obj,
+ 			       const octave_value_list& args, int nargout,
+                                bool do_check_access = true,
+                                const std::string& who = std::string ());
+@@ -1052,28 +1060,34 @@ private:
+     meta_subsref (const std::string& type,
+                   const std::list<octave_value_list>& idx, int nargout);
+ 
+     bool meta_is_postfix_index_handled (char type) const
+       { return (type == '(' || type == '.'); }
+ 
+   private:
+     cdef_method_rep (const cdef_method_rep& m)
+-      : cdef_meta_object_rep (m), function (m.function) { }
++      : cdef_meta_object_rep (m), function (m.function),
++        dispatch_type (m.dispatch_type)
++      { }
+ 
+     void check_method (void);
+ 
+     cdef_method wrap (void)
+       {
+         refcount++;
+         return cdef_method (this);
+       }
+ 
+   private:
+     octave_value function;
++
++    // When non-empty, the method is externally defined and this member
++    // is used to cache the dispatch type to look for the method.
++    std::string dispatch_type;
+   };
+ 
+ public:
+   cdef_method (void) : cdef_meta_object () { }
+ 
+   cdef_method (const std::string& nm)
+       : cdef_meta_object (new cdef_method_rep ())
+     { get_rep ()->set_name (nm); }
+@@ -1120,16 +1134,21 @@ public:
+     { get_rep ()->set_function (fcn); }
+ 
+   octave_value get_function (void) const
+     { return get_rep ()->get_function (); }
+ 
+   bool is_constructor (void) const
+     { return get_rep ()->is_constructor (); }
+ 
++  bool is_external (void) const { return get_rep ()->is_external (); }
++
++  void mark_as_external (const std::string& dtype)
++    { get_rep ()->mark_as_external (dtype); }
++
+ private:
+   cdef_method_rep* get_rep (void)
+     { return dynamic_cast<cdef_method_rep *> (cdef_object::get_rep ()); }
+   
+   const cdef_method_rep* get_rep (void) const
+     { return dynamic_cast<const cdef_method_rep *> (cdef_object::get_rep ()); }
+ };
+ 
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -3836,17 +3836,20 @@ parse_fcn_file (const std::string& full_
+             {
+               // Convert parse tree for classdef object to
+               // meta.class info (and stash it in the symbol
+               // table?).  Return pointer to constructor?
+ 
+               if (fcn_ptr)
+                 panic_impossible ();
+ 
+-              fcn_ptr = parser.classdef_object->make_meta_class ();
++              bool is_at_folder = ! dispatch_type.empty ();
++
++              fcn_ptr =
++                parser.classdef_object->make_meta_class (is_at_folder);
+             }
+           else if (fcn_ptr)
+             {
+               fcn_ptr->maybe_relocate_end ();
+ 
+               if (parser.parsing_subfunctions)
+                 {
+                   if (! parser.endfunction_found)
+diff --git a/libinterp/parse-tree/pt-classdef.cc b/libinterp/parse-tree/pt-classdef.cc
+--- a/libinterp/parse-tree/pt-classdef.cc
++++ b/libinterp/parse-tree/pt-classdef.cc
+@@ -228,20 +228,20 @@ tree_classdef_body::~tree_classdef_body 
+       delete *p;
+       enum_lst.erase (p);
+     }
+ }
+ 
+ // Classdef
+ 
+ octave_function*
+-tree_classdef::make_meta_class (void)
++tree_classdef::make_meta_class (bool is_at_folder)
+ {
+   octave_value retval;
+-  cdef_class cls = cdef_class::make_meta_class (this);
++  cdef_class cls = cdef_class::make_meta_class (this, is_at_folder);
+ 
+   if (cls.ok ())
+     return cls.get_constructor_function ();
+ 
+   return 0;
+ }
+ 
+ tree_classdef *
+diff --git a/libinterp/parse-tree/pt-classdef.h b/libinterp/parse-tree/pt-classdef.h
+--- a/libinterp/parse-tree/pt-classdef.h
++++ b/libinterp/parse-tree/pt-classdef.h
+@@ -623,17 +623,17 @@ public:
+ 
+   tree_classdef_body *body (void) { return element_list; }
+ 
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
+   const std::string& package_name (void) const { return pack_name; }
+ 
+-  octave_function* make_meta_class (void);
++  octave_function* make_meta_class (bool is_at_folder = false);
+ 
+   tree_classdef *dup (symbol_table::scope_id scope,
+                       symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
+ private:
+ 

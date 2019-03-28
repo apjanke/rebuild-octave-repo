@@ -1,0 +1,241 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1553530871 0
+#      Mon Mar 25 16:21:11 2019 +0000
+# Node ID 4ba3658176527e7ad3ca450470e4955bd0310f8a
+# Parent  be5c2a1bad93a0a2571723b32ed2d15a094c5768
+allow dispatch class to be stored in octave_fcn_handle (bug #45351)
+
+* ov-fcn-handle.h, ov-fcn-handle.cc
+(octave_fcn_handle::m_dispatch_class): New data member.
+(octave_fcn_handle::set_dispatch_class,
+octave_fcn_handle::get_dispatch_class): New methods.
+(make_fcn_handle): If handle is created inside a classdef method or
+constructor, store dispatch class in function handle object.
+(octave_fcn_handle::call): Temporarily set dispatch type for function
+call in call stack.
+
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -80,17 +80,17 @@ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (oct
+                                      "function handle",
+                                      "function_handle");
+ 
+ const std::string octave_fcn_handle::anonymous ("@<anonymous>");
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave::symbol_scope& scope,
+                                       const std::string& n)
+   : m_fcn (), m_obj (), m_name (n), m_scope (scope), m_is_nested (false),
+-    m_closure_frames (nullptr)
++    m_closure_frames (nullptr), m_dispatch_class ()
+ {
+   if (! m_name.empty () && m_name[0] == '@')
+     m_name = m_name.substr (1);
+ 
+   size_t pos = m_name.find ('.');
+ 
+   if (pos != std::string::npos)
+     {
+@@ -114,17 +114,17 @@ octave_fcn_handle::octave_fcn_handle (co
+         m_obj = val;
+     }
+ }
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave::symbol_scope& scope,
+                                       const octave_value& f,
+                                       const std::string& n)
+   : m_fcn (f), m_obj (), m_name (n), m_scope (scope), m_is_nested (false),
+-    m_closure_frames (nullptr)
++    m_closure_frames (nullptr), m_dispatch_class ()
+ {
+   octave_user_function *uf = m_fcn.user_function_value (true);
+ 
+   if (uf && m_name != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+       if (uf_scope)
+@@ -133,17 +133,17 @@ octave_fcn_handle::octave_fcn_handle (co
+ 
+   if (uf && uf->is_nested_function () && ! uf->is_subfunction ())
+     m_is_nested = true;
+ }
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave_value& f,
+                                       const std::string& n)
+   : m_fcn (f), m_obj (), m_name (n), m_scope (), m_is_nested (false),
+-    m_closure_frames (nullptr)
++    m_closure_frames (nullptr), m_dispatch_class ()
+ {
+   octave_user_function *uf = m_fcn.user_function_value (true);
+ 
+   if (uf && m_name != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+       if (uf_scope)
+@@ -220,25 +220,25 @@ octave_value_list
+ octave_fcn_handle::call (int nargout, const octave_value_list& args)
+ {
+   // FIXME: if m_name has a '.' in the name, lookup first component.  If
+   // it is a classdef meta object, then build TYPE and IDX arguments and
+   // make a subsref call using them.
+ 
+   octave_value fcn_to_call = m_fcn;
+ 
++  octave::interpreter& interp
++    = octave::__get_interpreter__ ("octave_fcn_handle::call");
++
+   if (! fcn_to_call.is_defined ())
+     {
+       // The following code is similar to part of
+       // tree_evaluator::visit_index_expression but simpler because it
+       // handles a more restricted case.
+ 
+-      octave::interpreter& interp
+-        = octave::__get_interpreter__ ("octave_fcn_handle::call");
+-
+       octave::symbol_table& symtab = interp.get_symbol_table ();
+ 
+       size_t pos = m_name.find ('.');
+ 
+       if (pos != std::string::npos)
+         {
+           // We can have one of
+           //
+@@ -375,21 +375,29 @@ octave_fcn_handle::call (int nargout, co
+   if (! fcn_to_call.is_defined ())
+     err_invalid_fcn_handle (m_name);
+ 
+   octave::stack_frame *closure_context = nullptr;
+ 
+   if (m_closure_frames && m_closure_frames->size () > 0)
+     closure_context = m_closure_frames->front ();
+ 
+-  octave::tree_evaluator& tw
+-    = octave::__get_evaluator__ ("octave_fcn_handle::call");
++  octave::tree_evaluator& tw = interp.get_evaluator ();
+ 
+   octave_function *of = fcn_to_call.function_value ();
+ 
++  octave::unwind_protect frame;
++
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  frame.add_method (cs, &octave::call_stack::set_dispatch_class,
++                    std::string ());
++
++  cs.set_dispatch_class (m_dispatch_class);
++
+   return of->call (tw, nargout, args, closure_context);
+ }
+ 
+ dim_vector
+ octave_fcn_handle::dims (void) const
+ {
+   static dim_vector dv (1, 1);
+   return dv;
+@@ -1824,23 +1832,31 @@ namespace octave
+             break;
+ 
+           case '|':
+             tnm = "or";
+             break;
+           }
+       }
+ 
+-    octave::tree_evaluator& tw = interp.get_evaluator ();
++    tree_evaluator& tw = interp.get_evaluator ();
+ 
+     octave::symbol_scope curr_scope = tw.get_current_scope ();
+ 
+-    return new octave_fcn_handle (curr_scope, tnm);
++    octave_fcn_handle *fh = new octave_fcn_handle (curr_scope, tnm);
++
++    octave::call_stack& cs = interp.get_call_stack ();
++
++    std::string dispatch_class;
+ 
+-    return retval;
++    if (cs.is_class_method_executing (dispatch_class)
++        || cs.is_class_constructor_executing (dispatch_class))
++      fh->set_dispatch_class (dispatch_class);
++
++    return octave_value (fh);
+   }
+ }
+ 
+ /*
+ %!test
+ %! x = {".**", "power";
+ %!      ".'", "transpose";
+ %!      ".+", "plus";
+diff --git a/libinterp/octave-value/ov-fcn-handle.h b/libinterp/octave-value/ov-fcn-handle.h
+--- a/libinterp/octave-value/ov-fcn-handle.h
++++ b/libinterp/octave-value/ov-fcn-handle.h
+@@ -53,17 +53,17 @@ private:
+   typedef std::map<std::string, octave_value> str_ov_map;
+ 
+ public:
+ 
+   static const std::string anonymous;
+ 
+   octave_fcn_handle (void)
+     : m_fcn (), m_obj (), m_name (), m_scope (), m_is_nested (false),
+-      m_closure_frames (nullptr)
++      m_closure_frames (nullptr), m_dispatch_class ()
+   { }
+ 
+   octave_fcn_handle (const octave::symbol_scope& scope, const std::string& n);
+ 
+   octave_fcn_handle (const octave::symbol_scope& scope,
+                      const octave_value& f,
+                      const std::string& n = anonymous);
+ 
+@@ -113,16 +113,23 @@ public:
+   octave_value fcn_val (void) const { return m_fcn; }
+ 
+   std::string fcn_name (void) const { return m_name; }
+ 
+   void push_closure_context (octave::tree_evaluator& tw);
+ 
+   octave_value workspace (void) const;
+ 
++  void set_dispatch_class (const std::string& class_name)
++  {
++    m_dispatch_class = class_name;
++  }
++
++  std::string get_dispatch_class (void) const { return m_dispatch_class; }
++
+   bool is_equal_to (const octave_fcn_handle&) const;
+ 
+   octave_value convert_to_str_internal (bool pad, bool force, char type) const;
+ 
+   bool save_ascii (std::ostream& os);
+ 
+   bool load_ascii (std::istream& is);
+ 
+@@ -174,16 +181,21 @@ protected:
+   // TRUE means this is a handle to a nested function.
+   bool m_is_nested;
+ 
+   // Saved stack frames for handles to nested functions.  This allows us
+   // to access non-locals and other context info when calling nested
+   // functions indirectly through handles.
+   std::list<octave::stack_frame *> *m_closure_frames;
+ 
++  // The name of the class in which this handle was created, if any.
++  // Used to determine access permission when the referenced function is
++  // called.
++  std::string m_dispatch_class;
++
+   bool parse_anon_fcn_handle (const std::string& fcn_text);
+ 
+   virtual octave_value_list call (int nargout, const octave_value_list& args);
+ };
+ 
+ namespace octave
+ {
+   extern octave_value

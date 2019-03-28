@@ -1,0 +1,690 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1303383182 -7200
+#      Thu Apr 21 12:53:02 2011 +0200
+# Node ID 37d12b4531c5d4b0198a8729432eea2443a02116
+# Parent  a51ad78b51c5b8d96ba69251dab3c80f85cc6072
+Fetching the history was not thread-safe, now it is through encapsulation with OctaveLink.
+
+diff --git a/gui//src/MainWindow.h b/gui//src/MainWindow.h
+--- a/gui//src/MainWindow.h
++++ b/gui//src/MainWindow.h
+@@ -162,27 +162,18 @@ protected:
+         while(m_mainWindow->isRunning()) {
+ 
+         // Get a full variable list.
+         QList<SymbolRecord> symbolTable = OctaveLink::instance()->currentSymbolTable();
+         if(symbolTable.size()) {
+             m_mainWindow->variablesDockWidget()->setVariablesList(symbolTable);
+         }
+ 
+-        // Check whether any requested variables have been returned.
+-        QList<OctaveLink::RequestedVariable> reqVars
+-                = OctaveLink::instance()->requestedVariables();
+-
+-        //for(std::vector<OctaveLink::RequestedVariable>::iterator it = reqVars.begin();
+-        //   it != reqVars.end(); it++ ) {
+-            // TODO: Process requested variables.
+-        //}
+-
+         // Collect history list.
+-        string_vector historyList = OctaveLink::instance()->getHistoryList();
++        string_vector historyList = OctaveLink::instance()->currentHistory();
+         if(historyList.length()) {
+             m_mainWindow->historyDockWidget()->updateHistory(historyList);
+         }
+ 
+             usleep(100000);
+         }
+     }
+ private:
+diff --git a/gui//src/OctaveLink.cpp b/gui//src/OctaveLink.cpp
+--- a/gui//src/OctaveLink.cpp
++++ b/gui//src/OctaveLink.cpp
+@@ -20,39 +20,28 @@ 02110-1301, USA.
+ */
+ 
+ // Born July 13, 2007.
+ 
+ #include "OctaveLink.h"
+ 
+ OctaveLink OctaveLink::m_singleton;
+ 
+-static octave_user_code *
+-get_user_code (const std::string& fname = std::string ())
+-{
+-  octave_user_code *dbg_fcn = 0;
+ 
+-  if (fname.empty ())
+-    dbg_fcn = octave_call_stack::caller_user_code ();
+-  else
+-    {
+-      octave_value fcn = symbol_table::find_function (fname);
+-
+-      if (fcn.is_defined () && fcn.is_user_code ())
+-	dbg_fcn = fcn.user_code_value ();
+-    }
+-
+-  return dbg_fcn;
++OctaveLink::OctaveLink()
++    : QObject(),
++      m_previousHistoryLength(0) {
++    m_symbolTableSemaphore = new QSemaphore(1);
++    m_historySemaphore = new QSemaphore(1);
+ }
+ 
+-//*************************************************************************
++OctaveLink::~OctaveLink() {
++}
++
+ int OctaveLink::readlineEventHook() {
+-  // TODO: No need to run too quickly.  The documentation says it will run
+-  // at most 10 times per second.  This may be too fast and we will need to
+-  // artificially slow it down somehow.  Not sure at this time how.
+   OctaveLink::instance()->processOctaveServerData();
+   return 0;
+ }
+ 
+ QString OctaveLink::octaveValueAsQString(OctaveValue octaveValue) {
+     // Convert string.
+     if(octaveValue.is_string()) {
+         return QString("\"%1\"").arg(octaveValue.string_value().c_str());
+@@ -76,385 +65,58 @@ QString OctaveLink::octaveValueAsQString
+         return QString("{complex matrix}");
+ 
+     // If everything else does not fit, we could not recognize the type.
+     } else {
+         return QString("<Type not recognized>");
+     }
+ }
+ 
+-//*************************************************************************
+-OctaveLink::OctaveLink()
+-    : QObject(),
+-      m_previousHistoryLength(0) {
+-    m_symbolTableSemaphore = new QSemaphore(1);
+-}
+-
+-OctaveLink::~OctaveLink() {
+-}
+-
+ void OctaveLink::fetchSymbolTable() {
+     m_symbolTableSemaphore->acquire();
+     m_symbolTableBuffer.clear();
+     std::list<SymbolRecord> allVariables = symbol_table::all_variables();
+     std::list<SymbolRecord>::iterator iterator;
+     for(iterator = allVariables.begin(); iterator != allVariables.end(); iterator++)
+         m_symbolTableBuffer.append(*iterator);
+     m_symbolTableSemaphore->release();
++    emit symbolTableChanged();
++}
++
++
++void OctaveLink::fetchHistory() {
++    int currentLen = command_history::length();
++    if(currentLen != m_previousHistoryLength) {
++        m_historySemaphore->acquire();
++        for(int i = m_previousHistoryLength; i < currentLen; i++) {
++            m_historyBuffer.append(command_history::get_entry(i));
++        }
++        m_historySemaphore->release();
++        m_previousHistoryLength = currentLen;
++        emit historyChanged();
++    }
+ }
+ 
+ QList<SymbolRecord> OctaveLink::currentSymbolTable() {
+     QList<SymbolRecord> m_symbolTableCopy;
+ 
+     // Generate a deep copy of the current symbol table.
+     m_symbolTableSemaphore->acquire();
+     foreach(SymbolRecord symbolRecord, m_symbolTableBuffer)
+         m_symbolTableCopy.append(symbolRecord);
+     m_symbolTableSemaphore->release();
+ 
+     return m_symbolTableCopy;
+ }
+ 
+-
+-//*************************************************************************
+-QList<OctaveLink::RequestedVariable> OctaveLink::requestedVariables() {
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    return m_requestedVariables;
+-}
+-
+-//*************************************************************************
+-int OctaveLink::setRequestedVariableNames(QList<QString> variablesNames) {
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    m_variablesRequestList = variablesNames;
+-    return 0;
+-}
+-
+-//*************************************************************************
+-string_vector OctaveLink::getHistoryList(void)
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+-    // Copy the list of command history items
+-    string_vector retval( m_historyList );
+-    m_historyList = string_vector();
+-
+-    return retval;
+-}
+-
+-std::vector<OctaveLink::BreakPoint> OctaveLink::breakPointList(int& status)
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+-    // Copy the list of variable information
+-    std::vector<BreakPoint> retval (m_currentBreakpoints.size());
+-    std::copy( m_currentBreakpoints.begin(), m_currentBreakpoints.end(), retval.begin() );
+-
+-    status = 0;
+-    return retval;
+-}
+-
+-bool OctaveLink::isBreakpointReached()
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+-    // Copy the list of variable information
+-    bool retval = (m_reachedBreakpoints.size()>0);
+-    return retval;
+-}
+-
+-std::vector<OctaveLink::BreakPoint> OctaveLink::reachedBreakpoint()
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+-    // Copy the list of variable information
+-    std::vector<BreakPoint> retval (m_reachedBreakpoints.size());
+-    std::copy (m_reachedBreakpoints.begin(), m_reachedBreakpoints.end(), retval.begin() );
+-
++string_vector OctaveLink::currentHistory() {
++    m_historySemaphore->acquire();
++    string_vector retval(m_historyBuffer);
++    m_historyBuffer = string_vector();
++    m_historySemaphore->release();
+     return retval;
+ }
+ 
+-int OctaveLink::addBreakpoint( BreakPoint bp_info )
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-
+-    // Copy the list of variable information
+-    m_addedBreakpoints.push_back (bp_info);
+-
+-    return 0;
+-}
+-
+-int OctaveLink::removeBreakpoint( BreakPoint bp_info )
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    // Copy the list of variable information
+-    m_removedBreakpoints.push_back (bp_info);
+-    return 0;
+-}
+-
+-int OctaveLink::setBreakpointAction (BreakPointAction action)
+-{
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    m_breakPointAction = action;
+-    return 0;
+-}
+-
+-/*******************************************************************************
+- *******************************************************************************
+- * SERVER SIDE FUNCTIONS
+- *******************************************************************************
+- *******************************************************************************/
+-
+-//*************************************************************************
+-int OctaveLink::processOctaveServerData(void) {
+-    QMutexLocker mutexLocker(&m_internalAccessMutex);
+-    process_breakpoint_action();
+-    processBreakpointAndRemoveModify();
+-    processRequestedVariables();
++void OctaveLink::processOctaveServerData() {
+     fetchSymbolTable();
+-    setHistoryList();
+-    setBreakPointList();
+-    return 0;
+-}
+-
+-
+-
+-
+-//*************************************************************************
+-int OctaveLink::processRequestedVariables( void )
+-{
+-  /*
+-
+-  // Clear the list of existing requested variables
+-  requested_variables = std::vector<requested_variable_t>();
+-  
+-  //// Get the list of variables and copy them into requested_variables vector
+-  // XXX FIXME XXX Should separate argv to lists with and without dots.
+-  if ( top_level_sym_tab != NULL )
+-  {
+-    if ( global_command == 0 )
+-    {
+-      Array<symbol_record *> xsymbols = top_level_sym_tab->symbol_list ( string_vector(), 0xFF, SYMTAB_ALL_SCOPES);
+-      Array<symbol_record *> xsubsymbols = top_level_sym_tab->subsymbol_list ( string_vector(), 0xFF, SYMTAB_ALL_SCOPES);
+-
+-      int sym_len = xsymbols.length (), subsym_len = xsubsymbols.length (),
+-                                                     len = sym_len + subsym_len;
+-
+-      Array<symbol_record *> symbols (len);
+-
+-      if (len > 0)
+-      {
+-        //size_t bytes = 0;
+-        //size_t elements = 0;
+-
+-        int i;
+-
+-        // Joining symbolic tables.
+-        for (i = 0; i < sym_len; i++)
+-          symbols(i) = xsymbols(i);
+-
+-        for (i = 0; i < subsym_len; i++)
+-          symbols(i+sym_len) = xsubsymbols(i);
+-      }
+-
+-      for (int j = 0; j < len; j++)
+-      {
+-        if ( symbols(j)->is_user_variable() && 
+-	     std::find( variables_request_list.begin(), variables_request_list.end(), 
+-			symbols(j)->name() ) != variables_request_list.end() )
+-        {
+-          requested_variable_t tempVar;
+-          tempVar.name = symbols(j)->name();
+-          tempVar.ov = symbols(j);
+-          requested_variables.push_back(tempVar);
+-        }
+-      }
+-
+-    }
+-  }
+-
+-  variables_request_list = std::vector<std::string>();
+-  */
+-  return 0;
+-}
+-
+-
+-//*************************************************************************
+-int OctaveLink::setHistoryList( void )
+-{
+-  // Build up the current list
+-  int currentLen = command_history::length();
+-  if ( currentLen != m_previousHistoryLength )
+-  {
+-    for( int i = m_previousHistoryLength ; i < currentLen ; i++ )
+-      m_historyList.append( command_history::get_entry(i) );
+-    m_previousHistoryLength = currentLen;
+-  }
+-
+-  return 0;
++    fetchHistory();
+ }
+ 
+-//*************************************************************************
+-int OctaveLink::setBreakPointList( void )
+-{
+-  // Set the list of breakpoints
+-  m_currentBreakpoints = std::vector<BreakPoint>();
+-
+-  octave_value_list zz;
+-  
+-  bp_table::fname_line_map bp_list = bp_table::get_breakpoint_list(zz);
+-  for (bp_table::fname_line_map_iterator it = bp_list.begin () ; it != bp_list.end () ; it++)
+-  {	  
+-    bp_table::intmap m = it->second;
+-    size_t nel = m.size ();
+-    for (size_t j = 0; j < nel; j++)
+-
+-    {
+-      BreakPoint tmp;
+-      tmp.fileName = it->first;
+-      tmp.lineNumber = m[j];
+-
+-      m_currentBreakpoints.push_back (tmp);
+-    }
+-  }
+-
+-  // If in debug mode, set the location of the break
+-  m_reachedBreakpoints = std::vector<BreakPoint>();
+-
+-  octave_user_code *dbg_fcn = get_user_code ();
+-
+-  if (dbg_fcn)
+-    {
+-      bool have_file = true;
+-
+-      std::string name = dbg_fcn->fcn_file_name ();
+-
+-      if (name.empty ())
+-        {
+-          have_file = false;
+-	  
+-          name = dbg_fcn->name ();
+-        }
+-
+-      //octave_stdout << "stopped in " << name << " at ";
+-
+-      int l = octave_call_stack::caller_user_code_line ();
+-
+-      if (l > 0)
+-        {
+-
+-	  BreakPoint tmp;
+-	  QFileInfo pathInfo;
+-	  QString qFilePath (name.c_str());
+-	  pathInfo.setFile (qFilePath);
+-	  //(QString (name));
+-	  QString fileName (pathInfo.fileName ());
+-	  //std::string shortName = Glib::path_get_basename(name);
+-	  std::string shortName = fileName.toStdString ();
+-	  std::string funcName;
+-          int dot = shortName.find_first_of(".");
+-          if (dot!=(signed)std::string::npos)
+-	    {
+-	      funcName = shortName.substr (0,dot);
+-	    }
+-          tmp.fileName = funcName;
+-          tmp.lineNumber = l;
+-	  
+-	  //	  octave_stdout << "BP reached at " << tmp.filename << ":" << tmp.line_number << std::endl;
+-
+-          m_reachedBreakpoints.push_back (tmp);
+-        }
+-      else
+-        octave_stdout << " <unknown line>" << std::endl;
+-    }
+-  return 0;
+-}
+-
+-//*************************************************************************
+-int OctaveLink::process_breakpoint_action (void)
+-{
+-
+-  if (Vdebugging)
+-  {
+-    if (m_breakPointAction==StepInto)
+-    {
+-      Vdebugging = false;
+-      tree_evaluator::dbstep_flag = -1;
+-
+-      rl_line_buffer[0] = '\0';	
+-      rl_point = rl_end = 0;
+-      rl_done = 1;
+-      rl_forced_update_display ();
+-    }
+-    else if (m_breakPointAction==StepOver)
+-    {
+-      Vdebugging = false;
+-      tree_evaluator::dbstep_flag = 1;
+-
+-      rl_line_buffer[0] = '\0';	
+-      rl_point = rl_end = 0;
+-      rl_done = 1;
+-      rl_forced_update_display ();
+-    }
+-    else if (m_breakPointAction==StepOut)
+-    {
+-      Vdebugging = false;
+-      tree_evaluator::dbstep_flag = -2;
+-
+-      rl_line_buffer[0] = '\0';	
+-      rl_point = rl_end = 0;
+-      rl_done = 1;
+-      rl_forced_update_display ();
+-
+-      
+-    }
+-    else if (m_breakPointAction==Continue)
+-    {
+-      Vdebugging = false;
+-      tree_evaluator::dbstep_flag = 0;
+-
+-      rl_line_buffer[0] = '\0';	
+-      rl_point = rl_end = 0;
+-      rl_done = 1;
+-      rl_forced_update_display ();
+-    }
+-    else if (m_breakPointAction==Break)
+-    {
+-      tree_evaluator::dbstep_flag = 0;
+-      octave_throw_interrupt_exception ();
+-
+-      rl_line_buffer[0] = '\0';	
+-      rl_point = rl_end = 0;
+-      rl_done = 1;
+-      rl_forced_update_display ();
+-    }
+-    m_breakPointAction = None;
+-  }
+-
+-  return 0;
+-}
+-
+-//*************************************************************************
+-int OctaveLink::processBreakpointAndRemoveModify(void)
+-{
+-  //octave_stdout << "Processing breakpoints changes" << std::endl;
+-  // Process added breakpoints
+-  for (int i = 0 ; i < (signed)m_addedBreakpoints.size() ; i++)
+-  {
+-    std::string funcName = m_addedBreakpoints[i].fileName;
+-    bp_table::intmap lines;
+-    lines[0] = m_addedBreakpoints[i].lineNumber;
+-    bp_table::add_breakpoint (funcName,lines);
+-    octave_stdout << "Adding breakpoint: " << funcName << " : " << lines[0] << std::endl; 
+-  }
+-  m_addedBreakpoints = std::vector<BreakPoint>();
+-
+-  // Process removed breakpoints
+-  for (int i = 0 ; i < (signed)m_removedBreakpoints.size() ; i++)
+-  {
+-    std::string funcName = m_removedBreakpoints[i].fileName;
+-    bp_table::intmap lines;
+-    lines[0] = m_removedBreakpoints[i].lineNumber;
+-    bp_table::remove_breakpoint (funcName,lines);
+-    //octave_stdout << "Removing breakpoint: " << funcName << " : " << lines[0] << std::endl; 
+-  }
+-  m_removedBreakpoints = std::vector<BreakPoint>();
+-  return 0;
+-}
+diff --git a/gui//src/OctaveLink.h b/gui//src/OctaveLink.h
+--- a/gui//src/OctaveLink.h
++++ b/gui//src/OctaveLink.h
+@@ -86,167 +86,54 @@ class OctaveLink : QObject
+ {
+     Q_OBJECT
+ public:
+     static OctaveLink *instance() { return &m_singleton; }
+     static int readlineEventHook(void);
+     static QString octaveValueAsQString(OctaveValue octaveValue);
+ 
+     /**
+-     * Enumeration used to identify breakpoint actions
+-     */
+-    enum BreakPointAction
+-    {
+-        None,
+-        StepInto,
+-        StepOver,
+-        StepOut,
+-        Continue,
+-        Break
+-    };
++      * Returns a copy of the current symbol table buffer.
++      * \return Copy of the current symbol table buffer.
++      */
++    QList<SymbolRecord> currentSymbolTable();
+ 
+     /**
+-     * Structure used to store breakpoint info.
+-     *
+-     * Notes: used for add, remove, list operations, as well as for the BreakpointReached event.
+-     */
+-    typedef struct BreakPoint
+-    {
+-        /**
+-        * The full path and filename where the breakpoint resides.
+-        */
+-        std::string fileName;
+-
+-        /**
+-        * The line number where the breakpoint resides.
+-        * In the future, -1 can indicate an existing but disabled breakpoint.  This
+-        * assumes that no one will ever have an M file longer than 2Million lines.
+-        */
+-        int lineNumber;
+-    } BreakPoint;
+-
+-    typedef struct RequestedVariable
+-    {
+-        std::string name;
+-        octave_value ov;
+-    } RequestedVariable;
+-
+-    // Functions used to access data form the client side.
+-    /** Debugging related methods. */
++      * Returns a copy of the current history buffer.
++      * \return Copy of the current history buffer.
++      */
++    string_vector currentHistory();
+ 
+-    /** TODO: Describe. */
+-    std::vector<BreakPoint> breakPointList(int& status);
+-
+-    /** TODO: Describe. */
+-    std::vector<BreakPoint> reachedBreakpoint();
+-
+-    /** TODO: Describe. */
+-    bool isBreakpointReached();
+-
+-    /** TODO: Describe. */
+-    int addBreakpoint(BreakPoint bp_info);
+-
+-    /** TODO: Describe. */
+-    int	removeBreakpoint(BreakPoint bp_info);
+-
+-    /** TODO: Describe. */
+-    int	modifyBreakpoint(BreakPoint old_bp_info, BreakPoint new_bp_info);
+-
+-    /** TODO: Describe. */
+-    int	setBreakpointAction(BreakPointAction action);
+-
+-    QList<SymbolRecord> currentSymbolTable();
+-
+-    /** TODO: Describe. */
+-    QList<RequestedVariable> requestedVariables(void);
+-
+-    /** TODO: Describe. */
+-    int	setRequestedVariableNames(QList<QString> variableNames);
++    void processOctaveServerData();
+ 
+     /**
+-      * History related methods.
++      * Updates the current symbol table with new data
++      * from octave.
+       */
+-    string_vector getHistoryList(void);
+-
+-    // FUNCTIONS USED TO ACCESS DATA FROM THE OCTAVE SERVER SIDE
++    void fetchSymbolTable();
+ 
+-    // NOTE: THIS IMPLIES THAT THESE ARE ONLY CALLED FROM
+-    // OCTAVE DURING A TIME IN WHICH THINGS ARE KNOWN TO
+-    // BE "THREAD-SAFE".  PROPOSED LOCATIONS:
+-    //   src/toplev.cc - main_loop() at the end of the do...while
+-    //   src/pt-bp.h   - MAYBE_DO_BREAKPOINT just prior to the do_keyboard
+-    // Most of these will call octave API functions to "pull" the data, rather
+-    // than having octave pass in the data.  This will help make changes
+-    // exlusive to this class if/when the Octave API changes.
+     /**
+-     * Calls all the appropriate functions that follow to update Octave
+-     * according to the data sent from the client in a thread-safe manner.
+-     *
+-     * Algorithm:
+-     *   Acquire lock
+-     *   process_breakpoint_add_remove_modify
+-     *   set_current_breakpoint
+-     *   set_breakpoint_list
+-     *   ...http://oregano.gforge.lug.fi.uba.ar/
+-     *   Release lock
+-     */
+-    int processOctaveServerData(void);
+-
+-    /** Debugging related methods. */
+-    /** TODO: Describe. */
+-    int setBreakPointList(void);
+-
+-    /** TODO: Describe. */
+-    // duplicate of process_breakpoint_action or helper function???
+-    int setCurrentBreakpoint(std::string filename, int line_number);
+-
+-    /** TODO: Describe. */
+-    int processBreakpointAndRemoveModify(void);
+-
+-    /** TODO: Describe. */
+-    int process_breakpoint_action(void);
+-
+-    /** Variable related methods. */
+-    /** Retrieves all variables from Octave. */
+-    void fetchSymbolTable(void);
+-
+-    /** TODO: Describe. */
+-    int processRequestedVariables(void);
+-
+-    /** History related methods. */
+-    /** TODO: Describe. */
+-    int setHistoryList(void);
++      * Updates the current history buffer with new data
++      * from octave.
++      */
++    void fetchHistory();
+ 
+ signals:
+     void symbolTableChanged();
++    void historyChanged();
+ 
+ private:
+     OctaveLink();
+     ~OctaveLink();
+ 
+-    /** Mutex variable used to protect access to internal class data. */
+-    QMutex m_internalAccessMutex;
+-
+-    std::vector<BreakPoint> m_currentBreakpoints;
+-    std::vector<BreakPoint> m_reachedBreakpoints;
+-    std::vector<BreakPoint> m_addedBreakpoints;
+-    std::vector<BreakPoint> m_removedBreakpoints;
+-    std::vector<BreakPoint> m_modifiedBreakpointsOld;
+-    std::vector<BreakPoint> m_modifiedBreakpointsNew;
+-    BreakPointAction m_breakPointAction;
+-
+     /** Variable related member variables. */
+     QSemaphore *m_symbolTableSemaphore;
+     QList<SymbolRecord> m_symbolTableBuffer;
+-    QList<QString> m_variablesRequestList;
+-
+-    // NOTE: Create an overloaded operator<< for octave_value to do the
+-    // flattening.  This will allow us to append easily to an ostringstream
+-    // for output.
+-    QList<RequestedVariable> m_requestedVariables;
+ 
+     /** History related member variables. */
+-    string_vector m_historyList;
++    QSemaphore *m_historySemaphore;
++    string_vector m_historyBuffer;
+     int m_previousHistoryLength;
++
+     static OctaveLink m_singleton;
+ };
+ #endif // OCTAVELINK_H
+ 

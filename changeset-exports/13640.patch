@@ -1,0 +1,1103 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1314049765 -7200
+#      Mon Aug 22 23:49:25 2011 +0200
+# Node ID bad5cb3cfe2047f89ed70ba032e358c0fd5154e5
+# Parent  b643c51ca0f7981285bfd1de9227198fb8dec215
+Cleanly separated terminal emulation code with an interface for platform-dependent terminals.
+
+diff --git a/gui/octave-gui.pro b/gui/octave-gui.pro
+--- a/gui/octave-gui.pro
++++ b/gui/octave-gui.pro
+@@ -74,17 +74,19 @@ SOURCES +=\
+     src/IRCWidget.cpp \
+     src/SettingsDialog.cpp \
+     src/OctaveGUI.cpp \
+     src/ResourceManager.cpp \
+     src/CommandLineParser.cpp \
+     src/backend/OctaveCallbackThread.cpp \
+     src/backend/OctaveLink.cpp \
+     src/backend/OctaveMainThread.cpp \
+-    src/qirc/IRCClientImpl.cpp
++    src/qirc/IRCClientImpl.cpp \
++    src/terminal/TerminalEmulation.cpp \
++    src/terminal/LinuxTerminalEmulation.cpp
+ 
+ HEADERS += \
+         src/lexer/lexeroctavegui.h \
+         src/terminal/Pty.h \
+         src/terminal/kpty.h \
+         src/terminal/kpty_p.h \
+         src/terminal/kptyprocess.h \
+         src/terminal/kprocess.h \
+@@ -100,12 +102,14 @@ HEADERS += \
+     src/IRCWidget.h \
+     src/SettingsDialog.h \
+     src/ResourceManager.h \
+     src/CommandLineParser.h \
+     src/backend/OctaveCallbackThread.h \
+     src/backend/OctaveLink.h \
+     src/backend/OctaveMainThread.h \
+     src/qirc/IRCClientInterface.h \
+-    src/qirc/IRCClientImpl.h
++    src/qirc/IRCClientImpl.h \
++    src/terminal/TerminalEmulation.h \
++    src/terminal/LinuxTerminalEmulation.h
+ 
+ FORMS += \
+     src/SettingsDialog.ui
+diff --git a/gui/src/MainWindow.cpp b/gui/src/MainWindow.cpp
+--- a/gui/src/MainWindow.cpp
++++ b/gui/src/MainWindow.cpp
+@@ -280,18 +280,16 @@ MainWindow::construct ()
+   m_filesDockWidget->setStatusTip (tr ("Browse your files."));
+   m_statusBar = new QStatusBar (this);
+ 
+   // Setup essential MDI Windows.
+   m_octaveTerminal = new OctaveTerminal (this);
+   m_documentationWidget = new BrowserWidget (this);
+   m_ircWidget = new IRCWidget (this);
+ 
+-  m_octaveTerminal->openTerminal ();
+-
+   // Octave Terminal subwindow.
+   m_octaveTerminalSubWindow = new NonClosableMdiSubWindow (this);
+   m_octaveTerminalSubWindow->setWidget (m_octaveTerminal);
+   m_centralMdiArea->addSubWindow (m_octaveTerminalSubWindow, Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
+ 
+   m_octaveTerminalSubWindow->setObjectName ("OctaveTerminalSubWindow");
+   m_octaveTerminalSubWindow->setWindowTitle (tr ("Terminal"));
+   m_octaveTerminalSubWindow
+diff --git a/gui/src/OctaveTerminal.cpp b/gui/src/OctaveTerminal.cpp
+--- a/gui/src/OctaveTerminal.cpp
++++ b/gui/src/OctaveTerminal.cpp
+@@ -18,308 +18,42 @@
+ 
+ #include "OctaveTerminal.h"
+ #include <QHBoxLayout>
+ #include <QVBoxLayout>
+ #include <QStringListModel>
+ #include <QStringList>
+ #include <QScrollBar>
+ 
+-#include "pty.h"
+-#include "unistd.h"
+-#include <assert.h>
+-
+-#include <cstdio>
+-
+ OctaveTerminal::OctaveTerminal (QWidget * parent)
+-  : QPlainTextEdit (parent)
++  : QPlainTextEdit (parent), Terminal ()
+ {
+-  construct ();
++    setSizePolicy (QSizePolicy::Expanding, QSizePolicy::Expanding);
++    m_terminalEmulation = TerminalEmulation::newTerminalEmulation (this);
+ }
+ 
+ OctaveTerminal::~OctaveTerminal ()
+ {
+ }
+ 
+-void
+-OctaveTerminal::construct ()
++QTextCursor
++OctaveTerminal::textCursor ()
+ {
+-  setSizePolicy (QSizePolicy::Expanding, QSizePolicy::Expanding);
+-  m_textCodec = QTextCodec::codecForLocale ();
++  return QPlainTextEdit::textCursor();
+ }
+ 
+ void
+-OctaveTerminal::openTerminal ()
++OctaveTerminal::setTextCursor (const QTextCursor &cursor)
+ {
+-  int fdm, fds;
+-  if (openpty (&fdm, &fds, 0, 0, 0) < 0)
+-    {
+-      assert (0);
+-    }
+-  dup2 (fds, 0);
+-  dup2 (fds, 1);
+-  dup2 (fds, 2);
++  QPlainTextEdit::setTextCursor (cursor);
++}
+ 
+-  m_shellProcess = new Pty (fdm);
+-  connect (m_shellProcess, SIGNAL(receivedData(QByteArray)),
+-           this, SLOT(handleReceivedData(QByteArray)));
++void
++OctaveTerminal::bell ()
++{
++
+ }
+ 
+ void
+ OctaveTerminal::keyPressEvent (QKeyEvent * keyEvent)
+ {
+-  switch (keyEvent->key ())
+-    {
+-      case Qt::Key_PageUp:
+-      if (verticalScrollBar ())
+-        verticalScrollBar ()->setValue (verticalScrollBar ()->value () - 10);
+-      return;
+-      case Qt::Key_PageDown:
+-      if (verticalScrollBar ())
+-        verticalScrollBar ()->setValue (verticalScrollBar ()->value () + 10);
+-      return;
+-
+-      case Qt::Key_Up:
+-      m_shellProcess->sendData ("\033OA");
+-      break;
+-
+-      case Qt::Key_Down:
+-      m_shellProcess->sendData ("\033OB");
+-      break;
+-
+-      case Qt::Key_Right:
+-      m_shellProcess->sendData ("\033OC");
+-      break;
+-
+-      case Qt::Key_Left:
+-      m_shellProcess->sendData ("\033OF");
+-      break;
+-
+-      case Qt::Key_Backslash:
+-      m_shellProcess->sendData ("\03308");
+-      break;
+-
+-      default:
+-      m_shellProcess->sendData (keyEvent->text ().toUtf8 ());
+-      break;
+-    }
+-
+-  /*
+-  bool emitKeyPressSignal = true;
+-
+-  if (event->modifiers () == Qt::ControlModifier)
+-    {
+-      switch (event->key ())
+-    {
+-    case Qt::Key_C:
+-      copyClipboard ();
+-      break;
+-    case Qt::Key_V:
+-      pasteClipboard ();
+-      break;
+-    };
+-    }
+-  else if (event->modifiers () == Qt::ShiftModifier)
+-    {
+-      bool update = true;
+-
+-
+-      else
+-    update = false;
+-
+-    }
+-
+-
+-  Qt::KeyboardModifiers modifiers = keyEvent->modifiers ();
+-  KeyboardTranslator::States states = KeyboardTranslator::NoState;
+-
+-  // get current states
+-  if (getMode (MODE_NewLine))
+-    states |= KeyboardTranslator::NewLineState;
+-  if (getMode (MODE_Ansi))
+-    states |= KeyboardTranslator::AnsiState;
+-  if (getMode (MODE_AppCuKeys))
+-    states |= KeyboardTranslator::CursorKeysState;
+-  if (getMode (MODE_AppScreen))
+-    states |= KeyboardTranslator::AlternateScreenState;
+-  if (getMode (MODE_AppKeyPad) && (modifiers & Qt::KeypadModifier))
+-    states |= KeyboardTranslator::ApplicationKeypadState;
+-
+-  // check flow control state
+-  if (modifiers & Qt::ControlModifier)
+-    {
+-      if (event->key () == Qt::Key_S)
+-    emit flowControlKeyPressed (true);
+-      else
+-    if (event->key () == Qt::Key_Q)
+-      emit flowControlKeyPressed (false);
+-    }
+-
+-  // lookup key binding
+-  if (_keyTranslator)
+-    {
+-      KeyboardTranslator::Entry entry =
+-    _keyTranslator->findEntry (event->key (), modifiers, states);
+-
+-      // send result to terminal
+-      QByteArray textToSend;
+-
+-      // special handling for the Alt (aka. Meta) modifier.  pressing
+-      // Alt+[Character] results in Esc+[Character] being sent
+-      // (unless there is an entry defined for this particular combination
+-      //  in the keyboard modifier)
+-      bool wantsAltModifier =
+-    entry.modifiers () & entry.modifierMask () & Qt::AltModifier;
+-      bool wantsAnyModifier =
+-    entry.state () & entry.
+-    stateMask () & KeyboardTranslator::AnyModifierState;
+-
+-      if (modifiers & Qt::AltModifier
+-      && !(wantsAltModifier || wantsAnyModifier)
+-      && !event->text ().isEmpty ())
+-    {
+-      textToSend.prepend ("\033");
+-    }
+-
+-      if (entry.command () != KeyboardTranslator::NoCommand)
+-    {
+-      if (entry.command () & KeyboardTranslator::EraseCommand)
+-        textToSend += eraseChar ();
+-
+-      // TODO command handling
+-    }
+-      else if (!entry.text ().isEmpty ())
+-    {
+-      textToSend += _codec->fromUnicode (entry.text (true, modifiers));
+-    }
+-      else
+-    textToSend += _codec->fromUnicode (event->text ());
+-
+-    }*/
+-  keyEvent->accept ();
++  m_terminalEmulation->processKeyEvent (keyEvent);
+ }
+-
+-void OctaveTerminal::handleReceivedData (const QByteArray& data)
+-{
+-  int position;
+-  QTextCursor tc = textCursor ();
+-  tc.movePosition (QTextCursor::End);
+-
+-  // Decode data into cursor actions.
+-  foreach(QChar character, data)
+-    {
+-      unsigned short unicode = character.unicode ();
+-      switch (unicode)
+-        {
+-        case 0: // Null (NUL)
+-          qDebug ("NUL");
+-          break;
+-        case 1: // Start Of Heading (SOH)
+-          qDebug ("SOH");
+-          break;
+-        case 2: // Start Of Text (STX)
+-          qDebug ("STX");
+-          break;
+-        case 3: // End Of Text (ETX)
+-          qDebug ("ETX");
+-          break;
+-        case 4: // End Of Transmission (EOT)
+-          qDebug ("EOT");
+-          break;
+-        case 5: // Enquiry (ENQ)
+-          qDebug ("ENQ");
+-          break;
+-        case 6: // Acknowledgement (ACK)
+-          qDebug ("ACK");
+-          break;
+-        case 7: // Bell (BEL)
+-          emit bell ();
+-          break;
+-        case 8: // Backspace (BS)
+-          tc.deletePreviousChar ();
+-          break;
+-        case 9: // Horizontal Tab (HT)
+-          qDebug ("HT");
+-          break;
+-        case 10: // Line Feed (LF)
+-          position = tc.position ();
+-          tc.movePosition (QTextCursor::EndOfLine);
+-          tc.insertText ("\n");
+-          tc.setPosition (position);
+-          tc.movePosition (QTextCursor::Down);
+-          break;
+-        case 11: // Vertical Tab (VT)
+-          qDebug ("VT");
+-          break;
+-        case 12: // Form Feed (FF)
+-          qDebug ("FF");
+-          break;
+-        case 13: // Carriage Return (CR)
+-          tc.movePosition (QTextCursor::StartOfLine, QTextCursor::KeepAnchor);
+-          break;
+-        case 14: // Shift Out (SO)
+-          qDebug ("SO");
+-          break;
+-        case 15: // Shift In (SI)
+-          qDebug ("SI");
+-          break;
+-        case 16: // Data Link Escape (DLE)
+-          qDebug ("DLE");
+-          break;
+-        case 17: // Device Control 1 (DC1, XON)
+-          qDebug ("DC1");
+-          break;
+-        case 18: // Device Control 2 (DC2)
+-          qDebug ("DC2");
+-          break;
+-        case 19: // Device Control 3 (DC3, XOFF)
+-          qDebug ("DC3");
+-          break;
+-        case 20: // Device Control 4 (DC4)
+-          qDebug ("DC4");
+-          break;
+-        case 21: // Negative Acknowledgement (NAK)
+-          qDebug ("NAK");
+-          break;
+-        case 22: // Synchronous Idle (SYN)
+-          qDebug ("SYN");
+-          break;
+-        case 23: // End Of Transmission Block (ETB)
+-          qDebug ("ETB");
+-          break;
+-        case 24: // Cancel (CAN)
+-          qDebug ("CAN");
+-          break;
+-        case 25: // End of Medium (EM)
+-          qDebug ("EM");
+-          break;
+-        case 26: // Substitute (SUB)
+-          qDebug ("SUB");
+-          break;
+-        case 27: // Escape (ESC)
+-          qDebug ("ESC");
+-          break;
+-        case 28: // File Separator (FS)
+-          qDebug ("FS");
+-          break;
+-        case 29: // Group Separator (GS)
+-          qDebug ("GS");
+-          break;
+-        case 30: // Record Separator (RS)
+-          qDebug ("RS");
+-          break;
+-        case 31: // Unit Separator (US)
+-          qDebug ("US");
+-          break;
+-        case 127: // Delete (DEL)
+-          break;
+-        default:
+-          tc.insertText (character);
+-          break;
+-        }
+-    }
+-  setTextCursor (tc);
+-
+-  if (verticalScrollBar ())
+-    {
+-      verticalScrollBar ()->setValue (verticalScrollBar ()->maximum ());
+-    }
+-}
+diff --git a/gui/src/OctaveTerminal.h b/gui/src/OctaveTerminal.h
+--- a/gui/src/OctaveTerminal.h
++++ b/gui/src/OctaveTerminal.h
+@@ -14,36 +14,31 @@
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #ifndef OCTAVETERMINAL_H
+ #define OCTAVETERMINAL_H
+ #include <QPlainTextEdit>
+-#include <QTextCodec>
+-#include "Pty.h"
++#include "TerminalEmulation.h"
+ 
+-class OctaveTerminal:public QPlainTextEdit
++class OctaveTerminal:public QPlainTextEdit, Terminal
+ {
+ Q_OBJECT
+ public:
+   OctaveTerminal (QWidget * parent = 0);
+   ~OctaveTerminal ();
+ 
+-  void sendText (QString text) { m_shellProcess->sendData (text.toLocal8Bit ()); }
+-  void openTerminal ();
++  void sendText (QString text) { m_terminalEmulation->transmitText(text); }
+ 
+-signals:
++  // Terminal Interface
++  QTextCursor textCursor();
++  void setTextCursor (const QTextCursor &cursor);
+   void bell ();
+ 
+ protected:
+   void keyPressEvent (QKeyEvent *keyEvent);
+ 
+-protected slots:
+-  void handleReceivedData (const QByteArray& data);
+-
+ private:
+-  void construct ();
+-  QTextCodec *m_textCodec;
+-  Pty *m_shellProcess;
++  TerminalEmulation *m_terminalEmulation;
+ };
+ #endif // OCTAVETERMINAL_H
+diff --git a/gui/src/terminal/LinuxTerminalEmulation.cpp b/gui/src/terminal/LinuxTerminalEmulation.cpp
+new file mode 100644
+--- /dev/null
++++ b/gui/src/terminal/LinuxTerminalEmulation.cpp
+@@ -0,0 +1,192 @@
++#include "LinuxTerminalEmulation.h"
++
++LinuxTerminalEmulation::LinuxTerminalEmulation ()
++  : TerminalEmulation ()
++{
++  int fdm, fds;
++  if (openpty (&fdm, &fds, 0, 0, 0) < 0)
++    {
++      assert (0);
++    }
++  dup2 (fds, 0);
++  dup2 (fds, 1);
++  dup2 (fds, 2);
++
++  m_pty = new Pty (fdm);
++  connect (m_pty, SIGNAL(receivedData(QByteArray)),
++           this, SLOT(handleReceivedData(QByteArray)));
++}
++
++LinuxTerminalEmulation::~LinuxTerminalEmulation ()
++{
++  m_pty->terminate ();
++}
++
++void LinuxTerminalEmulation::processKeyEvent (QKeyEvent *keyEvent)
++{
++  switch (keyEvent->key ())
++    {
++      case Qt::Key_PageUp:
++      //if (verticalScrollBar ())
++      //  verticalScrollBar ()->setValue (verticalScrollBar ()->value () - 10);
++      return;
++      case Qt::Key_PageDown:
++      //if (verticalScrollBar ())
++      //  verticalScrollBar ()->setValue (verticalScrollBar ()->value () + 10);
++      return;
++
++      case Qt::Key_Up:
++      m_pty->sendData ("\033OA");
++      break;
++
++      case Qt::Key_Down:
++      m_pty->sendData ("\033OB");
++      break;
++
++      case Qt::Key_Right:
++      m_pty->sendData ("\033OC");
++      break;
++
++      case Qt::Key_Left:
++      m_pty->sendData ("\033OF");
++      break;
++
++      //case Qt::Key_Backspace:
++      //m_pty->sendData ("\03308");
++      //break;
++
++      default:
++      m_pty->sendData (keyEvent->text ().toAscii ());
++      break;
++    }
++  keyEvent->accept ();
++}
++
++void
++LinuxTerminalEmulation::transmitText (const QString &text)
++{
++  m_pty->sendData (text.toLocal8Bit ());
++}
++
++void
++LinuxTerminalEmulation::handleReceivedData (const QByteArray& data)
++{
++  int position;
++  QTextCursor tc = m_terminal->textCursor ();
++  tc.movePosition (QTextCursor::End);
++
++  // Decode data into cursor actions.
++  foreach(QChar character, data)
++    {
++      unsigned short unicode = character.unicode ();
++      switch (unicode)
++        {
++        case 0: // Null (NUL)
++          qDebug ("NUL");
++          break;
++        case 1: // Start Of Heading (SOH)
++          qDebug ("SOH");
++          break;
++        case 2: // Start Of Text (STX)
++          qDebug ("STX");
++          break;
++        case 3: // End Of Text (ETX)
++          qDebug ("ETX");
++          break;
++        case 4: // End Of Transmission (EOT)
++          qDebug ("EOT");
++          break;
++        case 5: // Enquiry (ENQ)
++          qDebug ("ENQ");
++          break;
++        case 6: // Acknowledgement (ACK)
++          qDebug ("ACK");
++          break;
++        case 7: // Bell (BEL)
++          m_terminal->bell ();
++          break;
++        case 8: // Backspace (BS)
++          tc.deletePreviousChar ();
++          break;
++        case 9: // Horizontal Tab (HT)
++          qDebug ("HT");
++          break;
++        case 10: // Line Feed (LF)
++          position = tc.position ();
++          tc.movePosition (QTextCursor::EndOfLine);
++          tc.insertText ("\n");
++          tc.setPosition (position);
++          tc.movePosition (QTextCursor::Down);
++          break;
++        case 11: // Vertical Tab (VT)
++          qDebug ("VT");
++          break;
++        case 12: // Form Feed (FF)
++          qDebug ("FF");
++          break;
++        case 13: // Carriage Return (CR)
++          tc.movePosition (QTextCursor::StartOfLine, QTextCursor::KeepAnchor);
++          break;
++        case 14: // Shift Out (SO)
++          qDebug ("SO");
++          break;
++        case 15: // Shift In (SI)
++          qDebug ("SI");
++          break;
++        case 16: // Data Link Escape (DLE)
++          qDebug ("DLE");
++          break;
++        case 17: // Device Control 1 (DC1, XON)
++          qDebug ("DC1");
++          break;
++        case 18: // Device Control 2 (DC2)
++          qDebug ("DC2");
++          break;
++        case 19: // Device Control 3 (DC3, XOFF)
++          qDebug ("DC3");
++          break;
++        case 20: // Device Control 4 (DC4)
++          qDebug ("DC4");
++          break;
++        case 21: // Negative Acknowledgement (NAK)
++          qDebug ("NAK");
++          break;
++        case 22: // Synchronous Idle (SYN)
++          qDebug ("SYN");
++          break;
++        case 23: // End Of Transmission Block (ETB)
++          qDebug ("ETB");
++          break;
++        case 24: // Cancel (CAN)
++          qDebug ("CAN");
++          break;
++        case 25: // End of Medium (EM)
++          qDebug ("EM");
++          break;
++        case 26: // Substitute (SUB)
++          qDebug ("SUB");
++          break;
++        case 27: // Escape (ESC)
++          qDebug ("ESC");
++          break;
++        case 28: // File Separator (FS)
++          qDebug ("FS");
++          break;
++        case 29: // Group Separator (GS)
++          qDebug ("GS");
++          break;
++        case 30: // Record Separator (RS)
++          qDebug ("RS");
++          break;
++        case 31: // Unit Separator (US)
++          qDebug ("US");
++          break;
++        case 127: // Delete (DEL)
++          break;
++        default:
++          tc.insertText (character);
++          break;
++        }
++    }
++  m_terminal->setTextCursor (tc);
++}
+diff --git a/gui/src/terminal/LinuxTerminalEmulation.h b/gui/src/terminal/LinuxTerminalEmulation.h
+new file mode 100644
+--- /dev/null
++++ b/gui/src/terminal/LinuxTerminalEmulation.h
+@@ -0,0 +1,29 @@
++#ifndef LINUXTERMINALEMULATION_H
++#define LINUXTERMINALEMULATION_H
++
++#include "TerminalEmulation.h"
++#include "Pty.h"
++
++#include "pty.h"
++#include "unistd.h"
++#include <assert.h>
++#include <cstdio>
++
++class LinuxTerminalEmulation : public TerminalEmulation
++{
++  Q_OBJECT
++public:
++  LinuxTerminalEmulation ();
++  ~LinuxTerminalEmulation ();
++
++  void processKeyEvent (QKeyEvent *keyEvent);
++  void transmitText (const QString &text);
++
++private slots:
++  void handleReceivedData (const QByteArray& data);
++
++private:
++  Pty *m_pty;
++};
++
++#endif // LINUXTERMINALEMULATION_H
+diff --git a/gui/src/terminal/TerminalEmulation.cpp b/gui/src/terminal/TerminalEmulation.cpp
+new file mode 100644
+--- /dev/null
++++ b/gui/src/terminal/TerminalEmulation.cpp
+@@ -0,0 +1,19 @@
++#include "TerminalEmulation.h"
++
++#ifdef Q_OS_UNIX
++  #include "LinuxTerminalEmulation.h"
++#endif
++
++TerminalEmulation *TerminalEmulation::newTerminalEmulation (Terminal *terminal)
++{
++#ifdef Q_OS_UNIX
++  TerminalEmulation *terminalEmulation = new LinuxTerminalEmulation ();
++  terminalEmulation->m_terminal = terminal;
++  return terminalEmulation;
++#endif
++}
++
++TerminalEmulation::TerminalEmulation ()
++  : QObject ()
++{
++}
+diff --git a/gui/src/terminal/TerminalEmulation.h b/gui/src/terminal/TerminalEmulation.h
+new file mode 100644
+--- /dev/null
++++ b/gui/src/terminal/TerminalEmulation.h
+@@ -0,0 +1,31 @@
++#ifndef TERMINALEMULATION_H
++#define TERMINALEMULATION_H
++
++#include <QObject>
++#include <QKeyEvent>
++#include <QTextCursor>
++
++class Terminal
++{
++  public:
++    virtual QTextCursor textCursor () = 0;
++    virtual void setTextCursor (const QTextCursor& cursor) = 0;
++
++    virtual void bell () = 0;
++};
++
++class TerminalEmulation : public QObject
++{
++  Q_OBJECT
++public:
++  static TerminalEmulation *newTerminalEmulation (Terminal *terminal);
++  TerminalEmulation ();
++  virtual ~TerminalEmulation () {}
++
++  virtual void processKeyEvent (QKeyEvent *keyEvent) = 0;
++  virtual void transmitText (const QString& text) = 0;
++protected:
++  Terminal *m_terminal;
++};
++
++#endif // TERMINALEMULATION_H
+diff --git a/gui/src/terminal/kptydevice.cpp b/gui/src/terminal/kptydevice.cpp
+--- a/gui/src/terminal/kptydevice.cpp
++++ b/gui/src/terminal/kptydevice.cpp
+@@ -28,33 +28,18 @@
+ #include <QtCore/QSocketNotifier>
+ 
+ #include <unistd.h>
+ #include <errno.h>
+ #include <signal.h>
+ #include <termios.h>
+ #include <fcntl.h>
+ #include <sys/ioctl.h>
+-#ifdef HAVE_SYS_FILIO_H
+-#include <sys/filio.h>
+-#endif
+-#ifdef HAVE_SYS_TIME_H
+-#include <sys/time.h>
+-#endif
+ 
+-#if defined(Q_OS_FREEBSD) || defined(Q_OS_MAC)
+-  // "the other end's output queue size" - kinda braindead, huh?
+-#define PTY_BYTES_AVAILABLE TIOCOUTQ
+-#elif defined(TIOCINQ)
+-  // "our end's input queue size"
+ #define PTY_BYTES_AVAILABLE TIOCINQ
+-#else
+-  // likewise. more generic ioctl (theoretically)
+-#define PTY_BYTES_AVAILABLE FIONREAD
+-#endif
+ 
+ //////////////////
+ // private data //
+ //////////////////
+ 
+ // Lifted from Qt. I don't think they would mind. ;)
+ // Re-lift again from Qt whenever a proper replacement for pthread_once appears
+ static void
+@@ -73,58 +58,21 @@ qt_ignore_sigpipe ()
+ #define NO_INTR(ret,func) do { ret = func; } while (ret < 0 && errno == EINTR)
+ 
+ bool
+ KPtyDevicePrivate::_k_canRead ()
+ {
+   Q_Q (KPtyDevice);
+   qint64 readBytes = 0;
+ 
+-#ifdef Q_OS_IRIX		// this should use a config define, but how to check it?
+-  size_t available;
+-#else
++
+   int available;
+-#endif
+   if (!::ioctl (q->masterFd (), PTY_BYTES_AVAILABLE, (char *) &available))
+     {
+-#ifdef Q_OS_SOLARIS
+-      // A Pty is a STREAMS module, and those can be activated
+-      // with 0 bytes available. This happens either when ^C is
+-      // pressed, or when an application does an explicit write(a,b,0)
+-      // which happens in experiments fairly often. When 0 bytes are
+-      // available, you must read those 0 bytes to clear the STREAMS
+-      // module, but we don't want to hit the !readBytes case further down.
+-      if (!available)
+-	{
+-	  char c;
+-	  // Read the 0-byte STREAMS message
+-	  NO_INTR (readBytes, read (q->masterFd (), &c, 0));
+-	  // Should return 0 bytes read; -1 is error
+-	  if (readBytes < 0)
+-	    {
+-	      readNotifier->setEnabled (false);
+-	      emit q->readEof ();
+-	      return false;
+-	    }
+-	  return true;
+-	}
+-#endif
+-
+       char *ptr = readBuffer.reserve (available);
+-#ifdef Q_OS_SOLARIS
+-      // Even if available > 0, it is possible for read()
+-      // to return 0 on Solaris, due to 0-byte writes in the stream.
+-      // Ignore them and keep reading until we hit *some* data.
+-      // In Solaris it is possible to have 15 bytes available
+-      // and to (say) get 0, 0, 6, 0 and 9 bytes in subsequent reads.
+-      // Because the stream is set to O_NONBLOCK in finishOpen(),
+-      // an EOF read will return -1.
+-      readBytes = 0;
+-      while (!readBytes)
+-#endif
+ 	// Useless block braces except in Solaris
+ 	{
+ 	  NO_INTR (readBytes, read (q->masterFd (), ptr, available));
+ 	}
+       if (readBytes < 0)
+ 	{
+ 	  readBuffer.unreserve (available);
+ 	  q->setErrorString (i18n ("Error reading from PTY"));
+@@ -205,57 +153,40 @@ KPtyDevicePrivate::_k_canWrite ()
+         } \
+     } while (0)
+ #endif
+ 
+ bool
+ KPtyDevicePrivate::doWait (int msecs, bool reading)
+ {
+   Q_Q (KPtyDevice);
+-#ifndef __linux__
+-  struct timeval etv;
+-#endif
+   struct timeval tv, *tvp;
+ 
+   if (msecs < 0)
+     tvp = 0;
+   else
+     {
+       tv.tv_sec = msecs / 1000;
+       tv.tv_usec = (msecs % 1000) * 1000;
+-#ifndef __linux__
+-      gettimeofday (&etv, 0);
+-      timeradd (&tv, &etv, &etv);
+-#endif
+       tvp = &tv;
+     }
+ 
+   while (reading ? readNotifier->isEnabled () : !writeBuffer.isEmpty ())
+     {
+       fd_set rfds;
+       fd_set wfds;
+ 
+       FD_ZERO (&rfds);
+       FD_ZERO (&wfds);
+ 
+       if (readNotifier->isEnabled ())
+ 	FD_SET (q->masterFd (), &rfds);
+       if (!writeBuffer.isEmpty ())
+ 	FD_SET (q->masterFd (), &wfds);
+ 
+-#ifndef __linux__
+-      if (tvp)
+-	{
+-	  gettimeofday (&tv, 0);
+-	  timersub (&etv, &tv, &tv);
+-	  if (tv.tv_sec < 0)
+-	    tv.tv_sec = tv.tv_usec = 0;
+-	}
+-#endif
+-
+       switch (select (q->masterFd () + 1, &rfds, &wfds, 0, tvp))
+ 	{
+ 	case -1:
+ 	  if (errno == EINTR)
+ 	    break;
+ 	  return false;
+ 	case 0:
+ 	  q->setErrorString (i18n ("PTY operation timed out"));
+@@ -293,20 +224,16 @@ KPtyDevicePrivate::finishOpen (QIODevice
+     new QSocketNotifier (q->masterFd (), QSocketNotifier::Write, q);
+   QObject::connect (readNotifier, SIGNAL (activated (int)), q,
+ 		    SLOT (_k_canRead ()));
+   QObject::connect (writeNotifier, SIGNAL (activated (int)), q,
+ 		    SLOT (_k_canWrite ()));
+   readNotifier->setEnabled (true);
+ }
+ 
+-/////////////////////////////
+-// public member functions //
+-/////////////////////////////
+-
+ KPtyDevice::KPtyDevice (QObject * parent):
+ QIODevice (parent), KPty (new KPtyDevicePrivate (this))
+ {
+ }
+ 
+ KPtyDevice::~KPtyDevice ()
+ {
+   close ();
+@@ -359,22 +286,16 @@ KPtyDevice::close ()
+   delete d->writeNotifier;
+ 
+   QIODevice::close ();
+ 
+   KPty::close ();
+ }
+ 
+ bool
+-KPtyDevice::isSequential () const
+-{
+-  return true;
+-}
+-
+-bool
+ KPtyDevice::canReadLine () const
+ {
+   Q_D (const KPtyDevice);
+   return QIODevice::canReadLine () || d->readBuffer.canReadLine ();
+ }
+ 
+ bool
+ KPtyDevice::atEnd () const
+@@ -392,30 +313,16 @@ KPtyDevice::bytesAvailable () const
+ 
+ qint64
+ KPtyDevice::bytesToWrite () const
+ {
+   Q_D (const KPtyDevice);
+   return d->writeBuffer.size ();
+ }
+ 
+-bool
+-KPtyDevice::waitForReadyRead (int msecs)
+-{
+-  Q_D (KPtyDevice);
+-  return d->doWait (msecs, true);
+-}
+-
+-bool
+-KPtyDevice::waitForBytesWritten (int msecs)
+-{
+-  Q_D (KPtyDevice);
+-  return d->doWait (msecs, false);
+-}
+-
+ void
+ KPtyDevice::setSuspended (bool suspended)
+ {
+   Q_D (KPtyDevice);
+   d->readNotifier->setEnabled (!suspended);
+ }
+ 
+ bool
+diff --git a/gui/src/terminal/kptydevice.h b/gui/src/terminal/kptydevice.h
+--- a/gui/src/terminal/kptydevice.h
++++ b/gui/src/terminal/kptydevice.h
+@@ -100,20 +100,16 @@ Q_OBJECT Q_DECLARE_PRIVATE_MI (KPtyDevic
+      * data.
+      *
+      * Do not use on closed ptys.
+      *
+      * See setSuspended()
+      */
+   bool isSuspended () const;
+ 
+-    /**
+-     * @return always true
+-     */
+-  virtual bool isSequential () const;
+ 
+     /**
+      * @reimp
+      */
+   bool canReadLine () const;
+ 
+     /**
+      * @reimp
+@@ -125,36 +121,32 @@ Q_OBJECT Q_DECLARE_PRIVATE_MI (KPtyDevic
+      */
+   qint64 bytesAvailable () const;
+ 
+     /**
+      * @reimp
+      */
+   qint64 bytesToWrite () const;
+ 
+-  bool waitForBytesWritten (int msecs = -1);
+-  bool waitForReadyRead (int msecs = -1);
+-
+-
+-    Q_SIGNALS:
++signals:
+     /**
+      * Emitted when EOF is read from the PTY.
+      *
+      * Data may still remain in the buffers.
+      */
+   void readEof ();
+ 
+ protected:
+-    virtual qint64 readData (char *data, qint64 maxSize);
++  virtual qint64 readData (char *data, qint64 maxSize);
+   virtual qint64 readLineData (char *data, qint64 maxSize);
+   virtual qint64 writeData (const char *data, qint64 maxSize);
+ 
+ private:
+   Q_PRIVATE_SLOT (d_func (), bool _k_canRead ())
+-    Q_PRIVATE_SLOT (d_func (), bool _k_canWrite ())};
++  Q_PRIVATE_SLOT (d_func (), bool _k_canWrite ())};
+ 
+ #define KMAXINT ((int)(~0U >> 1))
+ 
+ /////////////////////////////////////////////////////
+ // Helper. Remove when QRingBuffer becomes public. //
+ /////////////////////////////////////////////////////
+ 
+ #include <QtCore/qbytearray.h>
+diff --git a/gui/src/terminal/kptyprocess.cpp b/gui/src/terminal/kptyprocess.cpp
+--- a/gui/src/terminal/kptyprocess.cpp
++++ b/gui/src/terminal/kptyprocess.cpp
+@@ -76,32 +76,16 @@ KPtyProcess::setPtyChannels (PtyChannels
+ 
+ KPtyProcess::PtyChannels KPtyProcess::ptyChannels () const
+ {
+   Q_D (const KPtyProcess);
+ 
+   return d->ptyChannels;
+ }
+ 
+-void
+-KPtyProcess::setUseUtmp (bool value)
+-{
+-  Q_D (KPtyProcess);
+-
+-  d->addUtmp = value;
+-}
+-
+-bool
+-KPtyProcess::isUseUtmp () const
+-{
+-  Q_D (const KPtyProcess);
+-
+-  return d->addUtmp;
+-}
+-
+ KPtyDevice *
+ KPtyProcess::pty () const
+ {
+   Q_D (const KPtyProcess);
+ 
+   return d->pty;
+ }
+ 
+diff --git a/gui/src/terminal/kptyprocess.h b/gui/src/terminal/kptyprocess.h
+--- a/gui/src/terminal/kptyprocess.h
++++ b/gui/src/terminal/kptyprocess.h
+@@ -88,35 +88,16 @@ Q_OBJECT Q_DECLARE_PRIVATE (KPtyProcess)
+ 
+     /**
+      * Query to which channels the PTY is assigned.
+      *
+      * @return the output channel handling mode
+      */
+   PtyChannels ptyChannels () const;
+ 
+-    /**
+-     * Set whether to register the process as a TTY login in utmp.
+-     *
+-     * Utmp is disabled by default.
+-     * It should enabled for interactively fed processes, like terminal
+-     * emulations.
+-     *
+-     * This function must be called before starting the process.
+-     *
+-     * @param value whether to register in utmp.
+-     */
+-  void setUseUtmp (bool value);
+-
+-    /**
+-     * Get whether to register the process as a TTY login in utmp.
+-     *
+-     * @return whether to register in utmp
+-     */
+-  bool isUseUtmp () const;
+ 
+     /**
+      * Get the PTY device of this process.
+      *
+      * @return the PTY device
+      */
+   KPtyDevice *pty () const;
+ 

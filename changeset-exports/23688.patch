@@ -1,0 +1,438 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1498373805 -7200
+#      Sun Jun 25 08:56:45 2017 +0200
+# Node ID cb36684b7a33c2bdf0e8fa3aed201d4ef0180c06
+# Parent  315a3dcc229c6b3bd869d657c080151b0037e919
+In the GUI editor, automatically add "endif" for "if" etc.
+
+* octave-qscintilla.cc (is_end, octave_qscintilla::keypressEvent):
+  New function.
+
+* octave-qscintilla.h (octave_qscintilla::keypressEvent): New function.
+
+* file-editor-tab.cc (file_editor_tab::notice_settings):
+  New config setting, editor/auto_endif
+
+* settings-dialog.cc (settings_dialog::settings_dialog,
+                      settings_dialog::write_changed_settings):
+  New config setting, editor/auto_endif
+
+* settings-dialog.ui:
+  New config setting, editor/auto_endif
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -2343,33 +2343,35 @@ file_editor_tab::notice_settings (const 
+                this, SLOT (auto_margin_width ()));
+     }
+   else
+     {
+       _edit_area->setMarginLineNumbers (2, false);
+       disconnect (_edit_area, SIGNAL (linesChanged ()), 0, 0);
+     }
+ 
+-  _edit_area->setAutoIndent
+-        (settings->value ("editor/auto_indent",true).toBool ());
+   _smart_indent = settings->value ("editor/auto_indent",true).toBool ();
++  _edit_area->setAutoIndent (_smart_indent);
+   _edit_area->setTabIndents
+         (settings->value ("editor/tab_indents_line",false).toBool ());
+   _edit_area->setBackspaceUnindents
+         (settings->value ("editor/backspace_unindents_line",false).toBool ());
+   _edit_area->setIndentationGuides
+         (settings->value ("editor/show_indent_guides",false).toBool ());
+   _edit_area->setIndentationsUseTabs
+         (settings->value ("editor/indent_uses_tabs",false).toBool ());
+   _edit_area->setIndentationWidth
+         (settings->value ("editor/indent_width",2).toInt ());
+ 
+   _edit_area->setTabWidth
+         (settings->value ("editor/tab_width",2).toInt ());
+ 
++  _edit_area->set_auto_endif
++        (settings->value ("editor/auto_endif",1).toInt ());
++
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETHSCROLLBAR,
+         settings->value ("editor/show_hscroll_bar",true).toBool ());
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTH,-1);
+   _edit_area->SendScintilla (QsciScintillaBase::SCI_SETSCROLLWIDTHTRACKING,true);
+ 
+   _long_title = settings->value ("editor/longWindowTitle", false).toBool ();
+   update_window_title (_edit_area->isModified ());
+ 
+diff --git a/libgui/src/m-editor/octave-qscintilla.cc b/libgui/src/m-editor/octave-qscintilla.cc
+--- a/libgui/src/m-editor/octave-qscintilla.cc
++++ b/libgui/src/m-editor/octave-qscintilla.cc
+@@ -48,17 +48,17 @@ along with Octave; see the file COPYING.
+ #include <QMessageBox>
+ 
+ #include "octave-qscintilla.h"
+ #include "file-editor-tab.h"
+ #include "shortcut-manager.h"
+ #include "resource-manager.h"
+ 
+ octave_qscintilla::octave_qscintilla (QWidget *p)
+-  : QsciScintilla (p)
++  : QsciScintilla (p), _auto_endif (1)
+ {
+   connect (this, SIGNAL (textChanged ()), this, SLOT (text_changed ()));
+ 
+   // clear scintilla edit shortcuts that are handled by the editor
+   QsciCommandSet *cmd_set = standardCommands ();
+ 
+ #if defined (HAVE_QSCI_VERSION_2_6_0)
+   // find () was added in QScintilla 2.6
+@@ -417,16 +417,191 @@ octave_qscintilla::get_style (int pos)
+     // The positition has to be reduced by 2 for getting the real style (?)
+     position = SendScintilla (QsciScintillaBase::SCI_GETCURRENTPOS) - 2;
+   else
+     position = pos;
+ 
+   return SendScintilla (QsciScintillaBase::SCI_GETSTYLEAT, position);
+ }
+ 
++// Return true if CANDIDATE is a "closing" that matches OPENING,
++// such as "end" or "endif" for "if", or "catch" for "try".
++// Used for testing the last word of an "if" etc. line,
++// or the first word of the following line.
++static bool
++is_end (QString candidate, QString& opening)
++{
++  bool retval = false;
++
++  if (opening == "do")          // The only one that can't be ended by "end"
++    {
++      if (candidate == "until")
++        retval = true;
++    }
++  else
++    {
++      if (candidate == "end")
++        retval =  true;
++      else
++        {
++          if (opening == "try")
++            {
++              if (candidate == "catch" || candidate == "end_try_catch")
++                retval = true;
++            }
++          else if (opening == "unwind_protect")
++            {
++              if (candidate == "unwind_protect_cleanup"
++                  || candidate == "end_unwind_protect")
++                retval = true;
++            }
++          else if (candidate == "end" + opening)
++            retval = true;
++          else if (opening == "if" && candidate == "else")
++            retval = true;
++        }
++    }
++
++  return retval;
++}
++
++void
++octave_qscintilla::keyPressEvent (QKeyEvent *e)
++{
++  // On receiving Enter, insert and "end" for an "if" etc., if needed.
++  // (Use of "while" allows "break" to skip the rest.
++  // It may be clearer to use "if" and "goto",
++  // but that violates the coding standards.)
++  while (_auto_endif
++         && e->type () == QEvent::KeyPress
++         && (e->key () == Qt::Key_Return || e->key () == Qt::Key_Enter)
++         && !(e->modifiers () & (Qt::ControlModifier | Qt::MetaModifier
++                                 | Qt::AltModifier)))
++    {
++      bool autofill_simple_end = (_auto_endif == 2) ;
++
++      // Get line.
++      QPoint global_pos, local_pos;
++      get_global_textcursor_pos (&global_pos, &local_pos);
++      int linenr = lineAt (local_pos);
++      QString line = text (linenr);   // should always exist;
++
++      // Don't autocomplete an empty line.
++      size_t start = line.toStdString ().find_first_not_of (" \t");
++      if (start == std::string::npos)
++        break;
++
++      // Get the first word of the line
++          // Keep a compiled regular expression to extract the first word.
++      QRegExp rx_start, rx_end;
++      static bool first = true;
++      if (first)
++        {
++          rx_start = QRegExp ("(\\w+)");
++          // last word except for comments, assuming no ' or " in comment.
++          // rx_end = QRegExp ("(\\w+)[ \t;\r\n]*([%#][^\"']*)?$");
++
++          // last word except for comments,
++          // allowing % and # in single or double quoted strings
++          // FIXME This will get confused by transpose.
++          rx_end = QRegExp ("(?:(?:['\"][^'\"]*['\"])?[^%#]*)*"
++                            "(\\w+)[ \t;\r\n]*([%#].*)?$");
++        }
++
++      int tmp = rx_start.indexIn (line, start);
++      if (tmp == -1)
++        break;
++
++      QString first_word = rx_start.cap(1);
++
++      // Check if the first word of the line was an opening needing a close
++      if (! (first_word == "classdef" || first_word == "for"
++             || first_word == "while" || first_word == "if"
++             || first_word == "switch" || first_word == "properties"
++             || first_word == "events" || first_word == "function"
++             || first_word == "parfor" || first_word == "methods"
++             || first_word == "try" || first_word == "do"
++             || first_word == "unwind_protect"))
++        break;
++      if (rx_end.indexIn (line, start) != -1
++          && is_end (rx_end.cap(1), first_word))
++        break;
++
++      // Check if following line has the same or less indentation
++      // Check if the following line does not start with
++      //       end* (until) (catch)
++      if (linenr < lines () - 1)
++        {
++          int offset = 1;
++          size_t next_start;
++          QString next_line;
++          do                            // find next non-blank line
++            {
++              next_line = text (linenr + offset++);
++              next_start = next_line.toStdString ().find_first_not_of (" \t\n");
++            }
++          while (linenr + offset < lines ()
++                 && next_start == std::string::npos);
++
++          if (next_start == std::string::npos)
++            next_start = 0;
++
++          if (next_start > start)       // more indented => don't add "end"
++            break;
++          if (next_start == start)      // same => check if already is "end"
++            {
++              tmp = rx_start.indexIn (next_line, start);
++              if (tmp != -1 && is_end (rx_start.cap(1), first_word))
++                 break;
++            }
++        }
++
++      // If all of the above, insert a new line, with matching indent
++      // and either 'end' or 'end...', depending on a flag.
++
++      // If we insert directly after the last line, the "end" is autoindented,
++      // so add a dummy line.
++      if (linenr + 1 == lines ())
++        insertAt (QString ("\n"), linenr + 1, 0);
++
++      // For try/catch/end, fill "end" first, so "catch" is top of undo stack
++      if (first_word == "try")
++        insertAt (QString (start, ' ')
++                  + (autofill_simple_end ? "end\n" : "end_try_catch\n"),
++                  linenr + 1, 0);
++      else if (first_word == "unwind_protect")
++        insertAt (QString (start, ' ')
++                  + (autofill_simple_end ? "end\n" : "end_unwind_protect\n"),
++                  linenr + 1, 0);
++
++      QString next_line;
++      if (first_word == "do")
++        next_line = "until\n";
++      else if (first_word == "try")
++        next_line = "catch\n";
++      else if (first_word == "unwind_protect")
++        next_line = "unwind_protect_cleanup\n";
++      else if (autofill_simple_end)
++        next_line = "end\n";
++      else
++        {
++          if (first_word == "unwind_protect")
++            first_word = "_" + first_word;
++          next_line = "end" + first_word + "\n";
++        }
++
++      insertAt (QString (start, ' ') + next_line, linenr + 1, 0);
++
++      break;
++    }
++
++  // Call default processing, even if we did the above.
++  QsciScintilla::keyPressEvent (e);
++}
++
+ // Is a specific cursor position in a line or block comment?
+ int
+ octave_qscintilla::is_style_comment (int pos)
+ {
+   int lexer = SendScintilla (QsciScintillaBase::SCI_GETLEXER);
+   int style = get_style (pos);
+ 
+   switch (lexer)
+diff --git a/libgui/src/m-editor/octave-qscintilla.h b/libgui/src/m-editor/octave-qscintilla.h
+--- a/libgui/src/m-editor/octave-qscintilla.h
++++ b/libgui/src/m-editor/octave-qscintilla.h
+@@ -52,16 +52,17 @@ public:
+   void context_run ();
+   void get_global_textcursor_pos (QPoint *global_pos, QPoint *local_pos);
+   bool get_actual_word ();
+   void clear_indicator (int indicator_style);
+   void get_current_position (int *pos, int *line, int *col);
+   QString comment_string ();
+   int get_style (int pos = -1);
+   int is_style_comment (int pos = -1);
++  void set_auto_endif (int ai) { _auto_endif = ai; }
+ 
+ signals:
+ 
+   void execute_command_in_terminal_signal (const QString&);
+   void create_context_menu_signal (QMenu*);
+   void context_menu_edit_signal (const QString&);
+   void qsci_has_focus_signal (bool);
+   void status_update (bool,bool);
+@@ -83,13 +84,17 @@ private slots:
+   void text_changed (void);
+ 
+ protected:
+ 
+   void focusInEvent (QFocusEvent *focusEvent);
+ 
+ private:
+ 
++  void keyPressEvent (QKeyEvent *e);
++
++  int _auto_endif;
++
+   QString _word_at_cursor;
+ 
+ };
+ 
+ #endif
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -419,16 +419,18 @@ settings_dialog::settings_dialog (QWidge
+     settings->value ("editor/show_edit_status_bar",true).toBool ());
+   ui->cb_edit_tool_bar->setChecked (
+     settings->value ("editor/show_toolbar",true).toBool ());
+   ui->cb_code_folding->setChecked (
+     settings->value ("editor/code_folding",true).toBool ());
+   ui->editor_highlight_all_occurrences->setChecked (
+     settings->value ("editor/highlight_all_occurrences",true).toBool ());
+ 
++  ui->editor_auto_endif->setCurrentIndex (
++    settings->value ("editor/auto_endif", 1).toInt () );
+   ui->editor_codeCompletion->setChecked (
+     settings->value ("editor/codeCompletion", true).toBool ());
+   ui->editor_spinbox_ac_threshold->setValue (
+     settings->value ("editor/codeCompletion_threshold",2).toInt ());
+   ui->editor_checkbox_ac_keywords->setChecked (
+     settings->value ("editor/codeCompletion_keywords",true).toBool ());
+   ui->editor_checkbox_ac_builtins->setEnabled (
+     ui->editor_checkbox_ac_keywords->isChecked ());
+@@ -833,16 +835,18 @@ settings_dialog::write_changed_settings 
+   settings->setValue ("editor/codeCompletion_octave_functions",
+                       ui->editor_checkbox_ac_functions->isChecked ());
+   settings->setValue ("editor/codeCompletion_document",
+                       ui->editor_checkbox_ac_document->isChecked ());
+   settings->setValue ("editor/codeCompletion_case",
+                       ui->editor_checkbox_ac_case->isChecked ());
+   settings->setValue ("editor/codeCompletion_replace",
+                       ui->editor_checkbox_ac_replace->isChecked ());
++  settings->setValue ("editor/auto_endif",
++                      ui->editor_auto_endif->currentIndex ());
+   settings->setValue ("editor/show_white_space",
+                       ui->editor_ws_checkbox->isChecked ());
+   settings->setValue ("editor/show_white_space_indent",
+                       ui->editor_ws_indent_checkbox->isChecked ());
+   settings->setValue ("editor/show_eol_chars",
+                       ui->cb_show_eol->isChecked ());
+   settings->setValue ("editor/show_hscroll_bar",
+                       ui->cb_show_hscrollbar->isChecked ());
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -1298,16 +1298,76 @@
+                  <widget class="QCheckBox" name="editor_ind_uses_tabs_checkbox">
+                   <property name="text">
+                    <string>Indentation uses tabs</string>
+                   </property>
+                  </widget>
+                 </item>
+                </layout>
+               </item>
++
++              <item>
++               <layout class="QHBoxLayout" name="horizontalLayout_17">
++                <item>
++                 <widget class="QLabel" name="label_auto_endif">
++                  <property name="text">
++                   <string>Auto insert after "if" etc.</string>
++                  </property>
++                 </widget>
++                </item>
++                <item>
++                 <widget class="QComboBox" name="editor_auto_endif">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="sizeAdjustPolicy">
++                   <enum>QComboBox::AdjustToContents</enum>
++                  </property>
++                  <property name="minimumContentsLength">
++                   <number>5</number>
++                  </property>
++                  <item>
++                   <property name="text">
++                    <string>Nothing</string>
++                   </property>
++                  </item>
++                  <item>
++                   <property name="text">
++                    <string>"endif" etc.</string>
++                   </property>
++                  </item>
++                  <item>
++                   <property name="text">
++                    <string>"end"</string>
++                   </property>
++                  </item>
++                 </widget>
++                </item>
++                <item>
++                 <spacer name="horizontalSpacer_33">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeType">
++                   <enum>QSizePolicy::Expanding</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>10</width>
++                    <height>0</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
++               </layout>
++              </item>
++
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QGroupBox" name="groupBox_7">
+              <property name="title">
+               <string>Auto completion</string>
+              </property>

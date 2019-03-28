@@ -1,0 +1,1590 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1357264871 18000
+#      Thu Jan 03 21:01:11 2013 -0500
+# Branch classdef
+# Node ID 57be060d7672a22bf97ff8033ef157aff7cd28fc
+# Parent  ce8ad12ce8a0e0dd0c8880946399a8c24b35c5a6
+Implement full object construction and superclass references.
+
+* libinterp/octave-value/ov-classdef.h (cdef_object_rep::subsref): Add class
+context argument.
+(cdef_object_rep::ctor_list): New class member.
+(cdef_object_rep::mark_for_construction, cdef_object_rep::is_constructed_for,
+cdef_object_rep::is_partially_constructed_for,
+cdef_object_rep::mark_as_constructed, cdef_object_rep::is_constructed,
+cdef_object::mark_for_construction, cdef_object::is_constructed_for,
+cdef_object::is_partially_constructed_for, cdef_object::mark_as_constructed,
+cdef_object:is_constructed): New methods to manipulate the new ctor_list
+class member.
+(cdef_object_rep::cdef_object_rep (const cdef_object_rep&)): New copy
+constructor.
+(cdef_class::cdef_class_rep (std::string, std::list<cdef_class>)): New
+utility constructor.
+(cdef_class (std::string, std::list<cdef_class>)): Likewise.
+(cdef_class::cdef_class_rep::implicit_ctor_list): New class member.
+(cdef_method::cdef_method_rep::is_constructor, cdef_method::is_construcror):
+New methods.
+(cdef_method::get_function): Likewise.
+(cdef_package::cdef_package_rep::subsref): Remove method.
+(octave_classdef::get_object_ref): New method.
+(to_cdef_ref): New function.
+
+* libinterp/octave-value/ov-classdef.cc (is_superclass): Add max_depth argument.
+(is_direct_superclass): New utility function.
+(get_class_context): Add bool and std::string return values, as new reference
+arguments. Add overload without any arguments.
+(check_access): Check for valid class context when required.
+(make_class): Remove super_name_list argument. Do not set SuperClasses
+explicitly, use new cdef_class constructor instead.
+(octave_classdef::subsref): Change skip variable to size_t (avoids compilation
+warning). Call cdef_object::subsref with additional class context argument.
+(class octave_classdef_superclass_ref): New utility class.
+(F__superclass_reference__): Use it.
+(cdef_object_rep::subsref): Add class context argument.
+(cdef_object_rep::mark_for_construction): New method.
+(handle_cdef_object::~handle_cdef_object, value_cdef_object::~value_cdef_object,
+cdef_class::cdef_class_rep::subsref_meta, cdef_class::make_meta_class): Use gnulib::printf explicitly.
+(cdef_class::cdef_class_rep (std::string, std::list<cdef_class>)): New
+constructor.
+(class ctor_analyzer): New utility class.
+(cdef_class::cdef_class_rep::install_method): Use it to analyze constructors
+and detect explicit superclass constructor calls.
+(cdef_class::cdef_class_rep::initialize_object): Call
+cdef_object::mark_for_construction.
+(cdef_class::cdef_class_rep::run_constructor): Run all implicit superclass
+constructors first.
+(cdef_class::cdef_class_rep::construct): Call cdef_object::mark_as_constructed.
+(cdef_class::make_meta_class): Remove snamelist variable.
+(cdef_property::cdef_property_rep::get_value,
+cdef_property::cdef_property_rep::set_value): Check if object is partially
+constructed for the property-defining class.
+(cdef_method::cdef_method_rep::is_constructor): New method.
+(cdef_package::cdef_package_rep::subsref): Delete method.
+
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -19,24 +19,29 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <algorithm>
+ #include <map>
+ 
+ #include "defun.h"
+ #include "ov-builtin.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-typeinfo.h"
++#include "pt-assign.h"
+ #include "pt-classdef.h"
++#include "pt-funcall.h"
++#include "pt-misc.h"
++#include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
+ #include "toplev.h"
+ 
+ static std::map<std::string, cdef_class> all_classes;
+ static std::map<std::string, cdef_package> all_packages;
+ 
+ static void
+@@ -205,115 +210,147 @@ to_ov (const std::list<cdef_class>& clas
+        it != class_list.end (); ++it, ++i)
+     cls(i) = to_ov (*it);
+ 
+   return octave_value (cls);
+ }
+ 
+ static bool
+ is_superclass (const cdef_class& clsa, const cdef_class& clsb,
+-	       bool allow_equal = true)
++	       bool allow_equal = true, int max_depth = -1)
+ {
++  bool retval = false;
++
+   if (allow_equal && clsa == clsb)
+-    return true;
+-  else
++    retval = true;
++  else if (max_depth != 0)
+     {
+       Cell c = clsb.get ("SuperClasses").cell_value ();
+ 
+-      bool retval = false;
+-
+-      for (int i = 0; ! retval && i < c.numel (); i++)
++      for (int i = 0; ! error_state && ! retval && i < c.numel (); i++)
+ 	{
+ 	  cdef_class cls = lookup_class (c(i).string_value ());
+ 
+ 	  if (! error_state)
+-	    retval = is_superclass (clsa, cls, true);
++	    retval = is_superclass (clsa, cls, true,
++                                    max_depth < 0 ? max_depth : max_depth-1);
+ 	}
+-
+-      return retval;
+     }
++
++  return retval;
+ }
+ 
+ inline bool
+ is_strict_superclass (const cdef_class& clsa, const cdef_class& clsb)
+ { return is_superclass (clsa, clsb, false); }
+ 
++inline bool
++is_direct_superclass (const cdef_class& clsa, const cdef_class& clsb)
++{ return is_superclass (clsa, clsb, false, 1); }
++
+ static octave_value_list
+ class_get_properties (const octave_value_list& args, int /* nargout */)
+ {
+   octave_value_list retval;
+ 
+   if (args.length () == 1 && args(0).type_name () == "object")
+     {
+       cdef_class cls (to_cdef (args(0)));
+ 
+       retval(0) = cls.get_properties ();
+     }
+ 
+   return retval;
+ }
+ 
+ static cdef_class
+-get_class_context (void)
++get_class_context (std::string& name, bool& in_constructor)
+ {
+   cdef_class cls;
+ 
+   octave_function* fcn = octave_call_stack::current ();
+ 
++  in_constructor = false;
++
+   if (fcn &&
+       (fcn->is_class_method ()
+-       || fcn->is_class_constructor ()
++       || fcn->is_classdef_constructor ()
+        || fcn->is_anonymous_function_of_class ()
+        || (fcn->is_private_function ()
+            && ! fcn->dispatch_class ().empty ())))
+-    cls = lookup_class (fcn->dispatch_class ());
++    {
++      cls = lookup_class (fcn->dispatch_class ());
++      if (! error_state)
++        {
++          name = fcn->name ();
++          in_constructor = fcn->is_classdef_constructor ();
++        }
++    }
+ 
+   return cls;
+ }
+ 
++inline cdef_class
++get_class_context (void)
++{
++  std::string dummy_string;
++  bool dummy_bool;
++
++  return get_class_context (dummy_string, dummy_bool);
++}
++
+ static bool
+ check_access (const cdef_class& cls, const octave_value& acc)
+ {
+   if (acc.is_string ())
+     {
+       std::string acc_s = acc.string_value ();
+ 
+       if (acc_s == "public")
+         return true;
+ 
+       cdef_class ctx = get_class_context ();
+ 
+-      if (acc_s == "private")
+-        return (ctx == cls);
+-      else if (acc_s == "protected")
+-        return is_superclass (cls, ctx);
+-      else
+-        panic_impossible ();
++      // The access is private or protected, this requires a
++      // valid class context.
++
++      if (! error_state && ctx.ok ())
++        {
++          if (acc_s == "private")
++            return (ctx == cls);
++          else if (acc_s == "protected")
++            return is_superclass (cls, ctx);
++          else
++            panic_impossible ();
++        }
+     }
+   else if (acc.is_cell ())
+     {
+       Cell acc_c = acc.cell_value ();
+ 
+       cdef_class ctx = get_class_context ();
+ 
+-      if (ctx == cls)
+-        return true;
+-
+-      for (int i = 0; ! error_state && i < acc.numel (); i++)
++      // At this point, a class context is always required.
++
++      if (! error_state && ctx.ok ())
+         {
+-          cdef_class acc_cls (to_cdef (acc_c(i)));
+-
+-          if (! error_state)
++          if (ctx == cls)
++            return true;
++
++          for (int i = 0; ! error_state && i < acc.numel (); i++)
+             {
+-              if (is_superclass (acc_cls, ctx))
+-                return true;
++              cdef_class acc_cls (to_cdef (acc_c(i)));
++
++              if (! error_state)
++                {
++                  if (is_superclass (acc_cls, ctx))
++                    return true;
++                }
+             }
+         }
+-
+-      return false;
+     }
+   else
+     error ("invalid property/method access in class `%s'",
+            cls.get_name ().c_str ());
+   
+   return false;
+ }
+ 
+@@ -539,44 +576,31 @@ handle_delete (const octave_value_list& 
+ 
+   // FIXME: implement this
+ 
+   return retval;
+ }
+ 
+ static cdef_class
+ make_class (const std::string& name,
+-            const std::list<cdef_class>& super_list = std::list<cdef_class> (),
+-            const std::list<std::string>& super_name_list = std::list<std::string> ())
++            const std::list<cdef_class>& super_list = std::list<cdef_class> ())
+ {
+-  cdef_class cls ("meta.class");
++  cdef_class cls ("meta.class", super_list);
+ 
+   cls.put ("ConstructOnLoad", false);
+   cls.put ("ContainingPackage", Matrix ());
+   cls.put ("Description", std::string ());
+   cls.put ("DetailedDescription", std::string ());
+   cls.put ("Events", Cell ());
+   cls.put ("Hidden", false);
+   cls.put ("InferiorClasses", Cell ());
+   cls.put ("Methods", Cell ());
+   cls.put ("Name", name);
+   cls.put ("Properties", Cell ());
+   cls.put ("Sealed", false);
+-  if (super_name_list.size () == super_list.size ())
+-    cls.put ("SuperClasses", Cell (super_name_list));
+-  else
+-    {
+-      std::list<std::string> snamelist;
+-
+-      for (std::list<cdef_class>::const_iterator it = super_list.begin ();
+-           it != super_list.end (); ++it)
+-        snamelist.push_back (it->get_name ());
+-
+-      cls.put ("SuperClasses", Cell (snamelist));
+-    }
+ 
+   if (name == "handle")
+     {
+       cls.put ("HandleCompatible", true);
+       cls.mark_as_handle_class ();
+     }
+   else if (super_list.empty ())
+     {
+@@ -726,22 +750,22 @@ octave_classdef::register_type (void)
+     (octave_classdef::t_name, "<unknown>", octave_value (new octave_classdef ()));
+ }
+ 
+ octave_value_list
+ octave_classdef::subsref (const std::string& type,
+                           const std::list<octave_value_list>& idx,
+                           int nargout)
+ {
+-  int skip = 0;
++  size_t skip = 0;
+   octave_value_list retval;
+ 
+   // FIXME: should check "subsref" method first
+ 
+-  retval = object.subsref (type, idx, nargout, skip);
++  retval = object.subsref (type, idx, nargout, skip, cdef_class ());
+ 
+   if (! error_state)
+     {
+       if (type.length () > skip && idx.size () > skip)
+ 	retval = retval(0).next_subsref (nargout, type, idx, skip);
+     }
+ 
+   return retval;
+@@ -787,16 +811,181 @@ public:
+     { return to_ov (klass); }
+ 
+ private:
+   cdef_class klass;
+ };
+ 
+ //----------------------------------------------------------------------------
+ 
++class octave_classdef_superclass_ref : public octave_function
++{
++public:
++  octave_classdef_superclass_ref (const octave_value_list& a)
++    : octave_function (), args (a) { }
++
++  ~octave_classdef_superclass_ref (void) { }
++
++  octave_value_list
++  subsref (const std::string& type,
++           const std::list<octave_value_list>& idx,
++           int nargout)
++    {
++      size_t skip = 0;
++      octave_value_list retval;
++
++      switch (type[0])
++        {
++        case '(':
++          skip = 1;
++          retval = do_multi_index_op (type.length () > 1 ? 1 : nargout,
++                                      idx.front ());
++          break;
++        default:
++          retval = do_multi_index_op (1, octave_value_list ());
++          break;
++        }
++
++      if (! error_state)
++        {
++          if (type.length () > skip && idx.size () > skip
++              && retval.length () > 0)
++            retval = retval(0).next_subsref (nargout, type, idx, skip);
++        }
++
++      return retval;
++    }
++
++  octave_value
++  subsref (const std::string& type,
++           const std::list<octave_value_list>& idx)
++    {
++      octave_value_list retval;
++
++      retval = subsref (type, idx, 1);
++
++      return (retval.length () > 0 ? retval(0) : octave_value ());
++    }
++
++  octave_value_list
++  do_multi_index_op (int nargout, const octave_value_list& idx)
++    {
++      octave_value_list retval;
++
++      std::string meth_name;
++      bool in_constructor;
++      cdef_class ctx;
++
++      ctx = get_class_context (meth_name, in_constructor);
++
++      if (! error_state && ctx.ok ())
++        {
++          std::string mname = args(0).string_value ();
++          std::string pname = args(1).string_value ();
++          std::string cname = args(2).string_value ();
++
++          std::string cls_name = (pname.empty () ?
++                                  cname : pname + "." + cname);
++          cdef_class cls = lookup_class (cls_name);
++
++          if (! error_state)
++            {
++              if (in_constructor)
++                {
++                  if (is_direct_superclass (cls, ctx))
++                    {
++                      if (is_constructed_object (mname))
++                        {
++                          octave_value& sym = symbol_table::varref (mname);
++
++                          cls.run_constructor (to_cdef_ref (sym), idx);
++
++                          retval(0) = sym;
++                        }
++                      else
++                        ::error ("cannot call superclass constructor with "
++                                 "variable `%s'", mname.c_str ());
++                    }
++                  else
++                    ::error ("`%s' is not a direct superclass of `%s'",
++                             cls_name.c_str (), ctx.get_name ().c_str ());
++                }
++              else
++                {
++                  if (mname == meth_name)
++                    {
++                      if (is_strict_superclass (cls, ctx))
++                        {
++                          // I see 2 possible implementations here:
++                          // 1) use cdef_object::subsref with a different class
++                          //    context; this avoids duplicating codem but
++                          //    assumes the object is always the first argument
++                          // 2) lookup the method manually and call
++                          //    cdef_method::execute; this duplicates part of
++                          //    logic in cdef_object::subsref, but avoid the
++                          //    assumption of 1)
++                          // Not being sure about the assumption of 1), I
++                          // go with option 2) for the time being.
++
++                          cdef_method meth = cls.find_method (meth_name, false);
++
++                          if (meth.ok ())
++                            {
++                              if (meth.check_access ())
++                                retval = meth.execute (idx, nargout);
++                              else
++                                gripe_method_access (meth_name, meth);
++                            }
++                          else
++                            ::error ("no method `%s' found in superclass `%s'",
++                                     meth_name.c_str (), cls_name.c_str ());
++                        }
++                      else
++                        ::error ("`%s' is not a superclass of `%s'",
++                                 cls_name.c_str (), ctx.get_name ().c_str ());
++                    }
++                  else
++                    ::error ("method name mismatch (`%s' != `%s')",
++                             mname.c_str (), meth_name.c_str ());
++                }
++            }
++        }
++      else if (! error_state)
++        ::error ("superclass calls can only occur in methods or constructors");
++
++      return retval;
++    }
++
++private:
++  bool is_constructed_object (const std::string nm)
++    {
++      octave_function *of = octave_call_stack::current ();
++
++      if (of->is_classdef_constructor ())
++        {
++          octave_user_function *uf = of->user_function_value (true);
++
++          if (uf)
++            {
++              tree_parameter_list *ret_list = uf->return_list ();
++
++              if (ret_list && ret_list->length () == 1)
++                return (ret_list->front ()->name () == nm);
++            }
++        }
++
++      return false;
++    }
++
++private:
++  octave_value_list args;
++};
++
++//----------------------------------------------------------------------------
++
+ cdef_class
+ cdef_object_rep::get_class (void) const
+ {
+   cdef_class cls = lookup_class (class_name ());
+ 
+   return cls;
+ }
+ 
+@@ -809,21 +998,22 @@ cdef_object_rep::map_keys (void) const
+     return cls.get_names ();
+   
+   return string_vector ();
+ }
+ 
+ octave_value_list
+ cdef_object_rep::subsref (const std::string& type,
+                           const std::list<octave_value_list>& idx,
+-                          int nargout, int& skip)
++                          int nargout, size_t& skip,
++                          const cdef_class& context)
+ {
+   skip = 0;
+ 
+-  cdef_class cls = get_class ();
++  cdef_class cls = (context.ok () ? context : get_class ());
+ 
+   octave_value_list retval;
+ 
+   if (! cls.ok ())
+     return retval;
+ 
+   switch (type[0])
+     {
+@@ -947,24 +1137,54 @@ cdef_object_rep::subsasgn (const std::st
+     default:
+       panic_impossible ();
+       break;
+     }
+ 
+   return retval;
+ }
+ 
++void
++cdef_object_rep::mark_for_construction (const cdef_class& cls)
++{
++  std::string cls_name = cls.get_name ();
++
++  Cell supcls = cls.get ("SuperClasses").cell_value ();
++
++  if (! error_state)
++    {
++      std::list<std::string> supcls_names;
++
++      for (int i = 0; ! error_state && i < supcls.numel (); i++)
++        supcls_names.push_back (supcls(i).string_value ());
++
++      if (! error_state)
++        ctor_list[cls_name] = supcls_names;
++    }
++}
++
+ handle_cdef_object::~handle_cdef_object (void)
+ {
+-  printf ("deleting %s object (handle)\n", cname.c_str ());
++  gnulib::printf ("deleting %s object (handle)\n", cname.c_str ());
+ }
+ 
+ value_cdef_object::~value_cdef_object (void)
+ {
+-  printf ("deleting %s object (value)\n", cname.c_str ());
++  gnulib::printf ("deleting %s object (value)\n", cname.c_str ());
++}
++
++cdef_class::cdef_class_rep::cdef_class_rep (const std::string& nm,
++                                            const std::list<cdef_class>& superclasses)
++     : handle_cdef_object (nm), handle_class (false)
++{
++  for (std::list<cdef_class>::const_iterator it = superclasses.begin ();
++       it != superclasses.end (); ++it)
++    implicit_ctor_list.push_back (it->get_name ());
++
++  put ("SuperClasses", Cell (implicit_ctor_list));
+ }
+ 
+ cdef_method
+ cdef_class::cdef_class_rep::find_method (const std::string& nm, bool local)
+ {
+   method_iterator it = method_map.find (nm);
+ 
+   if (it == method_map.end ())
+@@ -999,20 +1219,194 @@ cdef_class::cdef_class_rep::find_method 
+                 return meth;
+             }
+         }
+     }
+ 
+   return cdef_method ();
+ }
+ 
++class ctor_analyzer : public tree_walker
++{
++public:
++  ctor_analyzer (const std::string& ctor, const std::string& obj,
++                 const std::list<std::string>& l)
++    : tree_walker (), who (ctor), obj_name (obj), available_ctor_list (l) { }
++
++  void visit_statement_list (tree_statement_list& t)
++    {
++      for (tree_statement_list::const_iterator it = t.begin ();
++           ! error_state && it != t.end (); ++it)
++        (*it)->accept (*this);
++    }
++
++  void visit_statement (tree_statement& t)
++    {
++      if (t.is_expression ())
++        t.expression ()->accept (*this);
++    }
++
++  void visit_simple_assignment (tree_simple_assignment& t)
++    {
++      t.right_hand_side ()->accept (*this);
++    }
++
++  void visit_multi_assignment (tree_multi_assignment& t)
++    {
++      t.right_hand_side ()->accept (*this);
++    }
++
++  void visit_index_expression (tree_index_expression& t)
++    {
++      t.expression ()->accept (*this);
++    }
++
++  void visit_funcall (tree_funcall& t)
++    {
++      octave_value fcn = t.function ();
++
++      if (fcn.is_function ())
++        {
++          octave_function *of = fcn.function_value (true);
++
++          if (of)
++            {
++              if (of->name () == "__superclass_reference__")
++                {
++                  octave_value_list args = t.arguments ();
++
++                  if (args(0).string_value () == obj_name)
++                    {
++                      std::string package_name = args(1).string_value ();
++                      std::string class_name = args(2).string_value ();
++
++                      std::string ctor_name = (package_name.empty ()
++                                               ? class_name
++                                               : package_name + "." + class_name);
++
++                      if (std::find (available_ctor_list.begin (),
++                                     available_ctor_list.end (), ctor_name)
++                          == available_ctor_list.end ())
++                        ::error ("`%s' is not a direct superclass of `%s'",
++                                 ctor_name.c_str (), who.c_str ());
++                      else if (std::find (ctor_list.begin (), ctor_list.end (),
++                                          ctor_name) != ctor_list.end ())
++                        ::error ("calling constructor `%s' more than once",
++                                 ctor_name.c_str ());
++
++                      ctor_list.push_back (ctor_name);
++                    }
++                }
++            }
++        }
++    }
++
++  std::list<std::string> get_constructor_list (void) const
++    { return ctor_list; }
++
++  // NO-OP
++  void visit_anon_fcn_handle (tree_anon_fcn_handle&) { }
++  void visit_argument_list (tree_argument_list&) { }
++  void visit_binary_expression (tree_binary_expression&) { }
++  void visit_break_command (tree_break_command&) { }
++  void visit_colon_expression (tree_colon_expression&) { }
++  void visit_continue_command (tree_continue_command&) { }
++  void visit_global_command (tree_global_command&) { }
++  void visit_persistent_command (tree_persistent_command&) { }
++  void visit_decl_elt (tree_decl_elt&) { }
++  void visit_decl_init_list (tree_decl_init_list&) { }
++  void visit_simple_for_command (tree_simple_for_command&) { }
++  void visit_complex_for_command (tree_complex_for_command&) { }
++  void visit_octave_user_script (octave_user_script&) { }
++  void visit_octave_user_function (octave_user_function&) { }
++  void visit_function_def (tree_function_def&) { }
++  void visit_identifier (tree_identifier&) { }
++  void visit_if_clause (tree_if_clause&) { }
++  void visit_if_command (tree_if_command&) { }
++  void visit_if_command_list (tree_if_command_list&) { }
++  void visit_switch_case (tree_switch_case&) { }
++  void visit_switch_case_list (tree_switch_case_list&) { }
++  void visit_switch_command (tree_switch_command&) { }
++  void visit_matrix (tree_matrix&) { }
++  void visit_cell (tree_cell&) { }
++  void visit_no_op_command (tree_no_op_command&) { }
++  void visit_constant (tree_constant&) { }
++  void visit_fcn_handle (tree_fcn_handle&) { }
++  void visit_parameter_list (tree_parameter_list&) { }
++  void visit_postfix_expression (tree_postfix_expression&) { }
++  void visit_prefix_expression (tree_prefix_expression&) { }
++  void visit_return_command (tree_return_command&) { }
++  void visit_return_list (tree_return_list&) { }
++  void visit_try_catch_command (tree_try_catch_command&) { }
++  void visit_unwind_protect_command (tree_unwind_protect_command&) { }
++  void visit_while_command (tree_while_command&) { }
++  void visit_do_until_command (tree_do_until_command&) { }
++
++private:
++  /* The name of the constructor being analyzed */
++  std::string who;
++
++  /* The name of the first output argument of the constructor */
++  std::string obj_name;
++
++  /* The list of superclass constructors that are explicitly called */
++  std::list<std::string> ctor_list;
++
++  /* The list of possible superclass constructors */
++  std::list<std::string> available_ctor_list;
++};
++
+ void
+ cdef_class::cdef_class_rep::install_method (const cdef_method& meth)
+ {
+   method_map[meth.get_name ()] = meth;
++
++  if (meth.is_constructor ())
++    {
++      // Analyze the constructor code to determine what superclass
++      // constructors are called explicitly.
++
++      octave_function *of = meth.get_function ().function_value (true);
++
++      if (of)
++        {
++          octave_user_function *uf = of->user_function_value (true);
++
++          if (uf)
++            {
++              tree_parameter_list *ret_list = uf->return_list ();
++              tree_statement_list *body = uf->body ();
++
++              if (ret_list && ret_list->size () == 1)
++                {
++                  std::string obj_name = ret_list->front ()->name ();
++                  ctor_analyzer a (meth.get_name (), obj_name,
++                                   implicit_ctor_list);
++
++                  body->accept (a);
++                  if (! error_state)
++                    {
++                      std::list<std::string> explicit_ctor_list
++                        = a.get_constructor_list ();
++
++                      for (std::list<std::string>::const_iterator it = explicit_ctor_list.begin ();
++                           ! error_state && it != explicit_ctor_list.end (); ++it)
++                        {
++                          gnulib::printf ("explicit superclass constructor: %s\n",
++                                  it->c_str ());
++                          implicit_ctor_list.remove (*it);
++                        }
++                    }
++                }
++              else
++                ::error ("%s: invalid constructor output arguments",
++                         meth.get_name ().c_str ());
++            }
++        }
++    }
+ }
+ 
+ void
+ cdef_class::cdef_class_rep::load_all_methods (void)
+ {
+   // FIXME: re-scan class directory
+ }
+ 
+@@ -1308,22 +1702,22 @@ cdef_class::cdef_class_rep::subsref_meta
+                                           int nargout)
+ {
+   octave_value_list retval;
+ 
+   switch (type[0])
+     {
+     case '(':
+       // Constructor call
+-      printf ("constructor\n");
++      gnulib::printf ("constructor\n");
+       retval(0) = construct (idx.front ());
+       break;
+     case '.':
+       // Static method, constant (or property?)
+-      printf ("static method\n");
++      gnulib::printf ("static method\n");
+       break;
+     }
+ 
+   if (! error_state)
+     {
+       if (type.length () > 1 && idx.size () > 1 && ! retval.empty ())
+ 	retval = retval(0).next_subsref (nargout, type, idx);
+     }
+@@ -1354,48 +1748,71 @@ cdef_class::cdef_class_rep::initialize_o
+                   octave_value pvalue = it->second.get ("DefaultValue");
+ 
+                   if (pvalue.is_defined ())
+                     obj.put (it->first, pvalue);
+                   else
+                     obj.put (it->first, octave_value (Matrix ()));
+                 }
+             }
++
++          if (! error_state)
++            {
++              refcount++;
++              obj.mark_for_construction (cdef_class (this));
++            }
+         }
+     }
+ }
+ 
+ void
+ cdef_class::cdef_class_rep::run_constructor (cdef_object& obj,
+                                              const octave_value_list& args)
+ {
+-  // FIXME: Run constructors from superclasses if needed.
+-  //        One must analyze the class constructor to detect
+-  //        whether it explicitly calls them or not.
+-
+-  std::string ctor_name = get_base_name (get_name ());
++  octave_value_list empty_args;
++
++  for (std::list<std::string>::const_iterator it = implicit_ctor_list.begin ();
++       ! error_state && it != implicit_ctor_list.end (); ++it)
++    {
++      cdef_class supcls = lookup_class (*it);
++
++      if (! error_state)
++        supcls.run_constructor (obj, empty_args);
++    }
++
++  if (error_state)
++    return;
++
++  std::string cls_name = get_name ();
++  std::string ctor_name = get_base_name (cls_name);
++
+   cdef_method ctor = find_method (ctor_name);
+ 
+   if (ctor.ok ())
+     {
+       octave_value_list ctor_args (args);
+       octave_value_list ctor_retval;
+ 
+       ctor_args.prepend (to_ov (obj));
+       ctor_retval = ctor.execute (ctor_args, 1);
+ 
+       if (! error_state)
+         {
+           if (ctor_retval.length () == 1)
+             obj = to_cdef (ctor_retval(0));
+           else
+-            ::error ("%s: invalid number of output arguments for classdef constructor",
+-                     ctor_name.c_str ());
++            {
++              ::error ("%s: invalid number of output arguments for classdef constructor",
++                       ctor_name.c_str ());
++              return;
++            }
+         }
+     }
++
++  obj.mark_as_constructed (cls_name);
+ }
+ 
+ octave_value
+ cdef_class::cdef_class_rep::construct (const octave_value_list& args)
+ {
+   cdef_object_rep *r;
+ 
+   if (is_handle_class ())
+@@ -1457,41 +1874,37 @@ cdef_class
+ cdef_class::make_meta_class (tree_classdef* t)
+ {
+   cdef_class retval;
+   std::string class_name;
+ 
+   // Class creation
+ 
+   class_name = t->ident ()->name ();
+-  printf ("class: %s\n", class_name.c_str ());
+-
+-  std::list<std::string> snamelist;
++  gnulib::printf ("class: %s\n", class_name.c_str ());
++
+   std::list<cdef_class> slist;
+ 
+   if (t->superclass_list ())
+     {
+       for (tree_classdef_superclass_list::iterator it = t->superclass_list ()->begin ();
+            ! error_state && it != t->superclass_list ()->end (); ++it)
+         {
+           std::string sclass_name =
+             ((*it)->package () ? (*it)->package ()->name () + "." : std::string ())
+             + (*it)->ident ()->name ();
+ 
+-          printf ("superclass: %s\n", sclass_name.c_str ());
++          gnulib::printf ("superclass: %s\n", sclass_name.c_str ());
+ 
+           cdef_class sclass = lookup_class (sclass_name);
+ 
+           if (! error_state)
+             {
+               if (! sclass.get ("Sealed").bool_value ())
+-                {
+-                  slist.push_back (sclass);
+-                  snamelist.push_back (sclass_name);
+-                }
++                slist.push_back (sclass);
+               else
+                 {
+                   ::error ("`%s' cannot inherit from `%s', because it is sealed",
+                            class_name.c_str (), sclass_name.c_str ());
+                   return retval;
+                 }
+             }
+           else
+@@ -1510,17 +1923,17 @@ cdef_class::make_meta_class (tree_classd
+   if (t->attribute_list ())
+     {
+       for (tree_classdef_attribute_list::iterator it = t->attribute_list ()->begin ();
+            it != t->attribute_list ()->end (); ++it)
+         {
+           std::string aname = (*it)->ident ()->name ();
+           octave_value avalue = compute_attribute_value (*it);
+ 
+-          printf ("class attribute: %s = %s\n", aname.c_str (),
++          gnulib::printf ("class attribute: %s = %s\n", aname.c_str (),
+                   attribute_value_to_string (*it, avalue).c_str ());
+           retval.put (aname, avalue);
+         }
+     }
+ 
+   tree_classdef_body* b = t->body ();
+ 
+   if (b)
+@@ -1528,45 +1941,45 @@ cdef_class::make_meta_class (tree_classd
+       // Method blocks
+ 
+       std::list<tree_classdef_methods_block *> mb_list = b->methods_list ();
+ 
+       for (tree_classdef_body::methods_list_iterator it = mb_list.begin ();
+            it != mb_list.end (); ++it)
+         {
+           std::map<std::string, octave_value> amap;
+-          printf ("method block\n");
++          gnulib::printf ("method block\n");
+ 
+           // Method attributes
+ 
+           if ((*it)->attribute_list ())
+             {
+               for (tree_classdef_attribute_list::iterator ait = (*it)->attribute_list ()->begin ();
+                    ait != (*it)->attribute_list ()->end (); ++ait)
+                 {
+                   std::string aname = (*ait)->ident ()->name ();
+                   octave_value avalue = compute_attribute_value (*ait);
+ 
+-                  printf ("method attribute: %s = %s\n", aname.c_str (),
++                  gnulib::printf ("method attribute: %s = %s\n", aname.c_str (),
+                           attribute_value_to_string (*ait, avalue).c_str ());
+                   amap[aname] = avalue;
+                 }
+             }
+ 
+           // Methods
+ 
+           if ((*it)->element_list ())
+             {
+               for (tree_classdef_methods_list::iterator mit = (*it)->element_list ()->begin ();
+                    mit != (*it)->element_list ()->end (); ++mit)
+                 {
+                   std::string mname = mit->function_value ()->name ();
+                   cdef_method meth = make_method (retval, mname, *mit);
+ 
+-                  printf ("%s: %s\n", (mname == class_name ? "constructor" : "method"),
++                  gnulib::printf ("%s: %s\n", (mname == class_name ? "constructor" : "method"),
+                           mname.c_str ());
+                   for (std::map<std::string, octave_value>::iterator ait = amap.begin ();
+                        ait != amap.end (); ++ait)
+                     meth.put (ait->first, ait->second);
+ 
+                   retval.install_method (meth);
+                 }
+             }
+@@ -1580,29 +1993,29 @@ cdef_class::make_meta_class (tree_classd
+       //        value expressions.
+ 
+       std::list<tree_classdef_properties_block *> pb_list = b->properties_list ();
+ 
+       for (tree_classdef_body::properties_list_iterator it = pb_list.begin ();
+            it != pb_list.end (); ++it)
+         {
+           std::map<std::string, octave_value> amap;
+-          printf ("property block\n");
++          gnulib::printf ("property block\n");
+ 
+           // Property attributes
+ 
+           if ((*it)->attribute_list ())
+             {
+               for (tree_classdef_attribute_list::iterator ait = (*it)->attribute_list ()->begin ();
+                    ait != (*it)->attribute_list ()->end (); ++ait)
+                 {
+                   std::string aname = (*ait)->ident ()->name ();
+                   octave_value avalue = compute_attribute_value (*ait);
+ 
+-                  printf ("property attribute: %s = %s\n", aname.c_str (),
++                  gnulib::printf ("property attribute: %s = %s\n", aname.c_str (),
+                           attribute_value_to_string (*ait, avalue).c_str ());
+                   if (aname == "Access")
+                     {
+                       amap["GetAccess"] = avalue;
+                       amap["SetAccess"] = avalue;
+                     }
+                   else
+                     amap[aname] = avalue;
+@@ -1613,22 +2026,22 @@ cdef_class::make_meta_class (tree_classd
+ 
+           if ((*it)->element_list ())
+             {
+               for (tree_classdef_property_list::iterator pit = (*it)->element_list ()->begin ();
+                    pit != (*it)->element_list ()->end (); ++pit)
+                 {
+                   cdef_property prop = ::make_property (retval, (*pit)->ident ()->name ());
+ 
+-                  printf ("property: %s\n", (*pit)->ident ()->name ().c_str ());
++                  gnulib::printf ("property: %s\n", (*pit)->ident ()->name ().c_str ());
+                   if ((*pit)->expression ())
+                     {
+                       octave_value pvalue = (*pit)->expression ()->rvalue1 ();
+ 
+-                      printf ("property default: %s\n",
++                      gnulib::printf ("property default: %s\n",
+                               attribute_value_to_string (*pit, pvalue).c_str ());
+                       prop.put ("DefaultValue", pvalue);
+                     }
+ 
+                   for (std::map<std::string, octave_value>::iterator ait = amap.begin ();
+                        ait != amap.end (); ++ait)
+                     prop.put (ait->first, ait->second);
+ 
+@@ -1647,22 +2060,34 @@ cdef_class::get_method_function (const s
+   octave_classdef_proxy* p = new octave_classdef_proxy (*this);
+ 
+   return p;
+ }
+ 
+ octave_value
+ cdef_property::cdef_property_rep::get_value (const cdef_object& obj)
+ {
+-  // FIXME: should check whether we're already in get accessor method
+-
+   octave_value retval;
++
++  if (! obj.is_constructed ())
++    {
++      cdef_class cls (to_cdef (get ("DefiningClass")));
++
++      if (! obj.is_partially_constructed_for (cls.get_name ()))
++        {
++          ::error ("cannot reference properties of class `%s' for non-constructed object",
++                   cls.get_name ().c_str ());
++          return retval;
++        }
++    }
+  
+   octave_value get_fcn = get ("GetMethod");
+ 
++  // FIXME: should check whether we're already in get accessor method
++
+   if (get_fcn.is_empty ())
+     retval = obj.get (get ("Name").string_value ());
+   else
+     {
+       octave_value_list args;
+ 
+       args(0) = to_ov (obj);
+       
+@@ -1681,16 +2106,28 @@ cdef_property::cdef_property_rep::is_rec
+   // FIXME: implement
+   return false;
+ }
+ 
+ void
+ cdef_property::cdef_property_rep::set_value (cdef_object& obj,
+                                              const octave_value& val)
+ {
++  if (! obj.is_constructed ())
++    {
++      cdef_class cls (to_cdef (get ("DefiningClass")));
++
++      if (! obj.is_partially_constructed_for (cls.get_name ()))
++        {
++          ::error ("cannot reference properties of class `%s' for non-constructed object",
++                   cls.get_name ().c_str ());
++          return;
++        }
++    }
++ 
+   octave_value set_fcn = get ("SetMethod");
+ 
+   if (set_fcn.is_empty () || is_recursive_set (obj))
+     {
+       obj.put (get ("Name").string_value (), val);
+     }
+   else
+     {
+@@ -1791,16 +2228,25 @@ cdef_method::cdef_method_rep::execute (c
+   else
+     error ("%s: cannot execute abstract method",
+ 	   get ("Name").string_value ().c_str ());
+ 
+   return retval;
+ }
+ 
+ bool
++cdef_method::cdef_method_rep::is_constructor (void) const
++{
++  if (function.is_function())
++    return function.function_value ()->is_classdef_constructor ();
++
++  return false;
++}
++
++bool
+ cdef_method::check_access (void) const
+ {
+   cdef_class cls (to_cdef (get ("DefiningClass")));
+ 
+   if (! error_state)
+     return ::check_access (cls, get ("Access"));
+ 
+   return false;
+@@ -1910,24 +2356,16 @@ cdef_package::cdef_package_rep::install_
+ 
+ void
+ cdef_package::cdef_package_rep::install_package (const cdef_package& pack,
+                                                  const std::string& nm)
+ {
+   package_map[nm] = pack;
+ }
+ 
+-octave_value_list
+-cdef_package::cdef_package_rep::subsref (const std::string& type,
+-                                         const std::list<octave_value_list>& idx,
+-                                         int nargout, int& skip)
+-{
+-  return handle_cdef_object::subsref (type, idx, nargout, skip);
+-}
+-
+ template<class T1, class T2>
+ Cell
+ map2Cell (const std::map<T1, T2>& m)
+ {
+   Cell retval (1, m.size ());
+   int i = 0;
+ 
+   for (typename std::map<T1, T2>::const_iterator it = m.begin ();
+@@ -2123,25 +2561,17 @@ DEFUN (__meta_get_package__, args, , "")
+ }
+ 
+ DEFUN (__superclass_reference__, args, /* nargout */,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} __superclass_reference__ ()\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+-  octave_value retval;
+-
+-  std::cerr << "__superclass_reference__ ("
+-            << args(0).string_value () << ", "
+-            << args(1).string_value () << ", "
+-            << args(2).string_value () << ")"
+-            << std::endl;
+-
+-  return retval;
++  return octave_value (new octave_classdef_superclass_ref (args));
+ }
+ 
+ DEFUN (__meta_class_query__, args, /* nargout */,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} __meta_class_query__ ()\n\
+ Undocumented internal function.\n\
+ @end deftypefn")
+ {
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -72,46 +72,87 @@ public:
+ 	return val(0, 0);
+       else
+ 	{
+ 	  error ("get: unknown slot: %s", pname.c_str ());
+ 	  return octave_value ();
+ 	}
+     }
+ 
+-  virtual octave_value_list subsref (const std::string& type,
+-                                     const std::list<octave_value_list>& idx,
+-                                     int nargout, int& skip);
++  virtual octave_value_list
++  subsref (const std::string& type, const std::list<octave_value_list>& idx,
++           int nargout, size_t& skip, const cdef_class& context);
+ 
+-  virtual octave_value subsasgn (const std::string& type,
+-                                 const std::list<octave_value_list>& idx,
+-                                 const octave_value& rhs);
++  virtual octave_value
++  subsasgn (const std::string& type, const std::list<octave_value_list>& idx,
++            const octave_value& rhs);
+ 
+   virtual string_vector map_keys(void) const;
+ 
+   virtual bool is_valid (void) const { return false; }
+ 
+   std::string class_name (void) const { return cname; }
+ 
+-  void set_class_name (const std::string& nm)
+-    { cname = nm; }
++  void set_class_name (const std::string& nm) { cname = nm; }
++
++  void mark_for_construction (const cdef_class&);
++
++  //bool is_constructed_for (const cdef_class&) const;
++
++  bool is_constructed_for (const std::string& nm) const
++    {
++      return (is_constructed ()
++              || ctor_list.find (nm) == ctor_list.end ());
++    }
++
++  bool is_partially_constructed_for (const std::string& nm) const
++    {
++      std::map< std::string, std::list<std::string> >::const_iterator it;
++
++      if (is_constructed ())
++        return true;
++      else if ((it = ctor_list.find (nm)) == ctor_list.end ()
++               || it->second.empty ())
++        return true;
++
++      for (std::list<std::string>::const_iterator lit = it->second.begin ();
++           lit != it->second.end (); ++lit)
++        if (! is_constructed_for (*lit))
++          return false;
++
++      return true;
++    }
++
++  void mark_as_constructed (void) { ctor_list.clear (); }
++
++  void mark_as_constructed (const std::string& nm) { ctor_list.erase (nm); }
++
++  bool is_constructed (void) const { return ctor_list.empty (); }
+ 
+ protected:
+   /* reference count */
+   octave_refcount<int> refcount;
+ 
+   /* class name */
+   std::string cname;
+ 
+   /* object property values */
+   Octave_map map;
+ 
++  /* Internal/temporary structure used during object construction */
++  std::map< std::string, std::list<std::string> > ctor_list;
++
++protected:
++  /* Restricted copying */
++  cdef_object_rep (const cdef_object_rep& r)
++    : refcount (1), cname (r.cname), map (r.map),
++      ctor_list (r.ctor_list) { }
++
+ private:
+-  // No copying
+-  cdef_object_rep (const cdef_object_rep&);
++  /* No assignment */
+   cdef_object_rep& operator = (const cdef_object_rep& );
+ };
+ 
+ class
+ cdef_object
+ {
+ public:
+   /* FIXME: use a null object */
+@@ -159,32 +200,48 @@ public:
+     { return cdef_object (rep->clone ()); }
+ 
+   void put (const std::string& pname, const octave_value& val)
+     { rep->put (pname, val); }
+ 
+   octave_value get (const std::string& pname) const
+     { return rep->get (pname); }
+ 
+-  octave_value_list subsref (const std::string& type,
+-			     const std::list<octave_value_list>& idx,
+-			     int nargout, int& skip)
+-    { return rep->subsref (type, idx, nargout, skip); }
++  octave_value_list
++  subsref (const std::string& type, const std::list<octave_value_list>& idx,
++           int nargout, size_t& skip, const cdef_class& context)
++    { return rep->subsref (type, idx, nargout, skip, context); }
+ 
+-  octave_value subsasgn (const std::string& type,
+-                         const std::list<octave_value_list>& idx,
+-                         const octave_value& rhs)
++  octave_value
++  subsasgn (const std::string& type, const std::list<octave_value_list>& idx,
++            const octave_value& rhs)
+     { return rep->subsasgn (type, idx, rhs); }
+ 
+   string_vector map_keys (void) const { return rep->map_keys (); }
+ 
+   const cdef_object_rep* get_rep (void) const { return rep; }
+ 
+   bool ok (void) const { return rep->is_valid (); }
+ 
++  void mark_for_construction (const cdef_class& cls)
++    { rep->mark_for_construction (cls); }
++
++  bool is_constructed (void) const { return rep->is_constructed (); }
++
++  bool is_constructed_for (const std::string& nm) const
++    { return rep->is_constructed_for (nm); }
++
++  bool is_partially_constructed_for (const std::string& nm) const
++    { return rep->is_partially_constructed_for (nm); }
++
++  void mark_as_constructed (void) { rep->mark_as_constructed (); }
++
++  void mark_as_constructed (const std::string& nm)
++    { rep->mark_as_constructed (nm); }
++
+ protected:
+   cdef_object_rep* get_rep (void) { return rep; }
+ 
+ private:
+   cdef_object_rep *rep;
+ };
+ 
+ class
+@@ -248,16 +305,19 @@ private:
+ 
+   class
+   cdef_class_rep : public handle_cdef_object
+   {
+   public:
+     cdef_class_rep (const std::string& nm)
+ 	: handle_cdef_object (nm), handle_class (false) { }
+ 
++    cdef_class_rep (const std::string& nm,
++                    const std::list<cdef_class>& superclasses);
++
+     std::string get_name (void) const
+       { return get ("Name").string_value (); }
+ 
+     cdef_method find_method (const std::string& nm, bool local = false);
+ 
+     void install_method (const cdef_method& meth);
+ 
+     Cell get_methods (void);
+@@ -271,19 +331,19 @@ private:
+     string_vector get_names (void);
+ 
+     void set_directory (const std::string& dir) { directory = dir; }
+ 
+     std::string get_directory (void) const { return directory; }
+ 
+     void delete_object (cdef_object obj);
+ 
+-    octave_value_list subsref_meta (const std::string& type,
+-                                    const std::list<octave_value_list>& idx,
+-                                    int nargout);
++    octave_value_list
++    subsref_meta (const std::string& type,
++                  const std::list<octave_value_list>& idx, int nargout);
+ 
+     octave_value construct (const octave_value_list& args);
+ 
+     void initialize_object (cdef_object& obj);
+ 
+     void run_constructor (cdef_object& obj, const octave_value_list& args);
+ 
+     void mark_as_handle_class (void) { handle_class = true; }
+@@ -311,31 +371,40 @@ private:
+ 
+     // The properties defined by this class.
+     std::map<std::string,cdef_property> property_map;
+ 
+     // TRUE if this class is a handle class. A class is a handle
+     // class when the abstract "handle" class is one of its superclasses.
+     bool handle_class;
+ 
++    // The list of super-class constructors that are called implicitly by the
++    // the classdef engine when creating an object. These constructors are not
++    // called explicitly by the class constructor.
++    std::list<std::string> implicit_ctor_list;
++
+     // Utility iterator typedef's.
+     typedef std::map<std::string,cdef_method>::iterator method_iterator;
+     typedef std::map<std::string,cdef_method>::const_iterator method_const_iterator;
+     typedef std::map<std::string,cdef_property>::iterator property_iterator;
+     typedef std::map<std::string,cdef_property>::const_iterator property_const_iterator;
+   };
+ 
+ public:
+   // Create and invalid class object
+   cdef_class (void)
+       : cdef_object () { }
+ 
+   cdef_class (const std::string& nm)
+       : cdef_object (new cdef_class_rep (nm)) { }
+ 
++  cdef_class (const std::string& nm,
++              const std::list<cdef_class>& superclasses)
++      : cdef_object (new cdef_class_rep (nm, superclasses)) { }
++
+   cdef_class (const cdef_class& cls)
+       : cdef_object (cls) { }
+ 
+   cdef_class (const cdef_object& obj)
+       : cdef_object (obj)
+     {
+       // This should never happen...
+       if (class_name () != "meta.class")
+@@ -528,24 +597,25 @@ private:
+   cdef_method_rep : public handle_cdef_object
+   {
+   public:
+     cdef_method_rep (const std::string& nm)
+ 	: handle_cdef_object (nm) { }
+ 
+     octave_value get_function (void) const { return function; }
+ 
+-    void set_function (const octave_value& fcn)
+-      { function = fcn; }
++    void set_function (const octave_value& fcn) { function = fcn; }
+ 
+     octave_value_list execute (const octave_value_list& args, int nargout);
+ 
+     octave_value_list execute (const cdef_object& obj,
+ 			       const octave_value_list& args, int nargout);
+ 
++    bool is_constructor (void) const;
++
+   private:
+     void check_method (void);
+ 
+   private:
+     octave_value function;
+   };
+ 
+ public:
+@@ -588,16 +658,22 @@ public:
+     { return get ("Name").string_value (); }
+ 
+   bool is_static (void) const
+     { return get ("Static").bool_value (); }
+ 
+   void set_function (const octave_value& fcn)
+     { get_rep ()->set_function (fcn); }
+ 
++  octave_value get_function (void) const
++    { return get_rep ()->get_function (); }
++
++  bool is_constructor (void) const
++    { return get_rep ()->is_constructor (); }
++
+ private:
+   cdef_method_rep* get_rep (void)
+     { return dynamic_cast<cdef_method_rep *> (cdef_object::get_rep ()); }
+   
+   const cdef_method_rep* get_rep (void) const
+     { return dynamic_cast<const cdef_method_rep *> (cdef_object::get_rep ()); }
+ };
+ 
+@@ -626,20 +702,16 @@ private:
+       : handle_cdef_object (nm) { }
+ 
+     void install_class (const cdef_class& cls, const std::string& nm);
+ 
+     void install_function (const octave_value& fcn, const std::string& nm);
+ 
+     void install_package (const cdef_package& pack, const std::string& nm);
+ 
+-    octave_value_list subsref (const std::string& type,
+-                               const std::list<octave_value_list>& idx,
+-                               int nargout, int& skip);
+-
+     Cell get_classes (void) const;
+ 
+     Cell get_functions (void) const;
+ 
+     Cell get_packages (void) const;
+ 
+   private:
+     std::map<std::string, cdef_class> class_map;
+@@ -716,18 +788,19 @@ public:
+       : octave_base_value (obj), object (obj.object) { }
+ 
+   octave_base_value* clone (void) const
+     { return new octave_classdef (object.clone ()); }
+ 
+   octave_base_value* empty_clone (void) const
+     { return new octave_classdef (); }
+ 
+-  cdef_object get_object (void) const
+-    { return object; }
++  cdef_object get_object (void) const { return object; }
++
++  cdef_object& get_object_ref (void) { return object; }
+ 
+   bool is_defined (void) const { return true; }
+ 
+   bool is_map (void) const { return true; }
+ 
+   bool print_as_scalar (void) const { return true; }
+ 
+   void print(std::ostream& os, bool pr_as_read_syntax = false) const
+@@ -802,16 +875,30 @@ to_cdef (const octave_value& val)
+     return dynamic_cast<octave_classdef *> (val.internal_rep ())->get_object ();
+   else
+     {
+       warning ("trying to cast non-object into object");
+       return cdef_object ();
+     }
+ }
+ 
++inline cdef_object&
++to_cdef_ref (octave_value& val)
++{
++  static cdef_object empty;
++
++  if (val.type_name () == "object")
++    return dynamic_cast<octave_classdef *> (val.internal_rep ())->get_object_ref ();
++  else
++    {
++      warning ("trying to cast non-object into object");
++      return empty;
++    }
++}
++
+ inline cdef_object
+ to_cdef (const cdef_object& obj)
+ { return obj; }
+ 
+ OCTINTERP_API void install_classdef (void);
+ 
+ #endif
+ 

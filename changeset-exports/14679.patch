@@ -1,0 +1,282 @@
+# HG changeset patch
+# User David Bateman <dbateman@free.fr>
+# Date 1337805277 -7200
+#      Wed May 23 22:34:37 2012 +0200
+# Node ID a543ed02e6739431bdddd5eff87b3d5406bf94b6
+# Parent  757f729fd41dc4fed00342050f25448650d5be36
+Allow the builtin function mkdir to create missing parent directories
+
+* bootstrap.conf : Add the mkdir-p and savewd gnulib modules.
+* file-ops.cc (static int make_ancestor (const char*, const char*, void*)):
+New function.
+(int octave_mkdir (const std::string&, mode_t, std::string&, bool): Add fourth
+argument and use it to conditionally select whether to make the missing
+parent directories.
+* file-ops.h (int octave_mkdir (const std::string&, mode_t, std::string&, bool):
+Add fourth argument.
+* lo-cutils.c (struct mkdir_options): New structure
+(static void announce_mkdir (const char*, void*),
+static int process_dir (char *, struct savewd *, void *),
+int octave_mkdir_parents (const char *, mode_t, int (*make_ancestor)
+(const char *, const char *, void *)): New functions.
+* lo-cutils.h (int octave_mkdir_parents (const char *, mode_t, int
+(*make_ancestor) (const char *, const char *, void *)): New function.
+* dirfns.cc (Fmkdir): Call octave_mkdir with the make_parents argument set
+to true.
+
+diff --git a/build-aux/bootstrap.conf b/build-aux/bootstrap.conf
+--- a/build-aux/bootstrap.conf
++++ b/build-aux/bootstrap.conf
+@@ -35,32 +35,34 @@ gnulib_modules="
+   gethostname
+   getopt-gnu
+   gettimeofday
+   glob
+   isatty
+   link
+   lstat
+   mkdir
++  mkdir-p
+   mkfifo
+   mkostemp
+   mkstemp
+   mktime
+   nanosleep
+   nproc
+   opendir
+   pathmax
+   progname
+   readdir
+   readlink
+   rename
+   rewinddir
+   rmdir
+   round
+   roundf
++  savewd
+   sigaction
+   signal
+   sigprocmask
+   sleep
+   sleep
+   stat
+   stdint
+   stdio
+diff --git a/liboctave/file-ops.cc b/liboctave/file-ops.cc
+--- a/liboctave/file-ops.cc
++++ b/liboctave/file-ops.cc
+@@ -43,16 +43,17 @@ along with Octave; see the file COPYING.
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "oct-locbuf.h"
+ #include "oct-passwd.h"
+ #include "pathlen.h"
+ #include "quit.h"
+ #include "singleton-cleanup.h"
+ #include "str-vec.h"
++#include "lo-cutils.h"
+ 
+ file_ops *file_ops::instance = 0;
+ 
+ bool
+ file_ops::instance_ok (void)
+ {
+   bool retval = true;
+ 
+@@ -356,32 +357,42 @@ file_ops::concat (const std::string& dir
+ {
+   return dir.empty ()
+     ? file
+     : (is_dir_sep (dir[dir.length()-1])
+        ? dir + file
+        : dir + dir_sep_char () + file);
+ }
+ 
++static int 
++make_ancestor (const char *, const char *component, void *options)
++{
++  mode_t* mode = reinterpret_cast<mode_t *>(options);
++  return gnulib::mkdir (component, *mode);
++}
+ 
+ int
+ octave_mkdir (const std::string& nm, mode_t md)
+ {
+   std::string msg;
+-  return octave_mkdir (nm, md, msg);
++  return octave_mkdir (nm, md, msg, false);
+ }
+ 
+ int
+-octave_mkdir (const std::string& name, mode_t mode, std::string& msg)
++octave_mkdir (const std::string& name, mode_t mode, std::string& msg, 
++              bool make_parents)
+ {
+   msg = std::string ();
+ 
+   int status = -1;
+ 
+-  status = gnulib::mkdir (name.c_str (), mode);
++  if (make_parents)
++    status = octave_mkdir_parents (name.c_str (), mode, make_ancestor);
++  else
++    status = gnulib::mkdir (name.c_str (), mode);
+ 
+   if (status < 0)
+     msg = gnulib::strerror (errno);
+ 
+   return status;
+ }
+ 
+ int
+diff --git a/liboctave/file-ops.h b/liboctave/file-ops.h
+--- a/liboctave/file-ops.h
++++ b/liboctave/file-ops.h
+@@ -117,17 +117,18 @@ private:
+ // We don't have these in the file_ops class with their simple names
+ // (i.e., mkdir instead of octave_mdir) because function names in
+ // standard headers may be #defined.
+ 
+ extern OCTAVE_API int
+ octave_mkdir (const std::string& nm, mode_t md);
+ 
+ extern OCTAVE_API int
+-octave_mkdir (const std::string& nm, mode_t md, std::string& msg);
++octave_mkdir (const std::string& nm, mode_t md, std::string& msg,
++              bool make_parents = false);
+ 
+ extern OCTAVE_API int
+ octave_mkfifo (const std::string& nm, mode_t md);
+ 
+ extern OCTAVE_API int
+ octave_mkfifo (const std::string& nm, mode_t md, std::string& msg);
+ 
+ extern OCTAVE_API int
+diff --git a/liboctave/lo-cutils.c b/liboctave/lo-cutils.c
+--- a/liboctave/lo-cutils.c
++++ b/liboctave/lo-cutils.c
+@@ -27,25 +27,29 @@ along with Octave; see the file COPYING.
+ /* This gives us a better chance of finding a prototype for strptime
+    on some systems.  */
+ 
+ #if ! defined (_XOPEN_SOURCE)
+ #define _XOPEN_SOURCE
+ #endif
+ 
+ #include <sys/types.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ 
+ #include "lo-cutils.h"
+ #include "syswait.h"
+ 
++#include "savewd.h"
++#include "mkdir-p.h"
++
+ OCTAVE_API void
+ octave_qsort (void *base, size_t n, size_t size,
+               int (*cmp) (const void *, const void *))
+ {
+   qsort (base, n, size, cmp);
+ }
+ 
+ OCTAVE_API int
+@@ -71,8 +75,51 @@ octave_w32_library_search (HINSTANCE han
+ }
+ #endif
+ 
+ OCTAVE_API pid_t
+ octave_waitpid (pid_t pid, int *status, int options)
+ {
+   return WAITPID (pid, status, options);
+ }
++
++struct mkdir_options
++{
++  int (*make_ancestor_function) (const char *, const char *, void *);
++  mode_t ancestor_mode;
++  mode_t mode;
++  mode_t mode_bits;
++};
++
++static void
++announce_mkdir (const char *dir, void *options)
++{
++  /* Do nothing */
++}
++
++static int
++process_dir (char *dir, struct savewd *wd, void *options)
++{
++  struct mkdir_options const *o = options;
++  mode_t ancestor_mode = o->ancestor_mode;
++  return (make_dir_parents (dir, wd, o->make_ancestor_function, &ancestor_mode,
++                            o->mode, announce_mkdir, o->mode_bits, 
++                            (uid_t) -1, (gid_t) -1, false) ? 0 : -1);
++}
++
++OCTAVE_API int
++octave_mkdir_parents (const char *dir, mode_t mode,
++                      int (*make_ancestor) (const char *, const char *, void *))
++{
++  char *argv[1];
++  int retval;
++  char *dir2 = malloc (strlen (dir) + 1);
++  strcpy (dir2, dir); /* Make a copy to avoid passing a const char* as char* */
++  argv[0] = dir2;
++  struct mkdir_options o;
++  o.make_ancestor_function = make_ancestor;
++  o.ancestor_mode = mode | S_IWUSR | S_IXUSR; 
++  o.mode = mode | umask(0);
++  o.mode_bits = ~(mode & umask(0));
++  retval = (savewd_process_files (1, argv, process_dir, &o));
++  free (dir2);
++  return retval;
++}
+diff --git a/liboctave/lo-cutils.h b/liboctave/lo-cutils.h
+--- a/liboctave/lo-cutils.h
++++ b/liboctave/lo-cutils.h
+@@ -45,13 +45,17 @@ octave_strncasecmp (const char *s1, cons
+ #ifdef HAVE_LOADLIBRARY_API
+ OCTAVE_API void *
+ octave_w32_library_search (HINSTANCE handle, const char *name);
+ #endif
+ 
+ OCTAVE_API pid_t
+ octave_waitpid (pid_t pid, int *status, int options);
+ 
++OCTAVE_API int
++octave_mkdir_parents (const char *dir, mode_t mode,
++                      int (*make_ancestor) (char const *, char const *, void *));
++
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+ #endif
+diff --git a/src/dirfns.cc b/src/dirfns.cc
+--- a/src/dirfns.cc
++++ b/src/dirfns.cc
+@@ -266,17 +266,17 @@ message identifier.\n\
+           // directory already exists.
+ 
+           retval(2) = "mkdir";
+           retval(1) = "directory exists";
+           retval(0) = true;
+         }
+       else
+         {
+-          int status = octave_mkdir (dirname, 0777, msg);
++          int status = octave_mkdir (dirname, 0777, msg, true);
+ 
+           if (status < 0)
+             {
+               retval(2) = "mkdir";
+               retval(1) = msg;
+             }
+           else
+             retval(0) = true;

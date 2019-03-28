@@ -1,0 +1,517 @@
+# HG changeset patch
+# User jwe
+# Date 832160808 0
+#      Wed May 15 11:46:48 1996 +0000
+# Node ID 859030f15706c4bbe3b00e0fe513d0b7d454cda7
+# Parent  4be9ccca137bcab2c7a3290070e3da4058bff32c
+[project @ 1996-05-15 11:46:43 by jwe]
+
+diff --git a/src/pager.cc b/src/pager.cc
+--- a/src/pager.cc
++++ b/src/pager.cc
+@@ -40,17 +40,17 @@ Software Foundation, 59 Temple Place - S
+ #include "help.h"
+ #include "input.h"
+ #include "oct-obj.h"
+ #include "pager.h"
+ #include "sighandlers.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ 
+-pid_t octave_pager_pid = -1;
++static pid_t octave_pager_pid = -1;
+ 
+ // Our actual connection to the external pager.
+ static oprocstream *external_pager = 0;
+ 
+ // Nonzero means we write to the diary file.
+ static int write_to_diary_file = 0;
+ 
+ // The name of the current diary file.
+@@ -88,16 +88,34 @@ clear_external_pager (void)
+   if (saved_sigint_handler)
+     {
+       octave_set_signal_handler (SIGINT, saved_sigint_handler);
+       saved_sigint_handler = 0;
+     }
+ }
+ 
+ static void
++pager_death_handler (pid_t pid, int status)
++{
++  if (pid > 0)
++    {
++      if (WIFEXITED (status) || WIFSIGNALLED (status))
++	{
++	  octave_pager_pid = -1;
++
++	  // Don't call error() here because we don't want to set
++	  // the error state.
++
++	  warning ("connection to external pager lost --");
++	  warning ("pending computations and output have been discarded");
++	}
++    }
++}
++
++static void
+ do_sync (const char *msg, bool bypass_pager)
+ {
+   if (msg && *msg)
+     {
+       if (bypass_pager)
+ 	cout << msg;
+       else
+ 	{
+@@ -108,17 +126,22 @@ do_sync (const char *msg, bool bypass_pa
+ 	      if (! pgr.empty ())
+ 		{
+ 		  saved_sigint_handler
+ 		    = octave_set_signal_handler (SIGINT, SIG_IGN);
+ 
+ 		  external_pager = new oprocstream (pgr.c_str ());
+ 
+ 		  if (external_pager)
+-		    octave_pager_pid = external_pager->pid ();
++		    {
++		      octave_pager_pid = external_pager->pid ();
++
++		      octave_child_list::insert (octave_pager_pid,
++						 pager_death_handler);
++		    }
+ 		}
+ 	    }
+ 
+ 	  if (external_pager)
+ 	    {
+ 	      if (octave_pager_pid > 0 && external_pager->good ())
+ 		{
+ 		  *external_pager << msg;
+diff --git a/src/pager.h b/src/pager.h
+--- a/src/pager.h
++++ b/src/pager.h
+@@ -109,18 +109,16 @@ private:
+ };
+ 
+ #define octave_stdout (octave_pager_stream::stream ())
+ 
+ #define octave_diary (octave_diary_stream::stream ())
+ 
+ extern void flush_octave_stdout (void);
+ 
+-extern pid_t octave_pager_pid;
+-
+ extern void symbols_of_pager (void);
+ 
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+diff --git a/src/pt-plot.cc b/src/pt-plot.cc
+--- a/src/pt-plot.cc
++++ b/src/pt-plot.cc
+@@ -53,16 +53,17 @@ Software Foundation, 59 Temple Place - S
+ #include "help.h"
+ #include "load-save.h"
+ #include "mappers.h"
+ #include "oct-obj.h"
+ #include "pt-cmd.h"
+ #include "pt-exp.h"
+ #include "pt-plot.h"
+ #include "pt-walk.h"
++#include "sighandlers.h"
+ #include "sysdep.h"
+ #include "utils.h"
+ 
+ // If TRUE, a replot command is issued automatically each time a plot
+ // changes in some way.
+ static bool Vautomatic_replot;
+ 
+ // The name of the shell command to execute to start gnuplot.
+@@ -112,16 +113,27 @@ static oprocstream *plot_stream = 0;
+ #define GNUPLOT_COMMAND_WITH   "w"
+ #endif
+ 
+ #ifndef GNUPLOT_COMMAND_TITLE
+ #define GNUPLOT_COMMAND_TITLE  "t"
+ #endif
+ 
+ static void
++plot_stream_death_handler (pid_t pid, int)
++{
++  close_plot_stream ();
++
++  warning ("connection to external plotter (pid = %d) lost --", pid);
++  warning ("please try your plot command(s) again");
++}
++
++static sig_handler *saved_sigint_handler = 0;
++
++static void
+ open_plot_stream (void)
+ {
+   static bool initialized = false;
+ 
+   if (plot_stream && ! *plot_stream)
+     {
+       delete plot_stream;
+       plot_stream = 0;
+@@ -130,74 +142,60 @@ open_plot_stream (void)
+   if (! plot_stream)
+     {
+       initialized = false;
+ 
+       plot_line_count = 0;
+ 
+       string plot_prog = Vgnuplot_binary;
+ 
+-      if (! plot_prog.empty ())
++      if (plot_prog.empty ())
++	plot_prog = "gnuplot";
++
++      // XXX FIXME XXX -- I'm not sure this is the right thing to do,
++      // but without it, C-c at the octave prompt will kill gnuplot...
++
++      saved_sigint_handler = octave_set_signal_handler (SIGINT, SIG_IGN);
++
++      plot_stream = new oprocstream (plot_prog.c_str ());
++
++      octave_set_signal_handler (SIGINT, saved_sigint_handler);
++
++      if (plot_stream)
+ 	{
+-	  plot_stream = new oprocstream (plot_prog.c_str ());
+-
+-	  if (plot_stream && ! *plot_stream)
++	  if (! *plot_stream)
+ 	    {
+ 	      delete plot_stream;
+ 	      plot_stream = 0;
++
++	      error ("plot: unable to open pipe to `%s'", plot_prog.c_str ());
+ 	    }
+-
+-	  if (! plot_stream)
++	  else
+ 	    {
+-	      warning ("plot: unable to open pipe to `%s'",
+-		       plot_prog.c_str ());
+-
+-	      if (plot_prog == "gnuplot")
+-		{
+-		  warning ("having trouble finding plotting program.");
+-		  warning ("trying again with `gnuplot'");
+-		  goto last_chance;
+-		}
++	      pid_t id = plot_stream->pid ();
++    	      octave_child_list::insert (id, plot_stream_death_handler);
+ 	    }
+ 	}
+       else
+-	{
+-	last_chance:
+-
+-	  plot_stream = new oprocstream ("gnuplot");
+-
+-	  if (plot_stream && ! *plot_stream)
+-	    {
+-	      delete plot_stream;
+-	      plot_stream = 0;
+-	    }
+-
+-	  if (! plot_stream)
+-	    error ("plot: unable to open pipe to `%s'",
+-		   plot_prog.c_str ());
+-	}
++	error ("plot: unable to open pipe to `%s'", plot_prog.c_str ());
+     }
+ 
+   if (! error_state && plot_stream && *plot_stream && ! initialized)
+     {
+       initialized = true;
+       *plot_stream << "set data style lines\n";
+ 
+       if (gnuplot_terminal_type)
+ 	*plot_stream << "set term " << gnuplot_terminal_type << "\n";
+     }
+ }
+ 
+ static int
+ send_to_plot_stream (const char *cmd)
+ {
+-  // From sighandlers.cc:
+-
+-  extern int pipe_handler_error_count;
+-
+   if (! (plot_stream && *plot_stream))
+     {
+       open_plot_stream ();
+ 
+       if (error_state)
+ 	return -1;
+     }
+ 
+@@ -216,17 +214,16 @@ send_to_plot_stream (const char *cmd)
+       *plot_stream << cmd;
+ 
+       if (! (is_replot || is_splot || is_plot)
+ 	  && plot_line_count > 0
+ 	  && Vautomatic_replot)
+ 	*plot_stream << GNUPLOT_COMMAND_REPLOT << "\n";
+ 
+       plot_stream->flush ();
+-      pipe_handler_error_count = 0;
+     }
+ 
+   return 0;
+ }
+ 
+ // Plotting, eh?
+ 
+ tree_plot_command::~tree_plot_command (void)
+diff --git a/src/sighandlers.cc b/src/sighandlers.cc
+--- a/src/sighandlers.cc
++++ b/src/sighandlers.cc
+@@ -128,45 +128,46 @@ generic_sig_handler (int sig)
+   return;
+ #else
+   return 0;
+ #endif
+ }
+ 
+ // Handle SIGCHLD.
+ 
+-// XXX FIXME XXX -- this should probably be implemented by having a
+-// global list of pids to check and a corresponding list of functions
+-// to call if a pid is recognized.  That way, we just have to register
+-// functions elsewhere and this function doesn't have to change.
+-
+ static RETSIGTYPE
+ sigchld_handler (int /* sig */)
+ {
+   // Can this ever cause trouble on systems that don't forget signal
+   // handlers when they are invoked?
+ 
+   octave_set_signal_handler (SIGCHLD, sigchld_handler);
+ 
+-  if (octave_pager_pid > 0)
++  int n = octave_child_list::length ();
++
++  for (int i = 0; i < n; i++)
+     {
+-      int status;
+-      pid_t pid = waitpid (octave_pager_pid, &status, 0);
++      octave_child& elt = octave_child_list::elem (i);
++
++      pid_t pid = elt.pid;
+ 
+       if (pid > 0)
+ 	{
+-	  if (WIFEXITED (status) || WIFSIGNALLED (status))
++	  int status;
++
++	  if (waitpid (pid, &status, 0) > 0)
+ 	    {
+-	      octave_pager_pid = -1;
++	      elt.pid = -1;
+ 
+-	      // Don't call error() here because we don't want to set
+-	      // the error state.
++	      octave_child::dead_child_handler f = elt.handler;
+ 
+-	      warning ("connection to external pager lost --");
+-	      warning ("pending computations and output have been discarded");
++	      if (f)
++		(*f) (pid, status);
++
++	      break;
+ 	    }
+ 	}
+     }
+ }
+ 
+ #if defined (__alpha__)
+ static RETSIGTYPE
+ sigfpe_handler (int /* sig */)
+@@ -436,13 +437,64 @@ char *sys_siglist[NSIG + 1] =
+   "Special Signal Used By CPR",	    /* 35 SIGTHAW */
+ #endif
+ #endif /* sun */
+ #endif /* not AIX */
+   0
+   };
+ #endif
+ 
++octave_child_list *octave_child_list::instance = 0;
++
++void
++octave_child_list::do_insert (pid_t pid, octave_child::dead_child_handler f)
++{
++  // Insert item in first open slot, increasing size of list if
++  // necessary.
++
++  bool enlarge = true;
++
++  for (int i = 0; i < curr_len; i++)
++    {
++      octave_child tmp = list.elem (i);
++
++      if (tmp.pid < 0)
++	{
++	  list.elem (i) = octave_child (pid, f);
++	  enlarge = false;
++	  break;
++	}
++    }
++
++  if (enlarge)
++    {
++      int total_len = list.length ();
++
++      if (curr_len == total_len)
++	{
++	  if (total_len == 0)
++	    list.resize (16);
++	  else
++	    list.resize (total_len * 2);
++	}
++
++      list.elem (curr_len) = octave_child (pid, f);
++      curr_len++;
++    }
++}
++
++void
++octave_child_list::insert (pid_t pid, octave_child::dead_child_handler f)
++{
++  if (! instance)
++    instance = new octave_child_list ();
++
++  if (instance)
++    instance->do_insert (pid, f);
++  else
++    panic_impossible ();
++}
++
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/sighandlers.h b/src/sighandlers.h
+--- a/src/sighandlers.h
++++ b/src/sighandlers.h
+@@ -20,16 +20,20 @@ Software Foundation, 59 Temple Place - S
+ 
+ */
+ 
+ // This file should always be included after config.h!
+ 
+ #if !defined (octave_sighandlers_h)
+ #define octave_sighandlers_h 1
+ 
++#include <Array.h>
++
++#include "syswait.h"
++
+ // Signal handler return type.
+ #ifndef RETSIGTYPE
+ #define RETSIGTYPE void
+ #endif
+ #ifndef BADSIG
+ #define BADSIG (RETSIGTYPE (*)(int))-1
+ #endif
+ 
+@@ -59,15 +63,90 @@ extern char *sys_siglist[];
+ #endif
+ 
+ #if defined (HAVE_SIGACTION) && defined (HAVE_SIGPROCMASK)
+ #if defined (HAVE_SIGPENDING) && defined (HAVE_SIGSUSPEND)
+ #define HAVE_POSIX_SIGNALS
+ #endif
+ #endif
+ 
++// Maybe this should be in a separate file?
++
++class
++octave_child
++{
++public:
++
++  typedef void (*dead_child_handler) (pid_t, int);
++
++  octave_child (pid_t id = -1, dead_child_handler f = 0)
++    : pid (id), handler (f) { }
++
++  octave_child (const octave_child& oc)
++    : pid (oc.pid), handler (oc.handler) { }
++
++  octave_child& operator = (const octave_child& oc)
++    {
++      if (&oc != this)
++	{
++	  pid = oc.pid;
++	  handler = oc.handler;
++	}
++      return *this;
++    }
++
++  ~octave_child (void) { }
++
++  // The process id of this child.
++  pid_t pid;
++
++  // The function we call if this child dies.
++  dead_child_handler handler;
++};
++
++class
++octave_child_list
++{
++protected:
++
++  octave_child_list (void) : list (0), curr_len (0) { }
++
++public:
++
++  ~octave_child_list (void) { }
++
++  static void insert (pid_t pid, octave_child::dead_child_handler f);
++
++  static int length (void) { return instance ? instance->curr_len : 0; }
++
++  static octave_child& elem (int i)
++    {
++      static octave_child foo;
++
++      if (instance)
++	{
++	  int n = length ();
++
++	  if (i >= 0 && i < n)
++	    return instance->list (i);
++	}
++
++      return foo;
++    }
++
++private:
++
++  Array<octave_child> list;
++
++  int curr_len;
++
++  static octave_child_list *instance;
++
++  void do_insert (pid_t pid, octave_child::dead_child_handler f);
++};
++
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */

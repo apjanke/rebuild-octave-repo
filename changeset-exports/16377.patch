@@ -1,0 +1,940 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1364403552 14400
+#      Wed Mar 27 12:59:12 2013 -0400
+# Node ID 8430ea8c1594461c6746698f691c1ea1935a7cdc
+# Parent  a2f65b8f1955c7812b3ec640736a2ceeac9ef08c
+open editor tab and insert marker for debugging with gui
+
+* file-editor-interface.h (file_editor_interface::request_open_file):
+New public slot.
+(file_editor_interface::handle_dbstop_request): New virtual function.
+
+* file-editor-tab.h, file-editor-tab.cc (file_editor_tab::goto_line):
+New arg, line, with default value.  Don't prompt if line is greater
+than zero.
+
+(file_editor_tab::set_debugger_position): New arg, widget id.
+(file_editor_tab::add_filename_to_list): New arg, widget id.
+
+* file-editor.h, file-editor.cc (file_eidtor::editor_tab_map):
+New data member.
+(file_editor::fetFileNames) Delete.
+(file_editor::~file_editor, file_editor::check_conflict_save,
+file_editor::handle_add_filename_to_list): Use editor_tab_map instead
+of fetFileNames.
+(file_editor::request_open_file): New args, line and set_marker.
+Optionally position cursor at line and with debug marker.  If file is
+already open in tab, switch to it instead of giving error.
+
+(file_editor::construct): Connect fetab_set_debugger_position signal
+to set_debugger_position slot.
+
+* main-window.h, main-window.cc (main_window::dbstop_signal):
+New signal.
+(main_window::handle_dbstop_request): New function.
+
+* octave-event-listener.h (octave_event_listener::dbstop): New
+virtual function.
+
+* octave-qt-event-listener.h, octave-qt-event-listener.cc
+(octave_qt_event_listener::dbstop): New function.
+(octave_qt_event_listener::dbstop_signal): New signal.
+
+* octave-link.h, octave-link.cc (octave_link::dbstop,
+octave_link::do_dbstop, octave_link::dbstop_event_hook_fcn,
+octave_link::do_dbstop_event_hook_fcn): New functions
+
+* octave-main-thread.h, octave-main-thread.cc (dbstop_event_hook_fcn):
+New function.
+(octave_main_thread::run): Add it to the list of dbstop event hook
+functions.
+
+diff --git a/libgui/src/m-editor/file-editor-interface.h b/libgui/src/m-editor/file-editor-interface.h
+--- a/libgui/src/m-editor/file-editor-interface.h
++++ b/libgui/src/m-editor/file-editor-interface.h
+@@ -41,22 +41,24 @@ class file_editor_interface : public oct
+   virtual ~file_editor_interface () { }
+ 
+   virtual QMenu *get_mru_menu ( ) = 0;
+   virtual QMenu *debug_menu () = 0;
+   virtual QToolBar *toolbar () = 0;
+ 
+   virtual void handle_entered_debug_mode () = 0;
+   virtual void handle_quit_debug_mode () = 0;
++  virtual void handle_dbstop_request (const QString& file, int line) = 0;
+   virtual void set_focus () = 0;
+ 
+ public slots:
+   virtual void request_new_file () = 0;
+   virtual void request_open_file () = 0;
+-  virtual void request_open_file (const QString& fileName) = 0;
++  virtual void request_open_file (const QString& fileName, int line = -1,
++                                  bool set_marker = false) = 0;
+ 
+ //signals:
+ 
+ //protected:
+ 
+ //protected slots:
+ 
+ };
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -624,29 +624,36 @@ file_editor_tab::find (const QWidget* ID
+     }
+ 
+   _find_dialog->activateWindow ();
+   _find_dialog->init_search_text ();
+ 
+ }
+ 
+ void
+-file_editor_tab::goto_line (const QWidget* ID)
++file_editor_tab::goto_line (const QWidget* ID, int line)
+ {
+   if (ID != this)
+     return;
+ 
+-  int line, index;
++  bool ok = true;
+ 
+-  _edit_area->getCursorPosition(&line, &index);
++  if (line <= 0)
++    {
++      bool ok = false;
++
++      int index;
+ 
+-  bool ok = false;
++      _edit_area->getCursorPosition(&line, &index);
++
+ 
+-  line = QInputDialog::getInt (_edit_area, "Goto line", "Line number", 
+-                               line+1, 1, _edit_area->lines(), 1, &ok);
++      line = QInputDialog::getInt (_edit_area, "Goto line", "Line number", 
++                                   line+1, 1, _edit_area->lines(), 1, &ok);
++    }
++
+   if (ok)
+     _edit_area->setCursorPosition (line-1, 0);
+ }
+ 
+ 
+ void
+ file_editor_tab::do_comment_selected_text (bool comment)
+ {
+@@ -1098,17 +1105,17 @@ file_editor_tab::file_name_query (const 
+ {
+   // A zero (null pointer) means that all file editor tabs
+   // should respond, otherwise just the desired file editor tab.
+   if (ID != this && ID != 0)
+     return;
+ 
+   // Unnamed files shouldn't be transmitted.
+   if (!_file_name.isEmpty ())
+-    emit add_filename_to_list (_file_name);
++    emit add_filename_to_list (_file_name, this);
+ }
+ 
+ void
+ file_editor_tab::handle_file_reload_answer (int decision)
+ {
+   if (decision == QMessageBox::Yes)
+     { // reload: file is readded to the file watcher in set_file_name ()
+       load_file (_file_name);
+@@ -1135,18 +1142,21 @@ file_editor_tab::handle_file_resave_answ
+       // is posted. If the user cancels the close in this dialog the tab is
+       // left open with a non-existing file.
+       _edit_area->setModified (false);
+       close ();
+     }
+ }
+ 
+ void
+-file_editor_tab::set_debugger_position (int line)
++file_editor_tab::set_debugger_position (const QWidget *ID, int line)
+ {
++  if (ID != this || ID == 0)
++    return;
++
+   _edit_area->markerDeleteAll (debugger_position);
+   if (line > 0)
+     {
+       _edit_area->markerAdd (line, debugger_position);
+     }
+ }
+ 
+ #endif
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -70,32 +70,32 @@ public slots:
+   void toggle_breakpoint (const QWidget* ID);
+   void next_breakpoint (const QWidget* ID);
+   void previous_breakpoint (const QWidget* ID);
+   void remove_all_breakpoints (const QWidget* ID);
+ 
+   void comment_selected_text (const QWidget* ID);
+   void uncomment_selected_text (const QWidget* ID);
+   void find (const QWidget* ID);
+-  void goto_line (const QWidget* ID);
++  void goto_line (const QWidget* ID, int line = -1);
+ 
+-  void set_debugger_position (int line);
++  void set_debugger_position (const QWidget *ID, int line = -1);
+ 
+   void set_modified (bool modified = true);
+ 
+   QString load_file (const QString& fileName);
+   void new_file ();
+ 
+   void file_has_changed (const QString& fileName);
+ 
+ signals:
+   void file_name_changed (const QString& fileName, const QString& toolTip);
+   void editor_state_changed (bool copy_available, const QString& fileName);
+   void tab_remove_request ();
+-  void add_filename_to_list (const QString& fileName);
++  void add_filename_to_list (const QString&, QWidget *);
+   void mru_add_file (const QString& file_name);
+   void editor_check_conflict_save (const QString& saveFileName, bool remove_on_success);
+   void process_octave_code (const QString& command);
+ 
+ protected:
+   void closeEvent (QCloseEvent *event);
+   void set_file_name (const QString& fileName);
+ 
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -49,22 +49,27 @@ file_editor::file_editor (QWidget *p)
+   construct ();
+ 
+   setVisible (false);
+ }
+ 
+ file_editor::~file_editor ()
+ {
+   QSettings *settings = resource_manager::get_settings ();
+-  fetFileNames.clear ();
++  editor_tab_map.clear ();
+   if (settings->value ("editor/restoreSession",true).toBool ())
+     {
+       // Have all file editor tabs signal what their file names are.
+       emit fetab_file_name_query (0);
+     }
++  QStringList fetFileNames;
++  for (std::map<QString, QWidget *>::const_iterator p = editor_tab_map.begin ();
++       p != editor_tab_map.end (); p++)
++    fetFileNames.append (p->first);
++
+   settings->setValue ("editor/savedSessionTabs", fetFileNames);
+   settings->sync ();
+ 
+   if (_mru_file_menu)
+     delete _mru_file_menu;
+ }
+ 
+ // set focus to editor and its current tab
+@@ -137,83 +142,87 @@ file_editor::request_open_file ()
+   connect (fileDialog, SIGNAL (fileSelected (const QString&)),
+            this, SLOT (request_open_file (const QString&)));
+   fileDialog->setWindowModality (Qt::NonModal);
+   fileDialog->setAttribute (Qt::WA_DeleteOnClose);
+   fileDialog->show ();
+ }
+ 
+ void
+-file_editor::request_open_file (const QString& openFileName)
++file_editor::request_open_file (const QString& openFileName, int line,
++                                bool set_marker)
+ {
+   if (openFileName.isEmpty ())
+     {
+       // ??  Not sure this will happen.  This routine isn't even called
+       // if the user hasn't selected a file.
+     }
+   else
+     {
+       // Have all file editor tabs signal what their file names are.
+-      fetFileNames.clear ();
++      editor_tab_map.clear ();
+       emit fetab_file_name_query (0);
+ 
+       // Check whether this file is already open in the editor.
+-      if (fetFileNames.contains (openFileName, Qt::CaseSensitive))
++      std::map<QString, QWidget *>::const_iterator p = editor_tab_map.find (openFileName);
++      if (p != editor_tab_map.end ())
++        {
++          _tab_widget->setCurrentWidget (p->second);
++
++          if (line > 0)
++            {
++              emit fetab_goto_line (p->second, line);
++
++              if (set_marker)
++                emit fetab_set_debugger_position (p->second, line-1);
++            }
++
++          emit fetab_set_focus (p->second);
++        }
++      else
+         {
+-          // Create a NonModal message so nothing is blocked and
+-          // bring the existing file forward.
+-          QMessageBox* msgBox = new QMessageBox (
+-                  QMessageBox::Critical, tr ("Octave Editor"),
+-                  tr ("File %1 is already open in the editor.").
+-                  arg (openFileName), QMessageBox::Ok, 0);
+-          msgBox->setWindowModality (Qt::NonModal);
+-          msgBox->setAttribute (Qt::WA_DeleteOnClose);
+-          msgBox->show ();
+-          QFileInfo file(openFileName);
+-          QString short_openFileName = file.fileName();  // get file name only
+-          for(int i = 0; i < _tab_widget->count (); i++)
+-            { // check whether tab title is file name (long or short)
+-              if (_tab_widget->tabText (i) == openFileName ||
+-                  _tab_widget->tabText (i) == short_openFileName)
++          file_editor_tab *fileEditorTab = new file_editor_tab ();
++          if (fileEditorTab)
++            {
++              QString result = fileEditorTab->load_file(openFileName);
++              if (result == "")
+                 {
+-                  _tab_widget->setCurrentIndex (i);
+-                  break;
++                  // Supply empty title then have the file_editor_tab update
++                  // with full or short name.
++                  add_file_editor_tab (fileEditorTab, "");
++                  fileEditorTab->update_window_title (false);
++                  // file already loaded, add file to mru list here
++                  handle_mru_add_file(QDir::cleanPath (openFileName));
++
++                  if (line > 0)
++                    {
++                      emit fetab_goto_line (fileEditorTab, line);
++
++                      if (set_marker)
++                        emit fetab_set_debugger_position (fileEditorTab, line-1);
++                    }
++                }
++              else
++                {
++                  delete fileEditorTab;
++                  // Create a NonModal message about error.
++                  QMessageBox* msgBox = new QMessageBox (
++                                                         QMessageBox::Critical, tr ("Octave Editor"),
++                                                         tr ("Could not open file %1 for read:\n%2.").
++                                                         arg (openFileName).arg (result),
++                                                         QMessageBox::Ok, 0);
++                  msgBox->setWindowModality (Qt::NonModal);
++                  msgBox->setAttribute (Qt::WA_DeleteOnClose);
++                  msgBox->show ();
+                 }
+             }
+-          return;
++
++          // really show editor and the current editor tab
++          set_focus ();
+         }
+-
+-      file_editor_tab *fileEditorTab = new file_editor_tab ();
+-      if (fileEditorTab)
+-        {
+-          QString result = fileEditorTab->load_file(openFileName);
+-          if (result == "")
+-            {
+-              // Supply empty title then have the file_editor_tab update
+-              // with full or short name.
+-              add_file_editor_tab (fileEditorTab, "");
+-              fileEditorTab->update_window_title (false);
+-              // file already loaded, add file to mru list here
+-              handle_mru_add_file(QDir::cleanPath (openFileName));
+-            }
+-          else
+-            {
+-              delete fileEditorTab;
+-              // Create a NonModal message about error.
+-              QMessageBox* msgBox = new QMessageBox (
+-                      QMessageBox::Critical, tr ("Octave Editor"),
+-                      tr ("Could not open file %1 for read:\n%2.").
+-                      arg (openFileName).arg (result),
+-                      QMessageBox::Ok, 0);
+-              msgBox->setWindowModality (Qt::NonModal);
+-              msgBox->setAttribute (Qt::WA_DeleteOnClose);
+-              msgBox->show ();
+-            }
+-        }
+-      set_focus ();  // really show editor and the current editor tab
+     }
+ }
+ 
+ // open a file from the mru list
+ void
+ file_editor::request_mru_open_file ()
+ {
+   QAction *action = qobject_cast<QAction *>(sender ());
+@@ -223,21 +232,21 @@ file_editor::request_mru_open_file ()
+     }
+ }
+ 
+ 
+ void
+ file_editor::check_conflict_save (const QString& saveFileName, bool remove_on_success)
+ {
+   // Have all file editor tabs signal what their file names are.
+-  fetFileNames.clear ();
++  editor_tab_map.clear ();
+   emit fetab_file_name_query (0);
+ 
+-  // If one of those names matches the desired name, that's a conflict.
+-  if (fetFileNames.contains (saveFileName, Qt::CaseSensitive))
++  std::map<QString, QWidget *>::const_iterator p = editor_tab_map.find (saveFileName);
++  if (p != editor_tab_map.end ())
+     {
+       // Note: to overwrite the contents of some other file editor tab
+       // with the same name requires identifying which file editor tab
+       // that is (not too difficult) then close that tab.  Of course,
+       // that could trigger another dialog box if the file editor tab
+       // with the same name has modifications in it.  This could become
+       // somewhat confusing to the user.  For now, opt to do nothing.
+ 
+@@ -278,16 +287,22 @@ file_editor::check_conflict_save (const 
+       return;
+     }
+ 
+   // Can save without conflict, have the file editor tab do so.
+   emit fetab_save_file (saveFileWidget, saveFileName, remove_on_success);
+ }
+ 
+ void
++file_editor::handle_dbstop_request (const QString& file, int line)
++{
++  request_open_file (file, line, true);
++}
++
++void
+ file_editor::request_undo ()
+ {
+   emit fetab_undo (_tab_widget->currentWidget ());
+ }
+ 
+ void
+ file_editor::request_redo ()
+ {
+@@ -479,19 +494,21 @@ file_editor::handle_tab_remove_request (
+               _tab_widget->removeTab (i);
+               delete fileEditorTab;
+             }
+         }
+     }
+ }
+ 
+ void
+-file_editor::handle_add_filename_to_list (const QString& fileName)
++file_editor::handle_add_filename_to_list (const QString& fileName, QWidget *ID)
+ {
+-  fetFileNames.append (fileName);
++  // Should we allow multiple tabs for a single file?
++
++  editor_tab_map[fileName] = ID;
+ }
+ 
+ void
+ file_editor::active_tab_changed (int index)
+ {
+   emit fetab_change_request (_tab_widget->widget (index));
+ }
+ 
+@@ -783,18 +800,18 @@ file_editor::add_file_editor_tab (file_e
+ 
+   // Signals from the file editor_tab
+   connect (f, SIGNAL (file_name_changed (const QString&, const QString&)),
+            this, SLOT (handle_file_name_changed (const QString&, const QString&)));
+   connect (f, SIGNAL (editor_state_changed (bool, const QString&)),
+            this, SLOT (handle_editor_state_changed (bool, const QString&)));
+   connect (f, SIGNAL (tab_remove_request ()),
+            this, SLOT (handle_tab_remove_request ()));
+-  connect (f, SIGNAL (add_filename_to_list (const QString&)),
+-           this, SLOT (handle_add_filename_to_list (const QString&)));
++  connect (f, SIGNAL (add_filename_to_list (const QString&, QWidget *)),
++           this, SLOT (handle_add_filename_to_list (const QString&, QWidget *)));
+   connect (f, SIGNAL (editor_check_conflict_save (const QString&, bool)),
+            this, SLOT (check_conflict_save (const QString&, bool)));
+   connect (f, SIGNAL (mru_add_file (const QString&)),
+            this, SLOT (handle_mru_add_file (const QString&)));
+   connect (f, SIGNAL (process_octave_code (const QString&)),
+            parent (), SLOT (handle_command_double_clicked (const QString&)));
+   
+   // Signals from the file_editor non-trivial operations
+@@ -842,17 +859,19 @@ file_editor::add_file_editor_tab (file_e
+   connect (this, SIGNAL (fetab_remove_all_breakpoints (const QWidget*)),
+            f, SLOT (remove_all_breakpoints (const QWidget*)));
+   connect (this, SIGNAL (fetab_comment_selected_text (const QWidget*)),
+            f, SLOT (comment_selected_text (const QWidget*)));
+   connect (this, SIGNAL (fetab_uncomment_selected_text (const QWidget*)),
+            f, SLOT (uncomment_selected_text (const QWidget*)));
+   connect (this, SIGNAL (fetab_find (const QWidget*)),
+            f, SLOT (find (const QWidget*)));
+-  connect (this, SIGNAL (fetab_goto_line (const QWidget*)),
+-           f, SLOT (goto_line (const QWidget*)));
++  connect (this, SIGNAL (fetab_goto_line (const QWidget *, int)),
++           f, SLOT (goto_line (const QWidget *, int)));
+   connect (this, SIGNAL (fetab_set_focus (const QWidget*)),
+            f, SLOT (set_focus (const QWidget*)));
++  connect (this, SIGNAL (fetab_set_debugger_position (const QWidget *, int)),
++           f, SLOT (set_debugger_position (const QWidget *, int)));
+ 
+   _tab_widget->setCurrentWidget (f);
+ }
+ 
+ #endif
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -25,16 +25,18 @@ along with Octave; see the file COPYING.
+ 
+ #include <QToolBar>
+ #include <QAction>
+ #include <QMenuBar>
+ #include <QStatusBar>
+ #include <QCloseEvent>
+ #include <QTabWidget>
+ 
++#include <map>
++
+ #include "file-editor-interface.h"
+ #include "file-editor-tab.h"
+ 
+ enum editor_markers
+   {
+     bookmark,
+     breakpoint,
+     debugger_position
+@@ -80,17 +82,18 @@ signals:
+   void fetab_remove_bookmark (const QWidget* ID);
+   void fetab_toggle_breakpoint (const QWidget* ID);
+   void fetab_next_breakpoint (const QWidget* ID);
+   void fetab_previous_breakpoint (const QWidget* ID);
+   void fetab_remove_all_breakpoints (const QWidget* ID);
+   void fetab_comment_selected_text (const QWidget* ID);
+   void fetab_uncomment_selected_text (const QWidget* ID);
+   void fetab_find (const QWidget* ID);
+-  void fetab_goto_line (const QWidget* ID);
++  void fetab_goto_line (const QWidget* ID, int line = -1);
++  void fetab_set_debugger_position (const QWidget* ID, int line = -1);
+   void fetab_set_focus (const QWidget* ID);
+ 
+ public slots:
+   void request_new_file ();
+   void request_open_file ();
+   void request_mru_open_file ();
+ 
+   void request_undo ();
+@@ -115,35 +118,38 @@ public slots:
+   void request_uncomment_selected_text ();
+   void request_find ();
+ 
+   void request_goto_line ();
+ 
+   void handle_file_name_changed (const QString& fileName, const QString& toolTip);
+   void handle_tab_close_request (int index);
+   void handle_tab_remove_request ();
+-  void handle_add_filename_to_list (const QString& fileName);
++  void handle_add_filename_to_list (const QString& fileName, QWidget *ID);
+   void active_tab_changed (int index);
+   void handle_editor_state_changed (bool enableCopy, const QString& fileName);
+   void handle_mru_add_file (const QString& file_name);
+   void check_conflict_save (const QString& fileName, bool remove_on_success);
+ 
++  void handle_dbstop_request (const QString& file, int line);
++
+   /** Tells the editor to react on changed settings. */
+   void notice_settings ();
+ 
+ private slots:
+-  void request_open_file (const QString& fileName);
++  void request_open_file (const QString& fileName, int line = -1, bool = false);
+ 
+ private:
+   void construct ();
+   void add_file_editor_tab(file_editor_tab *f, const QString &fn);
+   void save_file_as (QWidget *fetabID = 0);
+   void mru_menu_update ();
+ 
+-  QStringList fetFileNames;
++  std::map<QString, QWidget *> editor_tab_map;
++
+   QString ced;
+ 
+   QMenuBar *        _menu_bar;
+   QToolBar *        _tool_bar;
+   QMenu *           _debug_menu;
+   QAction *         _copy_action;
+   QAction *         _cut_action;
+   QAction *         _run_action;
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -507,16 +507,24 @@ main_window::handle_quit_debug_mode ()
+   _debug_step_out->setEnabled (false);
+   _debug_quit->setEnabled (false);
+ #ifdef HAVE_QSCINTILLA
+   _file_editor->handle_quit_debug_mode ();
+ #endif
+ }
+ 
+ void
++main_window::handle_dbstop_request (const QString& file, int line)
++{
++#ifdef HAVE_QSCINTILLA
++  _file_editor->handle_dbstop_request (file, line);
++#endif
++}
++
++void
+ main_window::debug_continue ()
+ {
+   octave_link::post_event (this, &main_window::debug_continue_callback);
+ }
+ 
+ void
+ main_window::debug_step_into ()
+ {
+@@ -1150,16 +1158,20 @@ main_window::construct ()
+            SIGNAL (entered_debug_mode_signal ()),
+            this,
+            SLOT(handle_entered_debug_mode ()));
+ 
+   connect (_octave_qt_event_listener,
+            SIGNAL (quit_debug_mode_signal ()),
+            this,
+            SLOT (handle_quit_debug_mode ()));
++
++  connect (_octave_qt_event_listener,
++           SIGNAL (dbstop_signal (const QString&, int)), this,
++           SLOT (handle_dbstop_request (const QString&, int)));
+ }
+ 
+ void
+ main_window::save_workspace_callback (const std::string& file)
+ {
+   Fsave (ovl (file));
+ }
+ 
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -113,16 +113,17 @@ public slots:
+   void handle_command_history_visible (bool);
+   void handle_current_directory_visible (bool);
+   void handle_workspace_visible (bool);
+   void handle_editor_visible (bool);
+   void handle_documentation_visible (bool);
+ 
+   void handle_entered_debug_mode ();
+   void handle_quit_debug_mode ();
++  void handle_dbstop_request (const QString& file, int line);
+   void debug_continue ();
+   void debug_step_into ();
+   void debug_step_over ();
+   void debug_step_out ();
+   void debug_quit ();
+ 
+   void read_settings ();
+   void write_settings ();
+diff --git a/libgui/src/octave-adapter/octave-event-listener.h b/libgui/src/octave-adapter/octave-event-listener.h
+--- a/libgui/src/octave-adapter/octave-event-listener.h
++++ b/libgui/src/octave-adapter/octave-event-listener.h
+@@ -35,15 +35,17 @@ class octave_event_listener
+     current_directory_has_changed (const std::string& directory) = 0;
+ 
+     virtual void
+     update_workspace (void) = 0;
+ 
+     virtual void
+     update_history (void) = 0;
+ 
++    virtual void dbstop (const std::string& file, int line) = 0;
++
+     virtual void about_to_exit () = 0;
+ 
+     virtual void entered_debug_mode () = 0;
+     virtual void quit_debug_mode () = 0;
+ };
+ 
+ #endif // OCTAVEEVENTLISTENER_H
+diff --git a/libgui/src/octave-adapter/octave-link.cc b/libgui/src/octave-adapter/octave-link.cc
+--- a/libgui/src/octave-adapter/octave-link.cc
++++ b/libgui/src/octave-adapter/octave-link.cc
+@@ -152,27 +152,67 @@ octave_link::do_update_history (void)
+     {
+       event_listener->update_history ();
+ 
+       do_process_events ();
+     }
+ }
+ 
+ void
++octave_link::do_dbstop (const octave_value_list& args)
++{
++  if (event_listener)
++    {
++      if (args.length () == 1)
++        {
++          octave_scalar_map m = args(0).scalar_map_value ();
++
++          if (! error_state)
++            {
++              octave_value ov_file = m.getfield ("file");
++              octave_value ov_line = m.getfield ("line");
++
++              std::string file = ov_file.string_value ();
++              int line = ov_line.int_value ();
++
++              if (! error_state)
++                {
++                  event_listener->dbstop (file, line);
++
++                  do_process_events ();
++                }
++              else
++                ::error ("invalid struct in dbstop callback");
++            }
++          else
++            ::error ("expecting struct in dbstop callback");
++        }
++      else
++        ::error ("invalid call to dbstop callback");
++    }
++}
++
++void
+ octave_link::do_pre_input_event_hook_fcn (void)
+ {
+   do_update_workspace ();
+ }
+ 
+ void
+ octave_link::do_post_input_event_hook_fcn (void)
+ {
+   do_update_history ();
+ }
+ 
++void
++octave_link::do_dbstop_event_hook_fcn (const octave_value_list& args)
++{
++  do_dbstop (args);
++}
++
+ bool
+ octave_link::instance_ok (void)
+ {
+   bool retval = true;
+ 
+   if (! instance)
+     {
+       instance = new octave_link ();
+diff --git a/libgui/src/octave-adapter/octave-link.h b/libgui/src/octave-adapter/octave-link.h
+--- a/libgui/src/octave-adapter/octave-link.h
++++ b/libgui/src/octave-adapter/octave-link.h
+@@ -23,16 +23,18 @@ along with Octave; see the file COPYING.
+ 
+ #ifndef OCTAVELINK_H
+ #define OCTAVELINK_H
+ 
+ #include <string>
+ 
+ class octave_mutex;
+ 
++#include "oct-obj.h"
++
+ #include "event-queue.h"
+ 
+ #include "octave-main-thread.h"
+ #include "octave-event-listener.h"
+ 
+ // \class OctaveLink
+ // \brief Provides threadsafe access to octave.
+ // \author Jacob Dawid
+@@ -127,28 +129,40 @@ public:
+   }
+ 
+   static void update_history (void)
+   {
+     if (instance_ok ())
+       instance->do_update_history ();
+   }
+ 
++  static void dbstop (const octave_value_list& args)
++  {
++    if (instance_ok ())
++      instance->do_dbstop (args);
++  }
++
+   static void pre_input_event_hook_fcn (void)
+   {
+     if (instance_ok ())
+       instance->do_pre_input_event_hook_fcn ();
+   }
+ 
+   static void post_input_event_hook_fcn (void)
+   {
+     if (instance_ok ())
+       instance->do_post_input_event_hook_fcn ();
+   }
+ 
++  static void dbstop_event_hook_fcn (const octave_value_list& args)
++  {
++    if (instance_ok ())
++      instance->do_dbstop_event_hook_fcn (args);
++  }
++
+ private:
+ 
+   static octave_link *instance;
+ 
+   static void cleanup_instance (void) { delete instance; instance = 0; }
+ 
+   // No copying!
+ 
+@@ -201,14 +215,16 @@ private:
+   void do_about_to_exit (void);
+ 
+   void do_entered_readline_hook (void) { }
+   void do_finished_readline_hook (void) { }
+ 
+   std::string do_last_working_directory (void);
+   void do_update_workspace (void);
+   void do_update_history (void);
++  void do_dbstop (const octave_value_list& args);
+ 
+   void do_pre_input_event_hook_fcn (void);
+   void do_post_input_event_hook_fcn (void);
++  void do_dbstop_event_hook_fcn (const octave_value_list& args);
+ };
+ 
+ #endif // OCTAVELINK_H
+diff --git a/libgui/src/octave-adapter/octave-main-thread.cc b/libgui/src/octave-adapter/octave-main-thread.cc
+--- a/libgui/src/octave-adapter/octave-main-thread.cc
++++ b/libgui/src/octave-adapter/octave-main-thread.cc
+@@ -50,16 +50,26 @@ post_input_event_hook_fcn (const octave_
+ {
+   octave_value_list retval;
+ 
+   octave_link::post_input_event_hook_fcn ();
+ 
+   return retval;
+ }
+ 
++static octave_value_list
++dbstop_event_hook_fcn (const octave_value_list& args, int)
++{
++  octave_value_list retval;
++
++  octave_link::dbstop_event_hook_fcn (args);
++
++  return retval;
++}
++
+ octave_main_thread::octave_main_thread () : QThread ()
+ {
+ }
+ 
+ void
+ octave_main_thread::run ()
+ {
+   // Matlab uses "C" locale for LC_NUMERIC class regardless of local setting
+@@ -73,13 +83,17 @@ octave_main_thread::run ()
+   octave_value pre_fcn (new octave_builtin (pre_input_event_hook_fcn));
+   octave_value pre_fcn_handle (new octave_fcn_handle (pre_fcn));
+   Fadd_pre_input_event_hook (pre_fcn_handle);
+ 
+   octave_value post_fcn (new octave_builtin (post_input_event_hook_fcn));
+   octave_value post_fcn_handle (new octave_fcn_handle (post_fcn));
+   Fadd_post_input_event_hook (post_fcn_handle);
+ 
++  octave_value dbstop_fcn (new octave_builtin (dbstop_event_hook_fcn));
++  octave_value dbstop_fcn_handle (new octave_fcn_handle (dbstop_fcn));
++  Fadd_dbstop_event_hook (dbstop_fcn_handle);
++
+   // Prime the history list.
+   octave_link::update_history ();
+ 
+   octave_execute_interpreter ();
+ }
+diff --git a/libgui/src/octave-qt-event-listener.cc b/libgui/src/octave-qt-event-listener.cc
+--- a/libgui/src/octave-qt-event-listener.cc
++++ b/libgui/src/octave-qt-event-listener.cc
+@@ -19,16 +19,18 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <iostream>
++
+ #include "octave-qt-event-listener.h"
+ #include <QApplication>
+ 
+ octave_qt_event_listener::octave_qt_event_listener (QObject *p)
+   : QObject (p), octave_event_listener ()
+ {
+ }
+ 
+@@ -47,16 +49,22 @@ octave_qt_event_listener::update_workspa
+ 
+ void
+ octave_qt_event_listener::update_history (void)
+ {
+   emit update_history_signal ();
+ }
+ 
+ void
++octave_qt_event_listener::dbstop (const std::string& file, int line)
++{
++  emit dbstop_signal (QString::fromStdString (file), line);
++}
++
++void
+ octave_qt_event_listener::about_to_exit ()
+ {
+   qApp->quit ();
+ }
+ 
+ void
+ octave_qt_event_listener::entered_debug_mode ()
+ { emit entered_debug_mode_signal (); }
+diff --git a/libgui/src/octave-qt-event-listener.h b/libgui/src/octave-qt-event-listener.h
+--- a/libgui/src/octave-qt-event-listener.h
++++ b/libgui/src/octave-qt-event-listener.h
+@@ -32,22 +32,24 @@ class octave_qt_event_listener
+ {
+   Q_OBJECT
+   public:
+   octave_qt_event_listener (QObject *parent = 0);
+ 
+   void current_directory_has_changed (const std::string& directory);
+   void update_workspace (void);
+   void update_history (void);
++  void dbstop (const std::string& file, int line);
+   void about_to_exit ();
+ 
+   void entered_debug_mode ();
+   void quit_debug_mode ();
+ 
+ signals:
+   void current_directory_has_changed_signal (const QString& directory);
+   void update_workspace_signal (void);
+   void update_history_signal (void);
++  void dbstop_signal (const QString& file, int line);
+   void entered_debug_mode_signal ();
+   void quit_debug_mode_signal ();
+ };
+ 
+ #endif // OCTAVEQTEVENTLISTENER_H

@@ -1,0 +1,1153 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1202987864 -3600
+#      Thu Feb 14 12:17:44 2008 +0100
+# Node ID 8ca8e97e8c0aef9132d581b74c67634ef2a2742c
+# Parent  4739b6a1925cc9abca61ee4e5d13dc6ff9141700
+Add rendering interface for surface object (no implementation yet).
+* * *
+Add surface properties.
+* * *
+Add cdata -> RGB color conversion function. Use it in surface objects.
+* * *
+Add normals automatic computation to surface objects.
+* * *
+Make sure the correct "get" method is called.
+* * *
+Extend scaler interface to accept NDArray.
+* * *
+Surface rendering (1st part).
+* * *
+Fix wrong indexing.
+* * *
+Fix bug in xget_ancestor argument declaration.
+* * *
+Initialize OpenGL context correctly. Fix bug in surface rendering.
+* * *
+Set material color when rendering surface facets.
+* * *
+Add rendering of surface mesh and markers.
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -10,16 +10,59 @@ 2008-06-04  Shai Ayal  <shaiay@users.sou
+ 
+ 	* graphics.h.in (axes::properties::update_xlim): call the new
+ 	axes::properties::calc_ticks_and_lims method
+ 	(axes::properties::update_ylim): ditto
+ 	(axes::properties::update_zlim): ditto
+ 
+ 2008-06-04  Michael Goffioul <michael.goffioul@gmail.com>
+ 
++	* graphics.cc (xget_ancestor): Pass graphics_object argument by value
++	instead of by reference.
++
++	* graphics.h.in (surface::properties::xdata,
++	surface::properties::ydata, surface::properties::zdata,
++	surface::properties::normalmode, surface::properties::vertexnormals):
++	Add 'u' modifier.
++	(surface::properties::update_normals): New method to compute normals
++	automatically.
++	(surface::properties::update_xdata, surface::properties::update_ydata,
++	surface::properties::update_zdata,
++	surface::properties::update_normalmode,
++	surface::properties::update_vertexnormals): New updaters to update
++	normals automatically.
++	* graphics.cc (surface::properties::update_normals): Likewise.
++	(cross_product): New inlined utility function for cross product
++	computation adn accumulation.
++
++	* graphics.h.in (class base_scaler, class lin_scaler, class
++	log_scaler, class scaler): Add scale method for NDArray.
++	(log_scaler::do_scale): Factorize scaling code.
++
++	* graphics.h.in (figure::properties::update_position): Re-remove.
++	(figure::properties::facecolor): Re-add 'texturemap' value.
++	(surface::properties::get_color_data): New method to compute actual
++	surface color data from cdata.
++	* graphics.cc (surface::properties::get_color_data): Likewise.
++	(xget_ancestor): New utility function to retrieve an ancestor of a
++	given type.
++	(convert_cdata): New utility function to convert cdata property into
++	actual color data.
++
++	* graphics.h.in (surface::properties::facecolor): Add "texturemap"
++	as possible value.
++	(class surface::properties): New properties alphadata,
++	alphadatmapping, ambientstrength, backfacelighting, diffusestrength,
++	edgealpha, edgelighting, erasemode, facelighting, meshstyle,
++	normalmode, specularcolorreflectance, specularexponent,
++	specularstrength, vertexnormals.
++	(surface::properties::init): Add constraints for alphadata,
++	vertexnormals and cdata (the latter are commented until cdata
++	has changed type).
++
+ 	* graphics.h.in (base_properties::update_boundingbox): New method
+ 	to handle object resize.
+ 	(figure::properties::set_boundingbox): New method to set figure
+ 	position from backend.
+ 	(figure::properties::update_position): Remove method.
+ 	(figure::properties::position): Remove 'u' modifier and add 'S'
+ 	modifier.
+ 	(axes::properties::update_boundingbox): Overload to recompute
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -328,16 +328,111 @@ convert_position (const Matrix& pos, con
+ 	      retval(3) /= f;
+ 	    }
+ 	}
+     }
+ 
+   return retval;
+ }
+ 
++static graphics_object
++xget_ancestor (graphics_object go, const std::string& type)
++{
++  do
++    {
++      if (go.valid_object ())
++	{
++	  if (go.isa (type))
++	    return go;
++	  else
++	    go = gh_manager::get_object (go.get_parent ());
++	}
++      else
++	return graphics_object ();
++    } while (true);
++}
++
++static octave_value
++convert_cdata (const base_properties& props, const octave_value& cdata,
++	       bool is_scaled, int cdim)
++{
++  dim_vector dv (cdata.dims ());
++
++  if (dv.length () == cdim && dv(cdim-1) == 3)
++    return cdata;
++
++  Matrix cmap (1, 3, 0.0);
++  Matrix clim (1, 2, 0.0);
++
++  graphics_object go = gh_manager::get_object (props.get___myhandle__ ());
++  graphics_object fig = xget_ancestor (go, "figure");
++
++  if (fig.valid_object ())
++    {
++      Matrix _cmap = fig.get (caseless_str ("colormap")).matrix_value ();
++
++      if (! error_state)
++	cmap = _cmap;
++    }
++
++  if (is_scaled)
++    {
++      graphics_object ax = xget_ancestor (go, "axes");
++
++      if (ax.valid_object ())
++	{
++	  Matrix _clim = ax.get (caseless_str ("clim")).matrix_value ();
++
++	  if (! error_state)
++	    clim = _clim;
++	}
++    }
++
++  dv.resize (cdim);
++  dv(cdim-1) = 3;
++
++  NDArray a (dv);
++
++  int lda = static_cast<int> (a.numel () / 3);
++  int nc = cmap.rows ();
++
++  double *av = a.fortran_vec ();
++  const double *cmapv = cmap.data ();
++  const double *cv = 0;
++  const octave_uint8 *icv = 0;
++
++  if (cdata.is_integer_type ())
++    icv = cdata.uint8_array_value ().data ();
++  else
++    cv = cdata.array_value ().data ();
++
++  for (int i = 0; i < lda; i++)
++    {
++      double x = (cv ? cv[i] : double (icv[i]));
++
++      if (is_scaled)
++	x = xround ((nc - 1) * (x - clim(0)) / (clim(1) - clim(0)));
++      else
++	x = xround (x - 1);
++
++      if (x < 0)
++	x = 0;
++      else if (x >= nc)
++	x = (nc - 1);
++
++      int idx = static_cast<int> (x);
++
++      av[i]       = cmapv[idx];
++      av[i+lda]   = cmapv[idx+nc];
++      av[i+2*lda] = cmapv[idx+2*nc];
++    }
++
++  return octave_value (a);
++}
++
+ // ---------------------------------------------------------------------
+ 
+ radio_values::radio_values (const std::string& opt_string)
+ {
+   size_t beg = 0;
+   size_t len = opt_string.length ();
+   bool done = len == 0;
+ 
+@@ -2655,17 +2750,100 @@ axes::update_axis_limits (const std::str
+ // Note: "image" code is entirely auto-generated
+ 
+ // ---------------------------------------------------------------------
+ 
+ // Note: "patch" code is entirely auto-generated
+ 
+ // ---------------------------------------------------------------------
+ 
+-// Note: "surface" code is entirely auto-generated
++octave_value
++surface::properties::get_color_data (void) const
++{
++  return convert_cdata (*this, get_cdata (), cdatamapping_is ("scaled"), 3);
++}
++
++inline void
++cross_product (double x1, double y1, double z1,
++	       double x2, double y2, double z2,
++	       double& x, double& y, double& z)
++{
++  x += (y1 * z2 - z1 * y2);
++  y += (z1 * x2 - x1 * z2);
++  z += (x1 * y2 - y1 * x2);
++}
++
++void
++surface::properties::update_normals (void)
++{
++  if (normalmode_is ("auto"))
++    {
++      Matrix x = get_xdata ().matrix_value ();
++      Matrix y = get_ydata ().matrix_value ();
++      Matrix z = get_zdata ().matrix_value ();
++
++      int p = z.columns (), q = z.rows ();
++      int i1, i2, i3;
++      int j1, j2, j3;
++
++      bool x_mat = (x.rows () == q);
++      bool y_mat = (y.columns () == p);
++
++      NDArray n (dim_vector (q, p, 3), 0.0);
++
++      i1 = i2 = i3 = 0;
++      j1 = j2 = j3 = 0;
++
++      // FIXME: normal computation at boundaries
++      for (int i = 1; i < (p-1); i++)
++	{
++	  if (y_mat)
++	    {
++	      i1 = i-1;
++	      i2 = i;
++	      i3 = i+1;
++	    }
++
++	  for (int j = 1; j < (q-1); j++)
++	    {
++	      if (x_mat)
++		{
++		  j1 = j-1;
++		  j2 = j;
++		  j3 = j+1;
++		}
++
++	      double& nx = n(j, i, 0);
++	      double& ny = n(j, i, 1);
++	      double& nz = n(j, i, 2);
++
++	      cross_product (x(j3,i)-x(j2,i), y(j+1,i2)-y(j,i2), z(j+1,i)-z(j,i),
++			     x(j2,i+1)-x(j2,i), y(j,i3)-y(j,i2), z(j,i+1)-z(i,j),
++			     nx, ny, nz);
++	      cross_product (x(j2,i-1)-x(j2,i), y(j,i1)-y(j,i2), z(j,i-1)-z(j,i),
++			     x(j3,i)-x(j2,i), y(j+1,i2)-y(j,i2), z(j+1,i)-z(i,j),
++			     nx, ny, nz);
++	      cross_product (x(j1,i)-x(j2,i), y(j-1,i2)-y(j,i2), z(j-1,i)-z(j,i),
++			     x(j2,i-1)-x(j2,i), y(j,i1)-y(j,i2), z(j,i-1)-z(i,j),
++			     nx, ny, nz);
++	      cross_product (x(j2,i+1)-x(j2,i), y(j,i3)-y(j,i2), z(j,i+1)-z(j,i),
++			     x(j1,i)-x(j2,i), y(j-1,i2)-y(j,i2), z(j-1,i)-z(i,j),
++			     nx, ny, nz);
++
++	      double d = - sqrt (nx*nx + ny*ny + nz*nz);
++
++	      nx /= d;
++	      ny /= d;
++	      nz /= d;
++	    }
++	}
++
++      vertexnormals = n;
++    }
++}
+ 
+ // ---------------------------------------------------------------------
+ 
+ octave_value
+ base_graphics_object::get_default (const caseless_str& name) const
+ {
+   graphics_handle parent = get_parent ();
+   graphics_object parent_obj = gh_manager::get_object (parent);
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -190,16 +190,22 @@ public:
+   virtual ~base_scaler (void) { }
+ 
+   virtual Matrix scale (const Matrix& m) const
+     {
+       error ("invalid axis scale");
+       return m;
+     }
+ 
++  virtual NDArray scale (const NDArray& m) const
++    {
++      error ("invalid axis scale");
++      return m;
++    }
++
+   virtual double scale (double d) const
+     {
+       error ("invalid axis scale");
+       return d;
+     }
+   
+   virtual double unscale (double d) const
+     {
+@@ -213,62 +219,78 @@ public:
+ 
+ class lin_scaler : public base_scaler
+ {
+ public:
+   lin_scaler (void) { }
+ 
+   Matrix scale (const Matrix& m) const { return m; }
+ 
++  NDArray scale (const NDArray& m) const { return m; }
++
+   double scale (double d) const { return d; }
+ 
+   double unscale (double d) const { return d; }
+ 
+   base_scaler* clone (void) const { return new lin_scaler (); }
+ };
+ 
+ class log_scaler : public base_scaler
+ {
+ public:
+   log_scaler (void) { }
+ 
+   Matrix scale (const Matrix& m) const
+     {
+       Matrix retval (m.rows (), m.cols ());
+-      const double *d1 = m.fortran_vec ();
+-      double *d2 = retval.fortran_vec ();
+-
+-      for (int i = 0; i < m.numel (); i++)
+-	d2[i] = log10 (d1[i]);
+-
++
++      do_scale (m.data (), retval.fortran_vec (), m.numel ());
++      return retval;
++    }
++
++  NDArray scale (const NDArray& m) const
++    {
++      NDArray retval (m.dims ());
++
++      do_scale (m.data (), retval.fortran_vec (), m.numel ());
+       return retval;
+     }
+ 
+   double scale (double d) const
+     { return log10 (d); }
+ 
+   double unscale (double d) const
+     { return pow (10.0, d); }
+ 
+   base_scaler* clone (void) const
+     { return new log_scaler (); }
++
++private:
++  void do_scale (const double *src, double *dest, int n) const
++    {
++      for (int i = 0; i < n; i++)
++	dest[i] = log10(src[i]);
++    }
+ };
+ 
+ class scaler
+ {
+ public:
+   scaler (void) : rep (new base_scaler ()) { }
+ 
+   scaler (const scaler& s) : rep (s.rep->clone()) { }
+ 
+   ~scaler (void) { delete rep; }
+ 
+   Matrix scale (const Matrix& m) const
+     { return rep->scale (m); }
+ 
++  NDArray scale (const NDArray& m) const
++    { return rep->scale (m); }
++
+   double scale (double d) const
+     { return rep->scale (d); }
+ 
+   double unscale (double d) const
+     { return rep->unscale (d); }
+ 
+   scaler& operator = (const scaler& s)
+     {
+@@ -2895,42 +2917,84 @@ public:
+ // ---------------------------------------------------------------------
+ 
+ class OCTINTERP_API surface : public base_graphics_object
+ {
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
++    octave_value get_color_data (void) const;
++
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+ 
+     BEGIN_PROPERTIES(surface)
+-      data_property xdata l , Matrix ()
+-      data_property ydata l , Matrix ()
+-      data_property zdata l , Matrix ()
++      data_property xdata lu , Matrix ()
++      data_property ydata lu , Matrix ()
++      data_property zdata lu , Matrix ()
++      // FIXME: cdata can be of type "double" or "uint8"
+       data_property cdata l , Matrix ()
+       radio_property cdatamapping a , "{scaled}|direct"
+-      color_property facecolor , "{flat}|none|interp"
++      color_property facecolor , "{flat}|none|interp|texturemap"
++      // FIXME: should be a double-radio property
+       double_property facealpha , 1.0
+       color_property edgecolor , color_property (color_values (0, 0, 0), radio_values ("flat|none|interp"))
+       radio_property linestyle , "{-}|--|:|-.|none"
+       double_property linewidth , 0.5
+       radio_property marker , "{none}|s|o|x|+|.|*|<|>|v|^|d|p|h"
+       color_property markeredgecolor , "{auto}|none"
+       color_property markerfacecolor , "auto|{none}"
+       double_property markersize , 6
+       string_property keylabel , ""
+       radio_property interpreter , "{tex}|none|latex"
++      array_property alphadata , Matrix ()
++      radio_property alphadatamapping , "none|direct|{scaled}"
++      double_property ambientstrength , 0.3
++      radio_property backfacelighting , "unlit|lit|{reverselit}"
++      double_property diffusestrength , 0.6
++      // FIXME: should be a double-radio property
++      double_property edgealpha , 1.0
++      radio_property edgelighting , "{none}|flat|gouraud|phong"
++      radio_property erasemode , "{normal}|none|xor|background"
++      radio_property facelighting , "{none}|flat|gouraud|phong"
++      radio_property meshstyle , "{both}|row|column"
++      radio_property normalmode u , "{auto}|manual"
++      double_property specularcolorreflectance , 1
++      double_property specularexponent , 10
++      double_property specularstrength , 0.9
++      array_property vertexnormals u , Matrix ()
+     END_PROPERTIES
+ 
+   protected:
+     void init (void)
+       {
++	alphadata.add_constraint ("double");
++	alphadata.add_constraint ("uint8");
++	alphadata.add_constraint (dim_vector (-1, -1));
++	vertexnormals.add_constraint (dim_vector (-1, -1, 3));
++	// FIXME: uncomment this when cdata has the right type
++	//cdata.add_constraint ("double");
++	//cdata.add_constraint ("double");
++	//cdata.add_constraint (dim_vector (-1, -1));
++	//cdata.add_constraint (dim_vector (-1, -1, 3));
+       }
++
++  private:
++    void update_normals (void);
++
++    void update_xdata (void) { update_normals (); }
++    void update_ydata (void) { update_normals (); }
++    void update_zdata (void) { update_normals (); }
++
++    void update_normalmode (void)
++      { update_normals (); }
++
++    void update_vertexnormals (void)
++      { set_normalmode ("manual"); }
+   };
+ 
+ private:
+   properties xproperties;
+ 
+ public:
+   surface (const graphics_handle& mh, const graphics_handle& p)
+     : base_graphics_object (), xproperties (mh, p)
+diff --git a/src/graphics/ChangeLog b/src/graphics/ChangeLog
+--- a/src/graphics/ChangeLog
++++ b/src/graphics/ChangeLog
+@@ -1,5 +1,25 @@
++2008-02-17  Michael Goffioul  <michael.goffioul@gmail.com>
++
++	* opengl/gl-render.cc (opengl_renderer::draw(surface)): Set material
++	color when rendering surface facets.
++
++	* opengl/gl-render.cc (opengl_renderer::draw(surface)): Add rendering
++	of mesh and markers.
++
++2008-02-16  Michael Goffioul  <michael.goffioul@gmail.com>
++
++	* opengl/gl-render.cc (opengl_renderer::draw(figure)): Initialize the
++	OpenGL context correctly.
++	(opengl_renderer::draw(surface)): Add missing glEnd call.
++
++2008-02-14  Michael Goffioul  <michael.goffioul@gmail.com>
++
++	* opengl/gl-render.h opengl/gl-render.cc: Add rendering
++	interface for surface objects (actual implement still
++	missing).
++
+ 2008-06-04  Michael Goffioul  <michael.goffioul@gmail.com>
+ 
+ 	* Makefile.in Makerules.in: Initial import
+ 	* opengl/Makefile.in: Likewise.
+ 	* opengl/gl-render.h opengl/gl-render.cc: Likewise.
+diff --git a/src/graphics/opengl/gl-render.cc b/src/graphics/opengl/gl-render.cc
+--- a/src/graphics/opengl/gl-render.cc
++++ b/src/graphics/opengl/gl-render.cc
+@@ -25,54 +25,70 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include <lo-mappers.h>
+ #include "gl-render.h"
+ 
+ #include <GL/gl.h>
+ #include <GL/glu.h>
+ 
++#define LIGHT_MODE GL_FRONT_AND_BACK
++
+ enum {
+   AXE_ANY_DIR   = 0,
+   AXE_DEPTH_DIR = 1,
+   AXE_HORZ_DIR  = 2,
+   AXE_VERT_DIR  = 3
+ };
++
+ void
+ opengl_renderer::draw (const graphics_object& go)
+ {
+   if (! go.valid_object ())
+     return;
+ 
+   const base_properties& props = go.get_properties ();
+ 
+   if (go.isa ("figure"))
+     draw (dynamic_cast<const figure::properties&> (props));
+   else if (go.isa ("axes"))
+     draw (dynamic_cast<const axes::properties&> (props));
+   else if (go.isa ("line"))
+     draw (dynamic_cast<const line::properties&> (props));
++  else if (go.isa ("surface"))
++    draw (dynamic_cast<const surface::properties&> (props));
+   else
+     warning ("opengl_renderer: cannot render object of type `%s'",
+ 	     props.graphics_object_name ().c_str ());
+ }
+ 
+ void
+ opengl_renderer::draw (const figure::properties& props)
+ {
+   backend = props.get_backend ();
+ 
++  // Initialize OpenGL context
++
++  glEnable (GL_DEPTH_TEST);
++  glDepthFunc (GL_LEQUAL);
++  glBlendFunc (GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
++  glEnable (GL_NORMALIZE);
++
++  // Clear background
++
+   Matrix c = props.get_color_rgb ();
+ 
+   if (c.length() >= 3)
+     {
+       glClearColor (c(0), c(1), c(2), 1);
+       glClear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+     }
+ 
++  // Draw children
++
+   draw (props.get_children ());
+ }
+ 
+ void
+ opengl_renderer::draw (const axes::properties& props)
+ {
+   // setup OpenGL transformation
+ 
+@@ -1182,16 +1198,518 @@ opengl_renderer::draw (const line::prope
+ 
+       end_marker ();
+     }
+ 
+   set_clipping (props.is_clipping ());
+ }
+ 
+ void
++opengl_renderer::draw (const surface::properties& props)
++{
++  Matrix x = xform.xscale (props.get_xdata ().matrix_value ());
++  Matrix y = xform.yscale (props.get_ydata ().matrix_value ());
++  Matrix z = xform.zscale (props.get_zdata ().matrix_value ());
++
++  int zr = z.rows (), zc = z.columns ();
++
++  NDArray c;
++  NDArray n = props.get_vertexnormals ().array_value ();
++
++  // FIXME: handle transparency
++  Matrix a;
++
++  if (props.facelighting_is ("phong") || props.edgelighting_is ("phong"))
++    warning ("opengl_renderer::draw: phong light model not supported");
++
++  int fc_mode = (props.facecolor_is_rgb () ? 0 :
++		 (props.facecolor_is ("flat") ? 1 :
++		  (props.facecolor_is ("interp") ? 2 :
++		   (props.facecolor_is ("texturemap") ? 3 : -1))));
++  int fl_mode = (props.facelighting_is ("none") ? 0 :
++		 (props.facelighting_is ("flat") ? 1 : 2));
++  // FIXME: use facealpha as double-radio property
++  int fa_mode = 0;
++  int ec_mode = (props.edgecolor_is_rgb () ? 0 :
++		 (props.edgecolor_is ("flat") ? 1 :
++		  (props.edgecolor_is ("interp") ? 2 : -1)));
++  int el_mode = (props.edgelighting_is ("none") ? 0 :
++		 (props.edgelighting_is ("flat") ? 1 : 2));
++  // FIXME: use edgealpha as double-radio property
++  int ea_mode = 0;
++
++  Matrix fcolor = (fc_mode == 3 ? Matrix (1, 3, 1.0) : props.get_facecolor_rgb ());
++  Matrix ecolor = props.get_edgecolor_rgb ();
++
++  float as = props.get_ambientstrength ();
++  float ds = props.get_diffusestrength ();
++  float ss = props.get_specularstrength ();
++  float se = props.get_specularexponent ();
++  float cb[4] = { 0, 0, 0, 1 };
++
++  int i1, i2, j1, j2;
++  bool x_mat = (x.rows () == z.rows ());
++  bool y_mat = (y.columns () == z.columns ());
++
++  i1 = i2 = j1 = j2 = 0;
++
++  boolMatrix clip (z.dims ());
++
++  for (int i = 0; i < zr; i++)
++    {
++      if (x_mat)
++	i1 = i;
++
++      for (int j = 0; j < zr; j++)
++	{
++	  if (y_mat)
++	    j1 = j;
++
++	  clip(i,j) = is_nan_or_inf (x(i1,j), y(i,j1), z(i,j));
++	}
++    }
++
++  if ((fc_mode > 0 && fc_mode < 3) || ec_mode > 0)
++    c = props.get_color_data ().array_value ();
++
++  if (fa_mode > 0 || ea_mode > 0)
++    {
++      // FIXME: implement alphadata conversion
++      //a = props.get_alpha_data ();
++    }
++
++  if (fl_mode > 0 || el_mode > 0)
++    {
++      float buf[4] = { ss, ss, ss, 1 };
++
++      glMaterialfv (LIGHT_MODE, GL_SPECULAR, buf);
++      glMaterialf (LIGHT_MODE, GL_SHININESS, se);
++    }
++
++  if (fc_mode == 3)
++    {
++      // FIXME: transfer texture to OpenGL
++    }
++
++  if (! props.facecolor_is ("none"))
++    {
++      // FIXME: adapt to double-radio property type
++      if (props.get_facealpha () == 1)
++	{
++	  if (fc_mode == 0 || fc_mode == 3)
++	    {
++	      glColor3dv (fcolor.data ());
++	      if (fl_mode > 0)
++		{
++		  for (int i = 0; i < 3; i++)
++		    cb[i] = (as * fcolor(i));
++		  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++		  for (int i = 0; i < 3; i++)
++		    cb[i] *= (ds / as);
++		  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++		}
++	    }
++
++	  if (fl_mode > 0)
++	    glEnable (GL_LIGHTING);
++	  glShadeModel ((fc_mode == 2 || fl_mode == 2) ? GL_SMOOTH : GL_FLAT);
++	  set_polygon_offset (true, 1);
++	  if (fc_mode == 3)
++	    glEnable (GL_TEXTURE_2D);
++
++	  for (int i = 1; i < zc; i++)
++	    {
++	      if (y_mat)
++		{
++		  i1 = i-1;
++		  i2 = i;
++		}
++
++	      for (int j = 1; j < zr; j++)
++		{
++		  if (clip(j-1, i-1) || clip (j, i-1)
++		      || clip (j-1, i) || clip (j, i))
++		    continue;
++
++		  if (x_mat)
++		    {
++		      j1 = j-1;
++		      j2 = j;
++		    }
++
++		  glBegin (GL_QUADS);
++
++		  // Vertex 1
++		  if (fc_mode == 3)
++		    /* FIXME: set texture coordinates */;
++		  else if (fc_mode > 0)
++		    {
++		      // FIXME: is there a smarter way to do this?
++		      for (int k = 0; k < 3; k++)
++			cb[k] = c(j-1, i-1, k);
++		      glColor3fv (cb);
++
++		      if (fl_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= as;
++			  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++			  
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= (ds / as);
++			  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			}
++		    }
++		  if (fl_mode > 0)
++		    glNormal3d (n(j-1,i-1,0), n(j-1,i-1,1), n(j-1,i-1,2));
++		  glVertex3d (x(j1,i-1), y(j-1,i1), z(j-1,i-1));
++
++		  // Vertex 2
++		  if (fc_mode == 3)
++		    /* FIXME: set texture coordinates */;
++		  else if (fc_mode == 2)
++		    {
++		      for (int k = 0; k < 3; k++)
++			cb[k] = c(j-1, i, k);
++		      glColor3fv (cb);
++
++		      if (fl_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= as;
++			  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++			  
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= (ds / as);
++			  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			}
++		    }
++		  if (fl_mode == 2)
++		    glNormal3d (n(j-1,i,0), n(j-1,i,1), n(j-1,i,2));
++		  glVertex3d (x(j1,i), y(j-1,i2), z(j-1,i));
++		  
++		  // Vertex 3
++		  if (fc_mode == 3)
++		    /* FIXME: set texture coordinates */;
++		  else if (fc_mode == 2)
++		    {
++		      for (int k = 0; k < 3; k++)
++			cb[k] = c(j, i, k);
++		      glColor3fv (cb);
++
++		      if (fl_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= as;
++			  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++			  
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= (ds / as);
++			  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			}
++		    }
++		  if (fl_mode == 2)
++		    glNormal3d (n(j,i,0), n(j,i,1), n(j,i,2));
++		  glVertex3d (x(j2,i), y(j,i2), z(j,i));
++		  
++		  // Vertex 4
++		  if (fc_mode == 3)
++		    /* FIXME: set texture coordinates */;
++		  else if (fc_mode == 2)
++		    {
++		      for (int k = 0; k < 3; k++)
++			cb[k] = c(j, i-1, k);
++		      glColor3fv (cb);
++
++		      if (fl_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= as;
++			  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++			  
++			  for (int k = 0; k < 3; k++)
++			    cb[k] *= (ds / as);
++			  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			}
++		    }
++		  if (fl_mode == 2)
++		    glNormal3d (n(j,i-1,0), n(j,i-1,1), n(j,i-1,2));
++		  glVertex3d (x(j2,i-1), y(j,i1), z(j,i-1));
++
++		  glEnd ();
++		}
++	    }
++
++	  set_polygon_offset (false);
++	  if (fc_mode == 3)
++	    glDisable (GL_TEXTURE_2D);
++
++	  if (fl_mode > 0)
++	    glDisable (GL_LIGHTING);
++	}
++      else
++	{
++	  // FIXME: implement transparency
++	}
++    }
++
++  if (! props.edgecolor_is ("none"))
++    {
++      // FIXME: adapt to double-radio property
++      if (props.get_edgealpha () == 1)
++	{
++	  if (ec_mode == 0)
++	    {
++	      glColor3dv (ecolor.data ());
++	      if (fl_mode > 0)
++		{
++		  for (int i = 0; i < 3; i++)
++		    cb[i] = (as * ecolor(i));
++		  glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++		  for (int i = 0; i < 3; i++)
++		    cb[i] *= (ds / as);
++		  glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++		}
++	    }
++
++	  if (el_mode > 0)
++	    glEnable (GL_LIGHTING);
++	  glShadeModel ((ec_mode == 2 || el_mode == 2) ? GL_SMOOTH : GL_FLAT);
++
++	  set_linestyle (props.get_linestyle (), false);
++	  set_linewidth (props.get_linewidth ());
++
++	  // Mesh along Y-axis
++
++	  if (props.meshstyle_is ("both") || props.meshstyle_is ("column"))
++	    {
++	      for (int i = 0; i < zc; i++)
++		{
++		  if (y_mat)
++		    {
++		      i1 = i-1;
++		      i2 = i;
++		    }
++
++		  for (int j = 1; j < zr; j++)
++		    {
++		      if (clip(j-1,i) || clip(j,i))
++			continue;
++
++		      if (x_mat)
++			{
++			  j1 = j-1;
++			  j2 = j;
++			}
++
++		      glBegin (GL_LINES);
++
++		      // Vertex 1
++		      if (ec_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] = c(j-1, i, k);
++			  glColor3fv (cb);
++
++			  if (fl_mode > 0)
++			    {
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= as;
++			      glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= (ds / as);
++			      glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			    }
++			}
++		      if (el_mode > 0)
++			glNormal3d (n(j-1,i,0), n(j-1,i,1), n(j-1,i,2));
++		      glVertex3d (x(j1,i), y(j-1,i2), z(j-1,i));
++
++		      // Vertex 2
++		      if (ec_mode == 2)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] = c(j, i, k);
++			  glColor3fv (cb);
++
++			  if (fl_mode > 0)
++			    {
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= as;
++			      glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= (ds / as);
++			      glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			    }
++			}
++		      if (el_mode == 2)
++			glNormal3d (n(j,i,0), n(j,i,1), n(j,i,2));
++		      glVertex3d (x(j2,i), y(j,i2), z(j,i));
++
++		      glEnd ();
++		    }
++		}
++	    }
++
++	  // Mesh along X-axis
++
++	  if (props.meshstyle_is ("both") || props.meshstyle_is ("row"))
++	    {
++	      for (int j = 0; j < zr; j++)
++		{
++		  if (x_mat)
++		    {
++		      j1 = j-1;
++		      j2 = j;
++		    }
++
++		  for (int i = 1; i < zc; i++)
++		    {
++		      if (clip(j,i-1) || clip(j,i))
++			continue;
++
++		      if (y_mat)
++			{
++			  i1 = i-1;
++			  i2 = i;
++			}
++
++		      glBegin (GL_LINES);
++
++		      // Vertex 1
++		      if (ec_mode > 0)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] = c(j, i-1, k);
++			  glColor3fv (cb);
++
++			  if (fl_mode > 0)
++			    {
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= as;
++			      glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= (ds / as);
++			      glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			    }
++			}
++		      if (el_mode > 0)
++			glNormal3d (n(j,i-1,0), n(j,i-1,1), n(j,i-1,2));
++		      glVertex3d (x(j2,i-1), y(j,i1), z(j,i-1));
++		      
++		      // Vertex 2
++		      if (ec_mode == 2)
++			{
++			  for (int k = 0; k < 3; k++)
++			    cb[k] = c(j, i, k);
++			  glColor3fv (cb);
++
++			  if (fl_mode > 0)
++			    {
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= as;
++			      glMaterialfv (LIGHT_MODE, GL_AMBIENT, cb);
++
++			      for (int k = 0; k < 3; k++)
++				cb[k] *= (ds / as);
++			      glMaterialfv (LIGHT_MODE, GL_DIFFUSE, cb);
++			    }
++			}
++		      if (el_mode == 2)
++			glNormal3d (n(j,i,0), n(j,i,1), n(j,i,2));
++		      glVertex3d (x(j2,i), y(j,i2), z(j,i));
++		      
++		      glEnd ();
++		    }
++		}
++	    }
++
++	  set_linestyle ("-");
++	  set_linewidth (0.5);
++
++	  if (el_mode > 0)
++	    glDisable (GL_LIGHTING);
++	}
++      else
++	{
++	  // FIXME: implement transparency
++	}
++    }
++
++  if (! props.marker_is ("none") &&
++      ! (props.markeredgecolor_is ("none")
++	 && props.markerfacecolor_is ("none")))
++    {
++      // FIXME: check how transparency should be handled in markers
++      // FIXME: check what to do with marker facecolor set to auto
++      //        and facecolor set to none.
++
++      bool do_edge = ! props.markeredgecolor_is ("none");
++      bool do_face = ! props.markerfacecolor_is ("none");
++
++      Matrix mecolor = props.get_markeredgecolor_rgb ();
++      Matrix mfcolor = props.get_markerfacecolor_rgb ();
++      Matrix cc (1, 3, 0.0);
++
++      if (mecolor.numel () == 0 && props.markeredgecolor_is ("auto"))
++	{
++	  mecolor = props.get_edgecolor_rgb ();
++	  do_edge = ! props.edgecolor_is ("none");
++	}
++
++      if (mfcolor.numel () == 0 && props.markerfacecolor_is ("auto"))
++	{
++	  mfcolor = props.get_facecolor_rgb ();
++	  do_face = ! props.facecolor_is ("none");
++	}
++
++      if ((mecolor.numel () == 0 || mfcolor.numel () == 0)
++	  && c.numel () == 0)
++	c = props.get_color_data ().array_value ();
++
++      init_marker (props.get_marker (), props.get_markersize (),
++		   props.get_linewidth ());
++
++      for (int i = 0; i < zc; i++)
++	{
++	  if (y_mat)
++	    i1 = i;
++	  
++	  for (int j = 0; j < zr; j++)
++	    {
++	      if (clip(j,i))
++		continue;
++
++	      if (x_mat)
++		j1 = j;
++
++	      if ((do_edge && mecolor.numel () == 0)
++		  || (do_face && mfcolor.numel () == 0))
++		{
++		  for (int k = 0; k < 3; k++)
++		    cc(k) = c(j,i,k);
++		}
++
++	      Matrix lc = (do_edge ? (mecolor.numel () == 0 ? cc : mecolor) : Matrix ());
++	      Matrix fc = (do_face ? (mfcolor.numel () == 0 ? cc : mfcolor) : Matrix ());
++
++	      draw_marker (x(j1,i), y(j,i1), z(j,i), lc, fc);
++	    }
++	}
++
++      end_marker ();
++    }
++}
++
++void
+ opengl_renderer::set_viewport (int w, int h)
+ {
+   glViewport (0, 0, w, h);
+ }
+ 
+ void
+ opengl_renderer::set_color (const Matrix& c)
+ {
+diff --git a/src/graphics/opengl/gl-render.h b/src/graphics/opengl/gl-render.h
+--- a/src/graphics/opengl/gl-render.h
++++ b/src/graphics/opengl/gl-render.h
+@@ -53,16 +53,17 @@ public:
+     }
+ 
+   virtual void set_viewport (int w, int h);
+ 
+ protected:
+   virtual void draw (const figure::properties& props);
+   virtual void draw (const axes::properties& props);
+   virtual void draw (const line::properties& props);
++  virtual void draw (const surface::properties& props);
+ 
+   virtual void set_color (const Matrix& c);
+   virtual void set_polygon_offset (bool on, double offset = 0.0);
+   virtual void set_linewidth (float w);
+   virtual void set_linestyle (const std::string& s, bool stipple = false);
+   virtual void set_clipbox (double x1, double x2, double y1, double y2,
+ 			    double z1, double z2);
+   virtual void set_clipping (bool on);

@@ -1,0 +1,1539 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1312246765 -7200
+#      Tue Aug 02 02:59:25 2011 +0200
+# Node ID 3e5a8ef9c76dd446f82fbfd9d23eea6e77b1d160
+# Parent  64a3a1f237181491aa017bed3a4a570f6207a2ec
+Completely rewrote IRC client backend to make it platform-independent. Not all functionality has been reimplemented as of yet, though.
+
+diff --git a/gui/octave-gui.pro b/gui/octave-gui.pro
+--- a/gui/octave-gui.pro
++++ b/gui/octave-gui.pro
+@@ -80,18 +80,16 @@ SOURCES +=\
+     	  src/OctaveTerminal.cpp \
+     	  src/VariablesDockWidget.cpp \
+     	  src/HistoryDockWidget.cpp \
+     	  src/FilesDockWidget.cpp \
+     	  src/FileEditorMdiSubWindow.cpp \
+     	  src/BrowserWidget.cpp \
+     	  src/ImageViewerMdiSubWindow.cpp \
+     src/IRCWidget.cpp \
+-    src/qirc/IRCClient.cpp \
+-    src/qirc/IClientSocket.cpp \
+     src/SettingsDialog.cpp \
+     src/OctaveGUI.cpp \
+     src/ResourceManager.cpp \
+     src/CommandLineParser.cpp \
+     src/backend/OctaveCallbackThread.cpp \
+     src/backend/OctaveLink.cpp \
+     src/backend/OctaveMainThread.cpp \
+     src/qirc/IRCClientImpl.cpp
+@@ -128,18 +126,16 @@ HEADERS += \
+     	  src/VariablesDockWidget.h \
+     	  src/HistoryDockWidget.h \
+     	  src/FilesDockWidget.h \
+     	  src/FileEditorMdiSubWindow.h \
+     	  src/BrowserWidget.h \
+     	  src/ImageViewerMdiSubWindow.h \
+     src/IRCWidget.h \
+     src/qirc/IRCCodes.h \
+-    src/qirc/IRCClient.h \
+-    src/qirc/IClientSocket.h \
+     src/SettingsDialog.h \
+     src/ResourceManager.h \
+     src/CommandLineParser.h \
+     src/backend/OctaveCallbackThread.h \
+     src/backend/OctaveLink.h \
+     src/backend/OctaveMainThread.h \
+     src/qirc/IRCClientInterface.h \
+     src/qirc/IRCClientImpl.h
+diff --git a/gui/src/IRCWidget.cpp b/gui/src/IRCWidget.cpp
+--- a/gui/src/IRCWidget.cpp
++++ b/gui/src/IRCWidget.cpp
+@@ -23,17 +23,16 @@
+ #include <QVBoxLayout>
+ #include <QLabel>
+ #include <QSettings>
+ #include <QInputDialog>
+ 
+ IRCWidget::IRCWidget (QWidget * parent):
+ QWidget (parent)
+ {
+-  m_alternatingColor = false;
+   QSettings *settings = ResourceManager::instance ()->settings ();
+   bool connectOnStartup = settings->value ("connectOnStartup").toBool ();
+   m_autoIdentification = settings->value ("autoIdentification").toBool ();
+   m_nickServPassword = settings->value ("nickServPassword").toString ();
+ 
+   m_initialNick = settings->value ("IRCNick").toString ();
+ 
+   if (m_initialNick.isEmpty ())
+@@ -47,304 +46,253 @@ QWidget (parent)
+   QWidget *bottomWidget = new QWidget (this);
+ 
+   layout->addWidget (m_chatWindow);
+   layout->addWidget (bottomWidget);
+   setLayout (layout);
+ 
+   QHBoxLayout *bottomLayout = new QHBoxLayout ();
+   m_nickButton = new QPushButton (bottomWidget);
+-  m_nickButton->
+-    setStatusTip (tr ((char *) "Click here to change your nick."));
++  m_nickButton->setStatusTip (tr ((char *) "Click here to change your nick."));
+   m_nickButton->setText (m_initialNick);
+   m_inputLine = new QLineEdit (bottomWidget);
+   m_inputLine->setStatusTip (tr ((char *) "Enter your message here."));
++
+   bottomLayout->addWidget (m_nickButton);
+   bottomLayout->addWidget (new QLabel (":", this));
+   bottomLayout->addWidget (m_inputLine);
+   bottomLayout->setMargin (0);
+   bottomWidget->setLayout (bottomLayout);
++
+   m_nickButton->setEnabled (false);
+   m_inputLine->setEnabled (false);
+ 
+   //m_chatWindow->setFocusProxy (m_inputLine);
+   this->setFocusProxy (m_inputLine);
+   m_nickButton->setFocusProxy (m_inputLine);
+ 
+   QFont font;
+   font.setFamily ("Courier");
+   font.setPointSize (11);
+   m_chatWindow->setFont (font);
+-  m_ircClient = new IRCClient ();
++  m_ircClientImpl = new IRCClientImpl ();
+ 
++  connect (m_ircClientImpl, SIGNAL (connected (QString)),
++           this, SLOT (handleConnected (QString)));
++  connect (m_ircClientImpl, SIGNAL(loggedIn(QString)),
++           this, SLOT (joinOctaveChannel (QString)));
++  connect (m_ircClientImpl, SIGNAL (error (QString)),
++           this, SLOT (showErrorMessage (QString)));
++  connect (m_ircClientImpl, SIGNAL (debugMessage (QString)),
++           this, SLOT (showStatusMessage (QString)));
++  connect (m_ircClientImpl, SIGNAL (message (QString, QString, QString)),
++           this, SLOT (showMessage (QString, QString, QString )));
++  connect (m_ircClientImpl, SIGNAL (nicknameChanged (QString,QString)),
++           this, SLOT (handleNickChange (QString,QString)));
++  connect (m_ircClientImpl, SIGNAL (notification (QString,QString)),
++           this, SLOT (showNotification (QString,QString)));
++  connect (m_ircClientImpl, SIGNAL (loggedIn(QString)),
++           this, SLOT (handleLoggedIn(QString)));
+   connect (m_nickButton, SIGNAL (clicked ()), this, SLOT (nickPopup ()));
+   connect (m_inputLine, SIGNAL (returnPressed ()), this,
+ 	   SLOT (sendInputLine ()));
+ 
+-  connect (m_ircClient, SIGNAL (nickInUseChanged ()), this,
+-	   SLOT (handleNickInUseChanged ()));
+-  connect (m_ircClient, SIGNAL (connectionStatus (const char *)), this,
+-	   SLOT (showStatusMessage (const char *)));
+-  connect (m_ircClient, SIGNAL (error (const char *)), this,
+-	   SLOT (showStatusMessage (const char *)));
+-  connect (m_ircClient, SIGNAL (completedLogin (const char *)), this,
+-	   SLOT (loginSuccessful (const char *)));
+-  connect (m_ircClient, SIGNAL (completedLogin (const char *)), this,
+-	   SLOT (joinOctaveChannel (const char *)));
+-  connect (m_ircClient,
+-	   SIGNAL (topic (const char *, const char *, const char *)), this,
+-	   SLOT (showTopic (const char *, const char *, const char *)));
+-  connect (m_ircClient, SIGNAL (join (const char *, const char *)), this,
+-	   SLOT (showJoin (const char *, const char *)));
+-  connect (m_ircClient, SIGNAL (quit (const char *, const char *)), this,
+-	   SLOT (showQuit (const char *, const char *)));
+-  connect (m_ircClient,
+-	   SIGNAL (privateMessage (const char *, const char *, const char *)),
+-	   this,
+-	   SLOT (showPrivateMessage
+-		 (const char *, const char *, const char *)));
+-  connect (m_ircClient,
+-	   SIGNAL (notice (const char *, const char *, const char *)), this,
+-	   SLOT (showNotice (const char *, const char *, const char *)));
+-  connect (m_ircClient, SIGNAL (nick (const char *, const char *)), this,
+-	   SLOT (showNickChange (const char *, const char *)));
+-  connect (m_ircClient, SIGNAL (replyCode (IRCEvent *)), this,
+-	   SLOT (handleReplyCode (IRCEvent *)));
+-
+   if (connectOnStartup)
+     connectToServer ();
+ }
+ 
+ void
+ IRCWidget::connectToServer ()
+ {
+-  m_ircClient->connectToServer ("irc.freenode.net", 6667,
+-				m_initialNick.toStdString ().c_str (),
+-				m_initialNick.toStdString ().c_str (),
+-				"Unknown", "Unknown", 0, 0);
++  showStatusMessage ("<font color=\"#990000\"><b>IMPORTANT: THE BACKEND FOR THE IRC CHAT HAS BEEN REWRITTEN COMPLETELY TO MAKE IT PLATFORM-INDEPENDENT.</b></font>");
++  showStatusMessage ("<font color=\"#990000\"><b>IT WILL PROBABLY NOT WORK AS IT SHOULD UNTIL ALL BUGS HAVE BEEN FIXED.</b></font>");
++  showStatusMessage ("Looking up irc.freenode.net.");
++  QHostInfo hostInfo = QHostInfo::fromName ("irc.freenode.net");
++  QList<QHostAddress> hostAddresses = hostInfo.addresses();
++  if (hostAddresses.isEmpty ())
++    {
++      showStatusMessage ("Failed to lookup irc.freenode.net.");
++    }
++  else
++    {
++      showStatusMessage (QString ("Attempting to connect to %1.")
++                         .arg (hostAddresses.at (0).toString ()));
++      m_ircClientImpl->connectToHost(hostAddresses.at (0), 6667, m_initialNick);
++    }
+ }
+ 
+ void
+-IRCWidget::showStatusMessage (const char *message)
++IRCWidget::showStatusMessage (const QString& message)
+ {
+   m_chatWindow->append (QString ("<i>%1</i>").arg (message));
+ }
+ 
+ void
+-IRCWidget::joinOctaveChannel (const char *)
++IRCWidget::showErrorMessage (const QString& message)
+ {
+-  m_ircClient->joinChannel ("#octave");
++  m_chatWindow->append (QString ("<i>Error: %1</i>").arg (message));
+ }
+ 
+ void
+-IRCWidget::loginSuccessful (const char *nick)
++IRCWidget::handleConnected (const QString &host)
+ {
+-  m_chatWindow->
+-    append (QString
+-	    ("<i><font color=\"#00AA00\"><b>Successfully logged in as %1.</b></font></i>").
+-	    arg (nick));
+-  m_nickButton->setEnabled (true);
+-  m_inputLine->setEnabled (true);
+-  m_chatWindow->setEnabled (true);
+-  m_inputLine->setFocus ();
++  showStatusMessage (QString ("Connected to server %1.").arg (host));
++}
+ 
+-  if (m_autoIdentification)
+-    m_ircClient->sendCommand (2, COMMAND_PRIVMSG,
+-			      "NickServ",
+-			      QString ("identify %1").
+-			      arg (m_nickServPassword).toStdString ().
+-			      c_str ());
++void
++IRCWidget::joinOctaveChannel (const QString& nick)
++{
++  Q_UNUSED (nick);
++  showStatusMessage (QString ("Joining channel #octave."));
++  m_ircClientImpl->sendJoinRequest ("#octave");
+ }
+ 
+ void
+-IRCWidget::showPrivateMessage (const char *nick, const char *destination,
+-			       const char *message)
++IRCWidget::showMessage (const QString& channel, const QString& sender, const QString& message)
+ {
+-  Q_UNUSED (destination);
+-  QString msg(message);
+-  msg.replace ("<", "&lt;");
+-  msg.replace (">", "&gt;");
+-  if (msg.contains (m_ircClient->nickInUse ()))
++  Q_UNUSED (channel);
++  QString output;
++  if (message.contains (m_ircClientImpl->nickname ()))
+     {
+-      msg =
+-	QString ("<font color=\"#990000\"><b>%1:</b> %2</font>").arg (nick).
+-	arg (msg);
++      output =
++        QString ("<font color=\"#990000\"><b>%1:</b> %2</font>").arg (sender).
++        arg (message);
+     }
+   else
+     {
+-      msg =
+-	QString ("<font color=\"%3\"><b>%1:</b> %2</font>").arg (nick).
+-	arg (msg).arg (getAlternatingColor ());
++      output =
++        QString ("<b>%1:</b> %2").arg (sender).
++        arg (message);
+     }
+-  m_chatWindow->append (msg);
++  m_chatWindow->append (output);
+ }
+ 
+ void
+-IRCWidget::showNotice (const char *nick, const char *destination,
+-		       const char *message)
+-{
+-  Q_UNUSED (nick);
+-  Q_UNUSED (destination);
+-  m_chatWindow->append (QString ("<font color=\"#007700\">%1</font>").
+-			arg (message));
+-}
+-
+-void
+-IRCWidget::showTopic (const char *nick, const char *channel,
+-		      const char *message)
++IRCWidget::showNotification (const QString& sender, const QString& message)
+ {
+-  QString msg (message);
+-  msg.replace ("<", "&lt;");
+-  msg.replace (">", "&gt;");
+-  m_chatWindow->append (QString ("Topic for %2 was set by %1: %3").arg (nick).
+-                        arg (channel).arg (msg));
+-}
+-
+-void
+-IRCWidget::showNickChange (const char *oldNick, const char *newNick)
+-{
+-  m_chatWindow->append (QString ("%1 is now known as %2.").arg (oldNick).
+-			arg (newNick));
+-  m_nickList.removeAll (QString (oldNick));
+-  m_nickList.append (QString (newNick));
+-  updateNickCompleter ();
++  Q_UNUSED (sender);
++  m_chatWindow->append (QString ("<font color=\"#007700\">%1</font>").arg (message));
+ }
+ 
+ void
+ IRCWidget::nickPopup ()
+ {
+   bool ok;
+   QString newNick =
+     QInputDialog::getText (this, QString ("Nickname"),
+ 			   QString ("Type in your nickname:"),
+-			   QLineEdit::Normal, m_ircClient->nickInUse (), &ok);
++                           QLineEdit::Normal, m_ircClientImpl->nickname (), &ok);
+   if (ok)
+     {
+-      m_ircClient->sendNickChange (newNick);
++      m_ircClientImpl->sendNicknameChangeRequest (newNick);
+     }
+ }
+ 
+ void
+-IRCWidget::showJoin (const char *nick, const char *channel)
+-{
+-  m_chatWindow->append (QString ("<i>%1 has joined %2.</i>").arg (nick).
+-			arg (channel));
+-  m_nickList.append (QString (nick));
+-  updateNickCompleter ();
+-}
+-
+-void
+-IRCWidget::showQuit (const char *nick, const char *reason)
+-{
+-  m_chatWindow->append (QString ("<i>%1 has quit.(%2).</i>").arg (nick).
+-			arg (reason));
+-  m_nickList.removeAll (QString (nick));
+-  updateNickCompleter ();
+-}
+-
+-void
+ IRCWidget::sendMessage (QString message)
+ {
+   // Do not send empty messages.
+   if (message.isEmpty ())
+     return;
+ 
+   // Remove trailing spaces.
+   while (message.at (0).isSpace ())
+     message.remove (0, 1);
+   if (message.startsWith ("/"))
+     {
+       QStringList line =
+ 	message.split (QRegExp ("\\s+"), QString::SkipEmptyParts);
+       if (line.at (0) == "/join")
+ 	{
+-	  m_ircClient->joinChannel (line.at (1));
++          m_ircClientImpl->sendJoinRequest (line.at (1));
+ 	}
+       else if (line.at (0) == "/nick")
+ 	{
+-	  m_ircClient->sendNickChange (line.at (1));
++          m_ircClientImpl->sendNicknameChangeRequest (line.at (1));
+ 	}
+       else if (line.at (0) == "/msg")
+ 	{
+ 	  QString recipient = line.at (1);
+ 	  // Since we splitted the message before, we have to glue it together again.
+ 	  QString pmsg = "";
+ 	  for (int i = 2; i < line.length (); i++)
+ 	    {
+ 	      pmsg += line.at (i);
+ 	      pmsg += " ";
+ 	    }
+-	  m_ircClient->sendCommand (2, COMMAND_PRIVMSG,
+-				    recipient.toStdString ().c_str (),
+-				    pmsg.toStdString ().c_str ());
++          m_ircClientImpl->sendPrivateMessage(recipient, pmsg);
+ 	}
+     }
+   else
+     {
+-      m_ircClient->sendPublicMessage (message);
++      m_ircClientImpl->sendPublicMessage (message);
+       message.replace ("<", "&lt;");
+       message.replace (">", "&gt;");
+       m_chatWindow->append (QString ("<b>%1:</b> %2").
+-                            arg (m_ircClient->nickInUse ()).arg (message));
++                            arg (m_ircClientImpl->nickname ()).arg (message));
+     }
+ }
+ 
+ void
+ IRCWidget::sendInputLine ()
+ {
+   sendMessage (m_inputLine->text ());
+   m_inputLine->setText ("");
+ }
+ 
+ void
+-IRCWidget::handleNickInUseChanged ()
++IRCWidget::handleLoggedIn (const QString &nick)
+ {
+-  m_nickButton->setText (m_ircClient->nickInUse ());
+-  QSettings *settings = ResourceManager::instance ()->settings ();
+-  settings->setValue ("IRCNick", m_ircClient->nickInUse ());
++  m_chatWindow->
++    append (QString
++            ("<i><font color=\"#00AA00\"><b>Successfully logged in as %1.</b></font></i>").
++            arg (nick));
++  m_nickButton->setEnabled (true);
++  m_inputLine->setEnabled (true);
++  m_chatWindow->setEnabled (true);
++  m_inputLine->setFocus ();
++
++
++  if (m_autoIdentification)
++    {
++      m_ircClientImpl->sendPrivateMessage("NickServ", QString ("identify %1").
++                                          arg (m_nickServPassword));
++    }
+ }
+ 
+ void
+-IRCWidget::handleReplyCode (IRCEvent * event)
++IRCWidget::handleNickChange (const QString &oldNick, const QString &newNick)
+ {
+-  QSettings *settings = ResourceManager::instance ()->settings ();
++  m_chatWindow->append (QString ("%1 is now known as %2.").arg (oldNick).arg (newNick));
++  m_nickList.removeAll (QString (oldNick));
++  m_nickList.append (QString (newNick));
++  updateNickCompleter ();
+ 
+-  switch (event->getNumeric ())
+-    {
+-    case RPL_MOTDSTART:
+-    case RPL_MOTD:
+-    case ERR_NOMOTD:
+-    case RPL_ENDOFMOTD:
+-      if (settings->value ("showMessageOfTheDay").toBool ())
+-	m_chatWindow->append (QString ("<font color=\"#777777\">%1</font>").
+-			      arg (event->getParam (1)));
+-      break;
+-    case RPL_NOTOPIC:
+-    case RPL_TOPIC:
+-      if (settings->value ("showTopic").toBool ())
+-	m_chatWindow->
+-	  append (QString ("<font color=\"#000088\"><b>%1</b></font>").
+-		  arg (event->getParam (2)));
+-      break;
+-    case RPL_NAMREPLY:
+-      m_chatWindow->
+-	append (QString ("<font color=\"#000088\">Users online: %1</font>").
+-		arg (event->getParam (3)));
+-      m_nickList =
+-	event->getParam (3).split (QRegExp ("\\s+"), QString::SkipEmptyParts);
+-      updateNickCompleter ();
+-      break;
+-    case ERR_NICKNAMEINUSE:
+-    case ERR_NICKCOLLISION:
+-      m_chatWindow->
+-	append (QString ("<font color=\"#AA0000\">Nickname in use.</font>"));
+-      break;
+-    };
++  //m_nickButton->setText (m_ircClient->nickInUse ());
++  //QSettings *settings = ResourceManager::instance ()->settings ();
++  //settings->setValue ("IRCNick", m_ircClient->nickInUse ());
+ }
+ 
++void
++IRCWidget::handleUserJoined (const QString &nick, const QString &channel)
++{
++  m_chatWindow->append (QString ("<i>%1 has joined %2.</i>").arg (nick).
++                        arg (channel));
++  m_nickList.append (QString (nick));
++  updateNickCompleter ();
++}
++
++void
++IRCWidget::handleUserQuit (const QString &nick, const QString &reason)
++{
++  m_chatWindow->append (QString ("<i>%1 has quit.(%2).</i>").arg (nick).
++                        arg (reason));
++  m_nickList.removeAll (QString (nick));
++  updateNickCompleter ();
++}
+ 
+ void
+ IRCWidget::updateNickCompleter ()
+ {
+   QCompleter *completer = new QCompleter (m_nickList, this);
+   completer->setCompletionMode (QCompleter::InlineCompletion);
+   m_inputLine->setCompleter (completer);
+ }
+diff --git a/gui/src/IRCWidget.h b/gui/src/IRCWidget.h
+--- a/gui/src/IRCWidget.h
++++ b/gui/src/IRCWidget.h
+@@ -19,55 +19,48 @@
+ #ifndef IRCWIDGET_H
+ #define IRCWIDGET_H
+ 
+ #include <QWidget>
+ #include <QTextEdit>
+ #include <QPushButton>
+ #include <QLineEdit>
+ #include <QCompleter>
+-#include "IRCClient.h"
++#include "IRCClientImpl.h"
+ 
+ class IRCWidget:public QWidget
+ {
+ Q_OBJECT public:
+   explicit IRCWidget (QWidget * parent);
+   void connectToServer ();
+ 
+-    signals:public slots:void showStatusMessage (const char *);
+-  void joinOctaveChannel (const char *);
+-  void loginSuccessful (const char *);
+-  void showPrivateMessage (const char *, const char *, const char *);
+-  void showNotice (const char *, const char *, const char *);
+-  void showTopic (const char *, const char *, const char *);
+-  void showJoin (const char *, const char *);
+-  void showQuit (const char *, const char *);
+-  void showNickChange (const char *, const char *);
++public slots:
++  void showStatusMessage (const QString&);
++  void showErrorMessage (const QString&);
++  void showMessage (const QString& channel, const QString& sender, const QString& message);
++  void showNotification (const QString& sender, const QString& message);
++
++  void handleConnected (const QString& host);
++  void joinOctaveChannel (const QString& nick);
++
++  void handleLoggedIn (const QString& nick);
++  void handleNickChange (const QString& oldNick, const QString& newNick);
++  void handleUserJoined (const QString& nick, const QString& channel);
++  void handleUserQuit (const QString& nick, const QString& reason);
++
+   void nickPopup ();
+   void sendMessage (QString);
+   void sendInputLine ();
+-
+-  void handleNickInUseChanged ();
+-  void handleReplyCode (IRCEvent * event);
++  void updateNickCompleter ();
+ 
+-  void updateNickCompleter ();
+ private:
+-  IRCClient * m_ircClient;
++  IRCClientImpl * m_ircClientImpl;
+   QTextEdit *m_chatWindow;
+   QPushButton *m_nickButton;
+   QLineEdit *m_inputLine;
+-  bool m_alternatingColor;
+-
+-  QString getAlternatingColor ()
+-  {
+-    m_alternatingColor = !m_alternatingColor;
+-    if (m_alternatingColor)
+-      return "#000077";
+-    return "#005533";
+-  }
+ 
+   QString m_initialNick;
+   bool m_autoIdentification;
+   QString m_nickServPassword;
+   QString m_settingsFile;
+   QStringList m_nickList;
+ };
+ 
+diff --git a/gui/src/MainWindow.cpp b/gui/src/MainWindow.cpp
+--- a/gui/src/MainWindow.cpp
++++ b/gui/src/MainWindow.cpp
+@@ -23,17 +23,17 @@
+ #include <QDesktopServices>
+ #include <QFileDialog>
+ #include "MainWindow.h"
+ #include "FileEditorMdiSubWindow.h"
+ #include "ImageViewerMdiSubWindow.h"
+ #include "SettingsDialog.h"
+ #include "cmd-edit.h"
+ 
+-#define VERSION_STRING "Octave GUI (0.7.3)"
++#define VERSION_STRING "Octave GUI (0.7.4)"
+ 
+ MainWindow::MainWindow (QWidget * parent):QMainWindow (parent)
+ {
+   construct ();
+   OctaveLink::instance ()->launchOctave();
+ }
+ 
+ MainWindow::~MainWindow ()
+diff --git a/gui/src/qirc/IClientSocket.cpp b/gui/src/qirc/IClientSocket.cpp
+deleted file mode 100644
+--- a/gui/src/qirc/IClientSocket.cpp
++++ /dev/null
+@@ -1,289 +0,0 @@
+-/***************************************************************************
+-                          IClientSocket.cpp  -  description
+-                             -------------------
+-    begin                : Fri Sep 15 2000
+-    copyright            : (C) 2000 by gerardo Puga
+-    email                : gere@mailroom.com
+- ***************************************************************************/
+-
+-/***************************************************************************
+- *                                                                         *
+- *   This program is free software; you can redistribute it and/or modify  *
+- *   it under the terms of the GNU General Public License as published by  *
+- *   the Free Software Foundation; either version 2 of the License, or     *
+- *   (at your option) any later version.                                   *
+- *                                                                         *
+- ***************************************************************************/
+-
+-
+-#include <IClientSocket.h>
+-
+-#define ERROR_ICLIENTSOCKET_NOERROR		0
+-#define ERROR_ICLIENTSOCKET_NOSOCKET            1
+-#define ERROR_ICLIENTSOCKET_NOCONNECT           2
+-#define ERROR_ICLIENTSOCKET_NORESOLV            3
+-#define ERROR_ICLIENTSOCKET_NOREAD		4
+-#define ERROR_ICLIENTSOCKET_NOWRITE		5
+-#define ERROR_ICLIENTSOCKET_NOFCNTL		6
+-
+-const char *ICLIENTSOCKET_MENSAJES[] = { "Nothing has happened, boss",
+-  "Can't create the socket to initiate the connection",
+-  "Can't connect to the destination",
+-  "Can't resolv the server name",
+-  "Problems during read operation",
+-  "Problems during write operation",
+-  "Can't make the socket non-blocking"
+-};
+-
+-#define ICLIENT_MAX_MENSAJE_ERROR 300
+-
+-char ICLIENTSOCKETmensajeError[ICLIENT_MAX_MENSAJE_ERROR + 1];
+-
+-void
+-IClientSocket::inicializar ()
+-{
+-  handler = 0;
+-  puerto = 0;
+-  bzero ((void *) &ip, sizeof (in_addr));
+-
+-  conectado = false;
+-  socketCreado = false;
+-  blocking = true;
+-  lastError = ERROR_ICLIENTSOCKET_NOERROR;
+-}
+-
+-IClientSocket::IClientSocket ()
+-{
+-  inicializar ();
+-}
+-
+-
+-IClientSocket::~IClientSocket ()
+-{
+-  if (conectado == true)
+-    {
+-      close ();
+-    }
+-}
+-
+-int
+-IClientSocket::getSocket ()
+-{
+-  return handler;
+-}
+-
+-const char *
+-IClientSocket::strError ()
+-{
+-  switch (lastError)
+-    {
+-    case ERROR_ICLIENTSOCKET_NORESOLV:
+-      snprintf (ICLIENTSOCKETmensajeError, ICLIENT_MAX_MENSAJE_ERROR, "%s",
+-		ICLIENTSOCKET_MENSAJES[lastError]);
+-      break;
+-    default:
+-      snprintf (ICLIENTSOCKETmensajeError, ICLIENT_MAX_MENSAJE_ERROR,
+-		"%s - %s",
+-		ICLIENTSOCKET_MENSAJES[lastError],::
+-		strerror (lastErrnoValue));
+-      break;
+-    }
+-  return ICLIENTSOCKETmensajeError;
+-}
+-
+-int
+-IClientSocket::connect ()
+-{
+-  if (conectado == true)
+-    {
+-      close ();
+-    }
+-
+-  if ((handler = socket (AF_INET, SOCK_STREAM, 0)) < 0)
+-    {
+-      lastError = ERROR_ICLIENTSOCKET_NOSOCKET;
+-      lastErrnoValue = errno;
+-      return -1;
+-    }
+-  socketCreado = true;
+-
+-  if (blocking == false)
+-    {
+-      if (fcntl (handler, F_SETFL, O_NONBLOCK) < 0)
+-	{
+-	  lastError = ERROR_ICLIENTSOCKET_NOFCNTL;
+-	  lastErrnoValue = errno;
+-	}
+-    }
+-
+-  sockaddr_in addr;
+-  addr.sin_family = AF_INET;
+-  addr.sin_port = htons (puerto);
+-  addr.sin_addr = ip;
+-  bzero (&(addr.sin_zero), 8);
+-  int respuesta =::connect (handler, (sockaddr *) & addr,
+-			    sizeof (sockaddr_in));
+-
+-  if ((respuesta == 0)
+-      || ((respuesta < 0) && (errno == EINPROGRESS) && (blocking == false)))
+-    {
+-      conectado = true;
+-    }
+-  else
+-    {
+-      lastError = ERROR_ICLIENTSOCKET_NOCONNECT;
+-      lastErrnoValue = errno;
+-      return -1;
+-    }
+-
+-  return 0;
+-}
+-
+-
+-int
+-IClientSocket::connect (int socket, bool block)
+-{
+-  if (socketCreado)
+-    {
+-      close ();
+-    }
+-
+-  handler = socket;
+-  bzero ((void *) &ip, sizeof (in_addr));
+-
+-  conectado = true;
+-  socketCreado = true;
+-  blocking = block;
+-  lastError = 0;
+-
+-  if (block == false)
+-    {
+-      fcntl (handler, F_SETFL, O_NONBLOCK);
+-    }
+-
+-  return 0;
+-}
+-
+-int
+-IClientSocket::connect (in_addr addr, unsigned int p, bool block)
+-{
+-  if (socketCreado == true)
+-    {
+-      close ();
+-    }
+-
+-  ip = addr;
+-  puerto = p;
+-  blocking = block;
+-
+-  return connect ();
+-}
+-
+-int
+-IClientSocket::connect (const char *server, unsigned int p, bool block)
+-{
+-  if (socketCreado == true)
+-    {
+-      close ();
+-    }
+-
+-  puerto = p;
+-  blocking = block;
+-
+-  if (resolv (server, &ip) < 0)
+-    {
+-      lastError = ERROR_ICLIENTSOCKET_NORESOLV;
+-      return -1;
+-    }
+-  return connect ();
+-}
+-
+-long int
+-IClientSocket::read (char *data, long count)
+-{
+-  long done = 0;
+-  long res = 0;
+-
+-  do
+-    {
+-      res = recv (handler, data + done, count - done, 0);
+-
+-      if (res > 0)
+-	{
+-	  done += res;
+-	}
+-    }
+-  while ((((done < count) && (res > 0)) && (blocking == true))
+-	 || ((res < 0) && (errno == EINTR)));
+-
+-  if (res < 0)
+-    {
+-      if (errno == EWOULDBLOCK)
+-	{
+-	  return 0;
+-	}
+-      else
+-	{
+-	  lastError = ERROR_ICLIENTSOCKET_NOREAD;
+-	  lastErrnoValue = errno;
+-	  return -1;
+-	}
+-    }
+-  else
+-    {
+-      return done;
+-    }
+-}
+-
+-long
+-IClientSocket::write (const char *data, long count)
+-{
+-  long sent = 0;
+-  long response = 0;
+-
+-  do
+-    {
+-      response = send (handler, data + sent, count - sent, 0);
+-
+-      if (response > 0)
+-	{
+-	  sent += response;
+-	}
+-    }
+-  while (((sent < count) && (response >= 0))
+-	 || ((response < 0) && (errno == EWOULDBLOCK)));
+-
+-  if (response < 0)
+-    {
+-      lastError = ERROR_ICLIENTSOCKET_NOWRITE;
+-      lastErrnoValue = errno;
+-      return -1;
+-    }
+-  return sent;
+-}
+-
+-void
+-IClientSocket::close ()
+-{
+-  if (socketCreado == true)
+-    {
+-      ::close (handler);
+-      conectado = false;
+-      socketCreado = false;
+-      blocking = true;
+-    }
+-}
+-
+-int
+-IClientSocket::resolv (const char *fqdn, in_addr * ip)
+-{
+-  hostent *host;
+-  host = gethostbyname (fqdn);
+-  if (host == NULL)
+-    {
+-      return -1;
+-    }
+-
+-  bcopy ((void *) host->h_addr, (void *) ip, sizeof (in_addr));
+-  return 0;
+-}
+diff --git a/gui/src/qirc/IClientSocket.h b/gui/src/qirc/IClientSocket.h
+deleted file mode 100644
+--- a/gui/src/qirc/IClientSocket.h
++++ /dev/null
+@@ -1,68 +0,0 @@
+-/***************************************************************************
+-                          IClientSocket.h  -  description
+-                             -------------------
+-    begin                : Fri Sep 15 2000
+-    copyright            : (C) 2000 by gerardo Puga
+-    email                : gere@mailroom.com
+- ***************************************************************************/
+-
+-/***************************************************************************
+- *                                                                         *
+- *   This program is free software; you can redistribute it and/or modify  *
+- *   it under the terms of the GNU General Public License as published by  *
+- *   the Free Software Foundation; either version 2 of the License, or     *
+- *   (at your option) any later version.                                   *
+- *                                                                         *
+- ***************************************************************************/
+-
+-#ifndef  ICLIENTSOCKET_H
+-#define ICLIENTSOCKET_H
+-
+-#include <netinet/in.h>
+-#include <sys/types.h>
+-#include <sys/socket.h>
+-#include <netinet/in.h>
+-#include <netdb.h>
+-#include <arpa/inet.h>
+-#include <fcntl.h>
+-#include <unistd.h>
+-#include <errno.h>
+-#include <string.h>
+-#include <stdio.h>
+-
+-class IClientSocket
+-{
+-private:
+-  int handler;
+-  in_addr ip;
+-  unsigned int puerto;
+-
+-  int lastError, lastErrnoValue;
+-
+-  bool conectado;
+-  bool socketCreado;
+-  bool blocking;
+-
+-  void inicializar ();
+-  int connect ();
+-
+-public:
+-    IClientSocket ();
+-   ~IClientSocket ();
+-
+-  int getSocket ();
+-  const char *strError ();
+-
+-  int connect (int socket, bool block = true);
+-  int connect (in_addr addr, unsigned int puerto, bool blocking = true);
+-  int connect (const char *server, unsigned int puerto, bool blocking = true);
+-
+-  long int read (char *, long count);
+-  long int write (const char *, long count);
+-
+-  void close ();
+-
+-  int resolv (const char *fqdn, in_addr * ip);
+-};
+-
+-#endif
+diff --git a/gui/src/qirc/IRCClientImpl.cpp b/gui/src/qirc/IRCClientImpl.cpp
+--- a/gui/src/qirc/IRCClientImpl.cpp
++++ b/gui/src/qirc/IRCClientImpl.cpp
+@@ -1,22 +1,164 @@
+ #include "IRCClientImpl.h"
+ 
++IRCEvent::IRCEvent (const char *serverMessage)
++{
++  char prefix[MAX_LINE_LEN];
++  int index = 0;
++
++  nick = "";
++  user = "";
++  host = "";
++  for (int i = 0; i < 15; i++)
++    {
++      param[i] = "";
++    }
++
++  if (serverMessage[0] == CHR_COLON)
++    {
++      index++;
++      strcpy (prefix,
++              getStringToken (serverMessage, index).toStdString ().c_str ());
++
++      int etapa = 0;
++      for (unsigned int i = 0; i < strlen (prefix); i++)
++        {
++          switch (prefix[i])
++            {
++            case '!':
++              etapa = 1;
++              break;
++            case '@':
++              etapa = 2;
++              break;
++            default:
++              switch (etapa)
++                {
++                case 0:
++                  nick += prefix[i];
++                  break;
++                case 1:
++                  user += prefix[i];
++                  break;
++                default:
++                  host += prefix[i];
++                  break;
++                }
++            }
++        }
++    }
++
++  command = getStringToken (serverMessage, index);
++  command = command.toUpper ();
++
++  paramCount = 0;
++  while (serverMessage[index] != 0)
++    {
++      if ((serverMessage[index] == CHR_COLON) || (paramCount == 14))
++        {
++
++          if (serverMessage[index] == CHR_COLON)
++            {
++              index++;
++            }
++
++          param[paramCount] = (const char *) (serverMessage + index);
++          index += strlen (serverMessage + index);
++        }
++      else
++        {
++          param[paramCount] = getStringToken (serverMessage, index);
++        }
++      paramCount++;
++    }
++
++  if (strlen (command.toStdString ().c_str ()) ==
++      strspn (command.toStdString ().c_str (), DIGITS))
++    {
++      numeric = true;
++      codeNumber = atoi (command.toStdString ().c_str ());
++    }
++  else
++    {
++      numeric = false;
++    }
++}
++
++int
++IRCEvent::getNumeric ()
++{
++  if (!numeric)
++    {
++      return -1;
++    }
++  else
++    {
++      return codeNumber;
++    }
++}
++
++QString
++IRCEvent::getParam (int index)
++{
++  if ((index < 0) || (index > 14))
++    {
++      return QString ();
++    }
++  else
++    {
++      return param[index];
++    }
++}
++
++int
++IRCEvent::skipSpaces (const char *line, int &index)
++{
++  while (line[index] == CHR_SPACE)
++    {
++      index++;
++    }
++  return index;
++}
++
++QString
++IRCEvent::getStringToken (const char *line, int &index)
++{
++  QString token ("");
++  skipSpaces (line, index);
++  while ((line[index] != CHR_SPACE) && (line[index] != CHR_ZERO))
++    {
++      token += line[index];
++      index++;
++    }
++
++  skipSpaces (line, index);
++  return token;
++}
++
++QString
++IRCEvent::getStringToken (QString line, int &index)
++{
++  return getStringToken (line.toStdString ().c_str (), index);
++}
++
+ IRCClientImpl::IRCClientImpl ()
+   : IRCClientInterface ()
+ {
+   connect (&m_tcpSocket, SIGNAL (connected ()), this, SLOT (handleConnected ()));
+   connect (&m_tcpSocket, SIGNAL (disconnected ()), this, SLOT (handleDisconnected ()));
+   connect (&m_tcpSocket, SIGNAL (readyRead ()), this, SLOT (handleReadyRead ()));
+ }
+ 
+ void
+-IRCClientImpl::connectToServer (const QHostAddress& server, int port)
++IRCClientImpl::connectToHost (const QHostAddress& host, int port, const QString& initialNick)
+ {
+-  m_tcpSocket.connectToHost(server, port);
++  m_host = host;
++  m_nickname = initialNick;
++  m_tcpSocket.connectToHost(host, port);
+ }
+ 
+ void
+ IRCClientImpl::disconnect ()
+ {
+ 
+ }
+ 
+@@ -40,62 +182,76 @@ IRCClientImpl::host()
+ 
+ int
+ IRCClientImpl::port()
+ {
+   return m_port;
+ }
+ 
+ void
+-IRCClientImpl::enterChannel (const QString& channel)
++IRCClientImpl::sendJoinRequest (const QString& channel)
+ {
+-  Q_UNUSED (channel);
++  sendCommand (1, COMMAND_JOIN, channel.toStdString ().c_str ());
++  focusChannel (channel);
+ }
+ 
+ void
+ IRCClientImpl::leaveChannel (const QString& channel, const QString& reason)
+ {
+   Q_UNUSED (channel);
+   Q_UNUSED (reason);
+ }
+ 
+ void
+ IRCClientImpl::focusChannel (const QString& channel)
+ {
+-  Q_UNUSED (channel);
++  m_focussedChannel = channel;
+ }
+ 
+ void
+ IRCClientImpl::sendNicknameChangeRequest (const QString &nickname)
+ {
+-  Q_UNUSED (nickname);
++  sendCommand (1, COMMAND_NICK, nickname.toStdString ().c_str ());
+ }
+ 
+ void
+-IRCClientImpl::sendMessage (const QString& message)
++IRCClientImpl::sendPublicMessage (const QString& message)
+ {
+-  Q_UNUSED (message);
++  sendCommand (2, COMMAND_PRIVMSG, m_focussedChannel.toStdString ().c_str (),
++                message.toStdString ().c_str ());
++}
++
++void
++IRCClientImpl::sendPrivateMessage (const QString &recipient, const QString &message)
++{
++  sendCommand (2, COMMAND_PRIVMSG,
++                  recipient.toStdString ().c_str (),
++                  message.toStdString ().c_str ());
+ }
+ 
+ const QString&
+ IRCClientImpl::nickname ()
+ {
+   return m_nickname;
+ }
+ 
+ void
+ IRCClientImpl::handleConnected ()
+ {
+   m_connected = true;
++  sendCommand (4, COMMAND_USER, "na", "0", "0", "na");
++  sendNicknameChangeRequest (m_nickname);
++  emit connected (m_host.toString ());
+ }
+ 
+ void
+ IRCClientImpl::handleDisconnected ()
+ {
+   m_connected = false;
++  emit disconnected ();
+ }
+ 
+ void
+ IRCClientImpl::handleReadyRead ()
+ {
+   QByteArray line;
+   do
+     {
+@@ -106,11 +262,162 @@ IRCClientImpl::handleReadyRead ()
+         break;
+     }
+   while (true);
+ }
+ 
+ void
+ IRCClientImpl::handleIncomingLine (const QString &line)
+ {
+-  if (line.isEmpty())
+-    return;
++  if (m_connected && !line.isEmpty())
++    {
++      IRCEvent ircEvent(line.toStdString().c_str());
++      if (ircEvent.isNumeric () == true)
++        {
++          switch (ircEvent.getNumeric ())
++            {
++              case RPL_WELCOME:
++                emit loggedIn (nickname ());
++                break;
++              case ERR_NICKNAMEINUSE:
++              case ERR_NICKCOLLISION:
++                emit debugMessage ("FIXME: Received nickname in use reply.");
++                break;
++              case ERR_PASSWDMISMATCH:
++                emit debugMessage ("FIXME: Received password mismatch reply.");
++                break;
++              case RPL_MOTDSTART:
++              case RPL_MOTD:
++              case ERR_NOMOTD:
++              case RPL_ENDOFMOTD:
++                break;
++              case RPL_NOTOPIC:
++              case RPL_TOPIC:
++                break;
++              case RPL_NAMREPLY:
++                /*
++                m_nickList =
++                  event->getParam (3).split (QRegExp ("\\s+"), QString::SkipEmptyParts);
++                updateNickCompleter ();*/
++                break;
++            }
++        }
++      else
++        {
++          QString command = ircEvent.getCommand ();
++          if (command == COMMAND_NICK)
++            {
++              emit nicknameChanged (ircEvent.getParam(0), ircEvent.getParam(1));
++            }
++          else if (command == COMMAND_QUIT)
++            {
++              emit userQuit (ircEvent.getNick (), ircEvent.getParam (0));
++            }
++          else if (command == COMMAND_JOIN)
++            {
++              emit userJoined (ircEvent.getNick (), ircEvent.getParam (0));
++            }
++          else if (command == COMMAND_PART)
++            {
++              emit debugMessage ("WRITEME: Received part.");
++              //emit part (ircEvent.getNick ().toStdString ().c_str (),
++              //           ircEvent.getParam (0).toStdString ().c_str (),
++              //           ircEvent.getParam (1).toStdString ().c_str ());
++            }
++          else if (command == COMMAND_MODE)
++            {
++              emit debugMessage ("WRITEME: Received mode.");
++              //emit mode (&ircEvent);
++            }
++          else if (command == COMMAND_TOPIC)
++            {
++              emit debugMessage ("WRITEME: Received topic.");
++              //emit topic (ircEvent.getNick ().toStdString ().c_str (),
++              //            ircEvent.getParam (0).toStdString ().c_str (),
++              //            ircEvent.getParam (1).toStdString ().c_str ());
++            }
++          else if (command == COMMAND_KICK)
++            {
++              emit debugMessage ("WRITEME: Received kick.");
++              //emit kick (ircEvent.getNick ().toStdString ().c_str (),
++              //           ircEvent.getParam (0).toStdString ().c_str (),
++              //           ircEvent.getParam (1).toStdString ().c_str (),
++              //           ircEvent.getParam (2).toStdString ().c_str ());
++            }
++          else if (command == COMMAND_INVITE)
++            {
++              emit debugMessage ("WRITEME: Received invite.");
++              //emit invite (ircEvent.getNick ().toStdString ().c_str (),
++              //             ircEvent.getParam (1).toStdString ().c_str ());
++            }
++          else if (command == COMMAND_PRIVMSG)
++            {
++              emit message (ircEvent.getParam (0), ircEvent.getNick (), ircEvent.getParam (1));
++            }
++          else if (command == COMMAND_NOTICE)
++            {
++              emit notification (ircEvent.getNick ().toStdString ().c_str (),
++                                 ircEvent.getParam (1).toStdString ().c_str ());
++            }
++          else if (command == COMMAND_PING)
++            {
++              sendCommand (1, COMMAND_PONG, m_nickname.toStdString ().c_str ());
++            }
++          else if (command == COMMAND_ERROR)
++            {
++              emit error (ircEvent.getParam (0));
++            }
++          else
++            {
++              emit debugMessage (QString("FIXME: Received unknown reply: %1").arg(command));
++              // not recognized.
++            }
++        }
++    }
+ }
++
++void
++IRCClientImpl::sendLine (const QString &line)
++{
++  if (m_connected)
++    m_tcpSocket.write ((line + "\r\n").toStdString ().c_str ());
++}
++
++void
++IRCClientImpl::sendCommand (int numberOfCommands, const char *command, ...)
++{
++  char linea[513];
++  char *parametro;
++  va_list lp;
++
++  strncpy (linea, command, 512);
++  linea[512] = 0;
++  va_start (lp, command);
++  for (int i = 0; i < numberOfCommands; i++)
++    {
++      if (i == 15)
++        break;
++      parametro = va_arg (lp, char *);
++      if (i == numberOfCommands - 1)
++        {
++          if (strlen (linea) + strlen (parametro) + 2 > 512)
++            break;
++          if (strchr (parametro, ' ') != NULL)
++            {
++              strcat (linea, " :");
++            }
++          else
++            {
++              strcat (linea, " ");
++            }
++          strcat (linea, parametro);
++        }
++      else
++        {
++          if (strlen (linea) + strlen (parametro) + 1 > 512)
++            break;
++          strcat (linea, " ");
++          strcat (linea, parametro);
++        }
++    }
++  va_end (lp);
++  sendLine (linea);
++}
+diff --git a/gui/src/qirc/IRCClientImpl.h b/gui/src/qirc/IRCClientImpl.h
+--- a/gui/src/qirc/IRCClientImpl.h
++++ b/gui/src/qirc/IRCClientImpl.h
+@@ -1,47 +1,116 @@
+ #ifndef IRCCLIENTIMPL_H
+ #define IRCCLIENTIMPL_H
+ 
+ #include <QTcpSocket>
++#include <QHostInfo>
+ #include "IRCClientInterface.h"
+ 
++#define MAX_LINE_LEN 512
++#define PARAM_MAX_COUNT 15
++#define CHR_COLON ':'
++#define CHR_SPACE ' '
++#define CHR_ZERO '\0'
++#ifdef Q_OS_LINUX
++#define CRLF "\n"
++#else
++#define CRLF "\r\n"
++#endif
++#define DIGITS	"0123456789"
++
++class IRCEvent
++{
++private:
++  int codeNumber;
++  bool numeric;
++
++  QString nick, user, host;
++  QString command;
++  int paramCount;
++  QString param[PARAM_MAX_COUNT];
++
++protected:
++  int skipSpaces (const char *linea, int &index);
++  QString getStringToken (const char *linea, int &index);
++  QString getStringToken (QString linea, int &index);
++
++public:
++    IRCEvent (const char *serverMessage);
++
++  bool isNumeric ()
++  {
++    return numeric;
++  }
++
++  QString getNick ()
++  {
++    return nick;
++  }
++  QString getUser ()
++  {
++    return user;
++  }
++  QString getHost ()
++  {
++    return host;
++  }
++  QString getCommand ()
++  {
++    return command;
++  }
++  int getNumeric ();
++
++  int getParamCount ()
++  {
++    return paramCount;
++  }
++  QString getParam (int index);
++};
++
+ class IRCClientImpl : public IRCClientInterface
+ {
+   Q_OBJECT
+ public:
+   IRCClientImpl();
+ 
+ public slots:
+-  void connectToServer (const QHostAddress& host, int port);
++  void connectToHost (const QHostAddress& host, int port, const QString& initialNick);
+   void disconnect ();
+   void reconnect ();
+ 
+   bool isConnected ();
+   const QHostAddress& host();
+   int port();
+ 
+-  void enterChannel (const QString& channel);
++  void sendJoinRequest (const QString& channel);
+   void leaveChannel (const QString& channel, const QString& reason);
+ 
+   void focusChannel (const QString& channel);
+   void sendNicknameChangeRequest (const QString &nickname);
+-  void sendMessage (const QString& message);
++  void sendPublicMessage (const QString& message);
++  void sendPrivateMessage (const QString &recipient, const QString &message);
+ 
+   const QString& nickname ();
+ 
++signals:
++  void debugMessage (const QString& message);
++
+ private slots:
+   void handleConnected ();
+   void handleDisconnected ();
+   void handleReadyRead ();
+ 
+ private:
+   void handleIncomingLine (const QString& line);
++  void sendLine (const QString& line);
++  void sendCommand (int numberOfCommands, const char *command, ...);
+ 
+   QHostAddress  m_host;
+   int           m_port;
+   QString       m_nickname;
+   bool          m_connected;
++  QString       m_focussedChannel;
+ 
+   QTcpSocket    m_tcpSocket;
+ };
+ 
+ #endif // IRCCLIENTIMPL_H
+diff --git a/gui/src/qirc/IRCClientInterface.h b/gui/src/qirc/IRCClientInterface.h
+--- a/gui/src/qirc/IRCClientInterface.h
++++ b/gui/src/qirc/IRCClientInterface.h
+@@ -33,34 +33,40 @@ class IRCClientInterface : public QObjec
+ {
+   Q_OBJECT
+ public:
+   IRCClientInterface () { }
+   virtual ~IRCClientInterface () { }
+ 
+ public slots:
+   // Connection state:
+-  virtual void connectToServer (const QHostAddress& host, int port) = 0;
++  virtual void connectToHost (const QHostAddress& host, int port, const QString& initialNick) = 0;
+   virtual void disconnect () = 0;
+   virtual void reconnect () = 0;
+ 
+   virtual bool isConnected () = 0;
+   virtual const QHostAddress& host() = 0;
+   virtual int port() = 0;
+ 
+-  virtual void enterChannel (const QString& channel) = 0;
++  virtual void sendJoinRequest (const QString& channel) = 0;
+   virtual void leaveChannel (const QString& channel, const QString& reason) = 0;
+ 
+   // Messaging:
+   virtual void focusChannel (const QString& channel) = 0;
+   virtual void sendNicknameChangeRequest (const QString& nickname) = 0;
+-  virtual void sendMessage (const QString& message) = 0;
+-
++  virtual void sendPublicMessage (const QString& message) = 0;
++  virtual void sendPrivateMessage (const QString& recipient, const QString& message) = 0;
+   virtual const QString& nickname () = 0;
+ 
+ signals:
+   void newMessage (const QString& channel, const QString& sender, const QString& message);
+   void connected (const QString& server);
+   void disconnected ();
+-
++  void error (const QString& message);
++  void notification (const QString& sender, const QString& message);
++  void message (const QString& channel, const QString& sender, const QString& message);
++  void nicknameChanged (const QString& oldNick, const QString& newNick);
++  void userJoined (const QString& nick, const QString& channel);
++  void userQuit (const QString& nick, const QString& reason);
++  void loggedIn (const QString& nick);
+ };
+ 
+ #endif // IRCCLIENTINTERFACE_H

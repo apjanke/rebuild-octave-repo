@@ -1,0 +1,393 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1338900082 -7200
+#      Tue Jun 05 14:41:22 2012 +0200
+# Branch gui
+# Node ID e94a54ee0f467d6fd83392d9bdd367c35765f36f
+# Parent  7784625acf66aa281b8d9b97c32ebc96cd48aaaa
+Added debug events, debug mode detection and fixed compiling error.
+
+* main-window: Added new slots reacting on debug mode changes.
+* octave-event-listener: Extended interface to transmit debug mode changes.
+* octave-event: Added a lot of debug events.
+* octave-link: Added code to detect the change of the debug mode flag.
+* octave-qt-event-listener: Implemented new interface methods.
+* workspace-view.h: Added missing #include.
+
+diff --git a/gui/src/main-window.cc b/gui/src/main-window.cc
+--- a/gui/src/main-window.cc
++++ b/gui/src/main-window.cc
+@@ -30,23 +30,16 @@
+ #include "file-editor.h"
+ #include "settings-dialog.h"
+ 
+ main_window::main_window (QWidget * parent)
+   : QMainWindow (parent), octave_event_observer ()
+ {
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
+-  _octave_qt_event_listener = new octave_qt_event_listener ();
+-  octave_link::instance ()->register_event_listener (_octave_qt_event_listener);
+-
+-  connect (_octave_qt_event_listener,
+-           SIGNAL (current_directory_changed(QString)),
+-           this,
+-           SLOT (update_current_working_directory(QString)));
+ 
+   octave_link::instance ()->launch_octave();
+ }
+ 
+ main_window::~main_window ()
+ {
+ }
+ 
+@@ -205,16 +198,29 @@ main_window::change_current_working_dire
+ 
+ void
+ main_window::current_working_directory_up ()
+ {
+   _terminal->sendText ("cd ..\n");
+   _terminal->setFocus ();
+ }
+ 
++
++void
++main_window::handle_entered_debug_mode ()
++{
++  setWindowTitle ("Octave (Debugging)");
++}
++
++void
++main_window::handle_quit_debug_mode ()
++{
++  setWindowTitle ("Octave");
++}
++
+ void
+ main_window::show_about_octave ()
+ {
+   QString message =
+       "GNU Octave\n"
+       "Copyright (C) 2009 John W. Eaton and others.\n"
+       "This is free software; see the source code for copying conditions."
+       "There is ABSOLUTELY NO WARRANTY; not even for MERCHANTABILITY or"
+@@ -462,10 +468,28 @@ main_window::construct ()
+   setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
+   addDockWidget (Qt::LeftDockWidgetArea, _workspace_view);
+   addDockWidget (Qt::LeftDockWidgetArea, _history_dock_widget);
+   addDockWidget (Qt::RightDockWidgetArea, _files_dock_widget);
+   addDockWidget (Qt::RightDockWidgetArea, _file_editor);
+   addDockWidget (Qt::BottomDockWidgetArea, _terminal_dock_widget);
+   setStatusBar (_status_bar);
+   read_settings ();
++
++  _octave_qt_event_listener = new octave_qt_event_listener ();
++  octave_link::instance ()->register_event_listener (_octave_qt_event_listener);
++
++  connect (_octave_qt_event_listener,
++           SIGNAL (current_directory_has_changed_signal (QString)),
++           this,
++           SLOT (update_current_working_directory (QString)));
++
++  connect (_octave_qt_event_listener,
++           SIGNAL (entered_debug_mode_signal ()),
++           this,
++           SLOT(handle_entered_debug_mode ()));
++
++  connect (_octave_qt_event_listener,
++           SIGNAL (quit_debug_mode_signal ()),
++           this,
++           SLOT (handle_quit_debug_mode ()));
+ }
+ 
+diff --git a/gui/src/main-window.h b/gui/src/main-window.h
+--- a/gui/src/main-window.h
++++ b/gui/src/main-window.h
+@@ -86,16 +86,19 @@ public slots:
+   void notice_settings ();
+   void prepare_for_quit ();
+   void reset_windows ();
+   void update_current_working_directory (QString directory);
+   void change_current_working_directory ();
+   void change_current_working_directory (QString directory);
+   void current_working_directory_up ();
+ 
++  void handle_entered_debug_mode ();
++  void handle_quit_debug_mode ();
++
+ protected:
+   void closeEvent (QCloseEvent * closeEvent);
+   void read_settings ();
+   void write_settings ();
+ 
+ private:
+   void construct ();
+   void establish_octave_link ();
+diff --git a/gui/src/octave-adapter/octave-event-listener.h b/gui/src/octave-adapter/octave-event-listener.h
+--- a/gui/src/octave-adapter/octave-event-listener.h
++++ b/gui/src/octave-adapter/octave-event-listener.h
+@@ -23,11 +23,14 @@
+ class octave_event_listener
+ {
+   public:
+     octave_event_listener () { }
+     virtual ~octave_event_listener () { }
+ 
+     virtual void current_directory_has_changed (std::string directory) = 0;
+     virtual void about_to_exit () = 0;
++
++    virtual void entered_debug_mode () = 0;
++    virtual void quit_debug_mode () = 0;
+ };
+ 
+ #endif // OCTAVEEVENTLISTENER_H
+diff --git a/gui/src/octave-adapter/octave-event.h b/gui/src/octave-adapter/octave-event.h
+--- a/gui/src/octave-adapter/octave-event.h
++++ b/gui/src/octave-adapter/octave-event.h
+@@ -16,18 +16,21 @@
+  */
+ 
+ #ifndef OCTAVEEVENT_H
+ #define OCTAVEEVENT_H
+ 
+ #include <string>
+ #include "octave-event-observer.h"
+ #include "oct-env.h"
++#include "pt-eval.h"
+ #include "toplev.h"
+ 
++#include <readline/readline.h>
++
+ /**
+   * \class octave_event
+   * \brief Base class for an octave event.
+   * In order to make communication with octave threadsafe, comunication is
+   * implemented via events. An application may create events and post them,
+   * however there is no guarantee events will be processed in a given time.
+   *
+   * In order to create an event, there must be an event observer. The event
+@@ -117,9 +120,99 @@ class octave_change_directory_event : pu
+ 
+     bool perform () const
+     { return octave_env::chdir (_directory); }
+ 
+   private:
+     std::string _directory;
+ };
+ 
++class octave_debug_step_into_event : public octave_event
++{
++  public:
++    /** Creates a new octave_debug_step_into_event. */
++    octave_debug_step_into_event (octave_event_observer& o)
++      : octave_event (o) { }
++
++    bool perform () const
++    {
++      tree_evaluator::dbstep_flag = -1;
++      rl_line_buffer[0] = '\0';
++      rl_point = rl_end = 0;
++      rl_done = 1;
++      rl_forced_update_display ();
++      return true;
++    }
++};
++
++class octave_debug_step_over_event : public octave_event
++{
++  public:
++    /** Creates a new octave_debug_step_over_event. */
++    octave_debug_step_over_event (octave_event_observer& o)
++      : octave_event (o) { }
++
++    bool perform () const
++    {
++      tree_evaluator::dbstep_flag = 1;
++      rl_line_buffer[0] = '\0';
++      rl_point = rl_end = 0;
++      rl_done = 1;
++      rl_forced_update_display ();
++      return true;
++    }
++};
++
++class octave_debug_step_out_event : public octave_event
++{
++  public:
++    /** Creates a new octave_debug_step_out_event. */
++    octave_debug_step_out_event (octave_event_observer& o)
++      : octave_event (o) { }
++
++    bool perform () const
++    {
++      tree_evaluator::dbstep_flag = -2;
++      rl_line_buffer[0] = '\0';
++      rl_point = rl_end = 0;
++      rl_done = 1;
++      rl_forced_update_display ();
++      return true;
++    }
++};
++
++class octave_debug_step_continue_event : public octave_event
++{
++  public:
++    /** Creates a new octave_debug_step_out_event. */
++    octave_debug_step_continue_event (octave_event_observer& o)
++      : octave_event (o) { }
++
++    bool perform () const
++    {
++      tree_evaluator::dbstep_flag = 0;
++      rl_line_buffer[0] = '\0';
++      rl_point = rl_end = 0;
++      rl_done = 1;
++      rl_forced_update_display ();
++      return true;
++    }
++};
++
++class octave_debug_step_break_event : public octave_event
++{
++  public:
++    /** Creates a new octave_debug_step_out_event. */
++    octave_debug_step_break_event (octave_event_observer& o)
++      : octave_event (o) { }
++
++    bool perform () const
++    {
++      tree_evaluator::dbstep_flag = 0;
++      rl_line_buffer[0] = '\0';
++      rl_point = rl_end = 0;
++      rl_done = 1;
++      rl_forced_update_display ();
++      return true;
++    }
++};
++
+ #endif // OCTAVEEVENT_H
+diff --git a/gui/src/octave-adapter/octave-link.cc b/gui/src/octave-adapter/octave-link.cc
+--- a/gui/src/octave-adapter/octave-link.cc
++++ b/gui/src/octave-adapter/octave-link.cc
+@@ -65,16 +65,28 @@ octave_link::generate_events ()
+   std::string current_working_directory = octave_env::get_current_directory ();
+   if (current_working_directory != _last_working_directory)
+     {
+       _last_working_directory = current_working_directory;
+       if (_octave_event_listener)
+         _octave_event_listener
+             ->current_directory_has_changed (_last_working_directory);
+     }
++
++  if (_debugging_mode_active != tree_evaluator::debug_mode)
++    {
++      _debugging_mode_active = tree_evaluator::debug_mode;
++      if (_octave_event_listener)
++        {
++          if (_debugging_mode_active)
++            _octave_event_listener->entered_debug_mode ();
++          else
++            _octave_event_listener->quit_debug_mode ();
++        }
++    }
+ }
+ 
+ void
+ octave_link::process_events ()
+ {
+   _event_queue_mutex->lock ();
+   while (_event_queue.size () > 0)
+     {
+diff --git a/gui/src/octave-adapter/octave-link.h b/gui/src/octave-adapter/octave-link.h
+--- a/gui/src/octave-adapter/octave-link.h
++++ b/gui/src/octave-adapter/octave-link.h
+@@ -105,13 +105,14 @@ private:
+   /** Semaphore to lock access to the event queue. */
+   octave_mutex *_event_queue_mutex;
+ 
+   /** Buffer for queueing events until they will be processed. */
+   std::queue <octave_event *> _event_queue;
+ 
+   /** Stores the last known current working directory of octave. */
+   std::string _last_working_directory;
++  bool _debugging_mode_active;
+ 
+   /** Unique instance. Singelton! */
+   static octave_link _singleton;
+ };
+ #endif // OCTAVELINK_H
+diff --git a/gui/src/octave-qt-event-listener.cc b/gui/src/octave-qt-event-listener.cc
+--- a/gui/src/octave-qt-event-listener.cc
++++ b/gui/src/octave-qt-event-listener.cc
+@@ -20,15 +20,26 @@
+ 
+ octave_qt_event_listener::octave_qt_event_listener (QObject *parent)
+   : QObject (parent), octave_event_listener ()
+ {
+ }
+ 
+ void
+ octave_qt_event_listener::current_directory_has_changed (std::string directory)
+-{ emit current_directory_changed (QString::fromStdString (directory)); }
++{
++  emit current_directory_has_changed_signal
++      (QString::fromStdString (directory));
++}
+ 
+ void
+ octave_qt_event_listener::about_to_exit ()
+ {
+   qApp->quit ();
+ }
++
++void
++octave_qt_event_listener::entered_debug_mode ()
++{ emit entered_debug_mode_signal (); }
++
++void
++octave_qt_event_listener::quit_debug_mode ()
++{ emit quit_debug_mode_signal (); }
+diff --git a/gui/src/octave-qt-event-listener.h b/gui/src/octave-qt-event-listener.h
+--- a/gui/src/octave-qt-event-listener.h
++++ b/gui/src/octave-qt-event-listener.h
+@@ -27,13 +27,18 @@ class octave_qt_event_listener
+ {
+     Q_OBJECT
+   public:
+     octave_qt_event_listener (QObject *parent = 0);
+ 
+     void current_directory_has_changed (std::string directory);
+     void about_to_exit ();
+ 
++    void entered_debug_mode ();
++    void quit_debug_mode ();
++
+   signals:
+-    void current_directory_changed (QString directory);
++    void current_directory_has_changed_signal (QString directory);
++    void entered_debug_mode_signal ();
++    void quit_debug_mode_signal ();
+ };
+ 
+ #endif // OCTAVEQTEVENTLISTENER_H
+diff --git a/gui/src/workspace-view.h b/gui/src/workspace-view.h
+--- a/gui/src/workspace-view.h
++++ b/gui/src/workspace-view.h
+@@ -17,16 +17,17 @@
+ 
+ #ifndef WORKSPACEVIEW_H
+ #define WORKSPACEVIEW_H
+ 
+ #include <QDockWidget>
+ #include <QTreeView>
+ #include <QSemaphore>
+ #include "octave-link.h"
++#include "workspace-model.h"
+ 
+ class workspace_view : public QDockWidget
+ {
+   Q_OBJECT
+ public:
+   workspace_view (QWidget * parent = 0);
+ 
+ public slots:

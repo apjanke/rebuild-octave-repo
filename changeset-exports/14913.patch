@@ -1,0 +1,672 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1337358154 21600
+#      Fri May 18 10:22:34 2012 -0600
+# Node ID c7071907a641ea2926ec3b875d06aa23449a2ebe
+# Parent  3d3c002ccc60f8c2edfd6a29c5435b2684caa84d
+Use symbol_record_ref instead of names in JIT
+
+* src/pt-id.h (tree_identifier::symbol): New function.
+
+* src/symtab.h (tree_identifier::symbol_record_ref::operator->):
+ Added const variant.
+
+* src/pt-jit.h: Use symbol_record_ref
+* src/pt-jit.cc: Use symbol_record_ref
+
+diff --git a/src/pt-id.h b/src/pt-id.h
+--- a/src/pt-id.h
++++ b/src/pt-id.h
+@@ -109,16 +109,20 @@ public:
+ 
+   void eval_undefined_error (void);
+ 
+   tree_identifier *dup (symbol_table::scope_id scope,
+                         symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
++  symbol_table::symbol_record_ref symbol (void) const
++  {
++    return sym;
++  }
+ private:
+ 
+   // The symbol record that this identifier references.
+   symbol_table::symbol_record_ref sym;
+ 
+   // No copying!
+ 
+   tree_identifier (const tree_identifier&);
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -473,17 +473,16 @@ const jit_function::overload&
+ jit_typeinfo::print_value (jit_type *to_print) const
+ {
+   return print_fn.get_overload (to_print);
+ }
+ 
+ void
+ jit_typeinfo::to_generic (jit_type *type, llvm::GenericValue& gv)
+ {
+-  // duplication here can probably be removed somehow
+   if (type == any)
+     to_generic (type, gv, octave_value ());
+   else if (type == scalar)
+     to_generic (type, gv, octave_value (0));
+   else if (type == range)
+     to_generic (type, gv, octave_value (Range ()));
+   else
+     assert (false && "Type not supported yet");
+@@ -552,19 +551,16 @@ jit_typeinfo::new_type (const std::strin
+   id_to_type.push_back (ret);
+   return ret;
+ }
+ 
+ // -------------------- jit_infer --------------------
+ void
+ jit_infer::infer (tree_simple_for_command& cmd, jit_type *bounds)
+ {
+-  argin.insert ("#bounds");
+-  types["#bounds"] = bounds;
+-
+   infer_simple_for (cmd, bounds);
+ }
+ 
+ void
+ jit_infer::visit_anon_fcn_handle (tree_anon_fcn_handle&)
+ {
+   fail ();
+ }
+@@ -685,17 +681,18 @@ void
+ jit_infer::visit_function_def (tree_function_def&)
+ {
+   fail ();
+ }
+ 
+ void
+ jit_infer::visit_identifier (tree_identifier& ti)
+ {
+-  handle_identifier (ti.name (), ti.do_lookup ());
++  symbol_table::symbol_record_ref record = ti.symbol ();
++  handle_identifier (record);
+ }
+ 
+ void
+ jit_infer::visit_if_clause (tree_if_clause&)
+ {
+   fail ();
+ }
+ 
+@@ -848,17 +845,19 @@ jit_infer::visit_statement (tree_stateme
+ 
+       expr->accept (*this);
+ 
+       if (do_bind_ans)
+         {
+           is_lvalue = true;
+           rvalue_type = type_stack.back ();
+           type_stack.pop_back ();
+-          handle_identifier ("ans", symbol_table::varval ("ans"));
++
++          symbol_table::symbol_record_ref record (symbol_table::insert ("ans"));
++          handle_identifier (record);
+ 
+           if (rvalue_type != type_stack.back ())
+             fail ();
+ 
+           is_lvalue = false;
+           rvalue_type = 0;
+         }
+ 
+@@ -941,111 +940,81 @@ jit_infer::infer_simple_for (tree_simple
+   is_lvalue = false;
+   rvalue_type = 0;
+ 
+   tree_statement_list *body = cmd.body ();
+   body->accept (*this);
+ }
+ 
+ void
+-jit_infer::handle_identifier (const std::string& name, octave_value v)
++jit_infer::handle_identifier (const symbol_table::symbol_record_ref& record)
+ {
+-  type_map::iterator iter = types.find (name);
++  type_map::iterator iter = types.find (record);
+   if (iter == types.end ())
+     {
+-      jit_type *ty = tinfo->type_of (v);
++      jit_type *ty = tinfo->type_of (record->find ());
++      bool argin = false;
+       if (is_lvalue)
+         {
+           if (! ty)
+             ty = rvalue_type;
+         }
+       else
+         {
+           if (! ty)
+             fail ();
+-
+-          argin.insert (name);
++          argin = true;
+         }
+ 
+-      types[name] = ty;
++      types[record] = type_entry (argin, ty);
+       type_stack.push_back (ty);
+     }
+   else
+-    type_stack.push_back (iter->second);
++    type_stack.push_back (iter->second.second);
+ }
+ 
+ // -------------------- jit_generator --------------------
+-jit_generator::jit_generator (jit_typeinfo *ti, llvm::Module *module, tree &tee,
+-                              const std::set<std::string>& argin,
+-                              const type_map& infered_types, bool have_bounds)
+-  : tinfo (ti), is_lvalue (false)
++jit_generator::jit_generator (jit_typeinfo *ti, llvm::Module *mod,
++                              tree_simple_for_command& cmd, jit_type *bounds,
++                              const type_map& infered_types)
++  : tinfo (ti), module (mod), is_lvalue (false)
+ {
+-  // determine the function type through the type of all variables
+-  std::vector<llvm::Type *> arg_types (infered_types.size ());
+-  size_t idx = 0;
++  // create new vectors that include bounds
++  std::vector<std::string> names (infered_types.size () + 1);
++  std::vector<bool> argin (infered_types.size () + 1);
++  std::vector<jit_type *> types (infered_types.size () + 1);
++  names[0] = "#bounds";
++  argin[0] = true;
++  types[0] = bounds;
++  size_t i;
+   type_map::const_iterator iter;
+-  for (iter = infered_types.begin (); iter != infered_types.end (); ++iter, ++idx)
+-    arg_types[idx] = iter->second->to_llvm_arg ();
+-
+-  // now create the LLVM function from our determined types
+-  llvm::LLVMContext &ctx = llvm::getGlobalContext ();
+-  llvm::Type *tvoid = llvm::Type::getVoidTy (ctx);
+-  llvm::FunctionType *ft = llvm::FunctionType::get (tvoid, arg_types, false);
+-  function = llvm::Function::Create (ft, llvm::Function::ExternalLinkage,
+-                                     "foobar", module);
+-
+-  // declare each argument and copy its initial value
+-  llvm::BasicBlock *body = llvm::BasicBlock::Create (ctx, "body", function);
+-  builder.SetInsertPoint (body);
+-  llvm::Function::arg_iterator arg_iter = function->arg_begin();
+-  for (iter = infered_types.begin (); iter != infered_types.end ();
+-       ++iter, ++arg_iter)
+-
++  for (i = 1, iter = infered_types.begin (); iter != infered_types.end ();
++       ++i, ++iter)
+     {
+-      llvm::Type *vartype = iter->second->to_llvm ();
+-      llvm::Value *var = builder.CreateAlloca (vartype, 0, iter->first);
+-      variables[iter->first] = value (iter->second, var);
+-
+-      if (iter->second->force_init () || argin.count (iter->first))
+-        {
+-          llvm::Value *loaded_arg = builder.CreateLoad (arg_iter);
+-          builder.CreateStore (loaded_arg, var);
+-        }
++      names[i] = iter->first.name ();
++      argin[i] = iter->second.first;
++      types[i] = iter->second.second;
+     }
+ 
+-  // generate body
++  initialize (names, argin, types);
++
+   try
+     {
+-      tree_simple_for_command *cmd = dynamic_cast<tree_simple_for_command*>(&tee);
+-      if (have_bounds && cmd)
+-        {
+-          value bounds = variables["#bounds"];
+-          bounds.second = builder.CreateLoad (bounds.second);
+-          emit_simple_for (*cmd, bounds, true);
+-        }
+-      else
+-        tee.accept (*this);
++      value var_bounds = variables["#bounds"];
++      var_bounds.second = builder.CreateLoad (var_bounds.second);
++      emit_simple_for (cmd, var_bounds, true);
+     }
+   catch (const jit_fail_exception&)
+     {
+       function->eraseFromParent ();
+       function = 0;
+       return;
+     }
+ 
+-  // copy computed values back into arguments
+-  arg_iter = function->arg_begin ();
+-  for (iter = infered_types.begin (); iter != infered_types.end ();
+-       ++iter, ++arg_iter)
+-    {
+-      llvm::Value *var = variables[iter->first].second;
+-      llvm::Value *loaded_var = builder.CreateLoad (var);
+-      builder.CreateStore (loaded_var, arg_iter);
+-    }
+-  builder.CreateRetVoid ();
++  finalize (names);
+ }
+ 
+ void
+ jit_generator::visit_anon_fcn_handle (tree_anon_fcn_handle&)
+ {
+   fail ();
+ }
+ 
+@@ -1508,16 +1477,66 @@ jit_generator::emit_print (const std::st
+   const jit_function::overload& ol = tinfo->print_value (v.first);
+   if (! ol.function)
+     fail ();
+ 
+   llvm::Value *str = builder.CreateGlobalStringPtr (name);
+   builder.CreateCall2 (ol.function, str, v.second);
+ }
+ 
++void
++jit_generator::initialize (const std::vector<std::string>& names,
++                           const std::vector<bool>& argin,
++                           const std::vector<jit_type *> types)
++{
++  std::vector<llvm::Type *> arg_types (names.size ());
++  for (size_t i = 0; i < types.size (); ++i)
++    arg_types[i] = types[i]->to_llvm_arg ();
++
++  llvm::LLVMContext &ctx = llvm::getGlobalContext ();
++  llvm::Type *tvoid = llvm::Type::getVoidTy (ctx);
++  llvm::FunctionType *ft = llvm::FunctionType::get (tvoid, arg_types, false);
++  function = llvm::Function::Create (ft, llvm::Function::ExternalLinkage,
++                                     "foobar", module);
++
++  // create variables and copy initial values
++  llvm::BasicBlock *body = llvm::BasicBlock::Create (ctx, "body", function);
++  builder.SetInsertPoint (body);
++  llvm::Function::arg_iterator arg_iter = function->arg_begin();
++  for (size_t i = 0; i < names.size (); ++i, ++arg_iter)
++    {
++      llvm::Type *vartype = types[i]->to_llvm ();
++      const std::string& name = names[i];
++      llvm::Value *var = builder.CreateAlloca (vartype, 0, name);
++      variables[name] = value (types[i], var);
++
++      if (argin[i] || types[i]->force_init ())
++        {
++          llvm::Value *loaded_arg = builder.CreateLoad (arg_iter);
++          builder.CreateStore (loaded_arg, var);
++        }
++    }
++}
++
++void
++jit_generator::finalize (const std::vector<std::string>& names)
++{
++  // copy computed values back into arguments
++  // we use names instead of looping through variables because order is
++  // important
++  llvm::Function::arg_iterator arg_iter = function->arg_begin();
++  for (size_t i = 0; i < names.size (); ++i, ++arg_iter)
++    {
++      llvm::Value *var = variables[names[i]].second;
++      llvm::Value *loaded_var = builder.CreateLoad (var);
++      builder.CreateStore (loaded_var, arg_iter);
++    }
++  builder.CreateRetVoid ();
++}
++
+ // -------------------- tree_jit --------------------
+ 
+ tree_jit::tree_jit (void) : context (llvm::getGlobalContext ()), engine (0)
+ {
+   llvm::InitializeNativeTarget ();
+   module = new llvm::Module ("octave", context);
+ }
+ 
+@@ -1579,34 +1598,34 @@ tree_jit::optimize (llvm::Function *fn)
+ {
+   module_pass_manager->run (*module);
+   pass_manager->run (*fn);
+ }
+ 
+ // -------------------- jit_info --------------------
+ jit_info::jit_info (tree_jit& tjit, tree_simple_for_command& cmd,
+                     jit_type *bounds) : tinfo (tjit.get_typeinfo ()),
+-                                        engine (tjit.get_engine ())
++                                        engine (tjit.get_engine ()),
++                                        bounds_t (bounds)
+ {
+   jit_infer infer(tinfo);
+ 
+   try
+     {
+       infer.infer (cmd, bounds);
+     }
+   catch (const jit_fail_exception&)
+     {
+       function = 0;
+       return;
+     }
+ 
+-  argin = infer.get_argin ();
+   types = infer.get_types ();
+ 
+-  jit_generator gen(tinfo, tjit.get_module (), cmd, argin, types);
++  jit_generator gen(tinfo, tjit.get_module (), cmd, bounds, types);
+   function = gen.get_function ();
+ 
+   if (function)
+     {
+       if (debug_print)
+         {
+           std::cout << "Compiled code:\n";
+           std::cout << cmd.str_print_code () << std::endl;
+@@ -1630,60 +1649,59 @@ jit_info::jit_info (tree_jit& tjit, tree
+ }
+ 
+ bool
+ jit_info::execute (const octave_value& bounds) const
+ {
+   if (! function)
+     return false;
+ 
+-  std::vector<llvm::GenericValue> args (types.size ());
++  std::vector<llvm::GenericValue> args (types.size () + 1);
++  tinfo->to_generic (bounds_t, args[0], bounds);
++
+   size_t idx;
+   type_map::const_iterator iter;
+-  for (idx = 0, iter = types.begin (); iter != types.end (); ++iter, ++idx)
++  for (idx = 1, iter = types.begin (); iter != types.end (); ++iter, ++idx)
+     {
+-      if (argin.count (iter->first))
++      if (iter->second.first) // argin?
+         {
+-          octave_value ov;
+-          if (iter->first == "#bounds")
+-            ov = bounds;
+-          else
+-            ov = symbol_table::varval (iter->first);
+-
+-          tinfo->to_generic (iter->second, args[idx], ov);
++          octave_value ov = iter->first->varval ();
++          tinfo->to_generic (iter->second.second, args[idx], ov);
+         }
+       else
+-        tinfo->to_generic (iter->second, args[idx]);
++        tinfo->to_generic (iter->second.second, args[idx]);
+     }
+ 
+   engine->runFunction (function, args);
+ 
+-  for (idx = 0, iter = types.begin (); iter != types.end (); ++iter, ++idx)
++  for (idx = 1, iter = types.begin (); iter != types.end (); ++iter, ++idx)
+     {
+-      octave_value result = tinfo->to_octave_value (iter->second, args[idx]);
+-      symbol_table::varref (iter->first) = result;
++      octave_value result = tinfo->to_octave_value (iter->second.second, args[idx]);
++      octave_value &ref = iter->first->varref ();
++      ref = result;
+     }
+ 
+   tinfo->reset_generic ();
+ 
+   return true;
+ }
+ 
+ bool
+ jit_info::match () const
+ {
+-  for (std::set<std::string>::iterator iter = argin.begin ();
+-       iter != argin.end (); ++iter)
++  for (type_map::const_iterator iter = types.begin (); iter != types.end ();
++       ++iter)
++       
+     {
+-      if (*iter == "#bounds")
+-        continue;
++      if (iter->second.first) // argin?
++        {
++          jit_type *required_type = iter->second.second;
++          octave_value val = iter->first->varval ();
++          jit_type *current_type = tinfo->type_of (val);
+ 
+-      jit_type *required_type = types.find (*iter)->second;
+-      octave_value val = symbol_table::varref (*iter);
+-      jit_type *current_type = tinfo->type_of (val);
+-
+-      // FIXME: should be: ! required_type->is_parent (current_type)
+-      if (required_type != current_type)
+-        return false;
++          // FIXME: should be: ! required_type->is_parent (current_type)
++          if (required_type != current_type)
++            return false;
++        }
+     }
+ 
+   return true;
+ }
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <map>
+ #include <set>
+ #include <stdexcept>
+ #include <vector>
+ 
+ #include "Array.h"
+ #include "Range.h"
+ #include "pt-walk.h"
++#include "symtab.h"
+ 
+ // -------------------- Current status --------------------
+ // Simple binary operations (+-*/) on octave_scalar's (doubles) are optimized.
+ // However, there is no warning emitted on divide by 0. For example,
+ // a = 5;
+ // b = a * 5 + a;
+ //
+ // For other types all binary operations are compiled but not optimized. For
+@@ -290,18 +291,16 @@ public:
+   void to_generic (jit_type *type, llvm::GenericValue& gv);
+ 
+   void to_generic (jit_type *type, llvm::GenericValue& gv, octave_value ov);
+ 
+   octave_value to_octave_value (jit_type *type, llvm::GenericValue& gv);
+ 
+   void reset_generic (void);
+ private:
+-  typedef std::map<std::string, jit_type *> type_map;
+-
+   jit_type *new_type (const std::string& name, bool force_init,
+                       jit_type *parent, llvm::Type *llvm_type);
+ 
+   void add_print (jit_type *ty, void *call);
+ 
+   void add_binary_op (jit_type *ty, int op, int llvm_op);
+ 
+   llvm::Module *module;
+@@ -327,24 +326,26 @@ private:
+   std::list<double> scalar_out;
+   std::list<octave_base_value *> ov_out;
+   std::list<jit_range> range_out;
+ };
+ 
+ class
+ jit_infer : public tree_walker
+ {
+-  typedef std::map<std::string, jit_type *> type_map;
+ public:
++  // pair <argin, type>
++  typedef std::pair<bool, jit_type *> type_entry;
++  typedef std::map<symbol_table::symbol_record_ref, type_entry,
++                   symbol_table::symbol_record_ref::comparator> type_map;
++
+   jit_infer (jit_typeinfo *ti) : tinfo (ti), is_lvalue (false),
+                                   rvalue_type (0)
+   {}
+ 
+-  const std::set<std::string>& get_argin () const { return argin; }
+-
+   const type_map& get_types () const { return types; }
+ 
+   void infer (tree_simple_for_command& cmd, jit_type *bounds);
+ 
+   void visit_anon_fcn_handle (tree_anon_fcn_handle&);
+ 
+   void visit_argument_list (tree_argument_list&);
+ 
+@@ -428,37 +429,36 @@ public:
+ 
+   void visit_while_command (tree_while_command&);
+ 
+   void visit_do_until_command (tree_do_until_command&);
+ private:
+   void infer_simple_for (tree_simple_for_command& cmd,
+                          jit_type *bounds);
+ 
+-  void handle_identifier (const std::string& name, octave_value v);
++  void handle_identifier (const symbol_table::symbol_record_ref& record);
+ 
+   jit_typeinfo *tinfo;
+ 
+   bool is_lvalue;
+   jit_type *rvalue_type;
+ 
+   type_map types;
+-  std::set<std::string> argin;
+ 
+   std::vector<jit_type *> type_stack;
+ };
+ 
+ class
+ jit_generator : public tree_walker
+ {
+-  typedef std::map<std::string, jit_type *> type_map;
+ public:
+-  jit_generator (jit_typeinfo *ti, llvm::Module *module, tree &tee,
+-                 const std::set<std::string>& argin,
+-                 const type_map& infered_types, bool have_bounds = true);
++  typedef jit_infer::type_map type_map;
++
++  jit_generator (jit_typeinfo *ti, llvm::Module *mod, tree_simple_for_command &cmd,
++                 jit_type *bounds, const type_map& infered_types);
+ 
+   llvm::Function *get_function () const { return function; }
+ 
+   void visit_anon_fcn_handle (tree_anon_fcn_handle&);
+ 
+   void visit_argument_list (tree_argument_list&);
+ 
+   void visit_binary_expression (tree_binary_expression&);
+@@ -550,17 +550,24 @@ private:
+ 
+   void emit_print (const std::string& name, const value& v);
+ 
+   void push_value (jit_type *type, llvm::Value *v)
+   {
+     value_stack.push_back (value (type, v));
+   }
+ 
++  void initialize (const std::vector<std::string>& names,
++                   const std::vector<bool>& argin,
++                   const std::vector<jit_type *> types);
++
++  void finalize (const std::vector<std::string>& names);
++
+   jit_typeinfo *tinfo;
++  llvm::Module *module;
+   llvm::Function *function;
+ 
+   bool is_lvalue;
+   std::map<std::string, value> variables;
+   std::vector<value> value_stack;
+ };
+ 
+ class
+@@ -591,24 +598,24 @@ public:
+ 
+   jit_typeinfo *tinfo;
+ };
+ 
+ class
+ jit_info
+ {
+ public:
++  typedef jit_infer::type_map type_map;
++
+   jit_info (tree_jit& tjit, tree_simple_for_command& cmd, jit_type *bounds);
+ 
+   bool execute (const octave_value& bounds) const;
+ 
+   bool match (void) const;
+ private:
+-  typedef std::map<std::string, jit_type *> type_map;
+-  
+   jit_typeinfo *tinfo;
+   llvm::ExecutionEngine *engine;
+-  std::set<std::string> argin;
+   type_map types;
+   llvm::Function *function;
++  jit_type *bounds_t;
+ };
+ 
+ #endif
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -605,39 +605,45 @@ public:
+     const std::string& name (void) const { return sym.name (); }
+ 
+     symbol_record *operator-> (void)
+     {
+       update ();
+       return &sym;
+     }
+ 
++    symbol_record *operator-> (void) const
++    {
++      update ();
++      return &sym;
++    }
++
+     // can be used to place symbol_record_ref in maps, we don't overload < as
+     // it doesn't make any sense for symbol_record_ref
+     struct comparator
+     {
+       bool operator ()(const symbol_record_ref& lhs,
+                        const symbol_record_ref& rhs) const
+       {
+         return lhs.name () < rhs.name ();
+       }
+     };
+   private:
+-    void update (void)
++    void update (void) const
+     {
+       scope_id curr_scope = symbol_table::current_scope ();
+       if (scope != curr_scope || ! sym.is_valid ())
+         {
+           scope = curr_scope;
+           sym = symbol_table::insert (sym.name ());
+         }
+     }
+ 
+-    scope_id scope;
+-    symbol_record sym;
++    mutable scope_id scope;
++    mutable symbol_record sym;
+   };
+ 
+   class
+   fcn_info
+   {
+   public:
+ 
+     typedef std::map<std::string, std::string> dispatch_map_type;

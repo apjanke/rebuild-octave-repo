@@ -1,0 +1,192 @@
+# HG changeset patch
+# User Kai T. Ohlhus <k.ohlhus@gmail.com>
+# Date 1533639931 -7200
+#      Tue Aug 07 13:05:31 2018 +0200
+# Node ID af43eb4e6502071a8db2abcb63b60be02e7e6f68
+# Parent  f3aa4a90b91feb56b95e555eea4e2ae244d27b67
+publish.m: Improve code evaluation and add classdef support.
+
+* scripts/miscellaneous/publish.m (eval_context): New subfunction.  The previous
+code evaluation relied on storing variables to a temporary location, using
+save() and load() to emulate a temporary function context.
+
+Using eval_context() a solution inspired by the Octave manual has been chosen:
+https://octave.org/doc/v4.4.0/Evaluation-in-a-Different-Context.html.
+Instead of saving to a temporary hdd location, the data is saved in memory
+inside a persistent variable that is cleared at the end of code publishing.
+
+Somehow it is reverting the changes by Mike in cset ab1aa0e57b72, but with the
+new approach the variable dependency is reduced to a single instance, which is
+manageable.  Especially the "clear all"-bug (bug #51096) is no problem for this
+new solution.
+
+The pros of this solution are:
++ No dependency on temporary files
++ No file I/O for code evaluation
++ Support for not-storable data types (classdef objects, ...)
+
+diff --git a/scripts/miscellaneous/publish.m b/scripts/miscellaneous/publish.m
+--- a/scripts/miscellaneous/publish.m
++++ b/scripts/miscellaneous/publish.m
+@@ -388,16 +388,17 @@ function output_file = publish (file, va
+   ## Create output directory
+   [status, msg] = mkdir (options.outputDir);
+   if (status != 1)
+     error ("publish: cannot create output directory: %s", msg);
+   endif
+ 
+   if (options.evalCode)
+     doc = eval_code (doc, options);
++    eval_context ("clear");
+   endif
+ 
+   output_file = create_output (doc, options);
+ 
+ endfunction
+ 
+ 
+ function doc = parse_m_source (doc)
+@@ -954,40 +955,37 @@ function doc = eval_code (doc, options)
+   page_screen_output (false, "local");
+ 
+   ## Remember previously opened figures
+   fig_ids = findall (0, "type", "figure");
+   [~, fig_name] = fileparts (doc.m_source_file_name);
+   fig_num = 1;
+   fig_list = struct ();
+ 
+-  ## File used as temporary context
+-  tmp_context = [tempname() ".var"];
+-
+   ## Evaluate code, that does not appear in the output.
+-  eval_code_helper (tmp_context, options.codeToEvaluate);
++  eval_code_helper (options.codeToEvaluate);
+ 
+   ## Create a new figure, if there are existing plots
+   if (! isempty (fig_ids) && options.useNewFigure)
+     figure ();
+   endif
+ 
+   for i = 1:numel (doc.body)
+     if (strcmp (doc.body{i}.type, "code"))
+       r = doc.body{i}.lines;
+       code_str = strjoin (doc.m_source(r(1):r(2)), "\n");
+       if (options.catchError)
+         try
+-          doc.body{i}.output = eval_code_helper (tmp_context, code_str);
++          doc.body{i}.output = eval_code_helper (code_str);
+          catch err
+           doc.body{i}.output = cellstr (["error: ", err.message, ...
+                                                  "\n\tin:\n\n", code_str]);
+         end_try_catch
+       else
+-        doc.body{i}.output = eval_code_helper (tmp_context, code_str);
++        doc.body{i}.output = eval_code_helper (code_str);
+       endif
+ 
+       ## Check for newly created figures ...
+       fig_ids_new = setdiff (findall (0, "type", "figure"), fig_ids);
+       ## ... and save them
+       for j = 1:numel (fig_ids_new)
+         drawnow ();
+         if (isempty (get (fig_ids_new(j), "children")))
+@@ -1031,55 +1029,82 @@ function doc = eval_code (doc, options)
+       endif
+       doc.body{i}.output = strjoin (doc.body{i}.output, "\n");
+     endif
+   endfor
+ 
+   ## Close any figures opened by publish function
+   delete (setdiff (findall (0, "type", "figure"), fig_ids));
+ 
+-  ## Remove temporary context
+-  unlink (tmp_context);
+-
+   ## Insert figures to document
+   fig_code_blocks = fieldnames (fig_list);
+   body_offset = 0;
+   for i = 1:numel (fig_code_blocks)
+     elems = getfield (fig_list, fig_code_blocks{i});
+     ## Compute index where the figure(s) has to be inserted
+     j = str2double (fig_code_blocks{i}) + body_offset;
+     doc.body = [doc.body(1:j), elems, doc.body(j+1:end)];
+     body_offset = body_offset + numel (elems);
+   endfor
+ 
+ endfunction
+ 
+ 
+-function cstr = eval_code_helper (context, code)
++function cstr = eval_code_helper (__code__)
+   ## EVAL_CODE_HELPER evaluates a given string with Octave code in an extra
+   ## temporary context and returns a cellstring with the eval output.
+ 
+-  if (isempty (code))
++  if (isempty (__code__))
+     return;
+   endif
+ 
+-  load_snippet = "";
+-  if (exist (context, "file") == 2)
+-    load_snippet = sprintf ('load ("%s");', context);
+-  endif
+-  save_snippet = sprintf ('save ("-binary", "%s");', context);
+-
+-  eval (sprintf ("function __eval__ ()\n%s\n%s\n%s\nendfunction",
+-                 load_snippet, code, save_snippet));
+-
+-  cstr = strsplit (evalc ("__eval__"), "\n");
++  eval_context ("load");
++  cstr = evalc (__code__);
++  # Split string by lines and preserve blank lines.
++  cstr = strsplit (strrep (cstr, "\n\n", "\n \n"), "\n");
++  eval_context ("save");
+ endfunction
+ 
+ 
+-## FIXME: Missing any functional BIST tests
+-## FIXME: Need to create a temporary file for use with error testing
++function cstr = eval_context (op)
++  ## EVAL_CONTEXT temporary evaluation context.
++  persistent ctext
++  
++  # Variable cstr in "eval_code_helper" is newly created anyways.
++  forbidden_var_names = {"__code__"};
++
++  switch (op)
++    case "save"
++      # Clear previous context
++      ctext = containers.Map;
++      # Get variable names
++      var_names = evalin ("caller", "whos");
++      var_names = {var_names.name};
++      # Store all variables to context
++      for i = 1:length (var_names)
++        if (~any (strcmp (var_names{i}, forbidden_var_names)))
++          ctext(var_names{i}) = evalin ("caller", var_names{i});
++        end
++      endfor
++    case "load"
++      if (~isempty (ctext))
++        keys = ctext.keys ();
++        for i = 1:length (keys)
++          assignin ("caller", keys{i}, ctext(keys{i}));
++        endfor
++      endif
++    case "clear"
++      # Clear any context
++      ctext = [];
++    otherwise
++      # Do nothing
++  endswitch
++endfunction
++
++
++## Note: Functional BIST tests are located in the `test/publish` directory.
+ 
+ ## Test input validation
+ %!error publish ()
+ %!error publish (1)
+ %!error <FILE does not exist> publish ("%%_non_existent_file_%%.m")
+ %!error <only script files can be published> publish ("publish.m")
+ %!error publish ("test_script.m", "format", "html", "showCode")

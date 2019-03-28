@@ -1,0 +1,948 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1270022635 -7200
+#      Wed Mar 31 10:03:55 2010 +0200
+# Node ID ded9beac75822d5dc9f13a1ba028ec6ec586b623
+# Parent  d382db6b9d817c2d2203293bd886bf37ced87796
+optimize sparse matrix assembly
+
+diff --git a/liboctave/CSparse.h b/liboctave/CSparse.h
+--- a/liboctave/CSparse.h
++++ b/liboctave/CSparse.h
+@@ -84,16 +84,21 @@ public:
+     : MSparse<Complex> (a, r, c, nr, nc, sum_terms) { }
+ 
+   explicit SparseComplexMatrix (const Array<Complex> a, 
+                                 const Array<double>& r, 
+                                 const Array<double>& c, octave_idx_type nr = -1, 
+                                 octave_idx_type nc = -1, bool sum_terms = true)
+     : MSparse<Complex> (a, r, c, nr, nc, sum_terms) { }
+ 
++  SparseComplexMatrix (const Array<Complex>& a, const idx_vector& r, 
++                       const idx_vector& c, octave_idx_type nr = -1, 
++                       octave_idx_type nc = -1, bool sum_terms = true)
++    : MSparse<Complex> (a, r, c, nr, nc, sum_terms) { }
++
+   explicit SparseComplexMatrix (const SparseMatrix& a);
+ 
+   explicit SparseComplexMatrix (const SparseBoolMatrix& a);
+ 
+   explicit SparseComplexMatrix (const ComplexDiagMatrix& a);
+ 
+   SparseComplexMatrix (octave_idx_type r, octave_idx_type c, octave_idx_type num_nz) 
+     : MSparse<Complex> (r, c, num_nz) { }
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,16 @@
++2010-03-31  Jaroslav Hajek  <highegg@gmail.com>
++
++	* idx-vector.cc (idx_vector::idx_range_rep::as_array): Fix typo.
++	(idx_vector::raw): Use unchecked constructor.
++	* Sparse.cc (Sparse<T>::Sparse (const Array<T>&, const idx_vector&,
++	const idx_vector&, ...)): New ctor.
++	* Sparse.h: Declare it.
++
+ 2010-03-30  John W. Eaton  <jwe@octave.org>
+ 
+ 	* str-vec.cc (string_vector::string_vector (const char * const *)): 
+ 	Create empty string_vector object if arg is NULL.
+ 	Fixes bug #29386.
+ 
+ 2010-03-29  Jaroslav Hajek  <highegg@gmail.com>
+ 
+diff --git a/liboctave/MSparse.h b/liboctave/MSparse.h
+--- a/liboctave/MSparse.h
++++ b/liboctave/MSparse.h
+@@ -60,16 +60,20 @@ public:
+            octave_idx_type nc = -1, bool sum_terms = true)
+     : Sparse<T> (a, r, c, nr, nc, sum_terms) { }
+ 
+   MSparse (const Array<T> a, const Array<double>& r, 
+            const Array<double>& c, octave_idx_type nr = -1, 
+            octave_idx_type nc = -1, bool sum_terms = true)
+     : Sparse<T> (a, r, c, nr, nc, sum_terms) { }
+ 
++  MSparse (const Array<T>& a, const idx_vector& r, const idx_vector& c,
++           octave_idx_type nr = -1, octave_idx_type nc = -1, bool sum_terms = true)
++    : Sparse<T> (a, r, c, nr, nc, sum_terms) { }
++
+   explicit MSparse (octave_idx_type r, octave_idx_type c, T val) : Sparse<T> (r, c, val) { }
+ 
+   MSparse (octave_idx_type r, octave_idx_type c, octave_idx_type num_nz) : Sparse<T> (r, c, num_nz) { }
+ 
+   ~MSparse (void) { }
+ 
+   MSparse<T>& operator = (const MSparse<T>& a)
+     {
+diff --git a/liboctave/Sparse.cc b/liboctave/Sparse.cc
+--- a/liboctave/Sparse.cc
++++ b/liboctave/Sparse.cc
+@@ -30,16 +30,17 @@ along with Octave; see the file COPYING.
+ #include <climits>
+ 
+ #include <algorithm>
+ #include <iostream>
+ #include <sstream>
+ #include <vector>
+ 
+ #include "Array.h"
++#include "MArray.h"
+ #include "Array-util.h"
+ #include "Range.h"
+ #include "idx-vector.h"
+ #include "lo-error.h"
+ #include "quit.h"
+ #include "oct-locbuf.h"
+ 
+ #include "Sparse.h"
+@@ -546,16 +547,349 @@ Sparse<T>::Sparse (const Array<T>& a, co
+ 
+           while (cx < nc) 
+             xcidx (++cx) = ii + 1;
+         }
+     }
+ }
+ 
+ template <class T>
++Sparse<T>::Sparse (const Array<T>& a, const idx_vector& r, 
++                   const idx_vector& c, octave_idx_type nr,
++                   octave_idx_type nc, bool sum_terms)
++  : rep (nil_rep ()), dimensions (), idx (0), idx_count (0)
++{
++  if (nr < 0)
++      nr = r.extent (0);
++  else if (r.extent (nr) > nr)
++    (*current_liboctave_error_handler) ("sparse: row index %d out of bound %d",
++                                        r.extent (nr), nr);
++
++  if (nc < 0)
++      nc = c.extent (0);
++  else if (c.extent (nc) > nc)
++    (*current_liboctave_error_handler) ("sparse: column index %d out of bound %d",
++                                        r.extent (nc), nc);
++
++  if (--rep->count == 0)
++    delete rep;
++  rep = new SparseRep (nr, nc);
++
++  dimensions = dim_vector (nr, nc);
++
++
++  octave_idx_type n = a.numel (), rl = r.length (nr), cl = c.length (nc);
++  bool a_scalar = n == 1;
++  if (a_scalar)
++    {
++      if (rl != 1)
++        n = rl;
++      else if (cl != 1)
++        n = cl;
++    }
++
++  if ((rl != 1 && rl != n) || (cl != 1 && cl != n))
++    (*current_liboctave_error_handler) ("sparse: dimension mismatch");
++    
++  if (rl <= 1 && cl <= 1)
++    {
++      if (n == 1 && a(0) != T ())
++        {
++          change_capacity (1);
++          xridx(0) = r(0);
++          xdata(0) = a(0);
++          for (octave_idx_type j = 0; j < nc; j++)
++            xcidx(j+1) = j >= c(0);
++        }
++    }
++  else if (a_scalar)
++    {
++      // This is completely specialized, because the sorts can be simplified.
++      T a0 = a(0);
++      if (cl == 1)
++        {
++          // Sparse column vector. Sort row indices.
++          idx_vector rs = r.sorted ();
++
++          octave_quit ();
++
++          const octave_idx_type *rd = rs.raw ();
++          // Count unique indices.
++          octave_idx_type new_nz = 1;
++          for (octave_idx_type i = 1; i < n; i++)
++            new_nz += rd[i-1] != rd[i];
++          // Allocate result.
++          change_capacity (new_nz);
++          xcidx (1) = new_nz;
++          octave_idx_type *rri = ridx ();
++          T *rrd = data ();
++
++          octave_quit ();
++
++          octave_idx_type k = -1, l = -1;
++
++          if (sum_terms)
++            {
++              // Sum repeated indices.
++              for (octave_idx_type i = 0; i < n; i++)
++                {
++                  if (rd[i] != l)
++                    {
++                      l = rd[i];
++                      rri[++k] = rd[i];
++                      rrd[k] = a0;
++                    }
++                  else
++                    rrd[k] += a0;
++                }
++            }
++          else
++            {
++              // Pick the last one.
++              for (octave_idx_type i = 1; i < n; i++)
++                {
++                  if (rd[i] != l)
++                    {
++                      l = rd[i];
++                      rrd[++k] = a0;
++                      rri[k] = rd[i];
++                    }
++                }
++            }
++
++        }
++      else
++        {
++          idx_vector rr = r, cc = c;
++          const octave_idx_type *rd = rr.raw (), *cd = cc.raw ();
++          OCTAVE_LOCAL_BUFFER_INIT (octave_idx_type, ci, nc+1, 0);
++          ci[0] = 0;
++          // Bin counts of column indices.
++          for (octave_idx_type i = 0; i < n; i++)
++            ci[cd[i]+1]++;
++          // Make them cumulative, shifted one to right.
++          for (octave_idx_type i = 1, s = 0; i <= nc; i++)
++            {
++              octave_idx_type s1 = s + ci[i];
++              ci[i] = s;
++              s = s1;
++            }
++
++          octave_quit ();
++
++          // Bucket sort.
++          OCTAVE_LOCAL_BUFFER (octave_idx_type, sidx, n);
++          for (octave_idx_type i = 0; i < n; i++)
++            sidx[ci[cd[i]+1]++] = rd[i];
++
++          // Subsorts. We don't need a stable sort, all values are equal.
++          xcidx(0) = 0;
++          for (octave_idx_type j = 0; j < nc; j++)
++            {
++              std::sort (sidx + ci[j], sidx + ci[j+1]);
++              octave_idx_type l = -1, nzj = 0;
++              // Count.
++              for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++                {
++                  octave_idx_type k = sidx[i];
++                  if (k != l)
++                    {
++                      l = k;
++                      nzj++;
++                    }
++                }
++              // Set column pointer.
++              xcidx(j+1) = xcidx(j) + nzj;
++            }
++
++          change_capacity (xcidx (nc));
++          octave_idx_type *rri = ridx ();
++          T *rrd = data ();
++
++          // Fill-in data.
++          for (octave_idx_type j = 0, jj = -1; j < nc; j++)
++            {
++              octave_quit ();
++              octave_idx_type l = -1;
++              if (sum_terms)
++                {
++                  // Sum adjacent terms.
++                  for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++                    {
++                      octave_idx_type k = sidx[i];
++                      if (k != l)
++                        {
++                          l = k;
++                          rrd[++jj] = a0;
++                          rri[jj] = k;
++                        }
++                      else
++                        rrd[jj] += a0;
++                    }
++                }
++              else
++                {
++                  // Use the last one.
++                  for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++                    {
++                      octave_idx_type k = sidx[i];
++                      if (k != l)
++                        {
++                          l = k;
++                          rrd[++jj] = a0;
++                          rri[jj] = k;
++                        }
++                    }
++                }
++            }
++        }
++    }
++  else if (cl == 1)
++    {
++      // Sparse column vector. Sort row indices.
++      Array<octave_idx_type> rsi;
++      idx_vector rs = r.sorted (rsi);
++      
++      octave_quit ();
++
++      const octave_idx_type *rd = rs.raw (), *rdi = rsi.data ();
++      // Count unique indices.
++      octave_idx_type new_nz = 1;
++      for (octave_idx_type i = 1; i < n; i++)
++        new_nz += rd[i-1] != rd[i];
++      // Allocate result.
++      change_capacity (new_nz);
++      xcidx(1) = new_nz;
++      octave_idx_type *rri = ridx ();
++      T *rrd = data ();
++
++      octave_quit ();
++
++      octave_idx_type k = 0;
++      rri[k] = rd[0];
++      rrd[k] = a(rdi[0]);
++
++      if (sum_terms)
++        {
++          // Sum repeated indices.
++          for (octave_idx_type i = 1; i < n; i++)
++            {
++              if (rd[i] != rd[i-1])
++                {
++                  rri[++k] = rd[i];
++                  rrd[k] = a(rdi[i]);
++                }
++              else
++                rrd[k] += a(rdi[i]);
++            }
++        }
++      else
++        {
++          // Pick the last one.
++          for (octave_idx_type i = 1; i < n; i++)
++            {
++              if (rd[i] != rd[i-1])
++                rri[++k] = rd[i];
++              rrd[k] = a(rdi[i]);
++            }
++        }
++    }
++  else
++    {
++      idx_vector rr = r, cc = c;
++      const octave_idx_type *rd = rr.raw (), *cd = cc.raw ();
++      OCTAVE_LOCAL_BUFFER_INIT (octave_idx_type, ci, nc+1, 0);
++      ci[0] = 0;
++      // Bin counts of column indices.
++      for (octave_idx_type i = 0; i < n; i++)
++        ci[cd[i]+1]++;
++      // Make them cumulative, shifted one to right.
++      for (octave_idx_type i = 1, s = 0; i <= nc; i++)
++        {
++          octave_idx_type s1 = s + ci[i];
++          ci[i] = s;
++          s = s1;
++        }
++
++      octave_quit ();
++
++      typedef std::pair<octave_idx_type, octave_idx_type> idx_pair;
++      // Bucket sort.
++      OCTAVE_LOCAL_BUFFER (idx_pair, spairs, n);
++      for (octave_idx_type i = 0; i < n; i++)
++        {
++          idx_pair& p = spairs[ci[cd[i]+1]++];
++          p.first = rd[i];
++          p.second = i;
++        }
++
++      // Subsorts. We don't need a stable sort, the second index stabilizes it.
++      xcidx(0) = 0;
++      for (octave_idx_type j = 0; j < nc; j++)
++        {
++          std::sort (spairs + ci[j], spairs + ci[j+1]);
++          octave_idx_type l = -1, nzj = 0;
++          // Count.
++          for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++            {
++              octave_idx_type k = spairs[i].first;
++              if (k != l)
++                {
++                  l = k;
++                  nzj++;
++                }
++            }
++          // Set column pointer.
++          xcidx(j+1) = xcidx(j) + nzj;
++        }
++
++      change_capacity (xcidx (nc));
++      octave_idx_type *rri = ridx ();
++      T *rrd = data ();
++
++      // Fill-in data.
++      for (octave_idx_type j = 0, jj = -1; j < nc; j++)
++        {
++          octave_quit ();
++          octave_idx_type l = -1;
++          if (sum_terms)
++            {
++              // Sum adjacent terms.
++              for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++                {
++                  octave_idx_type k = spairs[i].first;
++                  if (k != l)
++                    {
++                      l = k;
++                      rrd[++jj] = a(spairs[i].second);
++                      rri[jj] = k;
++                    }
++                  else
++                    rrd[jj] += a(spairs[i].second);
++                }
++            }
++          else
++            {
++              // Use the last one.
++              for (octave_idx_type i = ci[j]; i < ci[j+1]; i++)
++                {
++                  octave_idx_type k = spairs[i].first;
++                  if (k != l)
++                    {
++                      l = k;
++                      rri[++jj] = k;
++                    }
++                  rrd[jj] = a(spairs[i].second);
++                }
++            }
++        }
++    }
++}
++
++template <class T>
+ Sparse<T>::Sparse (const Array<T>& a)
+   : dimensions (a.dims ()), idx (0), idx_count (0)
+ {
+   if (dimensions.length () > 2)
+     (*current_liboctave_error_handler)
+       ("Sparse::Sparse (const Array<T>&): dimension mismatch");
+   else
+     {
+diff --git a/liboctave/Sparse.h b/liboctave/Sparse.h
+--- a/liboctave/Sparse.h
++++ b/liboctave/Sparse.h
+@@ -218,16 +218,19 @@ public:
+   Sparse (const Sparse<T>& a, const dim_vector& dv);
+ 
+   Sparse (const Array<T>& a, const Array<octave_idx_type>& r, const Array<octave_idx_type>& c,
+           octave_idx_type nr, octave_idx_type nc, bool sum_terms);
+ 
+   Sparse (const Array<T>& a, const Array<double>& r, const Array<double>& c,
+           octave_idx_type nr, octave_idx_type nc, bool sum_terms);
+ 
++  Sparse (const Array<T>& a, const idx_vector& r, const idx_vector& c,
++          octave_idx_type nr = -1, octave_idx_type nc = -1, bool sum_terms = true);
++
+   // Sparsify a normal matrix
+   Sparse (const Array<T>& a);
+ 
+   virtual ~Sparse (void);
+ 
+   Sparse<T>& operator = (const Sparse<T>& a);
+ 
+   // Note that nzmax and capacity are the amount of storage for
+diff --git a/liboctave/boolSparse.h b/liboctave/boolSparse.h
+--- a/liboctave/boolSparse.h
++++ b/liboctave/boolSparse.h
+@@ -60,16 +60,21 @@ public:
+                              octave_idx_type nc = -1, bool sum_terms = true)
+     : Sparse<bool> (a, r, c, nr, nc, sum_terms) { }
+ 
+   explicit SparseBoolMatrix (const Array<bool> a, const Array<double>& r, 
+                              const Array<double>& c, octave_idx_type nr = -1, 
+                              octave_idx_type nc = -1, bool sum_terms = true)
+     : Sparse<bool> (a, r, c, nr, nc, sum_terms) { }
+ 
++  SparseBoolMatrix (const Array<bool>& a, const idx_vector& r, 
++                    const idx_vector& c, octave_idx_type nr = -1, 
++                    octave_idx_type nc = -1, bool sum_terms = true)
++    : Sparse<bool> (a, r, c, nr, nc, sum_terms) { }
++
+   SparseBoolMatrix (octave_idx_type r, octave_idx_type c, octave_idx_type num_nz) : Sparse<bool> (r, c, num_nz) { }
+ 
+   SparseBoolMatrix& operator = (const SparseBoolMatrix& a)
+     {
+       Sparse<bool>::operator = (a);
+       return *this;
+     }
+ 
+diff --git a/liboctave/dSparse.h b/liboctave/dSparse.h
+--- a/liboctave/dSparse.h
++++ b/liboctave/dSparse.h
+@@ -77,16 +77,21 @@ SparseMatrix : public MSparse<double>
+                          octave_idx_type nc = -1, bool sum_terms = true)
+     : MSparse<double> (a, r, c, nr, nc, sum_terms) { }
+ 
+   explicit SparseMatrix (const Array<double> a, const Array<double>& r, 
+                          const Array<double>& c, octave_idx_type nr = -1, 
+                          octave_idx_type nc = -1, bool sum_terms = true)
+     : MSparse<double> (a, r, c, nr, nc, sum_terms) { }
+ 
++  SparseMatrix (const Array<double>& a, const idx_vector& r, 
++                const idx_vector& c, octave_idx_type nr = -1, 
++                octave_idx_type nc = -1, bool sum_terms = true)
++    : MSparse<double> (a, r, c, nr, nc, sum_terms) { }
++
+   explicit SparseMatrix (const DiagMatrix& a);
+ 
+   explicit SparseMatrix (const PermMatrix& a);
+ 
+   SparseMatrix (octave_idx_type r, octave_idx_type c, octave_idx_type num_nz) : MSparse<double> (r, c, num_nz) { }
+ 
+   SparseMatrix& operator = (const SparseMatrix& a)
+     {
+diff --git a/liboctave/idx-vector.cc b/liboctave/idx-vector.cc
+--- a/liboctave/idx-vector.cc
++++ b/liboctave/idx-vector.cc
+@@ -210,17 +210,17 @@ idx_vector::idx_range_rep::unconvert (vo
+                 static_cast<double> (step), len);
+ }
+ 
+ Array<octave_idx_type>
+ idx_vector::idx_range_rep::as_array (void)
+ {
+   Array<octave_idx_type> retval (dim_vector (1, len));
+   for (octave_idx_type i = 0; i < len; i++)
+-    retval.xelem (i) = start + len*step;
++    retval.xelem (i) = start + i*step;
+ 
+   return retval;
+ }
+ 
+ inline octave_idx_type
+ convert_index (octave_idx_type i, bool& conv_error, 
+                octave_idx_type& ext)
+ {
+@@ -989,17 +989,17 @@ idx_vector::increment (void) const
+     }
+   return retval;
+ }
+ 
+ const octave_idx_type *
+ idx_vector::raw (void)
+ {
+   if (rep->idx_class () != class_vector)
+-    *this = as_array ();
++    *this = idx_vector (as_array (), extent (0));
+ 
+   idx_vector_rep * r = dynamic_cast<idx_vector_rep *> (rep);
+   assert (r != 0);
+   return r->get_data ();
+ }
+ 
+ void
+ idx_vector::copy_data (octave_idx_type *data) const
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,12 @@
++2010-03-31  Jaroslav Hajek  <highegg@gmail.com>
++
++	* DLD-FUNCTIONS/sparse.cc (Fsparse): Rewrite.
++
+ 2010-03-28  David Grundberg  <davidg@cs.umu.se>
+ 
+ 	* DLD-FUNCTIONS/convhulln.cc [HAVE_QHULL]: Neither include
+ 	qhull/qhull_a.h nor run tests if unless we HAVE_QHULL.
+ 
+ 2010-03-26  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* variables.cc (maybe_missing_function_hook): Temporarily clear before
+diff --git a/src/DLD-FUNCTIONS/sparse.cc b/src/DLD-FUNCTIONS/sparse.cc
+--- a/src/DLD-FUNCTIONS/sparse.cc
++++ b/src/DLD-FUNCTIONS/sparse.cc
+@@ -29,16 +29,17 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include "variables.h"
+ #include "utils.h"
+ #include "pager.h"
+ #include "defun-dld.h"
+ #include "gripes.h"
+ #include "quit.h"
++#include "unwind-prot.h"
+ 
+ #include "ov-re-sparse.h"
+ #include "ov-cx-sparse.h"
+ #include "ov-bool-sparse.h"
+ 
+ DEFUN_DLD (issparse, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Loadable Function} {} issparse (@var{expr})\n\
+@@ -93,276 +94,105 @@ same @var{i}, @var{j} indices, the last 
+ @code{sparse ([], [], [], @var{m}, @var{n}, 0)}\n\
+ \n\
+ If any of @var{sv}, @var{i} or @var{j} are scalars, they are expanded\n\
+ to have a common size.\n\
+ @seealso{full}\n\
+ @end deftypefn")
+ {
+    octave_value retval;
+-
+-   // WARNING: This function should always use constructions like
+-   //   retval = new octave_sparse_matrix (sm);
+-   // To avoid calling the maybe_mutate function. This is the only
+-   // function that should not call maybe_mutate
+-
+-   int nargin= args.length();
+-   if (nargin < 1 || (nargin == 4 && !args(3).is_string ()) || nargin > 6) 
+-     {
+-       print_usage ();
+-       return retval;
+-     }
++   int nargin = args.length ();
+ 
+-   bool use_complex = false;
+-   bool use_bool = false;
+-   if (nargin > 2)
+-     {
+-       use_complex= args(2).is_complex_type();
+-       use_bool = args(2).is_bool_type ();
+-     }
+-   else
+-     {
+-       use_complex= args(0).is_complex_type();
+-       use_bool = args(0).is_bool_type ();
+-     }
++   // Temporarily disable sparse_auto_mutate if set (it's obsolete anyway).
++   unwind_protect frame;
++   frame.protect_var (Vsparse_auto_mutate);
++   Vsparse_auto_mutate = false;
+ 
+    if (nargin == 1)
+      {
+        octave_value arg = args (0);
+-
+-       if (arg.is_sparse_type ())
++       if (arg.is_bool_type ())
++         retval = arg.sparse_bool_matrix_value ();
++       else if (arg.is_complex_type ())
++         retval = arg.sparse_complex_matrix_value ();
++       else if (arg.is_numeric_type ())
++         retval = arg.sparse_matrix_value ();
++       else
++         gripe_wrong_type_arg ("sparse", arg);
++     }
++   else if (nargin == 2)
++     {
++       octave_idx_type m = 0, n = 0;
++       if (args(0).is_scalar_type () && args(1).is_scalar_type ())
+          {
+-           if (use_complex) 
+-             {
+-               SparseComplexMatrix sm = arg.sparse_complex_matrix_value ();
+-               retval = new octave_sparse_complex_matrix (sm);
+-             }
+-           else if (use_bool) 
+-             {
+-               SparseBoolMatrix sm = arg.sparse_bool_matrix_value ();
+-               retval = new octave_sparse_bool_matrix (sm);
+-             }
+-           else
+-             {
+-               SparseMatrix sm = arg.sparse_matrix_value ();
+-               retval = new octave_sparse_matrix (sm);
+-             }
+-         }
+-       else if (arg.is_diag_matrix ())
+-         {
+-           if (arg.is_complex_type ())
+-             {
+-               SparseComplexMatrix sm = arg.sparse_complex_matrix_value ();
+-               retval = new octave_sparse_complex_matrix (sm);
+-             }
+-           else
+-             {
+-               SparseMatrix sm = arg.sparse_matrix_value ();
+-               retval = new octave_sparse_matrix (sm);
+-             }
+-         }
+-       else if (arg.is_perm_matrix ())
+-         {
+-           SparseMatrix sm = arg.sparse_matrix_value ();
+-           retval = new octave_sparse_matrix (sm);
++           m = args(0).idx_type_value ();
++           n = args(1).idx_type_value ();
+          }
+        else
++         error ("sparse: expecting scalar dimensions");
++
++       if (! error_state)
+          {
+-           if (use_complex) 
+-             {
+-               SparseComplexMatrix sm (args (0).complex_matrix_value ());
+-               if (error_state) 
+-                 return retval;
+-               retval = new octave_sparse_complex_matrix (sm);
+-             } 
+-           else if (use_bool) 
+-             {
+-               SparseBoolMatrix sm (args (0).bool_matrix_value ());
+-               if (error_state) 
+-                 return retval;
+-               retval = new octave_sparse_bool_matrix (sm);
+-             } 
+-           else 
+-             {
+-               SparseMatrix sm (args (0).matrix_value ());
+-               if (error_state) 
+-                 return retval;
+-               retval = new octave_sparse_matrix (sm);
+-             }
++           if (m >= 0 && n >= 0)
++             retval = SparseMatrix (m, n);
++           else
++             error ("sparse: dimensions must be nonnegative");
+          }
+      }
+-   else 
++   else if (nargin >= 3)
+      {
+-       octave_idx_type m = 1, n = 1;
+-       if (nargin == 2) 
++       bool summation = true;
++       if (nargin > 3 && args(nargin-1).is_string ())
+          {
+-           if (args(0).numel () == 1 && args(1).numel () == 1)
+-             {
+-               m = args(0).int_value();
+-               n = args(1).int_value();
+-               if (error_state) return retval;
+-
+-               if (use_complex) 
+-                 retval = new octave_sparse_complex_matrix 
+-                   (SparseComplexMatrix (m, n));
+-               else if (use_bool) 
+-                 retval = new octave_sparse_bool_matrix 
+-                   (SparseBoolMatrix (m, n));
+-               else
+-                 retval = new octave_sparse_matrix 
+-                   (SparseMatrix (m, n));
+-             }
++           std::string opt = args(nargin-1).string_value ();
++           if (opt == "unique")
++             summation = false;
++           else if (opt == "sum" || opt == "summation")
++             summation = true;
+            else
+-             error ("sparse: expecting scalar values");
+-         }
+-       else 
+-         {
+-           if (args(0).is_empty () || args (1).is_empty () 
+-               || args(2).is_empty ())
+-             {
+-               if (nargin > 4)
+-                 {
+-                   m = args(3).int_value();
+-                   n = args(4).int_value();
+-                 }
++             error ("sparse: invalid option: %s", opt.c_str ());
+ 
+-               if (use_bool)
+-                 retval = new octave_sparse_bool_matrix 
+-                   (SparseBoolMatrix (m, n));
+-               else
+-                 retval = new octave_sparse_matrix (SparseMatrix (m, n));
+-             }
+-           else
+-             {
+-// 
+-//  I use this clumsy construction so that we can use
+-//  any orientation of args
+-               ColumnVector ridxA = ColumnVector (args(0).vector_value 
+-                                              (false, true));
+-               ColumnVector cidxA = ColumnVector (args(1).vector_value 
+-                                                  (false, true));
+-               ColumnVector coefA;
+-               boolNDArray coefAB;
+-               ComplexColumnVector coefAC;
+-               bool assemble_do_sum = true; // this is the default in matlab6
+-
+-               if (use_complex) 
+-                 {
+-                   if (args(2).is_empty ())
+-                     coefAC = ComplexColumnVector (0);
+-                   else
+-                     coefAC = ComplexColumnVector 
+-                       (args(2).complex_vector_value (false, true));
+-                 }
+-               else if (use_bool)
+-                 {
+-                   if (args(2).is_empty ())
+-                     coefAB = boolNDArray (dim_vector (1, 0));
+-                   else
+-                     coefAB = args(2).bool_array_value ();
+-                   dim_vector AB_dims = coefAB.dims ();
+-                   if (AB_dims.length() > 2 || (AB_dims(0) != 1 && 
+-                                                AB_dims(1) != 1))
+-                     error ("sparse: vector arguments required");
+-                 }
+-               else 
+-                 if (args(2).is_empty ())
+-                   coefA = ColumnVector (0);
+-                 else
+-                   coefA = ColumnVector (args(2).vector_value (false, true));
+-
+-               if (error_state)
+-                 return retval;
++           nargin -= 1;
++         }
+ 
+-               // Confirm that i,j,s all have the same number of elements
+-               octave_idx_type ns;
+-               if (use_complex) 
+-                 ns = coefAC.length();
+-               else if (use_bool) 
+-                 ns = coefAB.length();
+-               else 
+-                 ns = coefA.length();
++       if (! error_state)
++         {
++           octave_idx_type m = -1, n = -1;
++           if (nargin == 5)
++             {
++               if (args(3).is_scalar_type () && args(4).is_scalar_type ())
++                 {
++                   m = args(3).idx_type_value ();
++                   n = args(4).idx_type_value ();
++                 }
++               else
++                 error ("sparse: expecting scalar dimensions");
+ 
+-               octave_idx_type ni = ridxA.length();
+-               octave_idx_type nj = cidxA.length();
+-               octave_idx_type nnz = (ni > nj ? ni : nj);
+-               if ((ns != 1 && ns != nnz) ||
+-                   (ni != 1 && ni != nnz) ||
+-                   (nj != 1 && nj != nnz)) 
+-                 {
+-                   error ("sparse i, j and s must have the same length");
+-                   return retval;
+-                 }
+-
+-               if (nargin == 3 || nargin == 4) 
+-                 {
+-                   m = static_cast<octave_idx_type> (ridxA.max());
+-                   n = static_cast<octave_idx_type> (cidxA.max());
+ 
+-                   // if args(3) is not string, then ignore the value
+-                   // otherwise check for summation or unique
+-                   if (nargin == 4 && args(3).is_string())
+-                     {
+-                       std::string vv= args(3).string_value();
+-                       if (error_state) return retval;
+-                       
+-                       if ( vv == "summation" ||
+-                            vv == "sum" ) 
+-                         assemble_do_sum = true;
+-                       else
+-                         if ( vv == "unique" )
+-                           assemble_do_sum = false;
+-                         else {
+-                           error("sparse repeat flag must be 'sum' or 'unique'");
+-                           return retval;
+-                         }
+-                     }
+-                 } 
+-               else 
+-                 {
+-                   m = args(3).int_value();
+-                   n = args(4).int_value();
+-                   if (error_state) 
+-                     return retval;
++               if (! error_state && (m < 0 || n < 0))
++                 error ("sparse: dimensions must be nonnegative");
++             }
++           else if (nargin != 3)
++             print_usage ();
++
++           if (! error_state)
++             {
++               idx_vector i = args(0).index_vector ();
++               idx_vector j = args(1).index_vector ();
+ 
+-                   // if args(5) is not string, then ignore the value
+-                   // otherwise check for summation or unique
+-                   if (nargin >= 6 && args(5).is_string())
+-                     {
+-                       std::string vv= args(5).string_value();
+-                       if (error_state) return retval;
+-                       
+-                       if ( vv == "summation" ||
+-                            vv == "sum" ) 
+-                         assemble_do_sum = true;
+-                       else
+-                         if ( vv == "unique" )
+-                           assemble_do_sum = false;
+-                         else {
+-                           error("sparse repeat flag must be 'sum' or 'unique'");
+-                           return retval;
+-                         }
+-                     }
+-                   
+-                 }
++               if (args(2).is_bool_type ())
++                 retval = SparseBoolMatrix (args(2).bool_array_value (), i, j,
++                                            m, n, summation);
++               else if (args(2).is_complex_type ())
++                 retval = SparseComplexMatrix (args(2).complex_array_value (), i, j,
++                                               m, n, summation);
++               else if (args(2).is_numeric_type ())
++                 retval = SparseMatrix (args(2).array_value (), i, j,
++                                        m, n, summation);
++               else
++                 gripe_wrong_type_arg ("sparse", args(2));
++             }
+ 
+-               // Convert indexing to zero-indexing used internally
+-               ridxA -= 1.;
+-               cidxA -= 1.;
+-
+-               if (use_complex) 
+-                 retval = new octave_sparse_complex_matrix 
+-                   (SparseComplexMatrix (coefAC, ridxA, cidxA, m, n, 
+-                                         assemble_do_sum));
+-               else if (use_bool) 
+-                 retval = new octave_sparse_bool_matrix 
+-                   (SparseBoolMatrix (coefAB, ridxA, cidxA, m, n, 
+-                                      assemble_do_sum));
+-               else
+-                 retval = new octave_sparse_matrix 
+-                   (SparseMatrix (coefA, ridxA, cidxA, m, n, 
+-                                  assemble_do_sum));
+-             }
+          }
+      }
+ 
+    return retval;
+ }

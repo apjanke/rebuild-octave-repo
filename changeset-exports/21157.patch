@@ -1,0 +1,2770 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1453593750 -39600
+#      Sun Jan 24 11:02:30 2016 +1100
+# Node ID 94fc5f13d51bf05bc4b361d41f9ce7d600523d5a
+# Parent  80b69efcd9601d94819439fec9c8df9971df9829
+dbstop: conditional breakpoint, dbstop if caught error etc. (bug #46795)
+
+* debug.cc (parse_dbfunction_params): Accept "in", "at" and "if" tokens.
+  Only breakpoints are returned; "dbstop if error" etc. are processed in
+  the parser.
+
+* debug.cc (dbstop_process_map_ags, Fdbstop): set breakpoints etc. based on the
+  output of A=dbstatus.  The structure of A is not Matlab compatible.
+
+* debug.cc (do_add_breakpoint_1, do_get_breakpoint_list): Store file
+  (not subfunction) names in bp_set, to avoid crash in "dbclear all".
+
+* debug.cc (dbclear_all_signals, condition_valid,
+            stop_on_err_warn_status): New function
+
+* debug.cc (do_add_breakpoint): take "condition" parameter.
+
+* debug.cc (do_get_breakpoint_list): Make invariant copy of bp_set (bug #44195)
+
+* debug.cc (do_add_breakpoint, do_remove_breakpoint,
+            do_remove_all_breakpoints_in_file): More informative error messages.
+
+* debug.cc (Fdbclear): clear break on signals (error, warning etc.)
+
+* debug.cc (Fdbstatus): Return all breakpoints when debugging, so that
+           "s = dbstatus; ...; dbstop (s)" works.
+	   (Related to bug #41338, bug #41556)
+
+* debug.cc (Fdbstatus): Return structure with conditions, and "if error" etc.
+
+* debug.h (debug_on_err, debug_on_caught, debug_on_warn): New functions
+
+* debug.h: Rename "fname_line_map" to "fname_bp_map", as it has conditions
+
+* error.cc (verror): Allow dbstop on selected errors, or errors in try/catch
+
+* error.h New globals: Vdebug_on_caught, in_try_catch.
+
+* toplev.cc: Experimental code for Matlab's "dbstop if naninf".
+
+* symtab.cc (load_class_constructor): Add class constructors to list of
+             methods so they can be breakpointed
+
+* pt-pb.{cc,h} (take_action): Add "condition" to set_breakpoint call,
+                              track bp_cond_list.
+
+* pt-eval.cc visit_.*_command: Ask if breakpoint condition is satisfied.
+
+* pt-eval.cc (visit_try_catch_command): Count the number of levels of
+             try/catch we are in to allow "dbstop if caught error".
+
+* pt-stmt.cc (set_breakpoint): Pass condition
+
+* pt-stmt.cc (is_breakpoint): If new argument is true, only return true
+			      if the condition is set.
+
+* pt-stmt.cc (bp_cond, preakpoints_and_conds): new function
+
+* pt-stmt.h: new declarations
+
+* pt.{cc,h} (meets_bp_condition, bp_cond): New function
+
+* octave-link.h (update_breakpoint): Accept condition
+
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -48,27 +48,34 @@ along with Octave; see the file COPYING.
+ #include "octave-preserve-stream-state.h"
+ #include "ov.h"
+ #include "ov-usr-fcn.h"
+ #include "ov-fcn.h"
+ #include "ov-struct.h"
+ #include "pt-pr-code.h"
+ #include "pt-bp.h"
+ #include "pt-eval.h"
++#include "pt-exp.h"
+ #include "pt-stmt.h"
++#include "sighandlers.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ #include "debug.h"
+ 
+ // Initialize the singleton object
+ bp_table *bp_table::instance = 0;
+ 
++std::set<std::string> bp_table::errors_that_stop;
++std::set<std::string> bp_table::caught_that_stop;
++std::set<std::string> bp_table::warnings_that_stop;
++
++// Read entire file called  fname  and return the contents as a string
+ static std::string
+ snarf_file (const std::string& fname)
+ {
+   std::string retval;
+ 
+   file_stat fs (fname);
+ 
+   if (fs)
+@@ -186,83 +193,255 @@ get_user_code (const std::string& fname 
+ 
+       if (fcn.is_defined () && fcn.is_user_code ())
+         dbg_fcn = fcn.user_code_value ();
+     }
+ 
+   return dbg_fcn;
+ }
+ 
+-static void
++#ifdef DBSTOP_NANINF
++#include "sigfpe.cc"
++#endif
++
++enum
++dbstop_args {dbstop_in, dbstop_at, dbstop_if, dbstop_none};
++
++// Parse parameters (args) of dbstop and dbclear commands.
++// For dbstop, who=="dbstop"; for dbclear, who=="dbclear".
++// The syntax is  dbstop [[in] symbol] [[at] line [line [...]]] [if condition]
++// where the form of condition depends on whether or not a file or line has
++// been seen.
++// Also execute "if [error|warning|interrupt|naninf]" clauses
++void
+ parse_dbfunction_params (const char *who, const octave_value_list& args,
+-                         std::string& symbol_name, bp_table::intmap& lines)
++                         std::string& symbol_name, bp_table::intmap& lines,
++                         std::string& cond)
+ {
+-  int idx = 0;
++  int nargin = args.length ();
+   int list_idx = 0;
+   symbol_name = "";
+   lines = bp_table::intmap ();
+ 
+-  if (args.length () == 0)
+-    return;
+-
+-  if (args(0).is_string ())
++  if (nargin == 0 || !args(0).is_string ())
++    print_usage (who);
++                                // elements already processed
++  bool seen_in = false, seen_at = false, seen_if = false;
++  int pos = 0;
++  dbstop_args token = dbstop_none;
++  while (pos < nargin)
+     {
+-      // string could be function name or line number
+-      int isint = atoi (args(0).string_value ().c_str ());
+-
+-      if (isint == 0)
++            // allow "in" and "at" to be implicit
++      if (args(pos).is_string ())
+         {
+-          // It was a function name
+-          symbol_name = args(0).string_value ();
+-
+-          idx = 1;
++          std::string arg = args(pos).string_value ();
++          if (arg == "in")
++            {
++              token = dbstop_in;
++              pos++;
++            }
++          else if (arg == "at")
++            {
++              token = dbstop_at;
++              pos++;
++            }
++          else if (arg == "if")
++            {
++              token = dbstop_if;
++              pos++;
++            }
++          else if (atoi (args(pos).string_value ().c_str ()) > 0)
++            token = dbstop_at;
++          else
++            token = dbstop_in;
+         }
+       else
++        token = dbstop_at;
++
++      if (pos >= nargin)
++        error ("%s: '%s' missing argument", who,
++               ( token == dbstop_in ? "in" :
++                (token == dbstop_at ? "at" : "if")));
++
++            // process the actual arguments
++      switch (token)
+         {
+-          // It was a line number.  Need to get function name from debugger.
+-          if (! Vdebugging)
+-            error ("%s: no function specified", who);
++          case dbstop_in:
++            symbol_name = args(pos).string_value ();
++            if (seen_in)
++              error ("%s: Too many function names specified -- %s",
++                     who, symbol_name.c_str ());
++            else if (seen_at || seen_if)
++              error ("%s: function name must come before line number and 'if'",
++                     who);
++            seen_in = true;
++            pos++;
++            break;
++
++          case dbstop_at:
++            if (seen_at)
++              error ("%s: Only one 'at' clause is allowed -- %s",
++                     who, args(pos).string_value ().c_str ());
++            else if (seen_if)
++                error ("%s: line number must come before 'if' clause\n");
++            seen_at = true;
+ 
+-          symbol_name = get_user_code ()->name ();
+-          idx = 0;
+-        }
+-    }
+-  else if (args(0).is_map ())
+-    {
+-      // This is a problem because parse_dbfunction_params()
+-      // can only pass out a single function.
+-      error ("%s: struct input not implemented", who);
+-    }
+-  else
+-    error ("%s: invalid parameter specified", who);
++            if (!seen_in)
++              {
++                // It was a line number. Get function name from debugger.
++                if (Vdebugging)
++                  //symbol_name = get_user_code ()->name ();
++                  symbol_name = get_user_code ()->fcn_file_name ();
++                else
++                  error ("%s: function name must come before line number "
++                         "and 'if'", who);
++                seen_in = true;
++              }
++            else if (seen_if)
++              error ("%s: line number must come before 'if' clause\n");
++
++              // Read a list of line numbers (or arrays thereof)
++            for ( ; pos < nargin; pos++)
++              {
++                if (args(pos).is_string ())
++                  {
++                    int line = atoi (args(pos).string_value ().c_str ());
++
++                    if (line > 0)
++                      lines[list_idx++] = line;
++                    else
++                      break;        // may be "if"
++                  }
++                else if (args(pos).is_numeric_type ())
++                  {
++                    const NDArray arg = args(pos).array_value ();
++
++                    for (octave_idx_type j = 0; j < arg.numel (); j++)
++                      lines[list_idx++] = static_cast<int> (arg.elem (j));
++                  }
++                else
++                  error ("%s: Invalid argument type %s",
++                         args(pos).type_name ().c_str ());
++              }
++            break;
++
++          case dbstop_if:
++            if (seen_in)    // conditional breakpoint
++              {
++                cond = "";  // remaining arguments form condition
++                for (; pos < nargin; pos++)
++                  {
++                    if (args(pos).is_string ())
++                      cond = cond + " " + args(pos).string_value ();
++                    else
++                      error ("%s: arguments to 'if' must all be strings", who);
++                  }
+ 
+-  for (int i = idx; i < args.length (); i++)
+-    {
+-      if (args(i).is_string ())
+-        {
+-          int line = atoi (args(i).string_value ().c_str ());
++                cond = cond.substr (1);   // omit initial space
++              }
++            else    // stop on event (error, warning, interrupt, NaN/inf)
++              {
++                std::string condition = args(pos).string_value ();
++                int on_off = !strcmp(who, "dbstop");
++
++                                // list of error/warning IDs to update
++                std::set<std::string> *id_list = NULL;
++                bool *stop_flag = NULL;         // Vdebug_on_... flag
+ 
+-          lines[list_idx++] = line;
+-        }
+-      else if (args(i).is_map ())
+-        octave_stdout << who << ": skipping struct input" << std::endl;
+-      else
+-        {
+-          const NDArray arg = args(i).array_value ();
++                if (condition == "error")
++                  {
++                    id_list = &bp_table::errors_that_stop;
++                    stop_flag = &Vdebug_on_error;
++                  }
++                else if (condition == "warning")
++                  {
++                    id_list = &bp_table::warnings_that_stop;
++                    stop_flag = &Vdebug_on_warning;
++                  }
++                else if (condition == "caught" && nargin > pos+1
++                         && args(pos+1).string_value () == "error")
++                  {
++                    id_list = &bp_table::caught_that_stop;
++                    stop_flag = &Vdebug_on_caught;
++                    pos++;
++                  }
++                else if (condition == "interrupt")
++                  {
++                    Vdebug_on_interrupt = on_off;
++                  }
++                else if (condition == "naninf")
++#ifdef DBSTOP_NANINF
++                  {
++                    Vdebug_on_naninf = on_off;
++                    enable_fpe (on_off);
++                  }
++#else
++                  warning ("%s: condition '%s' not yet supported",
++                           who, condition.c_str ());
++#endif
++                else
++                  error ("%s: invalid condition %s",
++                         who, condition.c_str ());
+ 
+-          for (octave_idx_type j = 0; j < arg.numel (); j++)
+-            {
+-              int line = static_cast<int> (arg.elem (j));
++                // process ID list for  "dbstop if error <error_ID>" etc
++                if (id_list != NULL)
++                  {
++                    pos++;
++                    if (pos < nargin)       // only affect a single error ID
++                      {
++                        if (!args(pos).is_string () || nargin > pos+1)
++                          error ("%s: ID must be a single string", who);
++                        else if (on_off == 1)
++                          {
++                            id_list->insert (args(pos).string_value ());
++                            *stop_flag = 1;
++                          }
++                        else
++                          {
++                            id_list->erase (args(pos).string_value ());
++                            if (id_list->empty ())
++                              *stop_flag = 0;
++                          }
++                      }
++                    else  // unqualified.  Turn all on or off
++                      {
++                        id_list->clear ();
++                        *stop_flag = on_off;
++                        if (stop_flag == &Vdebug_on_error)
++                          Vdebug_on_interrupt = on_off; // Matlabs stops on both
++                      }
++                  }
+ 
+-              lines[list_idx++] = line;
+-            }
++                pos = nargin;
++              }
++            break;
++
++          default:      // dbstop_none should never occur
++            break;
+         }
+     }
+ }
+ 
++/*
++%!test
++%! dbstop help;
++%! dbstop in ls;
++%! dbstop help at 100;
++%! dbstop in ls 100;
++%! dbstop help 200 if a==5;
++%! dbstop if error Octave:undefined-function
++%! s = dbstatus;
++%! dbclear all
++%! assert ({s.bkpt(:).name}, {"help", "help", "help>do_contents", "ls", "ls"});
++%! assert ([s.bkpt(:).line], [48, 100, 200, 58, 100]);
++%! assert (s.errs, {"Octave:undefined-function"});
++*/
++
++// Return  true  if there is a valid breakpoint table, false otherwise.
++// If not table exists, one is created; false is only returned if this fails
+ bool
+ bp_table::instance_ok (void)
+ {
+   if (! instance)
+     {
+       instance = new bp_table ();
+ 
+       if (instance)
+@@ -270,58 +449,214 @@ bp_table::instance_ok (void)
+     }
+ 
+   if (! instance)
+     error ("unable to create breakpoint table!");
+ 
+   return true;
+ }
+ 
++// Clear all reasons to stop, other than breakpoints
++void
++bp_table::dbclear_all_signals (void)
++{
++  Vdebug_on_error   = false;  bp_table::errors_that_stop.clear ();
++  Vdebug_on_caught  = false;  bp_table::caught_that_stop.clear ();
++  Vdebug_on_warning = false;  bp_table::warnings_that_stop.clear ();
++  Vdebug_on_interrupt = false;
++}
++
++// Process the "warn", "errs", "caught" and "intr" fields for a call of
++// "dbstop (p)".
++void
++bp_table::dbstop_process_map_args (const octave_map& mv)
++{
++  // process errs
++                                // why so many levels of indirection needed?
++  bool fail = false;
++  Cell U = mv.contents ("errs");
++  if (U.numel () != 1)
++    fail = (U.numel () > 1);
++  else
++    {
++      Array<octave_value> W = U.index (0);
++      if (W.numel () == 0 || W(0).length () == 0)
++        Vdebug_on_error = 1;    // like "dbstop if error" with no identifier
++      else if (!W(0).is_cell ())
++        fail = true;
++      else
++        {
++          Cell V = W(0).cell_value ();
++          for (int i = 0; i < V.numel (); i++)
++            {
++              errors_that_stop.insert (V(i).string_value ());
++              Vdebug_on_error = 1;
++            }
++        }
++    }
++  if (fail)
++    error ("dbstop: invalid 'errs' field");
++
++  // process caught
++                                // why so many levels of indirection needed?
++  fail = false;
++  U = mv.contents ("caught");
++  if (U.numel () != 1)
++    fail = (U.numel () > 1);
++  else
++    {
++      Array<octave_value> W = U.index (0);
++      if (W.numel () == 0 || W(0).length () == 0)
++        Vdebug_on_caught = 1;    // like "dbstop if caught error" with no ID
++      else if (!W(0).is_cell ())
++        fail = true;
++      else
++        {
++          Cell V = W(0).cell_value ();
++          for (int i = 0; i < V.numel (); i++)
++            {
++              caught_that_stop.insert (V(i).string_value ());
++              Vdebug_on_caught = 1;
++            }
++        }
++    }
++  if (fail)
++    error ("dbstop: invalid 'caught' field");
++
++  // process warn
++                                // why so many levels of indirection needed?
++  fail = false;
++  U = mv.contents ("warn");
++  if (U.numel () != 1)
++    fail = (U.numel () > 1);
++  else
++    {
++      Array<octave_value> W = U.index (0);
++      if (W.numel () == 0 || W(0).length () == 0)
++        Vdebug_on_warning = 1;    // like "dbstop if warning" with no identifier
++      else if (!W(0).is_cell ())
++        fail = true;
++      else
++        {
++          Cell V = W(0).cell_value ();
++          for (int i = 0; i < V.numel (); i++)
++            {
++              warnings_that_stop.insert (V(i).string_value ());
++              Vdebug_on_warning = 1;
++            }
++        }
++    }
++  if (fail)
++    error ("dbstop: invalid 'warn' field");
++
++  // process interrupt
++  if (mv.isfield ("intr"))
++    Vdebug_on_interrupt = 1;
++}
++
++
++// Insert a breakpoint in function  fcn  at  line  within file  fname,
++// to stop only when  condition  is true.
++// Record in  bp_set  that  fname  contains a breakpoint.
+ bool
+ bp_table::do_add_breakpoint_1 (octave_user_code *fcn,
+                                const std::string& fname,
+                                const bp_table::intmap& line,
++                               const std::string& condition,
+                                bp_table::intmap& retval)
+ {
+   bool found = false;
+ 
+   tree_statement_list *cmds = fcn->body ();
+ 
+   std::string file = fcn->fcn_file_name ();
+ 
+   if (cmds)
+     {
+-      retval = cmds->add_breakpoint (file, line);
++      retval = cmds->add_breakpoint (file, line, condition);
+ 
+       for (intmap_iterator p = retval.begin (); p != retval.end (); p++)
+         {
+           if (p->second != 0)
+             {
+-              bp_set.insert (fname);
++              // normalise to store only the file name.
++              // otherwise, there can be an entry for both file>subfunction and
++              // file, which causes a crash on  dbclear all
++              const char *s = strchr (fname.c_str (), '>');
++              if (s)
++                bp_set.insert (fname.substr (0, s - fname.c_str ()));
++              else
++                bp_set.insert (fname);
+               found = true;
+               break;
+             }
+         }
+     }
+ 
+   return found;
+ }
+ 
++// Cursory check that  cond  is a valid condition to use for a breakpoint
++// Currently allows conditions with side-effects, like 'y+=10' and 'y++';
++// it is odd that the former is not flagged by "is_assignment_expression".
++// Throws an exception if not valid.
++static bool
++condition_valid (const std::string& cond)
++{
++  if (cond.length () > 0)
++    {
++      octave_parser parser (cond + " ;"); // ; to reject partial expr like "y=="
++      parser.reset ();
++      int parse_status = parser.run ();
++      if (parse_status)
++        error ("dbstop: Cannot parse condition '%s'", cond.c_str ());
++      else
++        {
++          tree_statement *stmt = 0;
++          if (!parser.stmt_list)
++            error ("dbstop: "
++                   "condition is not empty, but has nothing to evaluate");
++          else
++            {
++              if (parser.stmt_list->length () == 1
++                  && (stmt = parser.stmt_list->front ())
++                  && stmt->is_expression ())
++                {
++                  tree_expression *expr = stmt->expression ();
++                  if (expr->is_assignment_expression ())
++                    error ("dbstop: condition cannot be an assignment.  "
++                           "Did you mean '=='?");
++                }
++              else
++                error ("dbstop: condition must be an expression");
++            }
++        }
++    }
++  return true;
++}
++
++// Given file name  fname,  find the subfunction at line  line  and create
++// a breakpoint there.  Put the system into debug_mode.
++// (FIXME: If  line  is multiple lines, what happens if they are in different
++//         functions?)
+ bp_table::intmap
+ bp_table::do_add_breakpoint (const std::string& fname,
+-                             const bp_table::intmap& line)
++                             const bp_table::intmap& line,
++                             const std::string& condition)
+ {
+   octave_user_code *dbg_fcn = get_user_code (fname);
+ 
+   if (! dbg_fcn)
+-    error ("add_breakpoint: unable to find the requested function\n");
++    error ("add_breakpoint: unable to find function '%s'\n", fname.c_str ());
++
++  condition_valid (condition);  // throws error if condition not valid
+ 
+   intmap retval;
+ 
+-  if (! do_add_breakpoint_1 (dbg_fcn, fname, line, retval))
++  if (! do_add_breakpoint_1 (dbg_fcn, fname, line, condition, retval))
+     {
+       // Search subfunctions in the order they appear in the file.
+ 
+       const std::list<std::string> subfcn_names
+         = dbg_fcn->subfunction_names ();
+ 
+       std::map<std::string, octave_value> subfcns
+         = dbg_fcn->subfunctions ();
+@@ -331,18 +666,19 @@ bp_table::do_add_breakpoint (const std::
+         {
+           std::map<std::string, octave_value>::const_iterator
+             q = subfcns.find (*p);
+ 
+           if (q != subfcns.end ())
+             {
+               octave_user_code *dbg_subfcn = q->second.user_code_value ();
+ 
+-              if (do_add_breakpoint_1 (dbg_subfcn, fname, line, retval))
+-                break;
++              if (do_add_breakpoint_1 (dbg_subfcn, fname, line, condition,
++                                       retval))
++              break;
+             }
+         }
+     }
+ 
+   tree_evaluator::debug_mode = bp_table::have_breakpoints () || Vdebugging;
+ 
+   return retval;
+ }
+@@ -409,17 +745,18 @@ bp_table::do_remove_breakpoint (const st
+       intmap results = remove_all_breakpoints_in_file (fname);
+       retval = results.size ();
+     }
+   else
+     {
+       octave_user_code *dbg_fcn = get_user_code (fname);
+ 
+       if (! dbg_fcn)
+-        error ("remove_breakpoint: unable to find the requested function\n");
++        error ("remove_breakpoint: unable to find function %s\n",
++               fname.c_str ());
+ 
+       retval = do_remove_breakpoint_1 (dbg_fcn, fname, line);
+ 
+       // Search subfunctions in the order they appear in the file.
+ 
+       const std::list<std::string> subfcn_names
+         = dbg_fcn->subfunction_names ();
+ 
+@@ -467,17 +804,17 @@ bp_table::do_remove_all_breakpoints_in_f
+ 
+           bp_set_iterator it = bp_set.find (fname);
+           if (it != bp_set.end ())
+             bp_set.erase (it);
+         }
+     }
+   else if (! silent)
+     error ("remove_all_breakpoint_in_file: "
+-           "unable to find the requested function\n");
++           "unable to find function %s\n", fname.c_str ());
+ 
+   tree_evaluator::debug_mode = bp_table::have_breakpoints () || Vdebugging;
+ 
+   return retval;
+ }
+ 
+ void
+ bp_table::do_remove_all_breakpoints (void)
+@@ -506,20 +843,20 @@ do_find_bkpt_list (octave_value_list sli
+           retval = slist(i).string_value ();
+           break;
+         }
+     }
+ 
+   return retval;
+ }
+ 
+-bp_table::fname_line_map
++bp_table::fname_bp_map
+ bp_table::do_get_breakpoint_list (const octave_value_list& fname_list)
+ {
+-  fname_line_map retval;
++  fname_bp_map retval;
+ 
+   // make copy since changes may invalidate iters of bp_set.
+   std::set<std::string> tmp_bp_set = bp_set;
+ 
+   for (bp_set_iterator it = tmp_bp_set.begin (); it != tmp_bp_set.end (); it++)
+     {
+       if (fname_list.length () == 0
+           || do_find_bkpt_list (fname_list, *it) != "")
+@@ -529,29 +866,54 @@ bp_table::do_get_breakpoint_list (const 
+           if (f)
+             {
+               tree_statement_list *cmds = f->body ();
+ 
+               // FIXME: move the operation on cmds to the
+               //        tree_statement_list class?
+               if (cmds)
+                 {
+-                  octave_value_list bkpts = cmds->list_breakpoints ();
+-                  octave_idx_type len = bkpts.length ();
++                  std::list<bp_type> bkpts = cmds->breakpoints_and_conds ();
+ 
+-                  if (len > 0)
++                  if (!bkpts.empty ())
+                     {
+-                      bp_table::intmap bkpts_vec;
++                      if (f->name () == *it)
++                        retval[f->name ()] = bkpts;
++                      else
++                        retval[*it + ">" + f->name ()] = bkpts;
++                    }
++                }
++
++              // look for breakpoints in subfunctions
++              const std::list<std::string> subf_nm = f->subfunction_names ();
++
++              std::map<std::string, octave_value> subf = f->subfunctions ();
+ 
+-                      for (int i = 0; i < len; i++)
+-                        bkpts_vec[i] = bkpts(i).double_value ();
++              for (std::list<std::string>::const_iterator p = subf_nm.begin ();
++                   p != subf_nm.end (); p++)
++                {
++                  std::map<std::string, octave_value>::const_iterator
++                    q = subf.find (*p);
++
++                  if (q != subf.end ())
++                    {
++                      octave_user_code *ff = q->second.user_code_value ();
+ 
+-                      std::string symbol_name = f->name ();
++                      cmds = ff->body ();
++                      if (cmds)
++                        {
++                          std::list<bp_type> bkpts
++                                             = cmds->breakpoints_and_conds ();
+ 
+-                      retval[symbol_name] = bkpts_vec;
++                          if (!bkpts.empty ())
++                            {
++                              std::string name = f->name () + ">" + ff->name ();
++                              retval[name] = bkpts;
++                            }
++                        }
+                     }
+                 }
+             }
+         }
+     }
+ 
+   return retval;
+ }
+@@ -576,70 +938,178 @@ intmap_to_ov (const bp_table::intmap& li
+ 
+   retval.resize (dim_vector (1, idx));
+ 
+   return retval;
+ }
+ 
+ DEFUN (dbstop, args, ,
+        "-*- texinfo -*-\n\
+-@deftypefn  {} {} dbstop @var{func}\n\
+-@deftypefnx {} {} dbstop @var{func} @var{line}\n\
+-@deftypefnx {} {} dbstop @var{func} @var{line1} @var{line2} @dots{}\n\
+-@deftypefnx {} {} dbstop @var{line} @dots{}\n\
+-@deftypefnx {} {@var{rline} =} dbstop (\"@var{func}\")\n\
+-@deftypefnx {} {@var{rline} =} dbstop (\"@var{func}\", @var{line})\n\
+-@deftypefnx {} {@var{rline} =} dbstop (\"@var{func}\", @var{line1}, @var{line2}, @dots{})\n\
+-@deftypefnx {} {} dbstop (\"@var{func}\", [@var{line1}, @dots{}])\n\
+-@deftypefnx {} {} dbstop (@var{line}, @dots{})\n\
+-Set a breakpoint at line number @var{line} in function @var{func}.\n\
++@deftypefn  {} {} dbstop in @var{func}\n\
++@deftypefnx {} {} dbstop in @var{func} at @var{line}\n\
++@deftypefnx {} {} dbstop in @var{func} at @var{line} if '@var{condition}'\n\
++@deftypefnx {} {} dbstop if @var{event}\n\
++@deftypefnx {} {} dbstop (@var{state})\n\
+ \n\
+-Arguments are\n\
++The argument @var{func} is the name of a function on the current path.\n\
++The argument @var{line} is the line number at which to break.\n\
++If @code{file.m} has a sub-function @code{func2}, then a breakpoint in\n\
++@code{func2} can be specified by specifying @var{func} either as @code{file}\n\
++or @code{file>func2}.  In either case, @var{line} is specified relative to\n\
++the start of @code{file.m}.  If @var{line} is not specified, it defaults to\n\
++the first line in @var{func}.  Multiple lines can be specified in a single\n\
++command; when function syntax is used, the lines may be passed as a single\n\
++vector argument.\n\
+ \n\
+-@table @var\n\
+-@item func\n\
+-Function name as a string variable.  When already in debug mode this argument\n\
++When already in debug mode the @var{func} argument\n\
+ can be omitted and the current function will be used.\n\
+ \n\
+-@item line\n\
+-Line number where the breakpoint should be set.  Multiple lines may be given\n\
+-as separate arguments or as a vector.\n\
++The @var{condition} is any Octave expression that will be able to be\n\
++evaluated in the context of the breakpoint.  When the breakpoint is\n\
++encountered, @var{condition} will be evaluated, and execution will break if\n\
++@var{condition} is true.  If it cannot be evaluated, for example because it\n\
++refers to an undefined variable, an error will be thrown.  Expressions with\n\
++side effects (such as @code{y++ > 1}) actually alter the variables, and \n\
++should generally be avoided.\n\
++Conditions containing quotes (\", ') or comment characters (#, %) should be\n\
++enclosed in quotes.  (This does not apply to conditions entered from the\n\
++the editor's context menu.)\n\
++For example,\n\
++@example\n\
++dbstop in strread at 209 if 'any(format == \"%f\")'\n\
++@end example\n\
++\n\
++The form specifying @var{event} does not cause a fixed breakpoint.  Instead\n\
++it causes debug mode to be entered when specific unexpected circumstances\n\
++arise.  Possible values are\n\
++\n\
++@table @asis\n\
++@item @qcode{error}\n\
++Stop whenever an error is reported.  This is equivalent to specifying\n\
++both @code{debug_on_error(1)} and @code{debug_on_interrupt(1)}.\n\
++@item @qcode{caught error}\n\
++Stop whenever an error is caught by a try-catch block\n\
++@item @qcode{interrupt}\n\
++Stop when an interrupt (ctrl-C) occurs.\n\
++@item @qcode{warning}\n\
++Stop whenever a warning is reported.  This is equivalent to specifying\n\
++@code{debug_on_warning(1)}.\n\
+ @end table\n\
++Error, caught error and warning can all be followed by a string specifying\n\
++an error ID or warning ID.  If that is done, only errors with the\n\
++specified ID will cause execution to stop.  To stop on one of a set of\n\
++IDs, multiple @qcode{dbstop} commands must be issued.\n\
+ \n\
+-When called with a single argument @var{func}, the breakpoint is set at the\n\
+-first executable line in the named function.\n\
++Values @qcode{naninf} and @qcode{caught error} give a warning that these\n\
++are not yet implemented, and other options give an error.\n\
++\n\
++These settings can be undone using @qcode{dbclear} commands with the same\n\
++syntax.\n\
++\n\
++It is possible to save all breakpoints and restore them at once by issuing\n\
++the commands @code{state = dbstatus; ...  dbstop (state)}.\n\
+ \n\
+ The optional output @var{rline} is the real line number where the breakpoint\n\
+ was set.  This can differ from the specified line if the line is not\n\
+ executable.  For example, if a breakpoint attempted on a blank line then\n\
+ Octave will set the real breakpoint at the next executable line.\n\
++\n\
++When a file is re-parsed, such as when it is modified outside the GUI,\n\
++all breakpoints within that file are cleared.\n\
++\n\
+ @seealso{dbclear, dbstatus, dbstep, debug_on_error, debug_on_warning, debug_on_interrupt}\n\
+ @end deftypefn")
+ {
+-  bp_table::intmap retval;
+-  std::string symbol_name;
++  bp_table::intmap retmap;
++  std::string symbol_name = ""; // stays empty for "dbstop if error" etc
+   bp_table::intmap lines;
++  std::string condition = "";
++  octave_value retval;
+ 
+-  parse_dbfunction_params ("dbstop", args, symbol_name, lines);
++  if (args.length() >= 1 && !args(0).is_map ())
++    {       // explicit function / line / condition
++      parse_dbfunction_params ("dbstop", args, symbol_name, lines, condition);
++
++      if (lines.size () == 0)
++        lines[0] = 1;
++
++      if (symbol_name != "")
++        {
++          retmap = bp_table::add_breakpoint (symbol_name, lines, condition);
++          retval = intmap_to_ov (retmap);
++        }
++    }
++  else if (args.length () != 1)
++    {
++      print_usage ();
++    }
++  else // structure of the form output by dbstatus
++    {
++      octave_map mv = args(0).map_value ();
++      if (mv.isfield ("bkpt") || mv.isfield ("errs") || mv.isfield ("warn")
++          || mv.isfield ("intr"))
++        {
++          bp_table::dbstop_process_map_args (mv);
+ 
+-  if (lines.size () == 0)
+-    lines[0] = 1;
++          // Replace mv by "bkpt", to use the processing below.
++          octave_value bkpt = mv.getfield ("bkpt");
++          if (bkpt.is_empty ())
++            mv = octave_map ();
++          else
++            {
++              if (bkpt.is_cell () && bkpt.cell_value ().numel () > 0
++                  && bkpt.cell_value () (0).is_map ())
++                mv = bkpt.cell_value () (0).map_value ();
++              else
++                {
++                  error ("dbstop: invalid 'bkpt' field");
++                  mv = octave_map ();
++                }
++            }
++        }
++      if (mv.numel () == 0)
++        {
++          // no changes requested.  Occurs if "errs" non-empty but "bkpt" empty
++        }
++      else if (!mv.isfield ("name") || !mv.isfield ("line"))
++        {
++          error ("dbstop: Cell array must contain fields 'name' and 'line'");
++          retval = octave_value (0);
++        }
++      else
++        {
++          bool use_cond = mv.isfield ("cond");
++          Cell name = mv.getfield ("name");
++          Cell line = mv.getfield ("line");
++          Cell cond = (use_cond ? mv.getfield ("cond") : Cell ());
++          std::string unconditional = "";
++          for (octave_idx_type i = 0; i < line.numel (); i++)
++            {
++              lines [0] = line(i).double_value ();
++              bp_table::add_breakpoint (name(i).string_value (), lines,
++                                        use_cond ? cond(i).string_value ()
++                                                 : unconditional );
++            }
++          retval = octave_value (line.numel ());
++        }
++    }
+ 
+-  retval = bp_table::add_breakpoint (symbol_name, lines);
+-
+-  return intmap_to_ov (retval);
++  return retval;
+ }
+ 
+ DEFUN (dbclear, args, ,
+        "-*- texinfo -*-\n\
+ @deftypefn  {} {} dbclear @var{func}\n\
+ @deftypefnx {} {} dbclear @var{func} @var{line}\n\
+ @deftypefnx {} {} dbclear @var{func} @var{line1} @var{line2} @dots{}\n\
+ @deftypefnx {} {} dbclear @var{line} @dots{}\n\
+ @deftypefnx {} {} dbclear all\n\
++@deftypefnx {} {} dbclear in @var{func}\n\
++@deftypefnx {} {} dbclear in @var{func} at @var{line}\n\
++@deftypefnx {} {} dbclear if @var{event}\n\
+ @deftypefnx {} {} dbclear (\"@var{func}\")\n\
+ @deftypefnx {} {} dbclear (\"@var{func}\", @var{line})\n\
+ @deftypefnx {} {} dbclear (\"@var{func}\", @var{line1}, @var{line2}, @dots{})\n\
+ @deftypefnx {} {} dbclear (\"@var{func}\", [@var{line1}, @dots{}])\n\
+ @deftypefnx {} {} dbclear (@var{line}, @dots{})\n\
+ @deftypefnx {} {} dbclear (\"all\")\n\
+ Delete a breakpoint at line number @var{line} in the function @var{func}.\n\
+ \n\
+@@ -648,166 +1118,369 @@ Arguments are\n\
+ @table @var\n\
+ @item func\n\
+ Function name as a string variable.  When already in debug mode this argument\n\
+ can be omitted and the current function will be used.\n\
+ \n\
+ @item line\n\
+ Line number from which to remove a breakpoint.  Multiple lines may be given\n\
+ as separate arguments or as a vector.\n\
++@item event\n\
++An even such as error, interrupt or warning; see dbstop for details.\n\
+ @end table\n\
+ \n\
+ When called without a line number specification all breakpoints in the named\n\
+ function are cleared.\n\
+ \n\
+ If the requested line is not a breakpoint no action is performed.\n\
+ \n\
+ The special keyword @qcode{\"all\"} will clear all breakpoints from all\n\
+ files.\n\
+ @seealso{dbstop, dbstatus, dbwhere}\n\
+ @end deftypefn")
+ {
+-  std::string symbol_name = "";
++  std::string symbol_name = ""; // stays empty for "dbclear if error" etc
+   bp_table::intmap lines;
++  std::string dummy;            // "if" condition -- only used for dbstop
+ 
+-  parse_dbfunction_params ("dbclear", args, symbol_name, lines);
++  int nargin = args.length ();
++
++  parse_dbfunction_params ("dbclear", args, symbol_name, lines, dummy);
+ 
+-  if (args.length () == 1 && symbol_name == "all")
+-    bp_table::remove_all_breakpoints ();
++  if (nargin == 1 && symbol_name == "all")
++    {
++      bp_table::remove_all_breakpoints ();
++      bp_table::dbclear_all_signals ();
++    }
+   else
+-    bp_table::remove_breakpoint (symbol_name, lines);
++    {
++      if (symbol_name != "")
++        bp_table::remove_breakpoint (symbol_name, lines);
++    }
+ 
+   return ovl ();
+ }
+ 
++// Report the status of "dbstop if error ..." and "dbstop if warning ..."
++// If to_screen is true, the output goes to  octave_stdout; otherwise it is
++// returned.
++// If dbstop if error is true but no explicit IDs are specified, the return
++// value will have an empty field called "errs".  If IDs are specified, the
++// "errs" field will have a row per ID.  If dbstop if error is false, there
++// is no "errs" field.  The "warn" field is set similarly by dbstop if warning
++octave_map
++bp_table::stop_on_err_warn_status (bool to_screen)
++{
++  octave_map retval;
++
++  // print dbstop if error  information
++  if (Vdebug_on_error)
++    {
++      if (errors_that_stop.empty ())
++        {
++          if (to_screen)
++            octave_stdout << "stop if error\n";
++          else
++            retval.assign ("errs", octave_value(""));
++        }
++      else
++        {
++          Cell errs (dim_vector (bp_table::errors_that_stop.size (), 1));
++          int i = 0;
++
++          for (std::set<std::string>::const_iterator e
++                                  = errors_that_stop.begin ();
++               e != errors_that_stop.end (); e++)
++            {
++              if (to_screen)
++                octave_stdout << "stop if error " << *e << "\n";
++              else
++                errs (i++) = *e;
++            }
++          if (!to_screen)
++            retval.assign ("errs", octave_value (errs));
++        }
++    }
++
++  // print  dbstop if caught error  information
++  if (Vdebug_on_caught)
++    {
++      if (caught_that_stop.empty ())
++        {
++          if (to_screen)
++            octave_stdout << "stop if caught error\n";
++          else
++            retval.assign ("caught", octave_value(""));
++        }
++      else
++        {
++          Cell errs (dim_vector (caught_that_stop.size (), 1));
++          int i = 0;
++
++          for (std::set<std::string>::const_iterator e
++                                  = caught_that_stop.begin ();
++               e != caught_that_stop.end (); e++)
++            {
++              if (to_screen)
++                octave_stdout << "stop if caught error " << *e << "\n";
++              else
++                errs (i++) = *e;
++            }
++          if (!to_screen)
++            retval.assign ("caught", octave_value (errs));
++        }
++    }
++
++  // print dbstop if warning  information
++  if (Vdebug_on_warning)
++    {
++      if (warnings_that_stop.empty ())
++        {
++          if (to_screen)
++            octave_stdout << "stop if warning\n";
++          else
++            retval.assign ("warn", octave_value(""));
++        }
++      else
++        {
++          Cell warn (dim_vector (warnings_that_stop.size (), 1));
++          int i = 0;
++
++          for (std::set<std::string>::const_iterator w
++                                  = warnings_that_stop.begin ();
++               w != warnings_that_stop.end (); w++)
++            {
++              if (to_screen)
++                octave_stdout << "stop if warning " << *w << "\n";
++              else
++                warn (i++) = *w;
++            }
++          if (!to_screen)
++            retval.assign ("warn", octave_value (warn));
++        }
++    }
++
++  // print  dbstop if interrupt  information
++  if (Vdebug_on_interrupt)
++    {
++      if (to_screen)
++        octave_stdout << "stop if interrupt\n";
++      else
++        retval.assign ("intr", octave_value ());
++    }
++
++  return retval;
++}
++
+ DEFUN (dbstatus, args, nargout,
+        "-*- texinfo -*-\n\
+ @deftypefn  {} {} dbstatus ()\n\
+ @deftypefnx {} {@var{brk_list} =} dbstatus ()\n\
+ @deftypefnx {} {@var{brk_list} =} dbstatus (\"@var{func}\")\n\
+ Report the location of active breakpoints.\n\
+ \n\
+ When called with no input or output arguments, print the list of all\n\
+ functions with breakpoints and the line numbers where those breakpoints are\n\
+ set.\n\
+ \n\
+ If a function name @var{func} is specified then only report breakpoints\n\
+-for the named function.\n\
++for the named function, and its sub-functions.\n\
+ \n\
+ The optional return argument @var{brk_list} is a struct array with the\n\
+ following fields.\n\
+ \n\
+ @table @asis\n\
+ @item name\n\
+-The name of the function with a breakpoint.\n\
++The name of the function with a breakpoint.  A sub-function, say @code{func2}\n\
++within a .m file, say @code{foo/file.m}, is specified as @code{file>func2}.\n\
+ \n\
+ @item file\n\
+ The name of the m-file where the function code is located.\n\
+ \n\
+ @item line\n\
+-A line number, or vector of line numbers, with a breakpoint.\n\
++The line number with the breakpoint.\n\
++\n\
++@item cond\n\
++The condition that must be satisfied for the breakpoint to be active, or\n\
++the empty string for unconditional breakpoints.\n\
+ @end table\n\
+ \n\
+-Note: When @code{dbstatus} is called from the debug prompt within a function,\n\
+-the list of breakpoints is automatically trimmed to the breakpoints in the\n\
+-current function.\n\
+-@seealso{dbclear, dbwhere}\n\
++@c Note: When @code{dbstatus} is called from the debug prompt within a function,\n\
++@c the list of breakpoints is automatically trimmed to the breakpoints in the\n\
++@c current function.\n\
++If @code{dbstop if error} is true but no explicit IDs are specified, the\n\
++return value will have an empty field called \"errs\".  If IDs are specified,\n\
++the \"errs\" field will have a row per ID.  If @code{dbstop if error} is\n\
++false, there is no \"errs\" field.  The \"warn\" field is set similarly by\n\
++@code{dbstop if warning}.\n\
++\n\
++@seealso{dbstop, dbclear, dbwhere, dblist, dbstack}\n\
+ @end deftypefn")
+ {
+   int nargin = args.length ();
+ 
+   if (nargin != 0 && nargin != 1)
+     error ("dbstatus: only zero or one arguments accepted\n");
+ 
+   octave_value_list fcn_list;
+-  bp_table::fname_line_map bp_list;
++  bp_table::fname_bp_map bp_list;
+   std::string symbol_name;
+ 
+   if (nargin == 1)
+     {
+       if (! args(0).is_string ())
+         err_wrong_type_arg ("dbstatus", args(0));
+ 
+       symbol_name = args(0).string_value ();
+       fcn_list(0) = symbol_name;
+       bp_list = bp_table::get_breakpoint_list (fcn_list);
+     }
+   else
+     {
++/*
+       if (Vdebugging)
+         {
+           octave_user_code *dbg_fcn = get_user_code ();
+           if (dbg_fcn)
+             {
+               symbol_name = dbg_fcn->name ();
+               fcn_list(0) = symbol_name;
+             }
+         }
++*/
+ 
+       bp_list = bp_table::get_breakpoint_list (fcn_list);
+     }
+ 
+   if (nargout == 0)
+     {
+       // Print out the breakpoint information.
+ 
+-      for (bp_table::fname_line_map_iterator it = bp_list.begin ();
++      for (bp_table::fname_bp_map_iterator it = bp_list.begin ();
+            it != bp_list.end (); it++)
+         {
+-          bp_table::intmap m = it->second;
++          std::list<bp_type> m = it->second;
++
++          // print unconditional breakpoints, if any, on a single line
+ 
+-          size_t nel = m.size ();
++              // first, check to see if there are any
++          int have_unconditional = 0;
++          for (std::list<bp_type>::const_iterator j = m.begin ();
++               j != m.end (); j++)
++            {
++              if (j->cond == "")
++                {
++                  if (have_unconditional++)
++                    break;                      // stop once we know its plural
++                }
++            }
++              // If we actually have some, print line numbers only
++          if (have_unconditional)
++            {
++              const char *_s_ = (have_unconditional > 1) ? "s" : "";
++              octave_stdout << "breakpoint" << _s_ <<" in " << it->first
++                            << " at line" << _s_ << " ";
+ 
+-          octave_stdout << "breakpoint in " << it->first;
+-          if (nel > 1)
+-            octave_stdout << " at lines ";
+-          else
+-            octave_stdout << " at line ";
++              for (std::list<bp_type>::const_iterator j = m.begin ();
++                   j != m.end (); j++)
++                {
++                  if (j->cond == "")
++                    octave_stdout << j->line << " ";
++                }
++              octave_stdout << std::endl;
++            }
+ 
+-          for (size_t j = 0; j < nel; j++)
+-            octave_stdout << m[j] << ((j < nel - 1) ? ", " : ".");
++          // print conditional breakpoints, one per line, with conditions
++          for (std::list<bp_type>::const_iterator j = m.begin ();
++               j != m.end (); j++)
++            {
++              if (j->cond != "")
++                octave_stdout << "breakpoint in " << it->first
++                              << " at line " << j->line
++                              << " if " << j->cond << "\n";
++            }
++        }
+ 
+-          if (nel > 0)
+-            octave_stdout << std::endl;
+-        }
++      bp_table::stop_on_err_warn_status (true);
++
+       return ovl ();
+     }
+   else
+     {
+       // Fill in an array for return.
++      int i = 0;
++      octave_map retmap;
++      octave_value retval;
+ 
+-      int i = 0;
+-      Cell names (dim_vector (bp_list.size (), 1));
+-      Cell file (dim_vector (bp_list.size (), 1));
+-      Cell line (dim_vector (bp_list.size (), 1));
++          // count how many breakpoints there are
++      int count = 0;
++      for (bp_table::const_fname_bp_map_iterator it = bp_list.begin ();
++           it != bp_list.end (); it++)
++        {
++          for (std::list<bp_type>::const_iterator j = it->second.begin ();
++               j != it->second.end (); j++)
++            count++;
++        }
+ 
+-      for (bp_table::const_fname_line_map_iterator it = bp_list.begin ();
++      Cell names (dim_vector (count, 1));
++      Cell file  (dim_vector (count, 1));
++      Cell line  (dim_vector (count, 1));
++      Cell cond  (dim_vector (count, 1));
++
++      for (bp_table::const_fname_bp_map_iterator it = bp_list.begin ();
+            it != bp_list.end (); it++)
+         {
+-          names(i) = it->first;
+-          line(i) = intmap_to_ov (it->second);
+-          file(i) = do_which (it->first);
+-          i++;
++          std::string filename = it->first;
++          const char *sub_fun = strchr (filename.c_str (), '>');
++          if (sub_fun)
++            filename = filename.substr(0, sub_fun - filename.c_str ());
++          octave_value path_name = do_which (filename);
++
++          for (std::list<bp_type>::const_iterator j = it->second.begin ();
++               j != it->second.end (); j++)
++            {
++              names(i) = it->first;
++              file(i) = path_name;
++              line(i) = octave_value (j->line);
++              cond(i) = octave_value (j->cond);
++              i++;
++            }
+         }
+ 
+-      octave_map retval;
+-      retval.assign ("name", names);
+-      retval.assign ("file", file);
+-      retval.assign ("line", line);
++      retmap.assign ("name", names);
++      retmap.assign ("file", file);
++      retmap.assign ("line", line);
++      retmap.assign ("cond", cond);
+ 
+-      return ovl (retval);
++      octave_map ew = bp_table::stop_on_err_warn_status (false);
++      if (ew.numel () == 0)
++        {
++          retval = octave_value (retmap);
++        }
++      else
++        {
++          octave_map outer (dim_vector (3,1));
++          outer.assign ("bkpt", Cell (retmap));
++          for (octave_map::const_iterator f = ew.begin (); f != ew.end (); f++)
++            {
++              outer.setfield (f->first, ew.contents (f));
++            }
++            retval = octave_value (outer);
++        }
++
++      return retval;
+     }
+ }
+ 
+ DEFUN (dbwhere, , ,
+        "-*- texinfo -*-\n\
+ @deftypefn {} {} dbwhere\n\
+ In debugging mode, report the current file and line number where execution\n\
+ is stopped.\n\
+-@seealso{dbstatus, dbcont, dbstep, dbup}\n\
++@seealso{dbstack, dblist, dbstatus, dbcont, dbstep, dbup, dbdown}\n\
+ @end deftypefn")
+ {
+   octave_user_code *dbg_fcn = get_user_code ();
+ 
+   if (! dbg_fcn)
+     error ("dbwhere: must be inside a user function to use dbwhere\n");
+ 
+   bool have_file = true;
+@@ -890,17 +1563,17 @@ When called with no arguments in debuggi
+ currently being debugged.\n\
+ \n\
+ An optional range specification can be used to list only a portion of the\n\
+ file.  The special keyword @qcode{\"end\"} is a valid line number\n\
+ specification for the last line of the file.\n\
+ \n\
+ When called with the name of a function, list that script file with line\n\
+ numbers.\n\
+-@seealso{dbwhere, dbstatus, dbstop}\n\
++@seealso{dblist, dbwhere, dbstatus, dbstop}\n\
+ @end deftypefn")
+ {
+   octave_user_code *dbg_fcn;
+ 
+   string_vector argv = args.make_argv ("dbtype");
+ 
+   switch (args.length ())
+     {
+@@ -1024,17 +1697,17 @@ numbers.\n\
+ DEFUN (dblist, args, ,
+        "-*- texinfo -*-\n\
+ @deftypefn  {} {} dblist\n\
+ @deftypefnx {} {} dblist @var{n}\n\
+ In debugging mode, list @var{n} lines of the function being debugged\n\
+ centered around the current line to be executed.\n\
+ \n\
+ If unspecified @var{n} defaults to 10 (+/- 5 lines)\n\
+-@seealso{dbwhere, dbtype}\n\
++@seealso{dbwhere, dbtype, dbstack}\n\
+ @end deftypefn")
+ {
+   int n = 10;
+ 
+   if (args.length () == 1)
+     {
+       octave_value arg = args(0);
+ 
+@@ -1241,17 +1914,17 @@ The column number of the line where the 
+ Undocumented.\n\
+ \n\
+ @item context\n\
+ Undocumented.\n\
+ @end table\n\
+ \n\
+ The return argument @var{idx} specifies which element of the @var{stack}\n\
+ struct array is currently active.\n\
+-@seealso{dbup, dbdown, dbwhere, dbstatus}\n\
++@seealso{dbup, dbdown, dbwhere, dblist, dbstatus}\n\
+ @end deftypefn")
+ {
+   return do_dbstack (args, nargout, octave_stdout);
+ }
+ 
+ static void
+ do_dbupdown (const octave_value_list& args, const std::string& who)
+ {
+diff --git a/libinterp/corefcn/debug.h b/libinterp/corefcn/debug.h
+--- a/libinterp/corefcn/debug.h
++++ b/libinterp/corefcn/debug.h
+@@ -25,49 +25,64 @@ along with Octave; see the file COPYING.
+ 
+ #include <map>
+ #include <set>
+ #include "ov.h"
+ #include "dRowVector.h"
+ 
+ class octave_value_list;
+ class octave_user_code;
++static std::string bp_empty_string ("");
++
++struct
++bp_type
++{
++  int line;
++  std::string cond;
++  bp_type (int l, const std::string& c) : line (l), cond (c)
++    { }
++};
+ 
+ // Interface to breakpoints,.
+-
+ class
+ OCTINTERP_API
+ bp_table
+ {
+ private:
+ 
+   bp_table (void) : bp_set () { }
+ 
+   ~bp_table (void) { }
+ 
+ public:
+ 
++  // mapping from (arbitrary index?? FIXME) to line number of breakpoint
+   typedef std::map<int, int> intmap;
+ 
+   typedef intmap::const_iterator const_intmap_iterator;
+   typedef intmap::iterator intmap_iterator;
+ 
+   typedef std::map <std::string, intmap> fname_line_map;
+ 
+   typedef fname_line_map::const_iterator const_fname_line_map_iterator;
+   typedef fname_line_map::iterator fname_line_map_iterator;
+ 
++  typedef std::map <std::string, std::list<bp_type> > fname_bp_map;
++  typedef fname_bp_map::const_iterator const_fname_bp_map_iterator;
++  typedef fname_bp_map::iterator fname_bp_map_iterator;
++
+   static bool instance_ok (void);
+ 
+   // Add a breakpoint at the nearest executable line.
+   static intmap add_breakpoint (const std::string& fname = "",
+-                                const intmap& lines = intmap ())
++                                const intmap& lines = intmap (),
++                                const std::string& condition = bp_empty_string)
+   {
+     return instance_ok ()
+-           ? instance->do_add_breakpoint (fname, lines) : intmap ();
++           ? instance->do_add_breakpoint (fname, lines, condition) : intmap ();
+   }
+ 
+   // Remove a breakpoint from a line in file.
+   static int remove_breakpoint (const std::string& fname = "",
+                                 const intmap& lines = intmap ())
+   {
+     return instance_ok ()
+            ? instance->do_remove_breakpoint (fname, lines) : 0;
+@@ -86,59 +101,101 @@ public:
+   static void remove_all_breakpoints (void)
+   {
+     if (instance_ok ())
+       instance->do_remove_all_breakpoints ();
+   }
+ 
+   // Return all breakpoints.  Each element of the map is a vector
+   // containing the breakpoints corresponding to a given function name.
+-  static fname_line_map
++  static fname_bp_map
+   get_breakpoint_list (const octave_value_list& fname_list)
+   {
+     return instance_ok ()
+-           ? instance->do_get_breakpoint_list (fname_list) : fname_line_map ();
++           ? instance->do_get_breakpoint_list (fname_list) : fname_bp_map ();
+   }
+ 
+   static bool
+   have_breakpoints (void)
+   {
+     return instance_ok () ? instance->do_have_breakpoints () : 0;
+   }
+ 
++  // Should we enter debugging for this particular error identifier?
++  static bool
++  debug_on_err (const std::string& ID)
++  {
++    return (errors_that_stop.empty () || errors_that_stop.count (ID));
++  }
++
++  // Should we enter debugging for this particular identifier in a try/catch?
++  static bool
++  debug_on_caught (const std::string& ID)
++  {
++    return (caught_that_stop.empty () || caught_that_stop.count (ID));
++  }
++
++  // Should we enter debugging for this particular warning identifier?
++  static bool
++  debug_on_warn (const std::string& ID)
++  {
++    return (warnings_that_stop.empty () || warnings_that_stop.count (ID));
++  }
++
++  static octave_map stop_on_err_warn_status (bool toScreen);
++
++  static void dbstop_process_map_args (const octave_map& mv);
++
++  static void dbclear_all_signals (void);
++
++  friend void parse_dbfunction_params (const char *, const octave_value_list&,
++                                       std::string&, bp_table::intmap&,
++                                       std::string&);
++
+ private:
+ 
+   typedef std::set<std::string>::const_iterator const_bp_set_iterator;
+   typedef std::set<std::string>::iterator bp_set_iterator;
+ 
+-  // Set of function names containing at least one breakpoint.
++  // Set of function (.m file) names containing at least one breakpoint.
+   std::set<std::string> bp_set;
+ 
++
++  // Set of error and warning message IDs that cause us to stop
++  // *if* Vdebug_on_error / Vdebug_on_caught / Vdebug_on_warning is set.
++  // Empty means stop on any error / caught error / warning.
++  static std::set<std::string> errors_that_stop;
++  static std::set<std::string> caught_that_stop;
++  static std::set<std::string> warnings_that_stop;
++
++
+   static bp_table *instance;
+ 
+   static void cleanup_instance (void) { delete instance; instance = 0; }
+ 
+   bool do_add_breakpoint_1 (octave_user_code *fcn, const std::string& fname,
+-                            const intmap& line, intmap& retval);
++                            const intmap& line, const std::string& condition,
++                            intmap& retval);
+ 
+-  intmap do_add_breakpoint (const std::string& fname, const intmap& lines);
++  intmap do_add_breakpoint (const std::string& fname, const intmap& lines,
++                            const std::string& condition);
+ 
+   int do_remove_breakpoint_1 (octave_user_code *fcn, const std::string&,
+                               const intmap& lines);
+ 
+   int do_remove_breakpoint (const std::string&, const intmap& lines);
+ 
+   intmap do_remove_all_breakpoints_in_file_1 (octave_user_code *fcn,
+                                               const std::string& fname);
+ 
+   intmap do_remove_all_breakpoints_in_file (const std::string& fname,
+                                             bool silent);
+ 
+   void do_remove_all_breakpoints (void);
+ 
+-  fname_line_map do_get_breakpoint_list (const octave_value_list& fname_list);
++  fname_bp_map do_get_breakpoint_list (const octave_value_list& fname_list);
+ 
+   bool do_have_breakpoints (void) { return (! bp_set.empty ()); }
+ };
+ 
+ extern std::string get_file_line (const std::string& fname, size_t line);
+ 
+ #endif
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ #include <cstdarg>
+ #include <cstring>
+ 
+ #include <iomanip>
+ #include <iostream>
+ #include <sstream>
+ #include <string>
+ 
++#include "debug.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "input.h"
+ #include "pager.h"
+ #include "ovl.h"
+ #include "oct-map.h"
+ #include "utils.h"
+ #include "ov.h"
+@@ -52,16 +53,20 @@ along with Octave; see the file COPYING.
+ // error messages.
+ static bool Vbeep_on_error = false;
+ 
+ // TRUE means that Octave will try to enter the debugger when an error
+ // is encountered.  This will also inhibit printing of the normal
+ // traceback message (you will only see the top-level error message).
+ bool Vdebug_on_error = false;
+ 
++// TRUE means that Octave will try to enter the debugger when an error
++// is encountered within the 'try' section of a 'try' / 'catch' block.
++bool Vdebug_on_caught = false;
++
+ // TRUE means that Octave will try to enter the debugger when a warning
+ // is encountered.
+ bool Vdebug_on_warning = false;
+ 
+ // TRUE means that Octave will try to display a stack trace when a
+ // warning is encountered.
+ static bool Vbacktrace_on_warning = true;
+ 
+@@ -98,26 +103,31 @@ static octave_map Vlast_error_stack;
+ //
+ int error_state = 0;
+ 
+ // Tell the error handler whether to print messages, or just store
+ // them for later.  Used for handling errors in eval() and
+ // the 'unwind_protect' statement.
+ int buffer_error_messages = 0;
+ 
++// The number of layers of try / catch blocks we're in.  Used to print
++// "caught error" instead of error when "dbstop if caught error" is on.
++int in_try_catch = 0;
++
+ // TRUE means error messages are turned off.
+ bool discard_error_messages = false;
+ 
+ // TRUE means warning messages are turned off.
+ bool discard_warning_messages = false;
+ 
+ void
+ reset_error_handler (void)
+ {
+   buffer_error_messages = 0;
++  in_try_catch = 0;
+   discard_error_messages = false;
+ }
+ 
+ static void
+ initialize_warning_options (const std::string& state)
+ {
+   octave_scalar_map initw;
+ 
+@@ -133,20 +143,20 @@ initialize_last_error_stack (void)
+   return octave_call_stack::empty_backtrace ();
+ }
+ 
+ static void
+ verror (bool save_last_error, std::ostream& os,
+         const char *name, const char *id, const char *fmt, va_list args,
+         bool with_cfn = false)
+ {
+-  if (discard_error_messages)
++  if (discard_error_messages && ! Vdebug_on_caught)
+     return;
+ 
+-  if (! buffer_error_messages)
++  if (! buffer_error_messages || Vdebug_on_caught)
+     flush_octave_stdout ();
+ 
+   // FIXME: we really want to capture the message before it has all the
+   //        formatting goop attached to it.  We probably also want just the
+   //        message, not the traceback information.
+ 
+   std::ostringstream output_buf;
+ 
+@@ -157,17 +167,22 @@ verror (bool save_last_error, std::ostre
+   bool to_beep_or_not_to_beep_p = Vbeep_on_error;
+ 
+   std::string msg_string;
+ 
+   if (to_beep_or_not_to_beep_p)
+     msg_string = "\a";
+ 
+   if (name)
+-    msg_string += std::string (name) + ": ";
++    {
++      if (in_try_catch && ! strcmp (name, "error"))
++        msg_string += "caught error: ";
++      else
++        msg_string += std::string (name) + ": ";
++    }
+ 
+   // If with_fcn is specified, we'll attempt to prefix the message with the name
+   // of the current executing function. But we'll do so only if:
+   // 1. the name is not empty (anonymous function)
+   // 2. it is not already there (including the following colon)
+   if (with_cfn)
+     {
+       octave_function *curfcn = octave_call_stack::current ();
+@@ -202,17 +217,17 @@ verror (bool save_last_error, std::ostre
+           octave_idx_type curr_frame = -1;
+ 
+           Vlast_error_stack = octave_call_stack::backtrace (0, curr_frame);
+         }
+       else
+         Vlast_error_stack = initialize_last_error_stack ();
+     }
+ 
+-  if (! buffer_error_messages)
++  if (! buffer_error_messages || Vdebug_on_caught)
+     {
+       octave_diary << msg_string;
+       os << msg_string;
+     }
+ }
+ 
+ static void
+ pr_where_2 (std::ostream& os, const char *fmt, va_list args)
+@@ -294,17 +309,19 @@ make_execution_exception (const char *wh
+   return retval;
+ }
+ 
+ static void
+ maybe_enter_debugger (octave_execution_exception& e,
+                       bool show_stack_trace = false)
+ {
+   if ((interactive || forced_interactive)
+-      && Vdebug_on_error && octave_call_stack::caller_user_code ())
++      && ((Vdebug_on_error && bp_table::debug_on_err (last_error_id ()))
++          || (Vdebug_on_caught && bp_table::debug_on_caught (last_error_id ())))
++      && octave_call_stack::caller_user_code ())
+     {
+       unwind_protect frame;
+       frame.protect_var (Vdebug_on_error);
+       Vdebug_on_error = false;
+ 
+       tree_evaluator::debug_mode = true;
+ 
+       tree_evaluator::current_frame = octave_call_stack::current_frame ();
+@@ -699,17 +716,17 @@ warning_1 (const char *id, const char *f
+       bool in_user_code = octave_call_stack::caller_user_code () != 0;
+ 
+       if (! fmt_suppresses_backtrace && in_user_code
+           && Vbacktrace_on_warning
+           && ! discard_warning_messages)
+         pr_where (std::cerr, "warning");
+ 
+       if ((interactive || forced_interactive)
+-          && Vdebug_on_warning && in_user_code)
++          && Vdebug_on_warning && in_user_code && bp_table::debug_on_warn (id))
+         {
+           unwind_protect frame;
+           frame.protect_var (Vdebug_on_warning);
+           Vdebug_on_warning = false;
+ 
+           tree_evaluator::debug_mode = true;
+ 
+           tree_evaluator::current_frame = octave_call_stack::current_frame ();
+@@ -2142,11 +2159,12 @@ interpreter_try (unwind_protect& frame)
+ {
+   frame.protect_var (buffer_error_messages);
+   frame.protect_var (Vdebug_on_error);
+   frame.protect_var (Vdebug_on_warning);
+ 
+   buffer_error_messages++;
+   Vdebug_on_error = false;
+   Vdebug_on_warning = false;
++  // leave Vdebug_on_caught as it was, so errors in try/catch are still caught
+ }
+ 
+ 
+diff --git a/libinterp/corefcn/error.h b/libinterp/corefcn/error.h
+--- a/libinterp/corefcn/error.h
++++ b/libinterp/corefcn/error.h
+@@ -127,31 +127,39 @@ set_warning_state (const octave_value_li
+ extern OCTINTERP_API void disable_warning (const std::string& id);
+ extern OCTINTERP_API void initialize_default_warning_state (void);
+ 
+ // TRUE means that Octave will try to enter the debugger when an error
+ // is encountered.  This will also inhibit printing of the normal
+ // traceback message (you will only see the top-level error message).
+ extern OCTINTERP_API bool Vdebug_on_error;
+ 
++// TRUE means that Octave will try to enter the debugger when an error
++// is encountered within the 'try' section of a 'try' / 'catch' block.
++extern OCTINTERP_API bool Vdebug_on_caught;
++
+ // TRUE means that Octave will try to enter the debugger when a warning
+ // is encountered.
+ extern OCTINTERP_API bool Vdebug_on_warning;
+ 
+ // Current error state.
+ extern OCTINTERP_API int error_state;
+ 
+ // Current warning state.
+ extern OCTINTERP_API int warning_state;
+ 
+ // Tell the error handler whether to print messages, or just store
+ // them for later.  Used for handling errors in eval() and
+ // the 'unwind_protect' statement.
+ extern OCTINTERP_API int buffer_error_messages;
+ 
++// The number of layers of try / catch blocks we're in.  Used to print
++// "caught error" instead of "error" when "dbstop if caught error" is on.
++extern OCTINTERP_API int in_try_catch;
++
+ // TRUE means error messages are turned off.
+ extern OCTINTERP_API bool discard_error_messages;
+ 
+ // TRUE means warning messages are turned off.
+ extern OCTINTERP_API bool discard_warning_messages;
+ 
+ // Helper functions to pass last error and warning messages and ids
+ extern OCTINTERP_API std::string last_error_message (void);
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -298,17 +298,18 @@ public:
+       {
+         instance->debugging = false;
+ 
+         instance->do_exit_debugger_event ();
+       }
+   }
+ 
+   static void
+-  update_breakpoint (bool insert, const std::string& file, int line)
++  update_breakpoint (bool insert, const std::string& file, int line,
++                     const std::string& cond = "")
+   {
+     if (enabled ())
+       instance->do_update_breakpoint (insert, file, line);
+   }
+ 
+   static void connect_link (octave_link *);
+ 
+   static void set_default_prompts (std::string& ps1, std::string& ps2,
+diff --git a/libinterp/corefcn/toplev.cc b/libinterp/corefcn/toplev.cc
+--- a/libinterp/corefcn/toplev.cc
++++ b/libinterp/corefcn/toplev.cc
+@@ -674,16 +674,24 @@ main_loop (void)
+         }
+       catch (const std::bad_alloc&)
+         {
+           recover_from_exception ();
+ 
+           std::cerr << "error: out of memory -- trying to return to prompt"
+                     << std::endl;
+         }
++
++#ifdef DBSTOP_NANINF
++      if (Vdebug_on_naninf)
++        {
++          if (setjump (naninf_jump) != 0)
++            debug_or_throw_exception (true);  // true = stack trace
++        }
++#endif
+     }
+   while (retval == 0);
+ 
+   octave_stdout << "\n";
+ 
+   if (retval == EOF)
+     retval = 0;
+ 
+diff --git a/libinterp/parse-tree/pt-bp.cc b/libinterp/parse-tree/pt-bp.cc
+--- a/libinterp/parse-tree/pt-bp.cc
++++ b/libinterp/parse-tree/pt-bp.cc
+@@ -346,16 +346,19 @@ tree_breakpoint::visit_statement (tree_s
+     }
+   else
+     {
+       if (stmt.line () >= line)
+         take_action (stmt);
+     }
+ }
+ 
++// Called by
++//      tree_statement_list::set_breakpoint (int line, std::string& condition)
++// with  lst  consisting of a user function in which to set a breakpoint.
+ void
+ tree_breakpoint::visit_statement_list (tree_statement_list& lst)
+ {
+   for (tree_statement_list::iterator p = lst.begin (); p != lst.end (); p++)
+     {
+       tree_statement *elt = *p;
+ 
+       if (elt)
+@@ -446,56 +449,62 @@ tree_breakpoint::visit_unwind_protect_co
+     }
+ }
+ 
+ void
+ tree_breakpoint::take_action (tree& tr)
+ {
+   if (act == set)
+     {
+-      tr.set_breakpoint ();
++      tr.set_breakpoint (condition);
+       line = tr.line ();
+       found = true;
+     }
+   else if (act == clear)
+     {
+       if (tr.is_breakpoint ())
+         {
+           tr.delete_breakpoint ();
+           found = true;
+         }
+     }
+   else if (act == list)
+     {
+       if (tr.is_breakpoint ())
+-        bp_list.append (octave_value (tr.line ()));
++        {
++          bp_list.append (octave_value (tr.line ()));
++          bp_cond_list.append (octave_value (tr.bp_cond ()));
++        }
+     }
+   else
+     panic_impossible ();
+ }
+ 
+ void
+ tree_breakpoint::take_action (tree_statement& stmt)
+ {
+   int lineno = stmt.line ();
+ 
+   if (act == set)
+     {
+-      stmt.set_breakpoint ();
++      stmt.set_breakpoint (condition);
+       line = lineno;
+       found = true;
+     }
+   else if (act == clear)
+     {
+       if (stmt.is_breakpoint ())
+         {
+           stmt.delete_breakpoint ();
+           found = true;
+         }
+     }
+   else if (act == list)
+     {
+       if (stmt.is_breakpoint ())
+-        bp_list.append (octave_value (lineno));
++        {
++          bp_list.append (octave_value (lineno));
++          bp_cond_list.append (octave_value (stmt.bp_cond ()));
++        }
+     }
+   else
+     panic_impossible ();
+ }
+diff --git a/libinterp/parse-tree/pt-bp.h b/libinterp/parse-tree/pt-bp.h
+--- a/libinterp/parse-tree/pt-bp.h
++++ b/libinterp/parse-tree/pt-bp.h
+@@ -27,25 +27,26 @@ along with Octave; see the file COPYING.
+ #include "ov-usr-fcn.h"
+ #include "pt-walk.h"
+ #include "pt-pr-code.h"
+ #include "toplev.h"
+ 
+ class tree;
+ class tree_decl_command;
+ 
++static std::string pt_bp_empty_string ("");
+ class
+ tree_breakpoint : public tree_walker
+ {
+ public:
+ 
+   enum action { set = 1, clear = 2, list = 3 };
+ 
+-  tree_breakpoint (int l, action a)
+-    : line (l), act (a), found (false), bp_list () { }
++  tree_breakpoint (int l, action a, const std::string& c = pt_bp_empty_string)
++    : line (l), act (a), condition (c), found (false), bp_list () { }
+ 
+   ~tree_breakpoint (void) { }
+ 
+   bool success (void) const { return found; }
+ 
+   void visit_argument_list (tree_argument_list&);
+ 
+   void visit_binary_expression (tree_binary_expression&);
+@@ -130,16 +131,17 @@ public:
+ 
+   void visit_switch_command (tree_switch_command&);
+ 
+   void visit_try_catch_command (tree_try_catch_command&);
+ 
+   void visit_unwind_protect_command (tree_unwind_protect_command&);
+ 
+   octave_value_list get_list (void) { return bp_list; }
++  octave_value_list get_cond_list (void) { return bp_cond_list; }
+ 
+   int get_line (void) { return found ? line : 0; }
+ 
+ private:
+ 
+   void do_decl_command (tree_decl_command&);
+ 
+   void take_action (tree& tr);
+@@ -147,22 +149,28 @@ private:
+   void take_action (tree_statement& stmt);
+ 
+   // Statement line number we are looking for.
+   int line;
+ 
+   // What to do.
+   action act;
+ 
++  // Expression which must be true to break
++  std::string condition;
++
+   // Have we already found the line?
+   bool found;
+ 
+   // List of breakpoint line numbers.
+   octave_value_list bp_list;
+ 
++  // List of breakpoint conditions.
++  octave_value_list bp_cond_list;
++
+   // No copying!
+ 
+   tree_breakpoint (const tree_breakpoint&);
+ 
+   tree_breakpoint& operator = (const tree_breakpoint&);
+ };
+ 
+ // TRUE means SIGINT should put us in the debugger at the next
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -92,34 +92,34 @@ tree_evaluator::visit_binary_expression 
+ {
+   panic_impossible ();
+ }
+ 
+ void
+ tree_evaluator::visit_break_command (tree_break_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   if (statement_context == function || statement_context == script
+       || in_loop_command)
+     tree_break_command::breaking = 1;
+ }
+ 
+ void
+ tree_evaluator::visit_colon_expression (tree_colon_expression&)
+ {
+   panic_impossible ();
+ }
+ 
+ void
+ tree_evaluator::visit_continue_command (tree_continue_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   if (statement_context == function || statement_context == script
+       || in_loop_command)
+     tree_continue_command::continuing = 1;
+ }
+ 
+ void
+ tree_evaluator::reset_debug_state (void)
+@@ -205,26 +205,26 @@ tree_evaluator::do_decl_init_list (decl_
+         }
+     }
+ }
+ 
+ void
+ tree_evaluator::visit_global_command (tree_global_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   do_decl_init_list (do_global_init, cmd.initializer_list ());
+ }
+ 
+ void
+ tree_evaluator::visit_persistent_command (tree_persistent_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   do_decl_init_list (do_static_init, cmd.initializer_list ());
+ }
+ 
+ void
+ tree_evaluator::visit_decl_elt (tree_decl_elt&)
+ {
+   panic_impossible ();
+@@ -277,17 +277,17 @@ quit_loop_now (void)
+ 
+   return quit;
+ }
+ 
+ void
+ tree_evaluator::visit_simple_for_command (tree_simple_for_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   // FIXME: need to handle PARFOR loops here using cmd.in_parallel ()
+   // and cmd.maxproc_expr ();
+ 
+   unwind_protect frame;
+ 
+   frame.protect_var (in_loop_command);
+ 
+@@ -392,17 +392,17 @@ tree_evaluator::visit_simple_for_command
+     error ("invalid type in for loop expression near line %d, column %d",
+            cmd.line (), cmd.column ());
+ }
+ 
+ void
+ tree_evaluator::visit_complex_for_command (tree_complex_for_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   unwind_protect frame;
+ 
+   frame.protect_var (in_loop_command);
+ 
+   in_loop_command = true;
+ 
+   tree_expression *expr = cmd.control_expr ();
+@@ -533,17 +533,17 @@ tree_evaluator::visit_if_command_list (t
+       tree_if_clause *tic = *p;
+ 
+       tree_expression *expr = tic->condition ();
+ 
+       if (statement_context == function || statement_context == script)
+         octave_call_stack::set_location (tic->line (), tic->column ());
+ 
+       if (debug_mode && ! tic->is_else_clause ())
+-        do_breakpoint (tic->is_breakpoint ());
++        do_breakpoint (tic->is_breakpoint (true));
+ 
+       if (tic->is_else_clause () || expr->is_logically_true ("if"))
+         {
+           tree_statement_list *stmt_lst = tic->commands ();
+ 
+           if (stmt_lst)
+             stmt_lst->accept (*this);
+ 
+@@ -575,17 +575,17 @@ tree_evaluator::visit_multi_assignment (
+ {
+   panic_impossible ();
+ }
+ 
+ void
+ tree_evaluator::visit_no_op_command (tree_no_op_command& cmd)
+ {
+   if (debug_mode && cmd.is_end_of_fcn_or_script ())
+-    do_breakpoint (cmd.is_breakpoint (), true);
++    do_breakpoint (cmd.is_breakpoint (true), true);
+ }
+ 
+ void
+ tree_evaluator::visit_constant (tree_constant&)
+ {
+   panic_impossible ();
+ }
+ 
+@@ -618,17 +618,17 @@ tree_evaluator::visit_prefix_expression 
+ {
+   panic_impossible ();
+ }
+ 
+ void
+ tree_evaluator::visit_return_command (tree_return_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   // Act like dbcont.
+ 
+   if (Vdebugging
+       && octave_call_stack::current_frame () == current_frame)
+     {
+       Vdebugging = false;
+ 
+@@ -678,17 +678,17 @@ tree_evaluator::visit_statement (tree_st
+ 
+       try
+         {
+           if (cmd)
+             cmd->accept (*this);
+           else
+             {
+               if (debug_mode)
+-                do_breakpoint (expr->is_breakpoint ());
++                do_breakpoint (expr->is_breakpoint (true));
+ 
+               // FIXME: maybe all of this should be packaged in
+               // one virtual function that returns a flag saying whether
+               // or not the expression will take care of binding ans and
+               // printing the result.
+ 
+               // FIXME: it seems that we should just have to
+               // call expr->rvalue1 () and that should take care of
+@@ -790,17 +790,17 @@ tree_evaluator::visit_switch_case_list (
+ {
+   panic_impossible ();
+ }
+ 
+ void
+ tree_evaluator::visit_switch_command (tree_switch_command& cmd)
+ {
+   if (debug_mode)
+-    do_breakpoint (cmd.is_breakpoint ());
++    do_breakpoint (cmd.is_breakpoint (true));
+ 
+   tree_expression *expr = cmd.switch_value ();
+ 
+   if (! expr)
+     error ("missing value in switch command near line %d, column %d",
+            cmd.line (), cmd.column ());
+ 
+   octave_value val = expr->rvalue1 ();
+@@ -848,22 +848,25 @@ tree_evaluator::visit_try_catch_command 
+   tree_statement_list *try_code = cmd.body ();
+ 
+   bool execution_error = false;
+ 
+   if (try_code)
+     {
+       try
+         {
++          in_try_catch++;
+           try_code->accept (*this);
++          in_try_catch--;
+         }
+       catch (const octave_execution_exception&)
+         {
+           recover_from_exception ();
+ 
++          in_try_catch--;          // must be restored before "catch" block
+           execution_error = true;
+         }
+     }
+ 
+   if (execution_error)
+     {
+       if (catch_code)
+         {
+@@ -881,18 +884,20 @@ tree_evaluator::visit_try_catch_command 
+ 
+               octave_scalar_map err;
+ 
+               err.assign ("message", last_error_message ());
+               err.assign ("identifier", last_error_id ());
+               err.assign ("stack", last_error_stack ());
+ 
+               ult.assign (octave_value::op_asn_eq, err);
++
+             }
+ 
++              // perform actual "catch" block
+           if (catch_code)
+             catch_code->accept (*this);
+         }
+     }
+ }
+ 
+ void
+ tree_evaluator::do_unwind_protect_cleanup_code (tree_statement_list *list)
+@@ -1025,17 +1030,17 @@ tree_evaluator::visit_while_command (tre
+   tree_expression *expr = cmd.condition ();
+ 
+   if (! expr)
+     panic_impossible ();
+ 
+   for (;;)
+     {
+       if (debug_mode)
+-        do_breakpoint (cmd.is_breakpoint ());
++        do_breakpoint (cmd.is_breakpoint (true));
+ 
+       if (expr->is_logically_true ("while"))
+         {
+           tree_statement_list *loop_body = cmd.body ();
+ 
+           if (loop_body)
+             loop_body->accept (*this);
+ 
+@@ -1072,27 +1077,27 @@ tree_evaluator::visit_do_until_command (
+ 
+       if (loop_body)
+         loop_body->accept (*this);
+ 
+       if (quit_loop_now ())
+         break;
+ 
+       if (debug_mode)
+-        do_breakpoint (cmd.is_breakpoint ());
++        do_breakpoint (cmd.is_breakpoint (true));
+ 
+       if (expr->is_logically_true ("do-until"))
+         break;
+     }
+ }
+ 
+ void
+ tree_evaluator::do_breakpoint (tree_statement& stmt) const
+ {
+-  do_breakpoint (stmt.is_breakpoint (), stmt.is_end_of_fcn_or_script ());
++  do_breakpoint (stmt.is_breakpoint (true), stmt.is_end_of_fcn_or_script ());
+ }
+ 
+ void
+ tree_evaluator::do_breakpoint (bool is_breakpoint,
+                                bool is_end_of_fcn_or_script) const
+ {
+   bool break_on_this_statement = false;
+ 
+diff --git a/libinterp/parse-tree/pt-stmt.cc b/libinterp/parse-tree/pt-stmt.cc
+--- a/libinterp/parse-tree/pt-stmt.cc
++++ b/libinterp/parse-tree/pt-stmt.cc
+@@ -43,16 +43,18 @@ along with Octave; see the file COPYING.
+ #include "pt-jump.h"
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
++#include "debug.h"
++
+ // A list of commands to be executed.
+ 
+ tree_statement::~tree_statement (void)
+ {
+   delete cmd;
+   delete expr;
+   delete comm;
+ }
+@@ -66,37 +68,44 @@ tree_statement::set_print_flag (bool pri
+ 
+ bool
+ tree_statement::print_result (void)
+ {
+   return expr && expr->print_result ();
+ }
+ 
+ void
+-tree_statement::set_breakpoint (void)
++tree_statement::set_breakpoint (const std::string& condition)
+ {
+   if (cmd)
+-    cmd->set_breakpoint ();
++    cmd->set_breakpoint (condition);
+   else if (expr)
+-    expr->set_breakpoint ();
++    expr->set_breakpoint (condition);
+ }
+ 
+ void
+ tree_statement::delete_breakpoint (void)
+ {
+   if (cmd)
+     cmd->delete_breakpoint ();
+   else if (expr)
+     expr->delete_breakpoint ();
+ }
+ 
+ bool
+-tree_statement::is_breakpoint (void) const
++tree_statement::is_breakpoint (bool check_active) const
+ {
+-  return cmd ? cmd->is_breakpoint () : (expr ? expr->is_breakpoint () : false);
++  return cmd ? cmd->is_breakpoint (check_active)
++             : (expr ? expr->is_breakpoint (check_active) : false);
++}
++
++std::string
++tree_statement::bp_cond () const
++{
++  return cmd ? cmd->bp_cond () : (expr ? expr->bp_cond () : "0");
+ }
+ 
+ int
+ tree_statement::line (void) const
+ {
+   return cmd ? cmd->line () : (expr ? expr->line () : -1);
+ }
+ 
+@@ -173,20 +182,22 @@ tree_statement::dup (symbol_table::scope
+ }
+ 
+ void
+ tree_statement::accept (tree_walker& tw)
+ {
+   tw.visit_statement (*this);
+ }
+ 
++// Create a "breakpoint" tree-walker, and get it to "walk" this statement list
++// (TODO:  What does that do???)
+ int
+-tree_statement_list::set_breakpoint (int line)
++tree_statement_list::set_breakpoint (int line, const std::string& condition)
+ {
+-  tree_breakpoint tbp (line, tree_breakpoint::set);
++  tree_breakpoint tbp (line, tree_breakpoint::set, condition);
+   accept (tbp);
+ 
+   return tbp.get_line ();
+ }
+ 
+ void
+ tree_statement_list::delete_breakpoint (int line)
+ {
+@@ -213,36 +224,61 @@ octave_value_list
+ tree_statement_list::list_breakpoints (void)
+ {
+   tree_breakpoint tbp (0, tree_breakpoint::list);
+   accept (tbp);
+ 
+   return tbp.get_list ();
+ }
+ 
++// Get list of pairs (breakpoint line, breakpoint condition)
++std::list<bp_type>
++tree_statement_list::breakpoints_and_conds (void)
++{
++  tree_breakpoint tbp (0, tree_breakpoint::list);
++  accept (tbp);
++
++  std::list<bp_type> retval;
++  octave_value_list lines = tbp.get_list ();
++  octave_value_list conds = tbp.get_cond_list ();
++
++  for (int i = 0; i < lines.length (); i++)
++    {
++      retval.push_back (bp_type (lines(i).double_value (),
++                                conds(i).string_value ()));
++    }
++
++  return retval;
++}
++
++// Add breakpoints to  file  at multiple lines (the second arguments of  line),
++// to stop only if  condition  is true.
++// Updates GUI via  octave_link::update_breakpoint.
++// TODO COME BACK TO ME
+ bp_table::intmap
+ tree_statement_list::add_breakpoint (const std::string& file,
+-                                     const bp_table::intmap& line)
++                                     const bp_table::intmap& line,
++                                     const std::string& condition)
+ {
+   bp_table::intmap retval;
+ 
+   octave_idx_type len = line.size ();
+ 
+   for (int i = 0; i < len; i++)
+     {
+       bp_table::const_intmap_iterator p = line.find (i);
+ 
+       if (p != line.end ())
+         {
+           int lineno = p->second;
+ 
+-          retval[i] = set_breakpoint (lineno);
++          retval[i] = set_breakpoint (lineno, condition);
+ 
+           if (retval[i] != 0 && ! file.empty ())
+-            octave_link::update_breakpoint (true, file, retval[i]);
++            octave_link::update_breakpoint (true, file, retval[i], condition);
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ bp_table::intmap
+ tree_statement_list::remove_all_breakpoints (const std::string& file)
+diff --git a/libinterp/parse-tree/pt-stmt.h b/libinterp/parse-tree/pt-stmt.h
+--- a/libinterp/parse-tree/pt-stmt.h
++++ b/libinterp/parse-tree/pt-stmt.h
+@@ -60,21 +60,22 @@ public:
+   void set_print_flag (bool print_flag);
+ 
+   bool print_result (void);
+ 
+   bool is_command (void) const { return cmd != 0; }
+ 
+   bool is_expression (void) const { return expr != 0; }
+ 
+-  void set_breakpoint (void);
++  void set_breakpoint (const std::string& condition);
+ 
+   void delete_breakpoint (void);
+ 
+-  bool is_breakpoint (void) const;
++  bool is_breakpoint (bool check_valid = false) const;
++  std::string bp_cond () const;
+ 
+   int line (void) const;
+   int column (void) const;
+ 
+   void set_location (int l, int c);
+ 
+   void echo_code (void);
+ 
+@@ -154,24 +155,27 @@ public:
+   void mark_as_script_body (void) { script_body = true; }
+ 
+   bool is_function_body (void) const { return function_body; }
+ 
+   bool is_anon_function_body (void) const { return anon_function_body; }
+ 
+   bool is_script_body (void) const { return script_body; }
+ 
+-  int set_breakpoint (int line);
++  int set_breakpoint (int line, const std::string& condition);
+ 
+   void delete_breakpoint (int line);
+ 
+   octave_value_list list_breakpoints (void);
+ 
++  std::list<bp_type> breakpoints_and_conds (void);
++
+   bp_table::intmap add_breakpoint (const std::string& file,
+-                                   const bp_table::intmap& line);
++                                   const bp_table::intmap& line,
++                                   const std::string& condition);
+ 
+   bp_table::intmap remove_all_breakpoints (const std::string& file);
+ 
+   tree_statement_list *dup (symbol_table::scope_id scope,
+                             symbol_table::context_id context) const;
+ 
+   void accept (tree_walker& tw);
+ 
+diff --git a/libinterp/parse-tree/pt.cc b/libinterp/parse-tree/pt.cc
+--- a/libinterp/parse-tree/pt.cc
++++ b/libinterp/parse-tree/pt.cc
+@@ -26,16 +26,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <iostream>
+ #include <sstream>
+ #include <string>
+ 
+ #include "ov-fcn.h"
+ #include "pt.h"
+ #include "pt-pr-code.h"
++#include "unwind-prot.h"
+ 
+ // Hide the details of the string buffer so that we are less likely to
+ // create a memory leak.
+ 
+ std::string
+ tree::str_print_code (void)
+ {
+   std::ostringstream buf;
+@@ -43,8 +44,56 @@ tree::str_print_code (void)
+   tree_print_code tpc (buf);
+ 
+   accept (tpc);
+ 
+   std::string retval = buf.str ();
+ 
+   return retval;
+ }
++
++// function from libinterp/parse-tree/oct-parse.cc, not listed in oct-parse.h
++octave_value_list eval_string (const std::string&, bool, int&, int);
++// Is the current breakpoint condition met?
++bool
++tree::meets_bp_condition () const
++{
++  bool retval;
++  if (bp == 0)
++    retval = false;
++  else if (bp->length () == 0)     // empty condition always met
++    retval = true;
++  else
++    {
++      int parse_status = 0;
++
++      unwind_protect frame;
++      frame.protect_var (buffer_error_messages);
++      frame.protect_var (Vdebug_on_error);
++      frame.protect_var (Vdebug_on_warning);
++
++      buffer_error_messages++;
++      Vdebug_on_error = false;
++      Vdebug_on_warning = false;
++
++      retval = true;                // default to stopping if any error
++      try
++        {
++          octave_value_list val = eval_string (*bp, 1, parse_status, 1);
++          if (parse_status == 0)
++            {
++              if (! val(0).is_scalar_type ())
++                warning ("Breakpoint condition must be a scalar, not size %s",
++                  val(0).dims ().str ('x').c_str ());
++              else
++                retval = val(0).bool_value ();
++            }
++          else
++            warning ("Error parsing breakpoint condition");
++        }
++      catch (const octave_execution_exception& e)
++        {
++          warning ("Error evaluating breakpoint condition:\n    %s",
++                   last_error_message ().c_str ());
++        }
++    }
++  return retval;
++}
+diff --git a/libinterp/parse-tree/pt.h b/libinterp/parse-tree/pt.h
+--- a/libinterp/parse-tree/pt.h
++++ b/libinterp/parse-tree/pt.h
+@@ -24,26 +24,28 @@ along with Octave; see the file COPYING.
+ #define octave_pt_h 1
+ 
+ #include <string>
+ 
+ #include <iosfwd>
+ 
+ class octave_function;
+ class tree_walker;
++class bp_table;
++bool meets_condition (std::string *);
+ 
+ // Base class for the parse tree.
+ 
+ class
+ tree
+ {
+ public:
+ 
+   tree (int l = -1, int c = -1)
+-    : line_num (l), column_num (c), bp (false) { }
++    : line_num (l), column_num (c), bp (NULL) { }
+ 
+   virtual ~tree (void) { }
+ 
+   virtual int line (void) const { return line_num; }
+ 
+   virtual int column (void) const { return column_num; }
+ 
+   void line (int l) { line_num = l; }
+@@ -51,35 +53,48 @@ public:
+   void column (int c) { column_num = c; }
+ 
+   void set_location (int l, int c)
+   {
+     line_num = l;
+     column_num = c;
+   }
+ 
+-  virtual void set_breakpoint (void) { bp = true; }
++  virtual void set_breakpoint (std::string condition)
++    { if (bp)
++        *bp = condition;
++      else
++        bp = new std::string(condition);
++    }
++
++  virtual void delete_breakpoint (void) { if (bp) delete bp; bp = NULL; }
+ 
+-  virtual void delete_breakpoint (void) { bp = false; }
++  bool meets_bp_condition (void) const;
++
++  bool is_breakpoint (bool check_active = false) const
++    { return bp && (!check_active || meets_bp_condition ()); }
+ 
+-  bool is_breakpoint (void) const { return bp; }
++  // breakpoint condition, or "0" (i.e., "false") if no breakpoint.
++  // To distinguish "0" from a disabled breakpoint, test "is_breakpoint" too.
++  const std::string bp_cond (void) const
++    { return bp ? *bp : std::string("0"); }
+ 
+   std::string str_print_code (void);
+ 
+   virtual void accept (tree_walker& tw) = 0;
+ 
+ private:
+ 
+   // The input line and column where we found the text that was
+   // eventually converted to this tree node.
+   int line_num;
+   int column_num;
+ 
+-  // Breakpoint flag.
+-  bool bp;
++  // Breakpoint flag: NULL if no breakpoint, or the condition if there is one
++  std::string *bp;
+ 
+   // No copying!
+ 
+   tree (const tree&);
+ 
+   tree& operator = (const tree&);
+ };
+ 

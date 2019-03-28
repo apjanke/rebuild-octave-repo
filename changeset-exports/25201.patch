@@ -1,0 +1,355 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1523413357 14400
+#      Tue Apr 10 22:22:37 2018 -0400
+# Branch stable
+# Node ID c80323fe49389dd54d4948923bedbf257a66c9d1
+# Parent  b3ee0179d7b005a29bea15bc9451e0e0ab85d39c
+improve handling of global symbols (bug #53599)
+
+
+* load-save.cc (install_loaded_variable): For global values, check
+global status and link to global symbol if needed.
+
+* symrec.h (symbol_record::symbol_record_rep::unbind_global_rep):
+New function.
+(symbol_record::symbol_record_rep::clear): Use unbind_global_rep to
+clearing global symbols.
+(symbol_record::symbol_record_rep::is_marked_global): New function.
+(symbol_record::symbol_record_rep::is_global): Use it.
+(symbol_record::symbol_record_rep::bind_fwd_rep): Don't forward again
+if symbol is already global.
+(symbol_record::unbind_fwd_rep): Eliminate argument.  Change all uses.
+(symbol_record::symbol_record_rep::unbind_fwd_rep):
+Eliminate argument.  Simplify.
+
+* test/bug-53599.tst: New file.
+* test/module.mk: Update.
+
+diff --git a/libinterp/corefcn/load-save.cc b/libinterp/corefcn/load-save.cc
+--- a/libinterp/corefcn/load-save.cc
++++ b/libinterp/corefcn/load-save.cc
+@@ -148,22 +148,28 @@ install_loaded_variable (const std::stri
+   octave::symbol_table& symtab
+     = octave::__get_symbol_table__ ("install_loaded_variable");
+ 
+   octave::symbol_scope scope
+     = symtab.require_current_scope ("install_loaded_variable");
+ 
+   if (global)
+     {
+-      scope.clear_variable (name);
+-      scope.mark_global (name);
+-      symtab.assign (name, val);
++      octave::symbol_record sym = scope.find_symbol (name);
++
++      if (! sym.is_global ())
++        {
++          octave::symbol_scope global_scope = symtab.global_scope ();
++          octave::symbol_record global_sym = global_scope.find_symbol (name);
++
++          sym.bind_fwd_rep (global_scope.get_rep (), global_sym);
++        }
+     }
+-  else
+-    scope.assign (name, val);
++
++  scope.assign (name, val);
+ }
+ 
+ // Return TRUE if NAME matches one of the given globbing PATTERNS.
+ 
+ static bool
+ matches_patterns (const string_vector& patterns, int pat_idx,
+                   int num_pat, const std::string& name)
+ {
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+--- a/libinterp/corefcn/symrec.h
++++ b/libinterp/corefcn/symrec.h
+@@ -198,17 +198,17 @@ namespace octave
+       }
+ 
+       void clear (context_id context)
+       {
+         // For globals, break the link to the global value first, then
+         // clear the local value.
+ 
+         if (is_global ())
+-          unbind_fwd_rep ();
++          unbind_global_rep ();
+ 
+         if (! (is_hidden () || is_inherited ()))
+           {
+             assign (octave_value (), context);
+ 
+             // For persistent values, we clear the value then unmark so
+             // that we clear the first element of the value stack.
+ 
+@@ -275,17 +275,17 @@ namespace octave
+         return ! m_fwd_rep.expired ();
+       }
+ 
+       bool is_global (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->is_global ();
+ 
+-        return m_storage_class & global;
++        return is_marked_global ();
+       }
+ 
+       bool is_persistent (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->is_persistent ();
+ 
+         return m_storage_class & persistent;
+@@ -358,16 +358,21 @@ namespace octave
+       // actually in the global symbol_scope, and that should only
+       // happen when it is added to the global symbol_scope.
+ 
+       void mark_global (void)
+       {
+         m_storage_class |= global;
+       }
+ 
++      bool is_marked_global (void) const
++      {
++        return m_storage_class & global;
++      }
++
+       void mark_persistent (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           {
+             t_fwd_rep->mark_persistent ();
+             return;
+           }
+ 
+@@ -477,61 +482,61 @@ namespace octave
+         // If this object is already bound to another scope (for
+         // example, a variable in a script or nested function is bound
+         // to the enclosing scope), then bind that object to the next
+         // scope.  FIXME: can this happen for any other reason than we
+         // are making a variable in a script global?
+ 
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           {
++            // If this is the symbol in the global scope, then don't
++            // forward again!
++
++            if (t_fwd_rep->is_marked_global ())
++              return;
++
+             t_fwd_rep->bind_fwd_rep (fwd_scope, fwd_rep);
+-            return;
+           }
+ 
+         m_fwd_scope = fwd_scope;
+         m_fwd_rep = fwd_rep;
+       }
+ 
+-      void unbind_fwd_rep (bool recurse = true)
++      void unbind_fwd_rep (void)
+       {
+-        // When unbinding variables in a script scope, recurse will be
+-        // false and we will only break the immediate link.  By doing
+-        // that, we ensure that any variables that are made global in
+-        // a script remain linked as globals in the enclosing scope.
+-
+-        // When unbinding variables in a (possibly nested) function
+-        // scope, recurse will be true and we will break the link to
+-        // the global scope, not just the immediate link to the parent
+-        // scope of the nested function.
+-
+-        if (recurse)
+-          {
+-            if (auto t_fwd_rep = m_fwd_rep.lock ())
+-              {
+-                // Currently, it is only possible to have at most two
+-                // levels of indirection here, either
+-                //
+-                //   nested function -> parent function -> global scope
+-                //
+-                // or
+-                //
+-                //   script -> top level scope -> global scope
+-                //
+-                // so we can break the recursion here by setting the
+-                // argument to unbind_fwd_rep to false.
+-
+-                t_fwd_rep->unbind_fwd_rep (false);
+-                return;
+-              }
+-          }
++        // When unbinding variables in a script scope, we only break
++        // the immediate link.  By doing that, we ensure that any
++        // variables that are made global in a script remain linked as
++        // globals in the enclosing scope.
+ 
+         m_fwd_scope = std::weak_ptr<symbol_scope_rep> ();
+         m_fwd_rep.reset ();
+       }
+ 
++      void unbind_global_rep (void)
++      {
++        // Break the link to the global symbol_record_rep.  These must
++        // forwarded, so we don't do anything unless the forward rep
++        // points to something.
++
++        if (auto t_fwd_rep = m_fwd_rep.lock ())
++          {
++            if (t_fwd_rep->is_marked_global ())
++              {
++                // The rep this object points to is in the global
++                // scope, so delete the link to it.
++
++                m_fwd_scope = std::weak_ptr<symbol_scope_rep> ();
++                m_fwd_rep.reset ();
++              }
++            else
++              t_fwd_rep->unbind_fwd_rep ();
++          }
++      }
++
+       std::shared_ptr<symbol_record_rep>
+       dup (const std::shared_ptr<symbol_scope_rep>& new_scope) const;
+ 
+       octave_value dump (context_id context) const;
+ 
+       std::string name (void) const { return m_name; }
+ 
+       void rename (const std::string& new_name) { m_name = new_name; }
+@@ -652,39 +657,41 @@ namespace octave
+     bool is_persistent (void) const { return m_rep->is_persistent (); }
+     bool is_added_static (void) const { return m_rep->is_added_static (); }
+ 
+     void mark_local (void) { m_rep->mark_local (); }
+     void mark_automatic (void) { m_rep->mark_automatic (); }
+     void mark_formal (void) { m_rep->mark_formal (); }
+     void mark_hidden (void) { m_rep->mark_hidden (); }
+     void mark_inherited (void) { m_rep->mark_inherited (); }
+-    void mark_global (void) { m_rep->mark_global (); }
+     void mark_persistent (void) { m_rep->mark_persistent (); }
+     void mark_added_static (void) { m_rep->mark_added_static (); }
+ 
+     void unmark_local (void) { m_rep->unmark_local (); }
+     void unmark_automatic (void) { m_rep->unmark_automatic (); }
+     void unmark_formal (void) { m_rep->unmark_formal (); }
+     void unmark_hidden (void) { m_rep->unmark_hidden (); }
+     void unmark_inherited (void) { m_rep->unmark_inherited (); }
+     void unmark_persistent (void) { m_rep->unmark_persistent (); }
+     void unmark_added_static (void) { m_rep->unmark_added_static (); }
+ 
++    bool is_marked_global (void) const { return m_rep->is_marked_global (); }
++    void mark_global (void) { m_rep->mark_global (); }
++
+     void init_persistent (void) { m_rep->init_persistent (); }
+ 
+     unsigned int storage_class (void) const { return m_rep->storage_class (); }
+ 
+     void bind_fwd_rep (const std::shared_ptr<symbol_scope_rep>& fwd_scope,
+                        const symbol_record& sr)
+     {
+       m_rep->bind_fwd_rep (fwd_scope, sr.m_rep);
+     }
+ 
+-    void unbind_fwd_rep (bool recurse = true) { m_rep->unbind_fwd_rep (recurse); }
++    void unbind_fwd_rep (void) { m_rep->unbind_fwd_rep (); }
+ 
+     octave_value dump (context_id context) const
+     {
+       return m_rep->dump (context);
+     }
+ 
+   private:
+ 
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -232,11 +232,11 @@ namespace octave
+       nm_sr.second.bind_fwd_rep (curr_scope,
+                                  curr_scope->find_symbol (nm_sr.first));
+   }
+ 
+   void
+   symbol_scope_rep::unbind_script_symbols (void)
+   {
+     for (auto& nm_sr : m_symbols)
+-      nm_sr.second.unbind_fwd_rep (false);
++      nm_sr.second.unbind_fwd_rep ();
+   }
+ }
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -787,16 +787,20 @@ namespace octave
+     }
+ 
+     void mark_hidden (const std::string& name)
+     {
+       if (m_rep)
+         m_rep->mark_hidden (name);
+     }
+ 
++    // This function should only be called for the global
++    // symbol_scope, and that should only happen when it is added to
++    // the global symbol_scope.
++
+     void mark_global (const std::string& name)
+     {
+       if (m_rep)
+         m_rep->mark_global (name);
+     }
+ 
+     std::list<symbol_record>
+     all_variables (bool defined_only = true,
+diff --git a/test/bug-53599.tst b/test/bug-53599.tst
+new file mode 100644
+--- /dev/null
++++ b/test/bug-53599.tst
+@@ -0,0 +1,23 @@
++%!function rval = sggval (val)
++%!  global gval
++%!  if (nargin == 1)
++%!    gval = val;
++%!  else
++%!    rval = gval;
++%!  endif
++%!endfunction
++
++%!test
++%! global gval
++%! assert (isempty (gval))
++%! sggval (13);
++%! assert (sggval (), 13);
++%! assert (gval, 13);
++%! clear global gval
++%! assert (sggval (), [])
++%! gval = 42;
++%! assert (sggval (), []);
++%! clear gval
++%! global gval
++%! gval = 42;
++%! assert (sggval (), 42);
+diff --git a/test/module.mk b/test/module.mk
+--- a/test/module.mk
++++ b/test/module.mk
+@@ -7,16 +7,17 @@
+ TEST_FILES += \
+   %reldir%/fntests.m \
+   %reldir%/args.tst \
+   %reldir%/bug-31371.tst \
+   %reldir%/bug-38565.tst \
+   %reldir%/bug-38576.tst \
+   %reldir%/bug-46330.tst \
+   %reldir%/bug-49904.tst \
++  %reldir%/bug-53599.tst \
+   %reldir%/colormaps.tst \
+   %reldir%/command.tst \
+   %reldir%/complex.tst \
+   %reldir%/deprecate-props.tst \
+   %reldir%/diag-perm.tst \
+   %reldir%/error.tst \
+   %reldir%/eval-catch.tst \
+   %reldir%/for.tst \

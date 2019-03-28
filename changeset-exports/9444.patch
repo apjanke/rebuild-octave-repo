@@ -1,0 +1,394 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1248194613 14400
+#      Tue Jul 21 12:43:33 2009 -0400
+# Node ID 0c785ad961fa7921c667b1e7ca6c3a0f4cb7e78f
+# Parent  8f9d8776d11c0fec73636f073d29a9e37448f1fd
+improve behavior of builtin
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,19 @@
++2009-07-21  John W. Eaton  <jwe@octave.org>
++
++	* symtab.cc (symbol_table::builtin_find,
++	symbol_table::do_builtin_find,
++	symbol_table::fcn_info::builtin_find,
++	symbol_table::fcn_info::fcn_info_rep::builtin_find,
++	symbol_table::fcn_info::fcn_info_rep::x_builtin_find): New functions.
++	* symtab.h: Provide decls.
++	* DLD-FUNCTIONS/dispatch.cc (Fbuiltin): Call
++	symbol_table::builtin_find instead of symbol_table::find_function.
++
+ 2009-07-20  Aleksej Saushev  <asau@inbox.ru>
+ 
+ 	* sysdep.cc: Also define BSD_init if __NetBSD__ is defined.
+ 	(sysdep_init): Also call BSD_init if __NetBSD__ is defined.
+ 
+ 2009-07-20  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* bitfcns.cc (DO_UBITSHIFT): Avoid overflow.
+diff --git a/src/DLD-FUNCTIONS/dispatch.cc b/src/DLD-FUNCTIONS/dispatch.cc
+--- a/src/DLD-FUNCTIONS/dispatch.cc
++++ b/src/DLD-FUNCTIONS/dispatch.cc
+@@ -53,17 +53,17 @@ some other function for the given type s
+   int nargin = args.length ();
+ 
+   if (nargin > 0)
+     {
+       const std::string name (args(0).string_value ());
+  
+       if (! error_state)
+ 	{
+-	  octave_value fcn = symbol_table::find_function (name);
++	  octave_value fcn = symbol_table::builtin_find (name);
+ 
+ 	  if (fcn.is_defined ())
+ 	    retval = feval (fcn.function_value (), args.splice (0, 1),
+ 			    nargout);
+ 	  else
+ 	    error ("builtin: lookup for symbol `%s' failed", name.c_str ());
+ 	}
+       else
+diff --git a/src/symtab.cc b/src/symtab.cc
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -719,16 +719,151 @@ symbol_table::fcn_info::fcn_info_rep::xf
+   if (fcn.is_defined ())
+     return fcn;
+ 
+   // Built-in function (might be undefined).
+ 
+   return built_in_function;
+ }
+ 
++// Find the definition of NAME according to the following precedence
++// list:
++//
++//   built-in function
++//   function on the path
++//   autoload function
++//   command-line function
++//   private function
++//   subfunction
++
++// This function is used to implement the "builtin" function, which
++// searches for "built-in" functions.  In Matlab, "builtin" only
++// returns functions that are actually built-in to the interpreter.
++// But since the list of built-in functions is different in Octave and
++// Matlab, we also search up the precedence list until we find
++// something that matches.  Note that we are only searching by name,
++// so class methods, constructors, and legacy dispatch functions are
++// skipped.
++
++octave_value
++symbol_table::fcn_info::fcn_info_rep::builtin_find (void)
++{
++  octave_value retval = x_builtin_find ();
++
++  if (! retval.is_defined ())
++    {
++      // It is possible that the user created a file on the fly since
++      // the last prompt or chdir, so try updating the load path and
++      // searching again.
++
++      load_path::update ();
++
++      retval = x_builtin_find ();
++    }
++
++  return retval;
++}
++
++octave_value
++symbol_table::fcn_info::fcn_info_rep::x_builtin_find (void)
++{
++  // Built-in function.
++  if (built_in_function.is_defined ())
++    return built_in_function;
++
++  // Function on the path.
++
++  octave_value fcn = find_user_function ();
++
++  if (fcn.is_defined ())
++    return fcn;
++
++  // Autoload?
++
++  fcn = find_autoload ();
++
++  if (fcn.is_defined ())
++    return fcn;
++
++  // Command-line function.
++
++  if (cmdline_function.is_defined ())
++    return cmdline_function;
++
++  // Private function.
++
++  octave_function *curr_fcn = octave_call_stack::current ();
++
++  if (curr_fcn)
++    {
++      std::string dir_name = curr_fcn->dir_name ();
++
++      if (! dir_name.empty ())
++	{
++	  str_val_iterator q = private_functions.find (dir_name);
++
++	  if (q == private_functions.end ())
++	    {
++	      octave_value val = load_private_function (dir_name);
++
++	      if (val.is_defined ())
++		return val;
++	    }
++	  else
++	    {
++	      octave_value& fval = q->second;
++
++	      if (fval.is_defined ())
++		out_of_date_check_internal (fval);
++
++	      if (fval.is_defined ())
++		return fval;
++	      else
++		{
++		  octave_value val = load_private_function (dir_name);
++
++		  if (val.is_defined ())
++		    return val;
++		}
++	    }
++	}
++    }
++
++  // Subfunction.  I think it only makes sense to check for
++  // subfunctions if we are currently executing a function defined
++  // from a .m file.
++
++  scope_val_iterator r = subfunctions.find (xcurrent_scope);
++
++  if (r != subfunctions.end ())
++    {
++      // FIXME -- out-of-date check here.
++
++      return r->second;
++    }
++  else if (curr_fcn)
++    {
++      scope_id pscope = curr_fcn->parent_fcn_scope ();
++
++      if (pscope > 0)
++	{
++	  r = subfunctions.find (pscope);
++
++	  if (r != subfunctions.end ())
++	    {
++	      // FIXME -- out-of-date check here.
++
++	      return r->second;
++	    }
++	}
++    }
++
++  return octave_value ();
++}
++
+ octave_value
+ symbol_table::fcn_info::fcn_info_rep::find_method (const std::string& dispatch_type)
+ {
+   octave_value retval;
+ 
+   str_val_iterator q = class_methods.find (dispatch_type);
+ 
+   if (q == class_methods.end ())
+@@ -963,16 +1098,24 @@ symbol_table::find (const std::string& n
+ 
+   return inst
+     ? inst->do_find (name, args, arg_names, evaluated_args,
+ 		     args_evaluated, skip_variables)
+     : octave_value ();
+ }
+ 
+ octave_value
++symbol_table::builtin_find (const std::string& name)
++{
++  symbol_table *inst = get_instance (xcurrent_scope);
++
++  return inst ? inst->do_builtin_find (name) : octave_value ();
++}
++
++octave_value
+ symbol_table::find_function (const std::string& name, tree_argument_list *args,
+ 			     const string_vector& arg_names,
+ 			     octave_value_list& evaluated_args,
+ 			     bool& args_evaluated)
+ {
+   octave_value retval;
+ 
+   if (! name.empty () && name[0] == '@')
+@@ -1167,16 +1310,40 @@ symbol_table::do_find (const std::string
+ 	fcn_table[name] = finfo;
+ 
+       return fcn;
+     }
+ 
+   return retval;
+ }
+ 
++octave_value
++symbol_table::do_builtin_find (const std::string& name)
++{
++  octave_value retval;
++
++  fcn_table_iterator p = fcn_table.find (name);
++
++  if (p != fcn_table.end ())
++    return p->second.builtin_find ();
++  else
++    {
++      fcn_info finfo (name);
++
++      octave_value fcn = finfo.builtin_find ();
++
++      if (fcn.is_defined ())
++	fcn_table[name] = finfo;
++
++      return fcn;
++    }
++
++  return retval;
++}
++
+ void
+ symbol_table::do_dump (std::ostream& os)
+ {
+   if (! persistent_table.empty ())
+     {
+       os << "  persistent variables in this scope:\n\n";
+ 
+       for (persistent_table_const_iterator p = persistent_table.begin ();
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -423,16 +423,18 @@ public:
+     symbol_record dup (void) const { return symbol_record (rep->dup ()); }
+ 
+     std::string name (void) const { return rep->name; }
+ 
+     octave_value
+     find (tree_argument_list *args, const string_vector& arg_names,
+ 	  octave_value_list& evaluated_args, bool& args_evaluated) const;
+ 
++    octave_value builtin_find (void) const;
++
+     void force_variable (context_id context = xcurrent_context)
+     {
+       rep->force_variable (context);
+     }
+ 
+     octave_value& varref (context_id context = xcurrent_context)
+     {
+       return rep->varref (context);
+@@ -539,16 +541,18 @@ public:
+       octave_value load_class_constructor (void);
+ 
+       octave_value load_class_method (const std::string& dispatch_type);
+ 
+       octave_value
+       find (tree_argument_list *args, const string_vector& arg_names,
+ 	    octave_value_list& evaluated_args, bool& args_evaluated);
+ 
++      octave_value builtin_find (void);
++
+       octave_value find_method (const std::string& dispatch_type);
+ 
+       octave_value find_autoload (void);
+ 
+       octave_value find_user_function (void);
+ 
+       bool is_user_function_defined (void) const
+       {
+@@ -730,16 +734,18 @@ public:
+       size_t count;
+ 
+     private:
+ 
+       octave_value
+       xfind (tree_argument_list *args, const string_vector& arg_names,
+ 	     octave_value_list& evaluated_args, bool& args_evaluated);
+ 
++      octave_value x_builtin_find (void);
++
+       // No copying!
+ 
+       fcn_info_rep (const fcn_info_rep&);
+ 
+       fcn_info_rep& operator = (const fcn_info_rep&);
+     };
+ 
+   public:
+@@ -771,16 +777,21 @@ public:
+       if (--rep->count == 0)
+ 	delete rep;
+     }
+ 
+     octave_value
+     find (tree_argument_list *args, const string_vector& arg_names,
+ 	  octave_value_list& evaluated_args, bool& args_evaluated);
+ 
++    octave_value builtin_find (void)
++    {
++      return rep->builtin_find ();
++    }
++
+     octave_value find_method (const std::string& dispatch_type) const
+     {
+       return rep->find_method (dispatch_type);
+     }
+ 
+     octave_value find_built_in_function (void) const
+     {
+       return rep->built_in_function;
+@@ -1041,16 +1052,18 @@ public:
+ 
+   // Find a value corresponding to the given name in the table.
+   static octave_value
+   find (const std::string& name, tree_argument_list *args,
+ 	const string_vector& arg_names,
+ 	octave_value_list& evaluated_args, bool& args_evaluated,
+ 	bool skip_variables = false);
+ 
++  static octave_value builtin_find (const std::string& name);
++
+   // Insert a new name in the table.
+   static symbol_record& insert (const std::string& name)
+   {
+     static symbol_record foobar;
+ 
+     symbol_table *inst = get_instance (xcurrent_scope);
+ 
+     return inst ? inst->do_insert (name) : foobar;
+@@ -1999,16 +2012,18 @@ private:
+     }
+ 
+   octave_value
+   do_find (const std::string& name, tree_argument_list *args,
+ 	   const string_vector& arg_names,
+ 	   octave_value_list& evaluated_args, bool& args_evaluated,
+ 	   bool skip_variables);
+ 
++  octave_value do_builtin_find (const std::string& name);
++
+   symbol_record& do_insert (const std::string& name)
+   {
+     table_iterator p = table.find (name);
+ 
+     return p == table.end ()
+       ? (table[name] = symbol_record (name)) : p->second;
+   }
+ 

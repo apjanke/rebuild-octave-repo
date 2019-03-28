@@ -1,0 +1,283 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1344629129 18000
+#      Fri Aug 10 15:05:29 2012 -0500
+# Node ID 709e8928e68cb1f1c816557cd194beba3d80816a
+# Parent  142e377e7e28911cd2e2650b1a67fcd243981b49
+Scalar unary operation support in JIT
+
+* jit-typeinfo.cc (jit_typeinfo::jit_typeinfo): Add scalar unary operations.
+* jit-typeinfo.h (jit_typeinfo::unary_op, jit_typeinfo::do_unary_op): New
+function.
+
+* pt-jit.cc (jit_convert::visit_postfix_expression,
+jit_convert::visit_prefix_expression): Impelment.
+(jit_convert::visit): Protect result.
+
+diff --git a/src/interp-core/jit-typeinfo.cc b/src/interp-core/jit-typeinfo.cc
+--- a/src/interp-core/jit-typeinfo.cc
++++ b/src/interp-core/jit-typeinfo.cc
+@@ -1101,16 +1101,24 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   binary_ops.resize (octave_value::num_binary_ops);
+   for (size_t i = 0; i < octave_value::num_binary_ops; ++i)
+     {
+       octave_value::binary_op op = static_cast<octave_value::binary_op> (i);
+       std::string op_name = octave_value::binary_op_as_string (op);
+       binary_ops[i].stash_name ("binary" + op_name);
+     }
+ 
++  unary_ops.resize (octave_value::num_unary_ops);
++  for (size_t i = 0; i < octave_value::num_unary_ops; ++i)
++    {
++      octave_value::unary_op op = static_cast<octave_value::unary_op> (i);
++      std::string op_name = octave_value::unary_op_as_string (op);
++      unary_ops[i].stash_name ("unary" + op_name);
++    }
++
+   for (int op = 0; op < octave_value::num_binary_ops; ++op)
+     {
+       llvm::Twine fn_name ("octave_jit_binary_any_any_");
+       fn_name = fn_name + llvm::Twine (op);
+ 
+       fn = create_function (jit_convention::internal, fn_name, any, any, any);
+       fn.mark_can_error ();
+       llvm::BasicBlock *block = fn.new_block ();
+@@ -1159,17 +1167,16 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   fn = create_identity (complex);
+   release_fn.add_overload (fn);
+ 
+   // release index
+   fn = create_identity (index);
+   release_fn.add_overload (fn);
+ 
+   // now for binary scalar operations
+-  // FIXME: Finish all operations
+   add_binary_op (scalar, octave_value::op_add, llvm::Instruction::FAdd);
+   add_binary_op (scalar, octave_value::op_sub, llvm::Instruction::FSub);
+   add_binary_op (scalar, octave_value::op_mul, llvm::Instruction::FMul);
+   add_binary_op (scalar, octave_value::op_el_mul, llvm::Instruction::FMul);
+ 
+   add_binary_fcmp (scalar, octave_value::op_lt, llvm::CmpInst::FCMP_ULT);
+   add_binary_fcmp (scalar, octave_value::op_le, llvm::CmpInst::FCMP_ULE);
+   add_binary_fcmp (scalar, octave_value::op_eq, llvm::CmpInst::FCMP_UEQ);
+@@ -1219,16 +1226,58 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   // can take on.
+   fn = create_function (jit_convention::external,
+                         "octave_jit_pow_scalar_scalar", complex, scalar,
+                         scalar);
+   fn.add_mapping (engine, &octave_jit_pow_scalar_scalar);
+   binary_ops[octave_value::op_pow].add_overload (fn);
+   binary_ops[octave_value::op_el_pow].add_overload (fn);
+ 
++  // now for unary scalar operations
++  // FIXME: Impelment not
++  fn = create_function (jit_convention::internal, "octave_jit_++", scalar,
++                        scalar);
++  body = fn.new_block ();
++  builder.SetInsertPoint (body);
++  {
++    llvm::Value *one = llvm::ConstantFP::get (scalar_t, 1);
++    llvm::Value *val = fn.argument (builder, 0);
++    val = builder.CreateFAdd (val, one);
++    fn.do_return (builder, val);
++  }
++  unary_ops[octave_value::op_incr].add_overload (fn);
++
++  fn = create_function (jit_convention::internal, "octave_jit_--", scalar,
++                        scalar);
++  body = fn.new_block ();
++  builder.SetInsertPoint (body);
++  {
++    llvm::Value *one = llvm::ConstantFP::get (scalar_t, 1);
++    llvm::Value *val = fn.argument (builder, 0);
++    val = builder.CreateFSub (val, one);
++    fn.do_return (builder, val);
++  }
++  unary_ops[octave_value::op_decr].add_overload (fn);
++
++  fn = create_function (jit_convention::internal, "octave_jit_uminus", scalar,
++                        scalar);
++  body = fn.new_block ();
++  builder.SetInsertPoint (body);
++  {
++    llvm::Value *mone = llvm::ConstantFP::get (scalar_t, -1);
++    llvm::Value *val = fn.argument (builder, 0);
++    val = builder.CreateFMul (val, mone);
++    fn.do_return (builder, val);
++  }
++
++  fn = create_identity (scalar);
++  unary_ops[octave_value::op_uplus].add_overload (fn);
++  unary_ops[octave_value::op_transpose].add_overload (fn);
++  unary_ops[octave_value::op_hermitian].add_overload (fn);
++
+   // now for binary complex operations
+   add_binary_op (complex, octave_value::op_add, llvm::Instruction::FAdd);
+   add_binary_op (complex, octave_value::op_sub, llvm::Instruction::FSub);
+ 
+   fn = create_function (jit_convention::internal,
+                         "octave_jit_*_complex_complex", complex, complex,
+                         complex);
+   body = fn.new_block ();
+diff --git a/src/interp-core/jit-typeinfo.h b/src/interp-core/jit-typeinfo.h
+--- a/src/interp-core/jit-typeinfo.h
++++ b/src/interp-core/jit-typeinfo.h
+@@ -471,16 +471,21 @@ public:
+     return instance->do_type_of (ov);
+   }
+ 
+   static const jit_operation& binary_op (int op)
+   {
+     return instance->do_binary_op (op);
+   }
+ 
++  static const jit_operation& unary_op (int op)
++  {
++    return instance->do_unary_op (op);
++  }
++
+   static const jit_operation& grab (void) { return instance->grab_fn; }
+ 
+   static const jit_function& get_grab (jit_type *type)
+   {
+     return instance->grab_fn.overload (type);
+   }
+ 
+   static const jit_operation& release (void)
+@@ -602,16 +607,22 @@ private:
+   jit_type *do_type_of (const octave_value &ov) const;
+ 
+   const jit_operation& do_binary_op (int op) const
+   {
+     assert (static_cast<size_t>(op) < binary_ops.size ());
+     return binary_ops[op];
+   }
+ 
++  const jit_operation& do_unary_op (int op) const
++  {
++    assert (static_cast<size_t> (op) < unary_ops.size ());
++    return unary_ops[op];
++  }
++
+   const jit_operation& do_cast (jit_type *to)
+   {
+     static jit_operation null_function;
+     if (! to)
+       return null_function;
+ 
+     size_t id = to->type_id ();
+     if (id >= casts.size ())
+@@ -732,16 +743,17 @@ private:
+   jit_type *complex;
+   jit_type *unknown_function;
+   std::map<size_t, jit_type *> ints;
+   std::map<std::string, jit_type *> builtins;
+ 
+   llvm::StructType *complex_ret;
+ 
+   std::vector<jit_operation> binary_ops;
++  std::vector<jit_operation> unary_ops;
+   jit_operation grab_fn;
+   jit_operation release_fn;
+   jit_operation print_fn;
+   jit_operation for_init_fn;
+   jit_operation for_check_fn;
+   jit_operation for_index_fn;
+   jit_operation logically_true_fn;
+   jit_operation make_range_fn;
+diff --git a/src/interp-core/pt-jit.cc b/src/interp-core/pt-jit.cc
+--- a/src/interp-core/pt-jit.cc
++++ b/src/interp-core/pt-jit.cc
+@@ -576,25 +576,43 @@ jit_convert::visit_fcn_handle (tree_fcn_
+ 
+ void
+ jit_convert::visit_parameter_list (tree_parameter_list&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+ void
+-jit_convert::visit_postfix_expression (tree_postfix_expression&)
++jit_convert::visit_postfix_expression (tree_postfix_expression& tpe)
+ {
+-  throw jit_fail_exception ();
++  octave_value::unary_op etype = tpe.op_type ();
++  tree_expression *operand = tpe.operand ();
++  jit_value *operandv = visit (operand);
++
++  const jit_operation& fn = jit_typeinfo::unary_op (etype);
++  result = create_checked (fn, operandv);
++
++  if (etype == octave_value::op_incr || etype == octave_value::op_decr)
++    {
++      // FIXME: Somehow copy operandv
++      // do_assign (operand, operandv);
++      throw jit_fail_exception ("Postfix ++ and -- not yet supported");
++    }
+ }
+ 
+ void
+-jit_convert::visit_prefix_expression (tree_prefix_expression&)
++jit_convert::visit_prefix_expression (tree_prefix_expression& tpe)
+ {
+-  throw jit_fail_exception ();
++  octave_value::unary_op etype = tpe.op_type ();
++  tree_expression *operand = tpe.operand ();
++  const jit_operation& fn = jit_typeinfo::unary_op (etype);
++  result = create_checked (fn, visit (operand));
++
++  if (etype == octave_value::op_incr || etype == octave_value::op_decr)
++    do_assign (operand, result);
+ }
+ 
+ void
+ jit_convert::visit_return_command (tree_return_command&)
+ {
+   throw jit_fail_exception ();
+ }
+ 
+@@ -900,22 +918,21 @@ jit_convert::do_assign (const std::strin
+     }
+ 
+   return var;
+ }
+ 
+ jit_value *
+ jit_convert::visit (tree& tee)
+ {
+-  result = 0;
+-  tee.accept (*this);
++  unwind_protect prot;
++  prot.protect_var (result);
+ 
+-  jit_value *ret = result;
+-  result = 0;
+-  return ret;
++  tee.accept (*this);
++  return result;
+ }
+ 
+ void
+ jit_convert::append_users_term (jit_terminator *term)
+ {
+   for (size_t i = 0; i < term->successor_count (); ++i)
+     {
+       if (term->alive (i))
+@@ -1958,9 +1975,17 @@ Test some simple cases that compile.
+ 
+ %!test
+ %! i = 0;
+ %! while i < 10
+ %!   i += 1;
+ %! endwhile
+ %! assert (i == 10);
+ 
++%!test
++%! i = 0;
++%! while i < 10
++%!   a = ++i;
++%! endwhile
++%! assert (i == 10);
++%! assert (a == 10);
++
+ */

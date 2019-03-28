@@ -1,0 +1,468 @@
+# HG changeset patch
+# User Daniel Kraft <d@domob.eu>
+# Date 1311954699 -7200
+#      Fri Jul 29 17:51:39 2011 +0200
+# Node ID 5d18231eee00217ee32e4bb8914f76434a18b5af
+# Parent  0ca8f06aba7a59b5e7bad4a92ff73e1222760b26
+Extend profiling support to operators.
+
+* profiler.h: Always use std::string with profiler name instead of
+octave_function references for identifying functions.
+* profiler.cc: Adapt for that.
+* ov-builtin.cc: Ditto.
+* ov-mex-fcn.cc: Ditto.
+* ov-usr-fcn.cc: Ditto.
+* pt-binop.cc (tree_binary_expression::rvalue1): Collect profiler data.
+* pt-unop.cc (tree_prefix_expression::rvalue1): Ditto.
+(tree_postfix_expression::rvalue1): Ditto.
+
+diff --git a/src/ov-builtin.cc b/src/ov-builtin.cc
+--- a/src/ov-builtin.cc
++++ b/src/ov-builtin.cc
+@@ -121,17 +121,17 @@ octave_builtin::do_multi_index_op (int n
+       if (lvalue_list || curr_lvalue_list)
+         {
+           frame.protect_var (curr_lvalue_list);
+           curr_lvalue_list = lvalue_list;
+         }
+ 
+       try
+         {
+-          profile_data_accumulator::enter pe (profiler, *this);
++          profile_data_accumulator::enter pe (profiler, profiler_name ());
+ 
+           retval = (*f) (args, nargout);
+           // Do not allow null values to be returned from functions.
+           // FIXME -- perhaps true builtins should be allowed?
+           retval.make_storable_values ();
+           // Fix the case of a single undefined value.
+           // This happens when a compiled function uses
+           //   octave_value retval;
+diff --git a/src/ov-mex-fcn.cc b/src/ov-mex-fcn.cc
+--- a/src/ov-mex-fcn.cc
++++ b/src/ov-mex-fcn.cc
+@@ -143,17 +143,17 @@ octave_mex_function::do_multi_index_op (
+       unwind_protect frame;
+ 
+       octave_call_stack::push (this);
+ 
+       frame.add_fcn (octave_call_stack::pop);
+ 
+       try
+         {
+-          profile_data_accumulator::enter pe (profiler, *this);
++          profile_data_accumulator::enter pe (profiler, profiler_name ());
+           retval = call_mex (have_fmex, mex_fcn_ptr, args, nargout, this);
+         }
+       catch (octave_execution_exception)
+         {
+           gripe_library_execution_error ();
+         }
+     }
+ 
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -130,17 +130,18 @@ octave_user_script::do_multi_index_op (i
+                   octave_call_stack::push (this);
+ 
+                   frame.add_fcn (octave_call_stack::pop);
+ 
+                   frame.protect_var (tree_evaluator::statement_context);
+                   tree_evaluator::statement_context = tree_evaluator::script;
+ 
+                   {
+-                    profile_data_accumulator::enter pe (profiler, *this);
++                    profile_data_accumulator::enter pe (profiler,
++                                                        profiler_name ());
+                     cmd_list->accept (*current_evaluator);
+                   }
+ 
+                   if (tree_return_command::returning)
+                     tree_return_command::returning = 0;
+ 
+                   if (tree_break_command::breaking)
+                     tree_break_command::breaking--;
+@@ -450,17 +451,17 @@ octave_user_function::do_multi_index_op 
+ 
+   frame.protect_var (tree_evaluator::statement_context);
+   tree_evaluator::statement_context = tree_evaluator::function;
+ 
+   bool special_expr = (is_inline_function ()
+                        || cmd_list->is_anon_function_body ());
+ 
+   {
+-    profile_data_accumulator::enter pe (profiler, *this);
++    profile_data_accumulator::enter pe (profiler, profiler_name ());
+ 
+     if (special_expr)
+       {
+         assert (cmd_list->length () == 1);
+ 
+         tree_statement *stmt = 0;
+ 
+         if ((stmt = cmd_list->front ())
+diff --git a/src/profiler.cc b/src/profiler.cc
+--- a/src/profiler.cc
++++ b/src/profiler.cc
+@@ -23,38 +23,37 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <iostream>
+ 
+ #include "defun.h"
+ #include "oct-time.h"
+-#include "ov-fcn.h"
+ #include "ov-struct.h"
+ #include "pager.h"
+ #include "profiler.h"
+ 
+ profile_data_accumulator::enter::enter (profile_data_accumulator& a,
+-                                        const octave_function& f)
++                                        const std::string& f)
+   : acc (a)
+ {
+   if (acc.is_active ())
+     {
+-      fcn = &f;
+-      acc.enter_function (*fcn);
++      fcn = f;
++      acc.enter_function (fcn);
+     }
+   else
+-    fcn = NULL;
++    fcn = "";
+ }
+ 
+ profile_data_accumulator::enter::~enter ()
+ {
+-  if (fcn)
+-    acc.exit_function (*fcn);
++  if (fcn != "")
++    acc.exit_function (fcn);
+ }
+ 
+ profile_data_accumulator::stats::stats ()
+   : time (0.0), calls (0), recursive (false),
+     parents (), children ()
+ {}
+ 
+ // With the help of a mapping name -> index, convert a function_set list
+@@ -93,54 +92,53 @@ profile_data_accumulator::set_active (bo
+       while (!call_stack.empty ())
+         call_stack.pop_back ();
+     }
+ 
+   enabled = value;
+ }
+ 
+ void
+-profile_data_accumulator::enter_function (const octave_function& fcn)
++profile_data_accumulator::enter_function (const std::string& fcn)
+ {
+   // The enter class will check and only call us if the profiler is active.
+   assert (is_active ());
+ 
+   // If there is already an active function, add to its time before
+   // pushing the new one.
+   if (!call_stack.empty ())
+     add_current_time ();
+ 
+   // Update non-timing related data for the function entered.
+-  const std::string name = fcn.profiler_name ();
+-  stats& entry = data[name];
++  stats& entry = data[fcn];
+   ++entry.calls;
+   if (!call_stack.empty ())
+     {
+-      const std::string parent_name = call_stack.back ()->profiler_name ();
++      const std::string parent_name = call_stack.back ();
+       entry.parents.insert (parent_name);
+-      data[parent_name].children.insert (name);
++      data[parent_name].children.insert (fcn);
+     }
+   if (!entry.recursive)
+     for (call_stack_type::iterator i = call_stack.begin ();
+          i != call_stack.end (); ++i)
+-      if (*i == &fcn)
++      if (*i == fcn)
+         {
+           entry.recursive = true;
+           break;
+         }
+ 
+-  call_stack.push_back (&fcn);
++  call_stack.push_back (fcn);
+   last_time = query_time ();
+ }
+ 
+ void
+-profile_data_accumulator::exit_function (const octave_function& fcn)
++profile_data_accumulator::exit_function (const std::string& fcn)
+ {
+   assert (!call_stack.empty ());
+-  assert (&fcn == call_stack.back ());
++  assert (fcn == call_stack.back ());
+ 
+   // Usually, if we are disabled this function is not even called.  But the
+   // call disabling the profiler is an exception.  So also check here
+   // and only record the time if enabled.
+   if (is_active ())
+     add_current_time ();
+ 
+   call_stack.pop_back ();
+@@ -224,17 +222,17 @@ profile_data_accumulator::query_time (vo
+ 
+ void
+ profile_data_accumulator::add_current_time (void)
+ {
+   const double t = query_time ();
+   assert (last_time >= 0.0 && last_time <= t);
+ 
+   assert (!call_stack.empty ());
+-  const std::string name = call_stack.back ()->profiler_name ();
++  const std::string name = call_stack.back ();
+ 
+   // The entry for this function should already be created; namely
+   // when entering the function via the non-timing data collection!
+   stats_map::iterator pos = data.find (name);
+   assert (pos != data.end ());
+   pos->second.time += t - last_time;
+ }
+ 
+diff --git a/src/profiler.h b/src/profiler.h
+--- a/src/profiler.h
++++ b/src/profiler.h
+@@ -20,40 +20,40 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if !defined (octave_profiler_h)
+ #define octave_profiler_h 1
+ 
+ #include <map>
+ #include <set>
++#include <string>
+ #include <vector>
+ 
+-class octave_function;
+ class octave_value;
+ 
+ class
+ OCTAVE_API
+ profile_data_accumulator
+ {
+ public:
+ 
+   // This is a utility class that can be used to call the enter/exit
+   // functions in a manner protected from stack unwinding.
+   class enter
+   {
+     private:
+ 
+       profile_data_accumulator& acc;
+ 
+-      const octave_function* fcn;
++      std::string fcn;
+ 
+     public:
+ 
+-      enter (profile_data_accumulator&, const octave_function& fcn);
++      enter (profile_data_accumulator&, const std::string&);
+ 
+       virtual ~enter (void);
+ 
+     private:
+ 
+       // No copying!
+ 
+       enter (const enter&);
+@@ -96,29 +96,29 @@ private:
+       static octave_value
+       function_set_value (const function_set&, const fcn_index_map&);
+ 
+       friend class profile_data_accumulator;
+   };
+ 
+   bool enabled;
+ 
+-  typedef std::vector<const octave_function*> call_stack_type;
++  typedef std::vector<std::string> call_stack_type;
+   call_stack_type call_stack;
+ 
+   typedef std::map<std::string, stats> stats_map;
+   stats_map data;
+ 
+   // Store last timestamp we had, when the currently active function was called.
+   double last_time;
+ 
+   // These are private as only the unwind-protecting inner class enter
+   // should be allowed to call them.
+-  void enter_function (const octave_function&);
+-  void exit_function (const octave_function&);
++  void enter_function (const std::string&);
++  void exit_function (const std::string&);
+ 
+   // Query a timestamp, used for timing calls (obviously).
+   // This is not static because in the future, maybe we want a flag
+   // in the profiler or something to choose between cputime, wall-time
+   // user-time, system-time, ...
+   double query_time () const;
+ 
+   // Add the time elapsed since last_time to the function on the top
+diff --git a/src/pt-binop.cc b/src/pt-binop.cc
+--- a/src/pt-binop.cc
++++ b/src/pt-binop.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
+ #include "defun.h"
+ #include "oct-obj.h"
+ #include "ov.h"
++#include "profiler.h"
+ #include "pt-binop.h"
+ #include "pt-bp.h"
+ #include "pt-walk.h"
+ #include "variables.h"
+ 
+ // TRUE means we mark | and & expressions for braindead short-circuit
+ // behavior.
+ static bool Vdo_braindead_shortcircuit_evaluation;
+@@ -115,16 +116,22 @@ tree_binary_expression::rvalue1 (int)
+       octave_value a = op_lhs->rvalue1 ();
+ 
+       if (! error_state && a.is_defined () && op_rhs)
+         {
+           octave_value b = op_rhs->rvalue1 ();
+ 
+           if (! error_state && b.is_defined ())
+             {
++              profile_data_accumulator::enter pe (profiler,
++                                                  "binary " + oper ());
++
++              /* Note: The profiler does not catch the braindead-short-circuit
++                 evaluation code above.  But that should be ok.  */
++
+               retval = ::do_binary_op (etype, a, b);
+ 
+               if (error_state)
+                 retval = octave_value ();
+             }
+         }
+     }
+ 
+@@ -178,16 +185,21 @@ tree_boolean_expression::rvalue1 (int)
+ {
+   octave_value retval;
+ 
+   if (error_state)
+     return retval;
+ 
+   bool result = false;
+ 
++  /* This evaluation is not caught by the profiler, since we can't find
++     a reasonable place where to time.  Note that we don't want to include
++     evaluation of LHS or RHS into the timing, but this is entangled
++     together with short-circuit evaluation here.  */
++
+   if (op_lhs)
+     {
+       octave_value a = op_lhs->rvalue1 ();
+ 
+       if (! error_state)
+         {
+           bool a_true = a.is_true ();
+ 
+diff --git a/src/pt-unop.cc b/src/pt-unop.cc
+--- a/src/pt-unop.cc
++++ b/src/pt-unop.cc
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "oct-lvalue.h"
+ #include "ov.h"
++#include "profiler.h"
+ #include "pt-bp.h"
+ #include "pt-unop.h"
+ #include "pt-walk.h"
+ 
+ // Unary expressions.
+ 
+ std::string
+ tree_unary_expression::oper (void) const
+@@ -67,28 +68,34 @@ tree_prefix_expression::rvalue1 (int)
+   if (op)
+     {
+       if (etype == octave_value::op_incr || etype == octave_value::op_decr)
+         {
+           octave_lvalue ref = op->lvalue ();
+ 
+           if (! error_state)
+             {
++              profile_data_accumulator::enter pe (profiler,
++                                                  "prefix " + oper ());
++              
+               ref.do_unary_op (etype);
+ 
+               if (! error_state)
+                 retval = ref.value ();
+             }
+         }
+       else
+         {
+           octave_value val = op->rvalue1 ();
+ 
+           if (! error_state && val.is_defined ())
+             {
++              profile_data_accumulator::enter pe (profiler,
++                                                  "prefix " + oper ());
++
+               // Attempt to do the operation in-place if it is unshared
+               // (a temporary expression).
+               if (val.get_count () == 1)
+                 retval = val.do_non_const_unary_op (etype);
+               else
+                 retval = ::do_unary_op (etype, val);
+ 
+               if (error_state)
+@@ -148,25 +155,31 @@ tree_postfix_expression::rvalue1 (int)
+       if (etype == octave_value::op_incr || etype == octave_value::op_decr)
+         {
+           octave_lvalue ref = op->lvalue ();
+ 
+           if (! error_state)
+             {
+               retval = ref.value ();
+ 
++              profile_data_accumulator::enter pe (profiler,
++                                                  "postfix " + oper ());
++
+               ref.do_unary_op (etype);
+             }
+         }
+       else
+         {
+           octave_value val = op->rvalue1 ();
+ 
+           if (! error_state && val.is_defined ())
+             {
++              profile_data_accumulator::enter pe (profiler,
++                                                  "postfix " + oper ());
++
+               retval = ::do_unary_op (etype, val);
+ 
+               if (error_state)
+                 retval = octave_value ();
+             }
+         }
+     }
+ 

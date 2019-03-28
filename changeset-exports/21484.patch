@@ -1,0 +1,1007 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1458334348 14400
+#      Fri Mar 18 16:52:28 2016 -0400
+# Node ID a6717373a0cd3615c651840050771b8c94f527da
+# Parent  fe56e066825df8d4cdb71b5d9233cce52c8f945e
+make delimited_stream, textscan_format_elt, and textscan_format_list private
+
+* textscan.cc (delimited_stream, textscan_format_elt,
+textscan_format_list): Move here.
+* textscan.h: From here.
+
+* textscan.h, textscan.cc (textscan::scan): New interface.
+(textscan::do_scan): What scan used to be.  Now private.
+(textscan::parse_options): Make private.  Eliminate first_param arg.
+
+diff --git a/libinterp/corefcn/textscan.cc b/libinterp/corefcn/textscan.cc
+--- a/libinterp/corefcn/textscan.cc
++++ b/libinterp/corefcn/textscan.cc
+@@ -31,16 +31,155 @@ along with Octave; see the file COPYING.
+ #include "Cell.h"
+ #include "defun.h"
+ #include "oct-stream.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "textscan.h"
+ #include "utils.h"
+ 
++// Delimited stream, optimised to read strings of characters separated
++// by single-character delimiters.
++//
++// The reason behind this class is that octstream doesn't provide
++// seek/tell, but the opportunity has been taken to optimise for the
++// textscan workload.
++//
++// The function reads chunks into a 4kiB buffer, and marks where the
++// last delimiter occurs.  Reads up to this delimiter can be fast.
++// After that last delimiter, the remaining text is moved to the front
++// of the buffer and the buffer is refilled.  This also allows cheap
++// seek and tell operations within a "fast read" block.
++
++class
++delimited_stream
++{
++public:
++
++  delimited_stream (std::istream& is, const std::string& delimiters,
++        int longest_lookahead, octave_idx_type bsize = 4096);
++
++  delimited_stream (std::istream& is, const delimited_stream& ds);
++
++  ~delimited_stream (void);
++
++  // Called when optimised sequence of get is finished.  Ensures that
++  // there is a remaining delimiter in buf, or loads more data in.
++  void field_done (void)
++  {
++    if (idx >= last)
++      refresh_buf ();
++  }
++
++  // Load new data into buffer, and set eob, last, idx.
++  // Return EOF at end of file, 0 otherwise.
++  int refresh_buf (void);
++
++  // Get a character, relying on caller to call field_done if
++  // a delimiter has been reached.
++  int get (void)   { return delimited ? *idx++ : get_undelim (); }
++
++  // Get a character, checking for underrun of the buffer.
++  int get_undelim (void);
++
++  // Read character that will be got by the next get.
++  int peek (void)   { return *idx; }
++
++  // Read character that will be got by the next get.
++  int peek_undelim (void);
++
++  // Undo a 'get' or 'get_undelim'.  It is the caller's responsibility
++  // to avoid overflow by calling putbacks only for a character got by
++  // get() or get_undelim(), with no intervening
++  // get, get_delim, field_done, refresh_buf, getline, read or seekg.
++  void putback (char /*ch*/ = 0)  { --idx; }
++
++  int getline  (std::string& dest, char delim);
++
++  // int skipline (char delim);
++
++  char *read (char *buffer, int size, char* &new_start);
++
++  // Return a position suitable to "seekg", valid only within this
++  // block between calls to field_done.
++  char *tellg (void) { return idx; }
++
++  void seekg (char *old_idx) { idx = old_idx; }
++
++  bool eof (void)
++  {
++    return (eob == buf && i_stream.eof ()) || (flags & std::ios_base::eofbit);
++  }
++
++  operator const void* (void) { return (!eof () && !flags) ? this : 0; }
++
++  bool fail (void) { return flags & std::ios_base::failbit; }
++
++  std::ios_base::iostate rdstate (void) { return flags; }
++
++  void setstate (std::ios_base::iostate m) { flags = flags | m; }
++
++  void clear (std::ios_base::iostate m
++              = (std::ios_base::eofbit & ~std::ios_base::eofbit))
++  {
++    flags = flags & m;
++  }
++
++  // Report if any characters have been consumed.
++  // (get, read etc. not cancelled by putback or seekg)
++
++  void progress_benchmark (void) { progress_marker = idx; }
++
++  bool no_progress (void) { return progress_marker == idx; }
++
++private:
++
++  // Number of characters to read from the file at once.
++  int bufsize;
++
++  // Stream to read from.
++  std::istream& i_stream;
++
++  // Temporary storage for a "chunk" of data.
++  char *buf;
++
++  // Current read pointer.
++  char *idx;
++
++  // Location of last delimiter in the buffer at buf (undefined if
++  // delimited is false).
++  char *last;
++
++  // Position after last character in buffer.
++  char *eob;
++
++  // True if there is delimiter in the bufer after idx.
++  bool delimited;
++
++  // Longest lookahead required.
++  int longest;
++
++  // Sequence of single-character delimiters.
++  const std::string delims;
++
++  // Position of start of buf in original stream.
++  std::streampos buf_in_file;
++
++  // Marker to see if a read consumes any characters.
++  char *progress_marker;
++
++  std::ios_base::iostate flags;
++
++  // No copying!
++
++  delimited_stream (const delimited_stream&);
++
++  delimited_stream& operator = (const delimited_stream&);
++};
++
+ // Create a delimited stream, reading from is, with delimiters delims,
+ // and allowing reading of up to tellg + longest_lookeahead.  When is
+ // is at EOF, lookahead may be padded by ASCII nuls.
+ 
+ delimited_stream::delimited_stream (std::istream& is,
+                                     const std::string& delimiters,
+                                     int longest_lookahead,
+                                     octave_idx_type bsize)
+@@ -288,16 +427,194 @@ delimited_stream::getline (std::string& 
+         }
+     }
+   out.resize (used);
+   field_done ();
+ 
+   return ch;
+ }
+ 
++// A single conversion specifier, such as %f or %c.
++
++class
++textscan_format_elt
++{
++public:
++
++  enum special_conversion
++  {
++    whitespace_conversion = 1,
++    literal_conversion = 2
++  };
++
++  textscan_format_elt (const char *txt = 0, int w = 0, int p = -1,
++                       int bw = 0, bool dis = false, char typ = '\0',
++                       const std::string& ch_class = std::string ())
++    : text (strsave (txt)), width (w), prec (p), bitwidth (bw),
++      char_class (ch_class), type (typ), discard (dis),
++      numeric(typ == 'd' || typ == 'u' || type == 'f' || type == 'n')
++  { }
++
++  textscan_format_elt (const textscan_format_elt& e)
++    : text (strsave (e.text)), width (e.width), prec (e.prec),
++      bitwidth (e.bitwidth), char_class (e.char_class), type (e.type),
++      discard (e.discard), numeric (e.numeric)
++  { }
++
++  textscan_format_elt& operator = (const textscan_format_elt& e)
++  {
++    if (this != &e)
++      {
++        text = strsave (e.text);
++        width = e.width;
++        prec = e.prec;
++        bitwidth = e.bitwidth;
++        discard = e.discard;
++        type = e.type;
++        numeric = e.numeric;
++        char_class = e.char_class;
++      }
++
++    return *this;
++  }
++
++  ~textscan_format_elt (void) { delete [] text; }
++
++  // The C-style format string.
++  const char *text;
++
++  // The maximum field width.
++  unsigned int width;
++
++  // The maximum number of digits to read after the decimal in a
++  // floating point conversion.
++  int prec;
++
++  // The size of the result.  For integers, bitwidth may be 8, 16, 34,
++  // or 64.  For floating point values, bitwidth may be 32 or 64.
++  int bitwidth;
++
++  // The class of characters in a `[' or `^' format.
++  std::string char_class;
++
++  // Type of conversion
++  //  -- `d', `u', `f', `n', `s', `q', `c', `%', `C', `D', `[' or `^'.
++  char type;
++
++  // TRUE if we are not storing the result of this conversion.
++  bool discard;
++
++  // TRUE if the type is 'd', 'u', 'f', 'n'
++  bool numeric;
++};
++
++class textscan;
++
++// The (parsed) sequence of format specifiers.
++
++class
++textscan_format_list
++{
++public:
++
++  textscan_format_list (const std::string& fmt = std::string ());
++
++  ~textscan_format_list (void);
++
++  octave_idx_type num_conversions (void) const { return nconv; }
++
++  // The length can be different than the number of conversions.
++  // For example, "x %d y %d z" has 2 conversions but the length of
++  // the list is 3 because of the characters that appear after the
++  // last conversion.
++
++  octave_idx_type numel (void) const { return list.numel (); }
++
++  const textscan_format_elt *first (void)
++  {
++    curr_idx = 0;
++    return current ();
++  }
++
++  const textscan_format_elt *current (void) const
++  {
++    return list.numel () > 0 ? list.elem (curr_idx) : 0;
++  }
++
++  const textscan_format_elt *next (bool cycle = true)
++  {
++    curr_idx++;
++
++    if (curr_idx >= list.numel ())
++      {
++        if (cycle)
++          curr_idx = 0;
++        else
++          return 0;
++      }
++
++    return current ();
++  }
++
++  void printme (void) const;
++
++  bool ok (void) const { return (nconv >= 0); }
++
++  operator const void* (void) const { return ok () ? this : 0; }
++
++  // True if number of %f to be set from data file.
++  bool set_from_first;
++
++  // At least one conversion specifier is s,q,c, or [...].
++  bool has_string;
++
++  int read_first_row (delimited_stream& is, textscan& ts);
++
++  std::list<octave_value> out_buf (void) const { return (output_container); }
++
++private:
++
++  // Number of conversions specified by this format string, or -1 if
++  // invalid conversions have been found.
++  octave_idx_type nconv;
++
++  // Index to current element;
++  octave_idx_type curr_idx;
++
++  // FIXME -- maybe LIST should be a std::list object?
++  // List of format elements.
++  Array<textscan_format_elt*> list;
++
++  // list holding column arrays of types specified by conversions
++  std::list<octave_value > output_container;
++
++  // Temporary buffer.
++  std::ostringstream *buf;
++
++  void add_elt_to_list (unsigned int width, int prec, int bitwidth,
++                        octave_value val_type, bool discard,
++                        char type, octave_idx_type& num_elts,
++                        const std::string& char_class = std::string ());
++
++  void process_conversion (const std::string& s, size_t& i, size_t n,
++                           octave_idx_type& num_elts);
++
++  int finish_conversion (const std::string& s, size_t& i, size_t n,
++                         unsigned int& width, int& prec, int& bitwidth,
++                         octave_value& val_type,
++                         bool discard, char& type,
++                         octave_idx_type& num_elts);
++  // No copying!
++
++  textscan_format_list (const textscan_format_list&);
++
++  textscan_format_list& operator = (const textscan_format_list&);
++};
++
++
+ textscan_format_list::textscan_format_list (const std::string& s)
+   : set_from_first (false), has_string (false), nconv (0), curr_idx (0),
+     list (dim_vector (16, 1)), buf (0)
+ {
+   octave_idx_type num_elts = 0;
+ 
+   size_t n = s.length ();
+ 
+@@ -906,18 +1223,64 @@ textscan_format_list::read_first_row (de
+     list(i) = new textscan_format_elt (*list(0));
+ 
+   return retval;             // May have returned 4 above.
+ }
+ 
+ // Perform actual textscan: read data from stream, and create cell array.
+ 
+ octave_value
+-textscan::scan (std::istream *isp, textscan_format_list& fmt_list,
+-                octave_idx_type ntimes)
++textscan::scan (std::istream *isp, const octave_value_list& args)
++{
++  std::string format;
++  int params = 0;
++
++  if (args.length () == 0)
++    format = "%f";      // ommited format = %f.  explicit "" = width from file
++  else if (args(0).is_string ())
++    {
++      format = args(0).string_value ();
++
++      if (args(0).is_sq_string ())
++        format = do_string_escapes (format);
++
++      params++;
++    }
++  else
++    error ("textscan: FORMAT must be a string, not <%s>",
++           args(0).class_name ().c_str ());
++
++  octave_idx_type ntimes = -1;
++
++  if (args.length () > 1)
++    {
++      if (args(1).is_numeric_type ())
++        {
++          ntimes = args(1).idx_type_value ();
++
++          if (ntimes < args(1).double_value ())
++            error ("textscan: REPEAT = %g is too large",
++                   args(1).double_value ());
++
++          params++;
++        }
++    }
++
++  octave_value_list tmp_args = args.splice (0, params);
++
++  textscan_format_list fmt_list (format);
++
++  parse_options (tmp_args, fmt_list);
++
++  return do_scan (isp, fmt_list, ntimes);
++}
++
++octave_value
++textscan::do_scan (std::istream *isp, textscan_format_list& fmt_list,
++                   octave_idx_type ntimes)
+ {
+   octave_value retval;
+ 
+   if (! isp)
+     error ("internal error: textscan called with invalid istream");
+ 
+   if (fmt_list.num_conversions () == -1)
+     error ("textscan: invalid format specified");
+@@ -1435,17 +1798,17 @@ textscan::scan_complex (delimited_stream
+         }
+     }
+   if (as_empty)
+     val = empty_value.scalar_value ();
+   else
+     val = Complex (re, im);
+ }
+ 
+-// Return in VAL the run of characters from IS NOT contained in PATTERN. 
++// Return in VAL the run of characters from IS NOT contained in PATTERN.
+ 
+ int
+ textscan::scan_caret (delimited_stream& is, const char *pattern,
+                       std::string& val) const
+ {
+   int c1 = EOF;
+   std::ostringstream obuf;              // Is this optimised for growing?
+ 
+@@ -1790,17 +2153,17 @@ textscan::scan_one (delimited_stream& is
+       if (vv.length () != 0)
+         is.clear (is.rdstate () & ~std::ios_base::failbit);
+     }
+ 
+   is.field_done ();
+ }
+ 
+ // Read data corresponding to the entire format string once, placing the
+-// values in row ROW of retval. 
++// values in row ROW of retval.
+ 
+ int
+ textscan::read_format_once (delimited_stream& is,
+                             textscan_format_list& fmt_list,
+                             std::list<octave_value> & retval,
+                             Array<octave_idx_type> row, int& done_after)
+ {
+   const textscan_format_elt *elem = fmt_list.first ();
+@@ -1902,32 +2265,32 @@ textscan::read_format_once (delimited_st
+ 
+   if (conversion_failed)
+     return (4 + no_conversions);
+ 
+   return 0;
+ }
+ 
+ void
+-textscan::parse_options (const octave_value_list& args, int first_param,
++textscan::parse_options (const octave_value_list& args,
+                          textscan_format_list& fmt_list)
+ {
+   int last = args.length ();
+-  int n = last - first_param;
++  int n = last;
+ 
+   if (n & 1)
+     error ("textscan: %d parameters given, but only %d values", n-n/2, n/2);
+ 
+   delim_len = 1;
+   bool have_delims = false;
+-  for (int i = first_param; i < last; i += 2)
++  for (int i = 0; i < last; i += 2)
+     {
+       if (! args(i).is_string ())
+         error ("textscan: Invalid paramter type <%s> for parameter %d",
+-               args(i).type_name ().c_str (), (i-first_param)/2 + 1);
++               args(i).type_name ().c_str (), i/2 + 1);
+ 
+       std::string param = args(i).string_value ();
+       std::transform (param.begin (), param.end (),
+                       param.begin (), ::tolower);
+       if (param == "delimiter")
+         {
+           bool invalid = true;
+           if (args(i+1).is_string ())
+@@ -2643,73 +3006,41 @@ Data columns are not padded; textscan re
+ \n\
+ The second output, @var{position}, provides the position, in characters\n\
+ from the beginning of the file or string, at which the processing stopped.\n\
+ \n\
+ @seealso{dlmread, fscanf, load, strread, textread}\n\
+ @end deftypefn")
+ {
+   octave_value_list retval;
+-  std::string format;
+-  int params = 1;
+ 
+   if (args.length () < 1)
+     print_usage ();
+-  else if (args.length () == 1)
+-    format = "%f";      // ommited format = %f.  explicit "" = width from file
+-  else if (args(1).is_string ())
+-    {
+-      format = args(1).string_value ();
+-
+-      if (args(1).is_sq_string ())
+-        format = do_string_escapes (format);
+-
+-      params++;
+-    }
+-  else
+-    error ("textscan: FORMAT must be a string, not <%s>",
+-           args(1).class_name ().c_str ());
+-
+-  octave_idx_type ntimes = -1;
++
++  octave_value_list tmp_args = args.splice (0, 1);
++
+   textscan tscanner;
+ 
+-  if (args.length () >= 3)
+-    {
+-      if (args(2).is_numeric_type ())
+-        {
+-          ntimes = args(2).idx_type_value ();
+-
+-          if (ntimes < args(2).double_value ())
+-            error ("textscan: REPEAT = %g is too large",
+-                   args(2).double_value ());
+-
+-          params = 3;
+-        }
+-    }
+-  textscan_format_list fmt_list (format);
+-
+-  tscanner.parse_options (args, params, fmt_list);
+-
+   if (args(0).is_string ())
+     {
+       std::istringstream is (args(0).string_value ());
+-      octave_value tmp = tscanner.scan (&is, fmt_list, ntimes);
+-      retval(0) = tmp;
++
++      retval(0) = tscanner.scan (&is, tmp_args);
+ 
+       std::ios::iostate state = is.rdstate ();
+       is.clear ();
+       retval(1) = octave_value (static_cast<long>(is.tellg ()));
+       is.setstate (state);
+     }
+   else
+     {
+       octave_stream os = octave_stream_list::lookup (args(0), "textscan");
+-      octave_value tmp = tscanner.scan (os.input_stream (), fmt_list, ntimes);
+-
+-      retval(0) = tmp;
++
++      retval(0) = tscanner.scan (os.input_stream (), tmp_args);
++
+       // FIXME -- warn if stream is not opened in binary mode?
+       std::ios::iostate state = os.input_stream ()->rdstate ();
+       os.input_stream ()->clear ();
+       retval(1) = os.tell ();
+       os.input_stream ()->setstate (state);
+     }
+ 
+   return retval;
+diff --git a/libinterp/corefcn/textscan.h b/libinterp/corefcn/textscan.h
+--- a/libinterp/corefcn/textscan.h
++++ b/libinterp/corefcn/textscan.h
+@@ -27,348 +27,37 @@ along with Octave; see the file COPYING.
+ #define octave_textscan_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <iosfwd>
+ #include <list>
+ #include <string>
+ 
++// These are only needed as arguments to private functions, so they
++// are also treated as private.
++
++class delimited_stream;
++class textscan_format_elt;
++class textscan_format_list;
++
+ #include "Cell.h"
+ #include "ov.h"
+-
+-// Delimited stream, optimised to read strings of characters separated
+-// by single-character delimiters.
+-//
+-// The reason behind this class is that octstream doesn't provide
+-// seek/tell, but the opportunity has been taken to optimise for the
+-// textscan workload.
+-//
+-// The function reads chunks into a 4kiB buffer, and marks where the
+-// last delimiter occurs.  Reads up to this delimiter can be fast.
+-// After that last delimiter, the remaining text is moved to the front
+-// of the buffer and the buffer is refilled.  This also allows cheap
+-// seek and tell operations within a "fast read" block.
+-
+-class
+-delimited_stream
+-{
+-public:
+-
+-  delimited_stream (std::istream& is, const std::string& delimiters,
+-        int longest_lookahead, octave_idx_type bsize = 4096);
+-
+-  delimited_stream (std::istream& is, const delimited_stream& ds);
+-
+-  ~delimited_stream (void);
+-
+-  // Called when optimised sequence of get is finished.  Ensures that
+-  // there is a remaining delimiter in buf, or loads more data in.
+-  void field_done (void)
+-  {
+-    if (idx >= last)
+-      refresh_buf ();
+-  }
+-
+-  // Load new data into buffer, and set eob, last, idx.
+-  // Return EOF at end of file, 0 otherwise.
+-  int refresh_buf (void);
+-
+-  // Get a character, relying on caller to call field_done if
+-  // a delimiter has been reached.
+-  int get (void)   { return delimited ? *idx++ : get_undelim (); }
+-
+-  // Get a character, checking for underrun of the buffer.
+-  int get_undelim (void);
+-
+-  // Read character that will be got by the next get.
+-  int peek (void)   { return *idx; }
+-
+-  // Read character that will be got by the next get.
+-  int peek_undelim (void);
+-
+-  // Undo a 'get' or 'get_undelim'.  It is the caller's responsibility
+-  // to avoid overflow by calling putbacks only for a character got by
+-  // get() or get_undelim(), with no intervening
+-  // get, get_delim, field_done, refresh_buf, getline, read or seekg.
+-  void putback (char /*ch*/ = 0)  { --idx; }
+-
+-  int getline  (std::string& dest, char delim);
+-
+-  // int skipline (char delim);
+-
+-  char *read (char *buffer, int size, char* &new_start);
+-
+-  // Return a position suitable to "seekg", valid only within this
+-  // block between calls to field_done.
+-  char *tellg (void) { return idx; }
+-
+-  void seekg (char *old_idx) { idx = old_idx; }
++#include "ovl.h"
+ 
+-  bool eof (void)
+-  {
+-    return (eob == buf && i_stream.eof ()) || (flags & std::ios_base::eofbit);
+-  }
+-
+-  operator const void* (void) { return (!eof () && !flags) ? this : 0; }
+-
+-  bool fail (void) { return flags & std::ios_base::failbit; }
+-
+-  std::ios_base::iostate rdstate (void) { return flags; }
+-
+-  void setstate (std::ios_base::iostate m) { flags = flags | m; }
+-
+-  void clear (std::ios_base::iostate m
+-              = (std::ios_base::eofbit & ~std::ios_base::eofbit))
+-  {
+-    flags = flags & m;
+-  }
+-
+-  // Report if any characters have been consumed.
+-  // (get, read etc. not cancelled by putback or seekg)
+-
+-  void progress_benchmark (void) { progress_marker = idx; }
+-
+-  bool no_progress (void) { return progress_marker == idx; }
+-
+-private:
+-
+-  // Number of characters to read from the file at once.
+-  int bufsize;
+-
+-  // Stream to read from.
+-  std::istream& i_stream;
+-
+-  // Temporary storage for a "chunk" of data.
+-  char *buf;
+-
+-  // Current read pointer.
+-  char *idx;
+-
+-  // Location of last delimiter in the buffer at buf (undefined if
+-  // delimited is false).
+-  char *last;
+-
+-  // Position after last character in buffer.
+-  char *eob;
+-
+-  // True if there is delimiter in the bufer after idx.
+-  bool delimited;
+-
+-  // Longest lookahead required.
+-  int longest;
+-
+-  // Sequence of single-character delimiters.
+-  const std::string delims;
+-
+-  // Position of start of buf in original stream.
+-  std::streampos buf_in_file;
+-
+-  // Marker to see if a read consumes any characters.
+-  char *progress_marker;
+-
+-  std::ios_base::iostate flags; 
+-
+-  // No copying!
+-
+-  delimited_stream (const delimited_stream&);
+-
+-  delimited_stream& operator = (const delimited_stream&);
+-};
+-
+-// A single conversion specifier, such as %f or %c.
++// Main class to implement textscan.  Read data and parse it
++// according to a format.
++//
++// The calling sequence is
++//
++//   textscan scanner ();
++//   scanner.scan (...);
+ 
+ class
+ OCTINTERP_API
+-textscan_format_elt
+-{
+-public:
+-
+-  enum special_conversion
+-  {
+-    whitespace_conversion = 1,
+-    literal_conversion = 2
+-  };
+-
+-  textscan_format_elt (const char *txt = 0, int w = 0, int p = -1,
+-                       int bw = 0, bool dis = false, char typ = '\0',
+-                       const std::string& ch_class = std::string ())
+-    : text (strsave (txt)), width (w), prec (p), bitwidth (bw),
+-      char_class (ch_class), type (typ), discard (dis),
+-      numeric(typ == 'd' || typ == 'u' || type == 'f' || type == 'n')
+-  { }
+-
+-  textscan_format_elt (const textscan_format_elt& e)
+-    : text (strsave (e.text)), width (e.width), prec (e.prec),
+-      bitwidth (e.bitwidth), char_class (e.char_class), type (e.type),
+-      discard (e.discard), numeric (e.numeric)
+-  { }
+-
+-  textscan_format_elt& operator = (const textscan_format_elt& e)
+-  {
+-    if (this != &e)
+-      {
+-        text = strsave (e.text);
+-        width = e.width;
+-        prec = e.prec;
+-        bitwidth = e.bitwidth;
+-        discard = e.discard;
+-        type = e.type;
+-        numeric = e.numeric;
+-        char_class = e.char_class;
+-      }
+-
+-    return *this;
+-  }
+-
+-  ~textscan_format_elt (void) { delete [] text; }
+-
+-  // The C-style format string.
+-  const char *text;
+-
+-  // The maximum field width.
+-  unsigned int width;
+-
+-  // The maximum number of digits to read after the decimal in a
+-  // floating point conversion.
+-  int prec;
+-
+-  // The size of the result.  For integers, bitwidth may be 8, 16, 34,
+-  // or 64.  For floating point values, bitwidth may be 32 or 64.
+-  int bitwidth;
+-
+-  // The class of characters in a `[' or `^' format.
+-  std::string char_class;
+-
+-  // Type of conversion
+-  //  -- `d', `u', `f', `n', `s', `q', `c', `%', `C', `D', `[' or `^'.
+-  char type;
+-
+-  // TRUE if we are not storing the result of this conversion.
+-  bool discard;
+-
+-  // TRUE if the type is 'd', 'u', 'f', 'n'
+-  bool numeric;
+-};
+-
+-class textscan;
+-
+-// The (parsed) sequence of format specifiers.
+-
+-class
+-OCTINTERP_API
+-textscan_format_list
+-{
+-public:
+-
+-  textscan_format_list (const std::string& fmt = std::string ());
+-
+-  ~textscan_format_list (void);
+-
+-  octave_idx_type num_conversions (void) const { return nconv; }
+-
+-  // The length can be different than the number of conversions.
+-  // For example, "x %d y %d z" has 2 conversions but the length of
+-  // the list is 3 because of the characters that appear after the
+-  // last conversion.
+-
+-  octave_idx_type numel (void) const { return list.numel (); }
+-
+-  const textscan_format_elt *first (void)
+-  {
+-    curr_idx = 0;
+-    return current ();
+-  }
+-
+-  const textscan_format_elt *current (void) const
+-  {
+-    return list.numel () > 0 ? list.elem (curr_idx) : 0;
+-  }
+-
+-  const textscan_format_elt *next (bool cycle = true)
+-  {
+-    curr_idx++;
+-
+-    if (curr_idx >= list.numel ())
+-      {
+-        if (cycle)
+-          curr_idx = 0;
+-        else
+-          return 0;
+-      }
+-
+-    return current ();
+-  }
+-
+-  void printme (void) const;
+-
+-  bool ok (void) const { return (nconv >= 0); }
+-
+-  operator const void* (void) const { return ok () ? this : 0; }
+-
+-  // True if number of %f to be set from data file.
+-  bool set_from_first;
+-
+-  // At least one conversion specifier is s,q,c, or [...].
+-  bool has_string;
+-
+-  int read_first_row (delimited_stream& is, textscan& ts);
+-
+-  std::list<octave_value> out_buf (void) const { return (output_container); }
+-
+-private:
+-
+-  // Number of conversions specified by this format string, or -1 if
+-  // invalid conversions have been found.
+-  octave_idx_type nconv;
+-
+-  // Index to current element;
+-  octave_idx_type curr_idx;
+-
+-  // FIXME -- maybe LIST should be a std::list object?
+-  // List of format elements.
+-  Array<textscan_format_elt*> list;
+-
+-  // list holding column arrays of types specified by conversions
+-  std::list<octave_value > output_container;
+-
+-  // Temporary buffer.
+-  std::ostringstream *buf;
+-
+-  void add_elt_to_list (unsigned int width, int prec, int bitwidth,
+-                        octave_value val_type, bool discard,
+-                        char type, octave_idx_type& num_elts,
+-                        const std::string& char_class = std::string ());
+-
+-  void process_conversion (const std::string& s, size_t& i, size_t n,
+-                           octave_idx_type& num_elts);
+-
+-  int finish_conversion (const std::string& s, size_t& i, size_t n,
+-                         unsigned int& width, int& prec, int& bitwidth,
+-                         octave_value& val_type,
+-                         bool discard, char& type,
+-                         octave_idx_type& num_elts);
+-  // No copying!
+-
+-  textscan_format_list (const textscan_format_list&);
+-
+-  textscan_format_list& operator = (const textscan_format_list&);
+-};
+-
+-
+-// Main class to implement textscan.  Read data and parse it
+-// according to a textscan_format_list.
+-//
+-// The calling sequence is
+-//
+-//   textscan ();
+-//   parse_options (...);
+-//   scan (...);
+-
+-class
+ textscan
+ {
+ public:
+ 
+   textscan (void)
+     : buf (""), delim_table (""), delims (), comment_len (0), comment_char(-2),
+       buffer_size (0),
+       empty_value (octave_NaN), exp_chars ("edED"), header_lines (0),
+@@ -379,21 +68,17 @@ public:
+     {
+       inf_nan = Cell (dim_vector (1,2));
+       inf_nan(0) = Cell (octave_value ("inf"));
+       inf_nan(1) = Cell (octave_value ("nan"));
+     };
+ 
+   ~textscan (void) { }
+ 
+-  octave_value scan (std::istream* isp, textscan_format_list& fmt_list,
+-                     octave_idx_type ntimes);
+-
+-  void parse_options (const octave_value_list& args, int first_param,
+-                      textscan_format_list& formats);
++  octave_value scan (std::istream *isp, const octave_value_list& args);
+ 
+ private:
+ 
+   friend class textscan_format_list;
+ 
+   std::string buf;
+ 
+   // Three cases for delim_table and delim_list
+@@ -446,16 +131,22 @@ private:
+ 
+   bool collect_output;
+   bool multiple_delims_as_one;
+   bool default_exp;
+   bool numeric_delim;
+ 
+   octave_idx_type lines;
+ 
++  octave_value do_scan (std::istream *isp, textscan_format_list& fmt_list,
++                        octave_idx_type ntimes);
++
++  void parse_options (const octave_value_list& args,
++                      textscan_format_list& fmt_list);
++
+   int read_format_once (delimited_stream &isp, textscan_format_list& fmt_list,
+                         std::list<octave_value> & retval,
+                         Array<octave_idx_type> row, int& done_after);
+ 
+   void scan_one (delimited_stream& is, const textscan_format_elt& fmt,
+                  octave_value& ov, Array<octave_idx_type> row);
+ 
+   // Methods to process a particular conversion specifier.

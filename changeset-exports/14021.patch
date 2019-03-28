@@ -1,0 +1,951 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1323447170 18000
+#      Fri Dec 09 11:12:50 2011 -0500
+# Node ID e3bed294b11776b0ba6f6b670af35b841955c7c9
+# Parent  caf69ec5b94c716af820a1272ab74878d2610d23
+refactor graphics_toolkit class (bug #31583)
+
+* graphics_toolkit.m: Call loaded_graphics_toolkits to check whether
+the given toolkit was correctly loaded.
+
+* graphics.cc (gnuplot_toolkit): Move to separate file.
+* __init_gnuplot__.cc: New file, split from graphics.cc.
+* DLD-FUNCTIONS/module-files: Include __init_gnuplot__.cc in the list.
+
+* graphics.h.in, graphics.cc (gtk_manager): New class, extracted from
+graphics_toolkit, to manage the available and loaded
+graphics_toolkits.  Change all uses of moved functions.
+
+* __init_fltk__.cc: Add PKG_ADD line to register toolkit.
+(toolkit_loaded): Rename from toolkit_registered.
+
+* graphics.cc (Fregister_graphics_toolkit, Floaded_graphics_toolkits):
+New functions.
+
+diff --git a/scripts/plot/graphics_toolkit.m b/scripts/plot/graphics_toolkit.m
+--- a/scripts/plot/graphics_toolkit.m
++++ b/scripts/plot/graphics_toolkit.m
+@@ -47,20 +47,20 @@ function retval = graphics_toolkit (name
+     [hlist, name] = deal (name, hlist);
+     if (! all (isfigure (hlist)))
+       error ("graphics_toolkit: invalid figure handle list HLIST");
+     elseif (! ischar (name))
+       error ("graphics_toolkit: invalid graphics toolkit NAME");
+     endif
+   endif
+ 
+-  if (! any (strcmp (available_graphics_toolkits (), name)))
++  if (! any (strcmp (loaded_graphics_toolkits (), name)))
+     feval (["__init_", name, "__"]);
+-    if (! any (strcmp (available_graphics_toolkits (), name)))
+-      error ("graphics_toolkit: %s toolkit was not correctly registered", name);
++    if (! any (strcmp (loaded_graphics_toolkits (), name)))
++      error ("graphics_toolkit: %s toolkit was not correctly loaded", name);
+     endif
+   endif
+ 
+   if (isempty (hlist))
+     set (0, "defaultfigure__graphics_toolkit__", name);
+   else
+     set (hlist, "__graphics_toolkit__", name);
+   endif
+diff --git a/src/DLD-FUNCTIONS/__init_fltk__.cc b/src/DLD-FUNCTIONS/__init_fltk__.cc
+--- a/src/DLD-FUNCTIONS/__init_fltk__.cc
++++ b/src/DLD-FUNCTIONS/__init_fltk__.cc
+@@ -24,16 +24,18 @@ along with Octave; see the file COPYING.
+ 
+ To initialize:
+ 
+   graphics_toolkit ("fltk");
+   plot (randn (1e3, 1));
+ 
+ */
+ 
++// PKG_ADD: register_graphics_toolkit ("fltk");
++
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #if defined (HAVE_FLTK)
+ 
+ #include <map>
+ #include <set>
+@@ -1764,22 +1766,22 @@ private:
+   }
+ };
+ 
+ figure_manager *figure_manager::instance = 0;
+ 
+ std::string figure_manager::fltk_idx_header="fltk index=";
+ int figure_manager::curr_index = 1;
+ 
+-static bool toolkit_registered = false;
++static bool toolkit_loaded = false;
+ 
+ static int
+ __fltk_redraw__ (void)
+ {
+-  if (toolkit_registered)
++  if (toolkit_loaded)
+     {
+       // We scan all figures and add those which use FLTK.
+       graphics_object obj = gh_manager::get_object (0);
+       if (obj && obj.isa ("root"))
+         {
+           base_properties& props = obj.get_properties ();
+           Matrix children = props.get_all_children ();
+ 
+@@ -1936,44 +1938,45 @@ public:
+     Matrix sz (1, 2, 0.0);
+     sz(0) = Fl::w ();
+     sz(1) = Fl::h ();
+     return sz;
+   }
+ 
+   void close (void)
+   {
+-    if (toolkit_registered)
++    if (toolkit_loaded)
+       {
+         munlock ("__init_fltk__");
+ 
+         figure_manager::close_all ();
+-        graphics_toolkit::unregister_toolkit (FLTK_GRAPHICS_TOOLKIT_NAME);
+-        toolkit_registered = false;
++        gtk_manager::unload_toolkit (FLTK_GRAPHICS_TOOLKIT_NAME);
++        toolkit_loaded = false;
+ 
+         octave_value_list args;
+         args(0) = "__fltk_redraw__";
+         feval ("remove_input_event_hook", args, 0);
+ 
+         // FIXME ???
+         Fl::wait (fltk_maxtime);
+       }
+   }
+ };
+ 
+ // Initialize the fltk graphics toolkit.
+ 
+ DEFUN_DLD (__init_fltk__, , , "")
+ {
+-  if (! toolkit_registered)
++  if (! toolkit_loaded)
+     {
+       mlock ();
+ 
+-      graphics_toolkit::register_toolkit (new fltk_graphics_toolkit);
+-      toolkit_registered = true;
++      graphics_toolkit tk (new fltk_graphics_toolkit ());
++      gtk_manager::load_toolkit (tk);
++      toolkit_loaded = true;
+ 
+       octave_value_list args;
+       args(0) = "__fltk_redraw__";
+       feval ("add_input_event_hook", args, 0);
+     }
+ 
+   octave_value retval;
+   return retval;
+diff --git a/src/DLD-FUNCTIONS/__init_gnuplot__.cc b/src/DLD-FUNCTIONS/__init_gnuplot__.cc
+new file mode 100644
+--- /dev/null
++++ b/src/DLD-FUNCTIONS/__init_gnuplot__.cc
+@@ -0,0 +1,193 @@
++/*
++
++Copyright (C) 2007-2011 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++/*
++
++To initialize:
++
++  graphics_toolkit ("gnuplot");
++  plot (randn (1e3, 1));
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "defun-dld.h"
++#include "error.h"
++#include "graphics.h"
++#include "parse.h"
++#include "variables.h"
++
++// PKG_ADD: register_graphics_toolkit ("gnuplot");
++
++static bool toolkit_loaded = false;
++
++class gnuplot_graphics_toolkit : public base_graphics_toolkit
++{
++public:
++  gnuplot_graphics_toolkit (void)
++      : base_graphics_toolkit ("gnuplot") { }
++
++  ~gnuplot_graphics_toolkit (void) { }
++
++  bool is_valid (void) const { return true; }
++
++  bool initialize (const graphics_object& go)
++    {
++      return go.isa ("figure");
++    }
++
++  void finalize (const graphics_object& go)
++    {
++      if (go.isa ("figure"))
++        {
++          const figure::properties& props =
++              dynamic_cast<const figure::properties&> (go.get_properties ());
++
++          send_quit (props.get___plot_stream__ ());
++        }
++    }
++
++  void update (const graphics_object& go, int id)
++    {
++      if (go.isa ("figure"))
++        {
++          graphics_object obj (go);
++
++          figure::properties& props =
++              dynamic_cast<figure::properties&> (obj.get_properties ());
++
++          switch (id)
++            {
++            case base_properties::ID_VISIBLE:
++              if (! props.is_visible ())
++                {
++                  send_quit (props.get___plot_stream__ ());
++                  props.set___plot_stream__ (Matrix ());
++                  props.set___enhanced__ (false);
++                }
++              break;
++            }
++        }
++    }
++
++  void redraw_figure (const graphics_object& go) const
++    {
++      octave_value_list args;
++      args(0) = go.get_handle ().as_octave_value ();
++      feval ("__gnuplot_drawnow__", args);
++    }
++
++  void print_figure (const graphics_object& go, const std::string& term,
++                     const std::string& file, bool mono,
++                     const std::string& debug_file) const
++    {
++      octave_value_list args;
++      if (! debug_file.empty ())
++        args(4) = debug_file;
++      args(3) = mono;
++      args(2) = file;
++      args(1) = term;
++      args(0) = go.get_handle ().as_octave_value ();
++      feval ("__gnuplot_drawnow__", args);
++    }
++
++  Matrix get_canvas_size (const graphics_handle&) const
++    {
++      Matrix sz (1, 2, 0.0);
++      return sz;
++    }
++
++  double get_screen_resolution (void) const
++    { return 72.0; }
++
++  Matrix get_screen_size (void) const
++    { return Matrix (1, 2, 0.0); }
++
++  void close (void)
++  {
++    if (toolkit_loaded)
++      {
++        munlock ("__init_gnuplot__");
++
++        gtk_manager::unload_toolkit ("gnuplot");
++
++        toolkit_loaded = false;
++      }
++  }
++
++private:
++
++  void send_quit (const octave_value& pstream) const
++    {
++      if (! pstream.is_empty ())
++        {
++          octave_value_list args;
++          Matrix fids = pstream.matrix_value ();
++
++          if (! error_state)
++            {
++              args(1) = "\nquit;\n";
++              args(0) = fids(0);
++              feval ("fputs", args);
++
++              args.resize (1);
++              feval ("fflush", args);
++              feval ("pclose", args);
++
++              if (fids.numel () > 1)
++                {
++                  args(0) = fids(1);
++                  feval ("pclose", args);
++
++                  if (fids.numel () > 2)
++                    {
++                      args(0) = fids(2);
++                      feval ("waitpid", args);
++                    }
++                }
++            }
++        }
++    }
++};
++
++// Initialize the fltk graphics toolkit.
++
++DEFUN_DLD (__init_gnuplot__, , , "")
++{
++  octave_value retval;
++
++  if (! toolkit_loaded)
++    {
++      mlock ();
++
++      graphics_toolkit tk (new gnuplot_graphics_toolkit ());
++      gtk_manager::load_toolkit (tk);
++
++      toolkit_loaded = true;
++    }
++
++  return retval;
++}
++
+diff --git a/src/DLD-FUNCTIONS/module-files b/src/DLD-FUNCTIONS/module-files
+--- a/src/DLD-FUNCTIONS/module-files
++++ b/src/DLD-FUNCTIONS/module-files
+@@ -1,16 +1,17 @@
+ # FILE|CPPFLAGS|LDFLAGS|LIBRARIES
+ __contourc__.cc
+ __delaunayn__.cc|$(QHULL_CPPFLAGS)|$(QHULL_LDFLAGS)|$(QHULL_LIBS)
+ __dispatch__.cc
+ __dsearchn__.cc
+ __fltk_uigetfile__.cc|$(GRAPHICS_CFLAGS) $(FT2_CPPFLAGS)|$(GRAPHICS_LDFLAGS) $(FT2_LDFLAGS)|$(GRAPHICS_LIBS) $(FT2_LIBS)
+ __glpk__.cc|$(GLPK_CPPFLAGS)|$(GLPK_LDFLAGS)|$(GLPK_LIBS)
+ __init_fltk__.cc|$(GRAPHICS_CFLAGS) $(FT2_CPPFLAGS)|$(GRAPHICS_LDFLAGS) $(FT2_LDFLAGS)|$(GRAPHICS_LIBS) $(FT2_LIBS)
++__init_gnuplot__.cc
+ __lin_interpn__.cc
+ __magick_read__.cc|$(MAGICK_CPPFLAGS)|$(MAGICK_LDFLAGS)|$(MAGICK_LIBS)
+ __pchip_deriv__.cc
+ __qp__.cc
+ __voronoi__.cc|$(QHULL_CPPFLAGS)|$(QHULL_LDFLAGS)|$(QHULL_LIBS)
+ amd.cc|$(SPARSE_XCPPFLAGS)|$(SPARSE_XLDFLAGS)|$(SPARSE_XLIBS)
+ balance.cc
+ besselj.cc
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -2758,147 +2758,16 @@ base_properties::delete_listener (const 
+   property p = get_property (nm);
+ 
+   if (! error_state && p.ok ())
+     p.delete_listener (v, mode);
+ }
+ 
+ // ---------------------------------------------------------------------
+ 
+-class gnuplot_toolkit : public base_graphics_toolkit
+-{
+-public:
+-  gnuplot_toolkit (void)
+-      : base_graphics_toolkit ("gnuplot") { }
+-
+-  ~gnuplot_toolkit (void) { }
+-
+-  bool is_valid (void) const { return true; }
+-
+-  bool initialize (const graphics_object& go)
+-    {
+-      return go.isa ("figure");
+-    }
+-
+-  void finalize (const graphics_object& go)
+-    {
+-      if (go.isa ("figure"))
+-        {
+-          const figure::properties& props =
+-              dynamic_cast<const figure::properties&> (go.get_properties ());
+-
+-          send_quit (props.get___plot_stream__ ());
+-        }
+-    }
+-
+-  void update (const graphics_object& go, int id)
+-    {
+-      if (go.isa ("figure"))
+-        {
+-          graphics_object obj (go);
+-
+-          figure::properties& props =
+-              dynamic_cast<figure::properties&> (obj.get_properties ());
+-
+-          switch (id)
+-            {
+-            case base_properties::ID_VISIBLE:
+-              if (! props.is_visible ())
+-                {
+-                  send_quit (props.get___plot_stream__ ());
+-                  props.set___plot_stream__ (Matrix ());
+-                  props.set___enhanced__ (false);
+-                }
+-              break;
+-            }
+-        }
+-    }
+-
+-  void redraw_figure (const graphics_object& go) const
+-    {
+-      octave_value_list args;
+-      args(0) = go.get_handle ().as_octave_value ();
+-      feval ("__gnuplot_drawnow__", args);
+-    }
+-
+-  void print_figure (const graphics_object& go, const std::string& term,
+-                     const std::string& file, bool mono,
+-                     const std::string& debug_file) const
+-    {
+-      octave_value_list args;
+-      if (! debug_file.empty ())
+-        args(4) = debug_file;
+-      args(3) = mono;
+-      args(2) = file;
+-      args(1) = term;
+-      args(0) = go.get_handle ().as_octave_value ();
+-      feval ("__gnuplot_drawnow__", args);
+-    }
+-
+-  Matrix get_canvas_size (const graphics_handle&) const
+-    {
+-      Matrix sz (1, 2, 0.0);
+-      return sz;
+-    }
+-
+-  double get_screen_resolution (void) const
+-    { return 72.0; }
+-
+-  Matrix get_screen_size (void) const
+-    { return Matrix (1, 2, 0.0); }
+-
+-  void close (void) { }
+-
+-private:
+-  void send_quit (const octave_value& pstream) const
+-    {
+-      if (! pstream.is_empty ())
+-        {
+-          octave_value_list args;
+-          Matrix fids = pstream.matrix_value ();
+-
+-          if (! error_state)
+-            {
+-              args(1) = "\nquit;\n";
+-              args(0) = fids(0);
+-              feval ("fputs", args);
+-
+-              args.resize (1);
+-              feval ("fflush", args);
+-              feval ("pclose", args);
+-
+-              if (fids.numel () > 1)
+-                {
+-                  args(0) = fids(1);
+-                  feval ("pclose", args);
+-
+-                  if (fids.numel () > 2)
+-                    {
+-                      args(0) = fids(2);
+-                      feval ("waitpid", args);
+-                    }
+-                }
+-            }
+-        }
+-    }
+-};
+-
+-graphics_toolkit
+-graphics_toolkit::default_toolkit (void)
+-{
+-  if (available_toolkits.size () == 0)
+-    register_toolkit (new gnuplot_toolkit ());
+-
+-  return available_toolkits["gnuplot"];
+-}
+-
+-std::map<std::string, graphics_toolkit> graphics_toolkit::available_toolkits;
+-
+-// ---------------------------------------------------------------------
+-
+ void
+ base_graphics_object::update_axis_limits (const std::string& axis_type)
+ {
+   if (valid_object ())
+     {
+       graphics_object parent_obj = gh_manager::get_object (get_parent ());
+ 
+       if (parent_obj)
+@@ -7500,17 +7369,17 @@ gh_manager::gh_manager (void)
+   : handle_map (), handle_free_list (),
+     next_handle (-1.0 - (rand () + 1.0) / (RAND_MAX + 2.0)),
+     figure_list (), graphics_lock (),  event_queue (),
+     callback_objects (), event_processing (0)
+ {
+   handle_map[0] = graphics_object (new root_figure ());
+ 
+   // Make sure the default graphics toolkit is registered.
+-  graphics_toolkit::default_toolkit ();
++  gtk_manager::default_toolkit ();
+ }
+ 
+ void
+ gh_manager::create_instance (void)
+ {
+   instance = new gh_manager ();
+ 
+   if (instance)
+@@ -9071,25 +8940,107 @@ Internal function: returns the pixel siz
+         error ("__image_pixel_size__: argument is not a handle");
+     }
+   else
+     print_usage ();
+ 
+   return retval;
+ }
+ 
++gtk_manager *gtk_manager::instance = 0;
++
++void
++gtk_manager::create_instance (void)
++{
++  instance = new gtk_manager ();
++
++  if (instance)
++    singleton_cleanup_list::add (cleanup_instance);
++}
++
++graphics_toolkit
++gtk_manager::do_get_toolkit (void) const
++{
++  graphics_toolkit retval;
++
++  const_loaded_toolkits_iterator pl = loaded_toolkits.find (dtk);
++
++  if (pl == loaded_toolkits.end ())
++    {
++      const_available_toolkits_iterator pa = available_toolkits.find (dtk);
++
++      if (pa != available_toolkits.end ())
++        {
++          octave_value_list args;
++          args(0) = dtk;
++          feval ("graphics_toolkit", args);
++
++          if (! error_state)
++            pl = loaded_toolkits.find (dtk);
++
++          if (error_state || pl == loaded_toolkits.end ())
++            error ("failed to load %s graphics toolkit", dtk.c_str ());
++          else
++            retval = pl->second;
++        }
++      else
++        error ("default graphics toolkit `%s' is not available!",
++               dtk.c_str ());
++    }
++  else
++    retval = pl->second;
++
++  return retval;
++}
++
+ DEFUN (available_graphics_toolkits, , ,
+    "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} available_graphics_toolkits ()\n\
+ Return a cell array of registered graphics toolkits.\n\
+ @end deftypefn")
+ {
+   gh_manager::auto_lock guard;
+ 
+-  return octave_value (graphics_toolkit::available_toolkits_list ());
++  return octave_value (gtk_manager::available_toolkits_list ());
++}
++
++DEFUN (register_graphics_toolkit, args, ,
++   "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} register_graphics_toolkit (@var{toolkit})\n\
++List @var{toolkit} as an available graphics toolkit.\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  gh_manager::auto_lock guard;
++
++  if (args.length () == 1)
++    {
++      std::string name = args(0).string_value ();
++
++      if (! error_state)
++        gtk_manager::register_toolkit (name);
++      else
++        error ("register_graphics_toolkit: expecting character string");
++    }
++  else
++    print_usage ();
++
++  return retval;
++}
++
++DEFUN (loaded_graphics_toolkits, , ,
++   "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} loaded_graphics_toolkits ()\n\
++Return a cell array of the currently loaded graphics toolkits.\n\
++@end deftypefn")
++{
++  gh_manager::auto_lock guard;
++
++  return octave_value (gtk_manager::loaded_toolkits_list ());
+ }
+ 
+ DEFUN (drawnow, args, ,
+    "-*- texinfo -*-\n\
+ @deftypefn  {Built-in Function} {} drawnow ()\n\
+ @deftypefnx {Built-in Function} {} drawnow (\"expose\")\n\
+ @deftypefnx {Built-in Function} {} drawnow (@var{term}, @var{file}, @var{mono}, @var{debug_file})\n\
+ Update figure windows and their children.  The event queue is flushed and\n\
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -2231,75 +2231,207 @@ public:
+     { rep->finalize (go); }
+ 
+   void finalize (const graphics_handle& h)
+     { rep->finalize (h); }
+ 
+   // Close the graphics toolkit.
+   void close (void) { rep->close (); }
+ 
+-  OCTINTERP_API static graphics_toolkit default_toolkit (void);
+-
+-  static void register_toolkit (const graphics_toolkit& b)
+-    { available_toolkits[b.get_name ()] = b; }
++private:
++
++  base_graphics_toolkit *rep;
++};
++
++class gtk_manager
++{
++public:
++
++  static graphics_toolkit get_toolkit (void)
++  {
++    return instance_ok () ? instance->do_get_toolkit () : graphics_toolkit ();
++  }
++
++  static void register_toolkit (const std::string& name)
++  {
++    if (instance_ok ())
++      instance->do_register_toolkit (name);
++  }
+ 
+   static void unregister_toolkit (const std::string& name)
+-    { available_toolkits.erase (name); }
++  {
++    if (instance_ok ())
++      instance->do_unregister_toolkit (name);
++  }
++
++  static void load_toolkit (const graphics_toolkit& tk)
++  {
++    if (instance_ok ())
++      instance->do_load_toolkit (tk);
++  }
++
++  static void unload_toolkit (const std::string& name)
++  {
++    if (instance_ok ())
++      instance->do_unload_toolkit (name);
++  }
+ 
+   static graphics_toolkit find_toolkit (const std::string& name)
+   {
+-    const_available_toolkits_iterator p = available_toolkits.find (name);
+-
+-    if (p != available_toolkits.end ())
+-      return p->second;
+-    else
+-      return default_toolkit ();
++    return instance_ok ()
++      ? instance->do_find_toolkit (name) : graphics_toolkit ();
+   }
+ 
+   static Cell available_toolkits_list (void)
+   {
++    return instance_ok () ? instance->do_available_toolkits_list () : Cell ();
++  }
++
++  static Cell loaded_toolkits_list (void)
++  {
++    return instance_ok () ? instance->do_loaded_toolkits_list () : Cell ();
++  }
++
++  static void unload_all_toolkits (void)
++  {
++    if (instance_ok ())
++      instance->do_unload_all_toolkits ();
++  }
++
++  static std::string default_toolkit (void)
++  {
++    return instance_ok () ? instance->do_default_toolkit () : std::string ();
++  }
++
++private:
++
++  // FIXME -- default toolkit should be configurable.
++
++  gtk_manager (void)
++    : dtk ("gnuplot"), available_toolkits (), loaded_toolkits () { }
++
++  ~gtk_manager (void) { }
++
++  static void create_instance (void);
++
++  static bool instance_ok (void)
++  {
++    bool retval = true;
++
++    if (! instance)
++      create_instance ();
++
++    if (! instance)
++      {
++        ::error ("unable to create gh_manager!");
++
++        retval = false;
++      }
++
++    return retval;
++  }
++
++  static void cleanup_instance (void) { delete instance; instance = 0; }
++
++  static gtk_manager *instance;
++
++  // The name of the default toolkit.
++  std::string dtk;
++
++  // The list of toolkits that we know about.
++  std::set<std::string> available_toolkits;
++
++  // The list of toolkits we have actually loaded.
++  std::map<std::string, graphics_toolkit> loaded_toolkits;
++
++  typedef std::set<std::string>::iterator available_toolkits_iterator;
++
++  typedef std::set<std::string>::const_iterator
++    const_available_toolkits_iterator;
++
++  typedef std::map<std::string, graphics_toolkit>::iterator
++    loaded_toolkits_iterator;
++
++  typedef std::map<std::string, graphics_toolkit>::const_iterator
++    const_loaded_toolkits_iterator;
++
++  graphics_toolkit do_get_toolkit (void) const;
++
++  void do_register_toolkit (const std::string& name)
++  {
++    available_toolkits.insert (name);
++  }
++
++  void do_unregister_toolkit (const std::string& name)
++  {
++    available_toolkits.erase (name);
++  }
++
++  void do_load_toolkit (const graphics_toolkit& tk)
++  {
++    loaded_toolkits[tk.get_name ()] = tk;
++  }
++
++  void do_unload_toolkit (const std::string& name)
++  {
++    loaded_toolkits.erase (name);
++  }
++
++  graphics_toolkit do_find_toolkit (const std::string& name) const
++  {
++    const_loaded_toolkits_iterator p = loaded_toolkits.find (name);
++
++    if (p != loaded_toolkits.end ())
++      return p->second;
++    else
++      return graphics_toolkit ();
++  }
++
++  Cell do_available_toolkits_list (void) const
++  {
+     Cell m (1 , available_toolkits.size ());
+-    const_available_toolkits_iterator p;
+-    int i;
+-
+-    for (i = 0, p = available_toolkits.begin ();
+-         p !=  available_toolkits.end (); p++, i++)
+-      m(i) = p->first;
++    
++    octave_idx_type i = 0;
++    for (const_available_toolkits_iterator p = available_toolkits.begin ();
++         p !=  available_toolkits.end (); p++)
++      m(i++) = *p;
+ 
+     return m;
+   }
+ 
+-  static void close_all_toolkits (void)
+-  {
+-    while (! available_toolkits.empty ())
++  Cell do_loaded_toolkits_list (void) const
++  {
++    Cell m (1 , loaded_toolkits.size ());
++    
++    octave_idx_type i = 0;
++    for (const_loaded_toolkits_iterator p = loaded_toolkits.begin ();
++         p !=  loaded_toolkits.end (); p++)
++      m(i++) = p->first;
++
++    return m;
++  }
++
++  void do_unload_all_toolkits (void)
++  {
++    while (! loaded_toolkits.empty ())
+       {
+-        available_toolkits_iterator p = available_toolkits.begin ();
++        loaded_toolkits_iterator p = loaded_toolkits.begin ();
+ 
+         std::string name = p->first;
+ 
+         p->second.close ();
+ 
+-        // The toolkit may have unregistered itself.  If not, we'll do
++        // The toolkit may have unloaded itself.  If not, we'll do
+         // it here.
+-        if (available_toolkits.find (name) != available_toolkits.end ())
+-          unregister_toolkit (name);
++        if (loaded_toolkits.find (name) != loaded_toolkits.end ())
++          unload_toolkit (name);
+       }
+   }
+ 
+-private:
+-  base_graphics_toolkit *rep;
+-
+-  static OCTINTERP_API std::map<std::string, graphics_toolkit>
+-    available_toolkits;
+-
+-  typedef std::map<std::string, graphics_toolkit>::iterator
+-    available_toolkits_iterator;
+-
+-  typedef std::map<std::string, graphics_toolkit>::const_iterator
+-    const_available_toolkits_iterator;
++  std::string do_default_toolkit (void) { return dtk; }
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class base_graphics_object;
+ class graphics_object;
+ 
+ class OCTINTERP_API base_properties
+@@ -3141,31 +3273,31 @@ public:
+ 
+     void remove_child (const graphics_handle& h);
+ 
+     void set_visible (const octave_value& val);
+ 
+     graphics_toolkit get_toolkit (void) const
+       {
+         if (! toolkit)
+-          toolkit = graphics_toolkit::default_toolkit ();
++          toolkit = gtk_manager::get_toolkit ();
+ 
+         return toolkit;
+       }
+ 
+     void set_toolkit (const graphics_toolkit& b);
+ 
+     void set___graphics_toolkit__ (const octave_value& val)
+     {
+       if (! error_state)
+         {
+           if (val.is_string ())
+             {
+               std::string nm = val.string_value ();
+-              graphics_toolkit b = graphics_toolkit::find_toolkit (nm);
++              graphics_toolkit b = gtk_manager::find_toolkit (nm);
+               if (b.get_name () != nm)
+                 {
+                   error ("set___graphics_toolkit__: invalid graphics toolkit");
+                 }
+               else
+                 {
+                   set_toolkit (b);
+                   mark_modified ();
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -666,17 +666,17 @@ main_loop (void)
+ 
+ void
+ clean_up_and_exit (int retval)
+ {
+   do_octave_atexit ();
+ 
+   OCTAVE_SAFE_CALL (gh_manager::close_all_figures, ());
+ 
+-  OCTAVE_SAFE_CALL (graphics_toolkit::close_all_toolkits, ());
++  OCTAVE_SAFE_CALL (gtk_manager::unload_all_toolkits, ());
+ 
+   OCTAVE_SAFE_CALL (symbol_table::cleanup, ());
+ 
+   OCTAVE_SAFE_CALL (cleanup_parser, ());
+ 
+   OCTAVE_SAFE_CALL (sysdep_cleanup, ());
+ 
+   OCTAVE_SAFE_CALL (singleton_cleanup_list::cleanup, ());

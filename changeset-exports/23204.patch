@@ -1,0 +1,671 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1487502383 -3600
+#      Sun Feb 19 12:06:23 2017 +0100
+# Node ID 75515a7b1b4b474a1594ddb77576c025fb3f4e04
+# Parent  03f1adaea50a0f57d045c7f56b75b742a468a18c
+add preference for closing files when editor is closed/hidden (bug #50106)
+
+* file-editor.cc (file_editor): initializing class variable _closed to false;
+  (check_closing): update comments related to editor closing;
+  (handle_visibility): check whether editor was closed before when becoming
+  visible again and restore the previous session if desired;
+  (closeEvent): overload closeEvent for closing all files/tabs if desired,
+  ignore event if closing is canceled by the user due to unsaved changes;
+
+* file-editor.h: added closeEvent and class variable _closed
+
+* settings-dialog.cc (settings_dialog): Initialize new checkbox from settings;
+  (write_changed_settings): save checkbox state into settings file
+
+* settings-dialog.ui: new checkbox for closing   files when hiding the editor
+
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -57,16 +57,17 @@ file_editor::file_editor (QWidget *p)
+   ced = QDir::currentPath ();
+ 
+   // set action that are later added by the main window to null,
+   // preventing access to them when they are still undefined
+   _undo_action = 0;
+   _copy_action = 0;
+   _paste_action = 0;
+   _selectall_action = 0;
++  _closed = false;
+ 
+   construct ();
+ 
+   // actions that should also be available in the find dialog
+   _fetab_actions << _find_next_action;
+   _fetab_actions << _find_previous_action;
+ 
+   setVisible (false);
+@@ -79,41 +80,42 @@ file_editor::~file_editor (void)
+ {
+   if (_mru_file_menu)
+     delete _mru_file_menu;
+ }
+ 
+ bool
+ file_editor::check_closing (void)
+ {
+-  // When the applications is closing all editor tabs are checked whether
++  // When the application or the editor is closing and the user wants to close
++  // all files in the latter case all editor tabs are checked whether
+   // they need to be saved. During these ckecked the tabs are not closed
+   // since the user might cancel closing octave during one of these saving
+   // dialogs. Therefore, saving the session for restoring at next start
+   // is not done before the application is definitely closing
+ 
+   // Have all file editor tabs signal what their filenames are.
+   editor_tab_map.clear ();
+   emit fetab_file_name_query (0);
+ 
+   // Save all tabs with confirmation.
+   file_editor_tab::reset_cancel ();
+   emit fetab_check_modified_file ();
+ 
+   // If there was a cancellation, make the already saved/discarded tabs
+   // recovering from the exit by removing the read-only state and by
+   // recovering the debugger breakpoints. Finally return false in order to
+-  // cancel closing the application
++  // cancel closing the application or the editor
+   if (file_editor_tab::was_cancelled ())
+     {
+       emit fetab_recover_from_exit ();
+       return false;
+     }
+ 
+-  // Here, the application will be closed -> store the session
++  // Here, the application or the editor will be closed -> store the session
+ 
+   // Save open files for restoring in next session; this only is possible
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   // save filenames (even if last session will not be restored next time)
+   // together with encoding and the tab index
+   QStringList fetFileNames;
+   QStringList fet_encodings;
+@@ -135,17 +137,17 @@ file_editor::check_closing (void)
+     }
+ 
+   settings->setValue ("editor/savedSessionTabs", fetFileNames);
+   settings->setValue ("editor/saved_session_encodings", fet_encodings);
+   settings->setValue ("editor/saved_session_tab_index", fet_index);
+   settings->sync ();
+ 
+   // Finally close all the tabs and return indication that we can exit
+-  // the application
++  // the application or close the editor
+   for (int i = _tab_widget->count () - 1; i >= 0; i--)
+     {
+       // backwards loop since _tab_widget->count () changes during the loop
+       delete _tab_widget->widget (i);
+       _tab_widget->removeTab (i);
+     }
+ 
+   return true;
+@@ -2352,20 +2354,28 @@ file_editor::empty_script (bool startup,
+ }
+ 
+ // This slot is a reimplementation of the virtual slot in octave_dock_widget.
+ // We need this for creating an empty script when the editor has no open files
+ // and is made visible
+ void
+ file_editor::handle_visibility (bool visible)
+ {
++  if (_closed && visible)
++    {
++      _closed = false;
++      QSettings *settings = resource_manager::get_settings ();
++      restore_session (settings);
++    }
++
+   empty_script (false, visible);
+ 
+   if (visible && ! isFloating ())
+     focus ();
++
+ }
+ 
+ void
+ file_editor::dragEnterEvent (QDragEnterEvent *e)
+ {
+   if (e->mimeData ()->hasUrls ())
+     {
+       e->acceptProposedAction ();
+@@ -2379,16 +2389,37 @@ file_editor::dropEvent (QDropEvent *e)
+     {
+       foreach (QUrl url, e->mimeData ()->urls ())
+       {
+         request_open_file (url.toLocalFile ());
+       }
+     }
+ }
+ 
++// handler for the close event
++void
++file_editor::closeEvent (QCloseEvent *e)
++{
++  QSettings *settings = resource_manager::get_settings ();
++  if (settings->value ("editor/hiding_closes_files",false).toBool ())
++    {
++      if (check_closing ())
++        {
++          // all tabs are closed without cancelling,
++          // store closing state for restoring session when shown again
++          _closed = true;
++          e->accept ();
++        }
++      else
++        e->ignore ();
++    }
++  else
++   e->accept ();
++}
++
+ // slots for tab navigation
+ void
+ file_editor::switch_left_tab ()
+ {
+   switch_tab (-1);
+ }
+ void
+ file_editor::switch_right_tab ()
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -253,16 +253,17 @@ public slots:
+ 
+   void set_shortcuts ();
+ 
+   void handle_visibility (bool visible);
+ 
+   void update_octave_directory (const QString& dir);
+ 
+ protected slots:
++
+   void copyClipboard ();
+   void pasteClipboard ();
+   void selectAll ();
+   void do_undo ();
+ 
+ private slots:
+ 
+   void request_open_files (const QStringList&);
+@@ -294,16 +295,17 @@ private slots:
+   void move_tab_left ();
+   void move_tab_right ();
+ 
+   void create_context_menu (QMenu *);
+   void edit_status_update (bool, bool);
+ 
+ protected:
+ 
++  void closeEvent (QCloseEvent *event);
+   void dragEnterEvent (QDragEnterEvent *event);
+   void dropEvent (QDropEvent *event);
+ 
+ private:
+ 
+   bool is_editor_console_tabbed ();
+   void construct (void);
+   void add_file_editor_tab (file_editor_tab *f, const QString& fn);
+@@ -427,16 +429,18 @@ private:
+   QMenu *_view_editor_menu;
+ 
+   QList<QAction*> _fetab_actions;
+ 
+   tab_widget *_tab_widget;
+ 
+   int _marker_breakpoint;
+ 
++  bool _closed;
++
+   QString _file_encoding;
+ 
+   enum { MaxMRUFiles = 10 };
+   QMenu *_mru_file_menu;
+   QAction *_mru_file_actions[MaxMRUFiles];
+   QStringList _mru_files;
+   QStringList _mru_files_encodings;
+ };
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -485,16 +485,18 @@ settings_dialog::settings_dialog (QWidge
+   ui->editor_notebook_tab_width_max->setValue (
+     settings->value ("editor/notebook_tab_width_max", 300).toInt ());
+   ui->editor_restoreSession->setChecked (
+     settings->value ("editor/restoreSession", true).toBool ());
+   ui->editor_create_new_file->setChecked (
+     settings->value ("editor/create_new_file",false).toBool ());
+   ui->editor_reload_changed_files->setChecked (
+     settings->value ("editor/always_reload_changed_files",false).toBool ());
++  ui->editor_hiding_closes_files->setChecked (
++    settings->value ("editor/hiding_closes_files",false).toBool ());
+ 
+   // terminal
+   ui->terminal_fontName->setCurrentFont (QFont (
+       settings->value ("terminal/fontName","Courier New").toString ()));
+   ui->terminal_fontSize->setValue (
+     settings->value ("terminal/fontSize", 10).toInt ());
+   ui->terminal_history_buffer->setValue (
+     settings->value ("terminal/history_buffer",1000).toInt ());
+@@ -861,16 +863,18 @@ settings_dialog::write_changed_settings 
+   settings->setValue ("editor/notebook_tab_width_min",
+                       ui->editor_notebook_tab_width_min->value ());
+   settings->setValue ("editor/notebook_tab_width_max",
+                       ui->editor_notebook_tab_width_max->value ());
+   settings->setValue ("editor/restoreSession",
+                       ui->editor_restoreSession->isChecked ());
+   settings->setValue ("editor/create_new_file",
+                       ui->editor_create_new_file->isChecked ());
++  settings->setValue ("editor/hiding_closes_files",
++                      ui->editor_hiding_closes_files->isChecked ());
+   settings->setValue ("editor/always_reload_changed_files",
+                       ui->editor_reload_changed_files->isChecked ());
+   settings->setValue ("terminal/fontSize", ui->terminal_fontSize->value ());
+   settings->setValue ("terminal/fontName",
+                       ui->terminal_fontName->currentFont ().family ());
+ 
+   // file browser
+   settings->setValue ("filesdockwidget/sync_octave_directory",
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -493,19 +493,19 @@
+         <widget class="QScrollArea" name="scrollArea">
+          <property name="widgetResizable">
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+-            <y>0</y>
++            <y>-327</y>
+             <width>642</width>
+-            <height>900</height>
++            <height>927</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_16">
+            <item>
+             <widget class="QGroupBox" name="groupBox_5">
+              <property name="title">
+               <string>General</string>
+              </property>
+@@ -520,145 +520,16 @@
+                   <property name="enabled">
+                    <bool>false</bool>
+                   </property>
+                   <property name="text">
+                    <string>Do not show whitespace used for indentation</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="10" column="0">
+-                 <widget class="QCheckBox" name="cb_show_hscrollbar">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show horizontal scroll bar</string>
+-                  </property>
+-                  <property name="checked">
+-                   <bool>true</bool>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="1" column="0">
+-                 <widget class="QCheckBox" name="editor_longWindowTitle">
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show complete path in window title</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="1" column="1">
+-                 <spacer name="horizontalSpacer_24">
+-                  <property name="orientation">
+-                   <enum>Qt::Horizontal</enum>
+-                  </property>
+-                  <property name="sizeType">
+-                   <enum>QSizePolicy::Fixed</enum>
+-                  </property>
+-                  <property name="sizeHint" stdset="0">
+-                   <size>
+-                    <width>10</width>
+-                    <height>0</height>
+-                   </size>
+-                  </property>
+-                 </spacer>
+-                </item>
+-                <item row="2" column="0">
+-                 <widget class="QCheckBox" name="editor_showLineNumbers">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show line numbers</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="5" column="2">
+-                 <layout class="QGridLayout" name="editor_grid_current_line" rowstretch="0" columnstretch="0,0,0,0,0">
+-                  <property name="horizontalSpacing">
+-                   <number>12</number>
+-                  </property>
+-                  <property name="verticalSpacing">
+-                   <number>0</number>
+-                  </property>
+-                  <item row="0" column="1">
+-                   <widget class="QLabel" name="editor_label_cl_color">
+-                    <property name="enabled">
+-                     <bool>false</bool>
+-                    </property>
+-                    <property name="text">
+-                     <string>Color</string>
+-                    </property>
+-                   </widget>
+-                  </item>
+-                  <item row="0" column="3">
+-                   <spacer name="horizontalSpacer_11">
+-                    <property name="orientation">
+-                     <enum>Qt::Horizontal</enum>
+-                    </property>
+-                    <property name="sizeType">
+-                     <enum>QSizePolicy::Fixed</enum>
+-                    </property>
+-                    <property name="sizeHint" stdset="0">
+-                     <size>
+-                      <width>80</width>
+-                      <height>20</height>
+-                     </size>
+-                    </property>
+-                   </spacer>
+-                  </item>
+-                  <item row="0" column="4">
+-                   <spacer name="horizontalSpacer_9">
+-                    <property name="orientation">
+-                     <enum>Qt::Horizontal</enum>
+-                    </property>
+-                    <property name="sizeHint" stdset="0">
+-                     <size>
+-                      <width>40</width>
+-                      <height>20</height>
+-                     </size>
+-                    </property>
+-                   </spacer>
+-                  </item>
+-                 </layout>
+-                </item>
+-                <item row="5" column="0">
+-                 <widget class="QCheckBox" name="editor_highlightCurrentLine">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Highlight current line</string>
+-                  </property>
+-                 </widget>
+-                </item>
+                 <item row="1" column="2">
+                  <layout class="QGridLayout" name="gridLayout_6">
+                   <item row="0" column="0">
+                    <widget class="QLabel" name="editor_lbl_min_tab_width">
+                     <property name="text">
+                      <string>Tab width min.</string>
+                     </property>
+                    </widget>
+@@ -798,16 +669,145 @@
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="text">
+                    <string>Show EOL characters</string>
+                   </property>
+                  </widget>
+                 </item>
++                <item row="5" column="2">
++                 <layout class="QGridLayout" name="editor_grid_current_line" rowstretch="0" columnstretch="0,0,0,0,0">
++                  <property name="horizontalSpacing">
++                   <number>12</number>
++                  </property>
++                  <property name="verticalSpacing">
++                   <number>0</number>
++                  </property>
++                  <item row="0" column="1">
++                   <widget class="QLabel" name="editor_label_cl_color">
++                    <property name="enabled">
++                     <bool>false</bool>
++                    </property>
++                    <property name="text">
++                     <string>Color</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item row="0" column="3">
++                   <spacer name="horizontalSpacer_11">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeType">
++                     <enum>QSizePolicy::Fixed</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>80</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                  <item row="0" column="4">
++                   <spacer name="horizontalSpacer_9">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="5" column="0">
++                 <widget class="QCheckBox" name="editor_highlightCurrentLine">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Highlight current line</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="10" column="0">
++                 <widget class="QCheckBox" name="cb_show_hscrollbar">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show horizontal scroll bar</string>
++                  </property>
++                  <property name="checked">
++                   <bool>true</bool>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="0">
++                 <widget class="QCheckBox" name="editor_longWindowTitle">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show complete path in window title</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="1">
++                 <spacer name="horizontalSpacer_24">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeType">
++                   <enum>QSizePolicy::Fixed</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>10</width>
++                    <height>0</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
++                <item row="2" column="0">
++                 <widget class="QCheckBox" name="editor_showLineNumbers">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show line numbers</string>
++                  </property>
++                 </widget>
++                </item>
+                </layout>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout_22">
+                 <property name="topMargin">
+                  <number>0</number>
+                 </property>
+                 <item>
+@@ -1475,34 +1475,34 @@
+                    <widget class="QCheckBox" name="editor_restoreSession">
+                     <property name="sizePolicy">
+                      <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+                       <horstretch>0</horstretch>
+                       <verstretch>0</verstretch>
+                      </sizepolicy>
+                     </property>
+                     <property name="text">
+-                     <string>Restore editor tabs from previous session on startup</string>
++                     <string>Restore editor tabs from previous session on startup or when editor is shown again after closing</string>
+                     </property>
+                    </widget>
+                   </item>
+                   <item row="3" column="0">
+                    <widget class="QCheckBox" name="editor_create_new file">
+                     <property name="sizePolicy">
+                      <sizepolicy hsizetype="Minimum" vsizetype="Fixed">
+                       <horstretch>0</horstretch>
+                       <verstretch>0</verstretch>
+                      </sizepolicy>
+                     </property>
+                     <property name="text">
+                      <string>Create nonexistent files without prompting</string>
+                     </property>
+                    </widget>
+                   </item>
+-                  <item row="5" column="0">
++                  <item row="6" column="0">
+                    <layout class="QHBoxLayout" name="horizontalLayout_2">
+                     <property name="topMargin">
+                      <number>0</number>
+                     </property>
+                     <item>
+                      <widget class="QLabel" name="label_22">
+                       <property name="text">
+                        <string>Default EOL mode</string>
+@@ -1550,17 +1550,17 @@
+                         <width>40</width>
+                         <height>20</height>
+                        </size>
+                       </property>
+                      </spacer>
+                     </item>
+                    </layout>
+                   </item>
+-                  <item row="7" column="0">
++                  <item row="8" column="0">
+                    <layout class="QHBoxLayout" name="horizontalLayout_16">
+                     <item>
+                      <widget class="QLabel" name="label_16">
+                       <property name="text">
+                        <string>Text encoding used for loading and saving</string>
+                       </property>
+                      </widget>
+                     </item>
+@@ -1577,16 +1577,23 @@
+                         <width>40</width>
+                         <height>20</height>
+                        </size>
+                       </property>
+                      </spacer>
+                     </item>
+                    </layout>
+                   </item>
++                  <item row="5" column="0">
++                   <widget class="QCheckBox" name="editor_hiding_closes_files">
++                    <property name="text">
++                     <string>Close all files when the editor widget is closed/hidden</string>
++                    </property>
++                   </widget>
++                  </item>
+                  </layout>
+                 </item>
+                </layout>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>

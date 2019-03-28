@@ -1,0 +1,787 @@
+# HG changeset patch
+# User Daniel Kraft <d@domob.eu>
+# Date 1309457074 -7200
+#      Thu Jun 30 20:04:34 2011 +0200
+# Node ID ad9263d965dc6c6c2db3d8ca2d5f3dadcc4f1422
+# Parent  0ca5672d5f1ab4be79b7f1c6053e5cbf7e31c253
+First experimental profiler implementation with flat profile.
+
+* profiler.cc: New file.
+* profiler.h: New file.
+* Makefile.am: Include new files in build process.
+* oct-parse.yy (frob_function): Store location of function parsed.
+* ov-fcn.h (octave_function::profiler_name): New method.
+* ov-builtin.cc (octave_builtin::do_multi_index_op): Record timings in profiler.
+* ov-mex-fcn.cc (octave_mex_function::do_multi_index_op): Ditto.
+* ov-usr-fcn.cc (octave_user_script::do_multi_index_op): Ditto.
+(octave_user_function::do_multi_index_op): Ditto.
+(octave_user_function::octave_user_function): Initialize location_line/column.
+(octave_user_function::profiler_name): New method.
+* ov-usr-fcn.h (octave_user_function): New variables location_line,
+location column and new method stash_fcn_location to set them.
+* pt-fcn-handle.cc (tree_anon_fcn_handle::rvalue1): Store location.
+
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -305,16 +305,17 @@ octinclude_HEADERS = \
+   $(OV_INCLUDES) \
+   $(OV_SPARSE_INCLUDES) \
+   $(PT_INCLUDES)
+ 
+ nodist_octinclude_HEADERS = \
+   defaults.h \
+   graphics.h \
+   oct-conf.h \
++  profiler.h \
+   mxarray.h \
+   version.h
+ 
+ OV_INTTYPE_SRC = \
+   ov-int16.cc \
+   ov-int32.cc \
+   ov-int64.cc \
+   ov-int8.cc \
+@@ -441,16 +442,17 @@ DIST_SRC = \
+   oct-prcstrm.cc \
+   oct-procbuf.cc \
+   oct-stream.cc \
+   oct-strstrm.cc \
+   octave.cc \
+   pager.cc \
+   pr-output.cc \
+   procstream.cc \
++  profiler.cc \
+   sighandlers.cc \
+   siglist.c \
+   sparse.cc \
+   sparse-xdiv.cc \
+   sparse-xpow.cc \
+   strfns.cc \
+   symtab.cc \
+   syscalls.cc \
+diff --git a/src/oct-parse.yy b/src/oct-parse.yy
+--- a/src/oct-parse.yy
++++ b/src/oct-parse.yy
+@@ -2895,16 +2895,17 @@ frob_function (const std::string& fname,
+            && reading_script_file
+            && curr_fcn_file_name == id_name)
+     {
+       warning ("function `%s' defined within script file `%s'",
+                id_name.c_str (), curr_fcn_file_full_name.c_str ());
+     }
+ 
+   fcn->stash_function_name (id_name);
++  fcn->stash_fcn_location (input_line_number, current_input_column);
+ 
+   if (! help_buf.empty () && current_function_depth == 1
+       && ! parsing_subfunctions)
+     {
+       fcn->document (help_buf.top ());
+ 
+       help_buf.pop ();
+     }
+diff --git a/src/ov-builtin.cc b/src/ov-builtin.cc
+--- a/src/ov-builtin.cc
++++ b/src/ov-builtin.cc
+@@ -24,16 +24,17 @@ along with Octave; see the file COPYING.
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
+ #include "gripes.h"
+ #include "oct-obj.h"
+ #include "ov-builtin.h"
+ #include "ov.h"
++#include "profiler.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_builtin);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_builtin,
+                                      "built-in function",
+                                      "built-in function");
+@@ -120,16 +121,18 @@ octave_builtin::do_multi_index_op (int n
+       if (lvalue_list || curr_lvalue_list)
+         {
+           frame.protect_var (curr_lvalue_list);
+           curr_lvalue_list = lvalue_list;
+         }
+ 
+       try
+         {
++          profile_data_accumulator::enter pe (profiler, *this);
++
+           retval = (*f) (args, nargout);
+           // Do not allow null values to be returned from functions.
+           // FIXME -- perhaps true builtins should be allowed?
+           retval.make_storable_values ();
+           // Fix the case of a single undefined value.
+           // This happens when a compiled function uses
+           //   octave_value retval;
+           // instead of
+diff --git a/src/ov-fcn.h b/src/ov-fcn.h
+--- a/src/ov-fcn.h
++++ b/src/ov-fcn.h
+@@ -55,16 +55,19 @@ public:
+ 
+   bool is_defined (void) const { return true; }
+ 
+   bool is_function (void) const { return true; }
+ 
+   virtual bool is_system_fcn_file (void) const { return false; }
+ 
+   virtual std::string fcn_file_name (void) const { return std::string (); }
++  
++  // The name to show in the profiler (also used as map-key).
++  virtual std::string profiler_name (void) const { return name (); }
+ 
+   virtual std::string parent_fcn_name (void) const { return std::string (); }
+ 
+   virtual symbol_table::scope_id parent_fcn_scope (void) const { return -1; }
+ 
+   virtual void mark_fcn_file_up_to_date (const octave_time&) { }
+ 
+   virtual symbol_table::scope_id scope (void) { return -1; }
+diff --git a/src/ov-mex-fcn.cc b/src/ov-mex-fcn.cc
+--- a/src/ov-mex-fcn.cc
++++ b/src/ov-mex-fcn.cc
+@@ -28,16 +28,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <defaults.h>
+ #include "dynamic-ld.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "oct-obj.h"
+ #include "ov-mex-fcn.h"
+ #include "ov.h"
++#include "profiler.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_mex_function);
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_mex_function,
+                                      "mex function", "mex function");
+ 
+@@ -142,16 +143,17 @@ octave_mex_function::do_multi_index_op (
+       unwind_protect frame;
+ 
+       octave_call_stack::push (this);
+ 
+       frame.add_fcn (octave_call_stack::pop);
+ 
+       try
+         {
++          profile_data_accumulator::enter pe (profiler, *this);
+           retval = call_mex (have_fmex, mex_fcn_ptr, args, nargout, this);
+         }
+       catch (octave_execution_exception)
+         {
+           gripe_library_execution_error ();
+         }
+     }
+ 
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -19,16 +19,18 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <sstream>
++
+ #include "str-vec.h"
+ 
+ #include <defaults.h>
+ #include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "input.h"
+@@ -42,16 +44,17 @@ along with Octave; see the file COPYING.
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
+ #include "toplev.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "parse.h"
++#include "profiler.h"
+ #include "variables.h"
+ 
+ // Whether to optimize subsasgn method calls.
+ static bool Voptimize_subsasgn_calls = true;
+ 
+ // User defined scripts.
+ 
+ DEFINE_OCTAVE_ALLOCATOR (octave_user_script);
+@@ -126,17 +129,20 @@ octave_user_script::do_multi_index_op (i
+                 {
+                   octave_call_stack::push (this);
+ 
+                   frame.add_fcn (octave_call_stack::pop);
+ 
+                   frame.protect_var (tree_evaluator::statement_context);
+                   tree_evaluator::statement_context = tree_evaluator::script;
+ 
+-                  cmd_list->accept (*current_evaluator);
++                  {
++                    profile_data_accumulator::enter pe (profiler, *this);
++                    cmd_list->accept (*current_evaluator);
++                  }
+ 
+                   if (tree_return_command::returning)
+                     tree_return_command::returning = 0;
+ 
+                   if (tree_break_command::breaking)
+                     tree_break_command::breaking--;
+ 
+                   if (error_state)
+@@ -171,16 +177,17 @@ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (oct
+ // extrinsic/intrinsic state?).
+ 
+ octave_user_function::octave_user_function
+   (symbol_table::scope_id sid, tree_parameter_list *pl,
+    tree_parameter_list *rl, tree_statement_list *cl)
+   : octave_user_code (std::string (), std::string ()),
+     param_list (pl), ret_list (rl), cmd_list (cl),
+     lead_comm (), trail_comm (), file_name (),
++    location_line (0), location_column (0),
+     parent_name (), t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     system_fcn_file (false), call_depth (-1),
+     num_named_args (param_list ? param_list->length () : 0),
+     subfunction (false), inline_function (false),
+     class_constructor (false), class_method (false),
+     parent_scope (-1), local_scope (sid),
+     curr_unwind_protect_frame (0)
+@@ -212,16 +219,32 @@ octave_user_function::define_ret_list (t
+ }
+ 
+ void
+ octave_user_function::stash_fcn_file_name (const std::string& nm)
+ {
+   file_name = nm;
+ }
+ 
++std::string
++octave_user_function::profiler_name (void) const
++{
++  std::ostringstream result;
++
++  if (is_inline_function ())
++    result << "anonymous@" << fcn_file_name ()
++           << ":" << location_line << ":" << location_column;
++  else if (is_subfunction ())
++    result << parent_fcn_name () << ">" << name ();
++  else
++    result << name ();
++
++  return result.str ();
++}
++
+ void
+ octave_user_function::mark_as_system_fcn_file (void)
+ {
+   if (! file_name.empty ())
+     {
+       // We really should stash the whole path to the file we found,
+       // when we looked it up, to avoid possible race conditions...
+       // FIXME
+@@ -426,32 +449,36 @@ octave_user_function::do_multi_index_op 
+   // Evaluate the commands that make up the function.
+ 
+   frame.protect_var (tree_evaluator::statement_context);
+   tree_evaluator::statement_context = tree_evaluator::function;
+ 
+   bool special_expr = (is_inline_function ()
+                        || cmd_list->is_anon_function_body ());
+ 
+-  if (special_expr)
+-    {
+-      assert (cmd_list->length () == 1);
++  {
++    profile_data_accumulator::enter pe (profiler, *this);
+ 
+-      tree_statement *stmt = 0;
++    if (special_expr)
++      {
++        assert (cmd_list->length () == 1);
++
++        tree_statement *stmt = 0;
+ 
+-      if ((stmt = cmd_list->front ())
+-          && stmt->is_expression ())
+-        {
+-          tree_expression *expr = stmt->expression ();
++        if ((stmt = cmd_list->front ())
++            && stmt->is_expression ())
++          {
++            tree_expression *expr = stmt->expression ();
+ 
+-          retval = expr->rvalue (nargout);
+-        }
+-    }
+-  else
+-    cmd_list->accept (*current_evaluator);
++            retval = expr->rvalue (nargout);
++          }
++      }
++    else
++      cmd_list->accept (*current_evaluator);
++  }
+ 
+   if (echo_commands)
+     print_code_function_trailer ();
+ 
+   if (tree_return_command::returning)
+     tree_return_command::returning = 0;
+ 
+   if (tree_break_command::breaking)
+diff --git a/src/ov-usr-fcn.h b/src/ov-usr-fcn.h
+--- a/src/ov-usr-fcn.h
++++ b/src/ov-usr-fcn.h
+@@ -184,16 +184,22 @@ public:
+   octave_user_code *user_code_value (bool = false) { return this; }
+ 
+   octave_user_function *define_param_list (tree_parameter_list *t);
+ 
+   octave_user_function *define_ret_list (tree_parameter_list *t);
+ 
+   void stash_fcn_file_name (const std::string& nm);
+ 
++  void stash_fcn_location (int line, int col)
++    {
++      location_line = line;
++      location_column = col;
++    }
++
+   void stash_parent_fcn_name (const std::string& p) { parent_name = p; }
+ 
+   void stash_parent_fcn_scope (symbol_table::scope_id ps) { parent_scope = ps; }
+ 
+   void stash_leading_comment (octave_comment_list *lc) { lead_comm = lc; }
+ 
+   void stash_trailing_comment (octave_comment_list *tc) { trail_comm = tc; }
+ 
+@@ -202,16 +208,18 @@ public:
+   void stash_fcn_file_time (const octave_time& t)
+     {
+       t_parsed = t;
+       mark_fcn_file_up_to_date (t);
+     }
+ 
+   std::string fcn_file_name (void) const { return file_name; }
+ 
++  std::string profiler_name (void) const;
++
+   std::string parent_fcn_name (void) const { return parent_name; }
+ 
+   symbol_table::scope_id parent_fcn_scope (void) const { return parent_scope; }
+ 
+   symbol_table::scope_id scope (void) { return local_scope; }
+ 
+   octave_time time_parsed (void) const { return t_parsed; }
+ 
+@@ -339,16 +347,20 @@ private:
+   octave_comment_list *lead_comm;
+ 
+   // The comments preceding the ENDFUNCTION token.
+   octave_comment_list *trail_comm;
+ 
+   // The name of the file we parsed.
+   std::string file_name;
+ 
++  // Location where this function was defined.
++  int location_line;
++  int location_column;
++
+   // The name of the parent function, if any.
+   std::string parent_name;
+ 
+   // The time the file was parsed.
+   octave_time t_parsed;
+ 
+   // The time the file was last checked to see if it needs to be
+   // parsed again.
+diff --git a/src/profiler.cc b/src/profiler.cc
+new file mode 100644
+--- /dev/null
++++ b/src/profiler.cc
+@@ -0,0 +1,231 @@
++/*
++
++Copyright (C) 2011 Daniel Kraft
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <iostream>
++
++#include "Cell.h"
++#include "defun.h"
++#include "oct-time.h"
++#include "ov-fcn.h"
++#include "ov-struct.h"
++#include "pager.h"
++#include "profiler.h"
++
++profile_data_accumulator::enter::enter (profile_data_accumulator& a,
++                                        const octave_function& f)
++  : acc (a)
++{
++  if (acc.is_active ())
++    {
++      fcn = &f;
++      acc.enter_function (*fcn);
++    }
++  else
++    fcn = NULL;
++}
++
++profile_data_accumulator::enter::~enter ()
++{
++  if (fcn)
++    acc.exit_function (*fcn);
++}
++
++profile_data_accumulator::profile_data_accumulator ()
++  : enabled (false), call_stack (), times (), last_time (-1.0)
++{}
++
++void
++profile_data_accumulator::set_active (bool value)
++{
++  // If we enable, clear the call-stack.  This ensures we freshly start
++  // with collecting times now.
++  if (value)
++    {
++      while (!call_stack.empty ())
++        call_stack.pop ();
++    }
++
++  enabled = value;
++}
++
++void
++profile_data_accumulator::enter_function (const octave_function& fcn)
++{
++  // The enter class will check and only call us if the profiler is active.
++  assert (is_active ());
++
++  // If there is already an active function, add to its time before
++  // pushing the new one.
++  if (!call_stack.empty ())
++    add_current_time ();
++
++  call_stack.push (&fcn);
++  last_time = query_time ();
++}
++
++void
++profile_data_accumulator::exit_function (const octave_function& fcn)
++{
++  assert (!call_stack.empty ());
++  assert (&fcn == call_stack.top ());
++
++  // Usually, if we are disabled this function is not even called.  But the
++  // call disabling the profiler is an exception.  So also check here
++  // and only record the time if enabled.
++  if (is_active ())
++    add_current_time ();
++
++  call_stack.pop ();
++
++  // If this was an "inner call", we resume executing the parent function
++  // up the stack.  So note the start-time for this!
++  last_time = query_time ();
++}
++
++void
++profile_data_accumulator::reset (void)
++{
++  if (is_active ())
++    {
++      error ("Can't reset active profiler.");
++      return;
++    }
++
++  times.clear ();
++  last_time = -1.0;
++}
++
++Cell
++profile_data_accumulator::get_data (void) const
++{
++  const int n = times.size ();
++
++  Cell result (1, n);
++  int i = 0;
++  for (timing_map::const_iterator p = times.begin (); p != times.end (); ++p)
++    {
++      octave_scalar_map entry;
++
++      entry.contents ("name") = octave_value (p->first);
++      entry.contents ("time") = octave_value (p->second);
++
++      result (i++) = entry;
++    }
++  assert (i == n);
++
++  return result;
++}
++
++double
++profile_data_accumulator::query_time (void) const
++{
++  octave_time now;
++  return now.double_value ();
++}
++
++void
++profile_data_accumulator::add_current_time (void)
++{
++  const double t = query_time ();
++  assert (last_time >= 0.0 && last_time <= t);
++
++  assert (!call_stack.empty ());
++  const std::string name = call_stack.top ()->profiler_name ();
++
++  // If the key is not yet present in the map, it is constructed
++  // with default value 0.
++  times[name] += t - last_time;
++}
++
++profile_data_accumulator profiler;
++
++DEFUN (profiler_enable, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn  {Built-in Function} {} profiler_enable (enabled)\n\
++Enable or disable the profiler data collection.\n\
++@end deftypefn")
++{
++  // If there is an output argument, return current (if we change the old)
++  // status of the profiler.
++  octave_value_list result;
++  if (nargout > 0)
++    {
++      if (nargout > 1)
++        error ("profiler_enable: too many output arguments requested");
++
++      result(0) = profiler.is_active ();
++    }
++
++  // If there is an input argument, set the status.
++  const int nargin = args.length ();
++  if (nargin > 0)
++    {
++      if (nargin > 1)
++        error ("profiler_enable: too many arguments specified");
++
++      profiler.set_active (args(0).bool_value ());
++    }
++
++  return result;
++}
++
++DEFUN (profiler_reset, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn  {Built-in Function} {} profiler_reset ()\n\
++Clear all collected profiling data.\n\
++@end deftypefn")
++{
++  octave_value_list result;
++  const int nargin = args.length ();
++
++  if (nargin > 0)
++    error ("profiler_reset: no arguments expected");
++  if (nargout > 0)
++    error ("profiler_reset: no output argument possible");
++
++  profiler.reset ();
++
++  return result;
++}
++
++DEFUN (profiler_data, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn  {Built-in Function} {} data = profiler_data ()\n\
++Query the timings collected by the profiler.\n\
++@end deftypefn")
++{
++  octave_value_list result;
++  const int nargin = args.length ();
++
++  if (nargin > 0)
++    error ("profiler_data: no arguments expected");
++  if (nargout != 1)
++    error ("profiler_reset: expected exactly one output argument");
++
++  result(0) = profiler.get_data ();
++
++  return result;
++}
+diff --git a/src/profiler.h b/src/profiler.h
+new file mode 100644
+--- /dev/null
++++ b/src/profiler.h
+@@ -0,0 +1,111 @@
++/*
++
++Copyright (C) 2011 Daniel Kraft
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if !defined (octave_profiler_h)
++#define octave_profiler_h 1
++
++#include <stack>
++#include <map>
++
++class octave_function;
++class Cell;
++
++class
++OCTAVE_API
++profile_data_accumulator
++{
++public:
++
++  // This is a utility class that can be used to call the enter/exit
++  // functions in a manner protected from stack unwinding.
++  class enter
++  {
++    private:
++
++      profile_data_accumulator& acc;
++
++      const octave_function* fcn;
++
++    public:
++
++      enter (profile_data_accumulator&, const octave_function& fcn);
++
++      virtual ~enter (void);
++
++    private:
++
++      // No copying!
++
++      enter (const enter&);
++
++      enter& operator = (const enter&);
++  };
++
++  profile_data_accumulator (void);
++
++  bool is_active (void) const { return enabled; }
++
++  void set_active (bool);
++
++  void reset (void);
++
++  Cell get_data (void) const;
++
++private:
++
++  bool enabled;
++
++  std::stack<const octave_function*> call_stack;
++
++  typedef std::map<std::string, double> timing_map;
++  timing_map times;
++
++  // Store last timestamp we had, when the currently active function was called.
++  double last_time;
++
++  // These are private as only the unwind-protecting inner class enter
++  // should be allowed to call them.
++  void enter_function (const octave_function&);
++  void exit_function (const octave_function&);
++
++  // Query a timestamp, used for timing calls (obviously).
++  // This is not static because in the future, maybe we want a flag
++  // in the profiler or something to choose between cputime, wall-time
++  // user-time, system-time, ...
++  double query_time () const;
++
++  // Add the time elapsed since last_time to the function on the top
++  // of our call-stack.  This is called from two different positions,
++  // thus it is useful to have it as a seperate function.
++  void add_current_time (void);
++
++  // No copying!
++
++  profile_data_accumulator (const profile_data_accumulator&);
++
++  profile_data_accumulator& operator = (const profile_data_accumulator&);
++};
++
++// The instance used.
++extern profile_data_accumulator profiler;
++
++#endif
+diff --git a/src/pt-fcn-handle.cc b/src/pt-fcn-handle.cc
+--- a/src/pt-fcn-handle.cc
++++ b/src/pt-fcn-handle.cc
+@@ -122,16 +122,17 @@ tree_anon_fcn_handle::rvalue1 (int)
+ 
+       if (parent_scope < 0)
+         parent_scope = curr_fcn->scope ();
+ 
+       uf->stash_parent_fcn_scope (parent_scope);
+     }
+ 
+   uf->mark_as_inline_function ();
++  uf->stash_fcn_location (line (), column ());
+ 
+   octave_value ov_fcn (uf);
+ 
+   octave_value fh (octave_fcn_binder::maybe_binder (ov_fcn));
+ 
+   return fh;
+ }
+ 

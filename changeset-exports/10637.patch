@@ -1,0 +1,313 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1274096817 -7200
+#      Mon May 17 13:46:57 2010 +0200
+# Node ID 9cd5aa83fa62ad38e83057c7bba055c267350cb9
+# Parent  c170eb1c067f161c05121d6007c46ebddd46036b
+implement 'local' parameter to pseudo-variables
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,20 @@
++2010-05-17  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov-usr-fcn.h (octave_user_function::curr_unwind_protect_frame): New
++	field.
++	(octave_user_function::local_protect): New template method.
++	* ov-usr-fcn.cc (octave_user_function::octave_user_function):
++	Initialize it here.
++	(octave_user_function::do_multi_index_op): Set and restore it here.
++	* variables.cc (wants_local_change, try_local_protect): New helper
++	funcs.
++	(set_internal_variable): Call them in all overloads.
++
+ 2010-05-14  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* symtab.cc (symtab::do_mark_global, symtab::do_mark_hidden): Force
+ 	non-existing symbol to be created.
+ 
+ 2010-05-13  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* xdiv.cc (solve_singularity_warning): Use ID for the warning.
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -177,17 +177,18 @@ octave_user_function::octave_user_functi
+     param_list (pl), ret_list (rl), cmd_list (cl),
+     lead_comm (), trail_comm (), file_name (),
+     parent_name (), t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     system_fcn_file (false), call_depth (-1),
+     num_named_args (param_list ? param_list->length () : 0),
+     nested_function (false), inline_function (false),
+     class_constructor (false), class_method (false),
+-    parent_scope (-1), local_scope (sid)
++    parent_scope (-1), local_scope (sid),
++    curr_unwind_protect_frame (0)
+ {
+   if (cmd_list)
+     cmd_list->mark_as_function_body ();
+ 
+   if (local_scope >= 0)
+     symbol_table::set_curr_fcn (this, local_scope);
+ }
+ 
+@@ -393,16 +394,22 @@ octave_user_function::do_multi_index_op 
+ 
+   bind_automatic_vars (arg_names, nargin, nargout, all_va_args (args));
+ 
+   bool echo_commands = (Vecho_executing_commands & ECHO_FUNCTIONS);
+ 
+   if (echo_commands)
+     print_code_function_header ();
+ 
++  // Set pointer to the current unwind_protect frame to allow
++  // certain builtins register simple cleanup in a very optimized manner.
++  // This is *not* intended as a general-purpose on-cleanup mechanism,
++  frame.protect_var (curr_unwind_protect_frame);
++  curr_unwind_protect_frame = &frame;
++
+   // Evaluate the commands that make up the function.
+ 
+   frame.protect_var (tree_evaluator::in_fcn_or_script_body);
+   tree_evaluator::in_fcn_or_script_body = true;
+ 
+   bool special_expr = (is_inline_function ()
+                        || cmd_list->is_anon_function_body ());
+ 
+diff --git a/src/ov-usr-fcn.h b/src/ov-usr-fcn.h
+--- a/src/ov-usr-fcn.h
++++ b/src/ov-usr-fcn.h
+@@ -29,16 +29,17 @@ along with Octave; see the file COPYING.
+ #include <string>
+ #include <stack>
+ 
+ #include "comment-list.h"
+ #include "oct-obj.h"
+ #include "ov-fcn.h"
+ #include "ov-typeinfo.h"
+ #include "symtab.h"
++#include "unwind-prot.h"
+ 
+ class string_vector;
+ 
+ class octave_value;
+ class tree_parameter_list;
+ class tree_statement_list;
+ class tree_va_return_list;
+ class tree_walker;
+@@ -279,16 +280,28 @@ public:
+   octave_comment_list *leading_comment (void) { return lead_comm; }
+ 
+   octave_comment_list *trailing_comment (void) { return trail_comm; }
+ 
+   bool subsasgn_optimization_ok (void);
+ 
+   void accept (tree_walker& tw);
+ 
++  template <class T>
++  bool local_protect (T& variable)
++    {
++      if (curr_unwind_protect_frame)
++        {
++          curr_unwind_protect_frame->protect_var (variable);
++          return true;
++        }
++      else
++        return false;
++    }
++
+ #if 0
+   void print_symtab_info (std::ostream& os) const;
+ #endif
+ 
+ private:
+ 
+   // List of arguments for this function.  These are local variables.
+   tree_parameter_list *param_list;
+@@ -342,16 +355,19 @@ private:
+   // TRUE means this function is a method for a class.
+   bool class_method;
+ 
+   // The scope of the parent function, if any.
+   symbol_table::scope_id parent_scope;
+ 
+   symbol_table::scope_id local_scope;
+ 
++  // pointer to the current unwind_protect frame of this function.
++  unwind_protect *curr_unwind_protect_frame;
++
+ #if 0
+   // The symbol record for argn in the local symbol table.
+   octave_value& argn_varref;
+ 
+   // The symbol record for nargin in the local symbol table.
+   octave_value& nargin_varref;
+ 
+   // The symbol record for nargout in the local symbol table.
+diff --git a/src/variables.cc b/src/variables.cc
+--- a/src/variables.cc
++++ b/src/variables.cc
+@@ -633,27 +633,69 @@ get_top_level_value (const std::string& 
+ void
+ set_top_level_value (const std::string& nm, const octave_value& val)
+ {
+   symbol_table::top_level_varref (nm) = val;
+ }
+ 
+ // Variable values.
+ 
++static bool
++wants_local_change (const octave_value_list& args, int& nargin)
++{
++  bool retval = false;
++
++  if (nargin == 2)
++    {
++      if (args(1).is_string () && args(1).string_value () == "local")
++        {
++          nargin = 1;
++          retval = true;
++        }
++      else
++        {
++          error_with_cfn ("expecting second argument to be \"local\"");
++          nargin = 0;
++        }
++    }
++
++  return retval;
++}
++
++template <class T>
++bool try_local_protect (T& var)
++{
++  octave_user_code *curr_usr_code = octave_call_stack::caller_user_code ();
++  octave_user_function *curr_usr_fcn = 0;
++  if (curr_usr_code && curr_usr_code->is_user_function ())
++    curr_usr_fcn = dynamic_cast<octave_user_function *> (curr_usr_code);
++
++  if (curr_usr_fcn && curr_usr_fcn->local_protect (var))
++    return true;
++  else
++    return false;
++}
++
+ octave_value
+ set_internal_variable (bool& var, const octave_value_list& args,
+                        int nargout, const char *nm)
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargout > 0 || nargin == 0)
+     retval = var;
+ 
++  if (wants_local_change (args, nargin))
++    {
++      if (! try_local_protect (var))
++        warning ("\"local\" has no effect outside a function");
++    }
++
+   if (nargin == 1)
+     {
+       bool bval = args(0).bool_value ();
+ 
+       if (! error_state)
+         var = bval;
+       else
+         error ("%s: expecting arg to be a logical value", nm);
+@@ -670,16 +712,22 @@ set_internal_variable (char& var, const 
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargout > 0 || nargin == 0)
+     retval = var;
+ 
++  if (wants_local_change (args, nargin))
++    {
++      if (! try_local_protect (var))
++        warning ("\"local\" has no effect outside a function");
++    }
++
+   if (nargin == 1)
+     {
+       std::string sval = args(0).string_value ();
+ 
+       if (! error_state)
+         {
+           switch (sval.length ())
+             {
+@@ -712,16 +760,22 @@ set_internal_variable (int& var, const o
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargout > 0 || nargin == 0)
+     retval = var;
+ 
++  if (wants_local_change (args, nargin))
++    {
++      if (! try_local_protect (var))
++        warning ("\"local\" has no effect outside a function");
++    }
++
+   if (nargin == 1)
+     {
+       int ival = args(0).int_value ();
+ 
+       if (! error_state)
+         {
+           if (ival < minval)
+             error ("%s: expecting arg to be greater than %d", nm, minval);
+@@ -747,16 +801,22 @@ set_internal_variable (double& var, cons
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargout > 0 || nargin == 0)
+     retval = var;
+ 
++  if (wants_local_change (args, nargin))
++    {
++      if (! try_local_protect (var))
++        warning ("\"local\" has no effect outside a function");
++    }
++
+   if (nargin == 1)
+     {
+       double dval = args(0).scalar_value ();
+ 
+       if (! error_state)
+         {
+           if (dval < minval)
+             error ("%s: expecting arg to be greater than %g", minval);
+@@ -780,16 +840,22 @@ set_internal_variable (std::string& var,
+ {
+   octave_value retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargout > 0 || nargin == 0)
+     retval = var;
+ 
++  if (wants_local_change (args, nargin))
++    {
++      if (! try_local_protect (var))
++        warning ("\"local\" has no effect outside a function");
++    }
++
+   if (nargin == 1)
+     {
+       std::string sval = args(0).string_value ();
+ 
+       if (! error_state)
+         {
+           if (empty_ok || ! sval.empty ())
+             var = sval;

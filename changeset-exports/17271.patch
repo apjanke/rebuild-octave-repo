@@ -1,0 +1,631 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1376858204 14400
+#      Sun Aug 18 16:36:44 2013 -0400
+# Node ID cb7233cfbf4335163ec4090b8501ddcf55c4841d
+# Parent  ba865ea9c7e9ee7a62710491adae92c9d8963122
+Prepare base text rendering code for full TeX support.
+
+* libinterp/corefcm/oct-tex-lexer.ll: Include newlines in string
+characters.
+* libinterp/corefcn/txt-eng-ft.h (list): New include.
+(class ft_render::ft_font): New class.
+(ft_render::current_face, ft_render::push_new_line,
+ft_render::compute_bbox, ft_render::compute_line_xoffset): New methods.
+(ft_render::fonts): New member, replaces obsolete face.
+(ft_render::line_bbox): New member.
+(ft_render::halign): New member, replaces obsolete multiline_halign.
+(ft_render::multiline_align_xoffsets): Remove member.
+(class ft_render): Add comments for each class member.
+* libinterp/corefcn/txt-eng-ft.cc (ft_render::text_to_pixels): Use halig
+instead of multiline_halign.
+(ft_render::ft_render): Adapt to added/removed members.
+(ft_render::~ft_render): Likewise.
+(ft_render::set_font): Use fonts member instead of face.
+(ft_render::push_new_line, ft_render::compute_bbox,
+ft_render::compute_line_xoffset): New methods.
+(ft_render::render, ft_render::get_extent): Call compute_bbox.
+(ft_render::visit(text_element_string)): Remove code for handling
+newlines, call push_new_line instead. Remove code related to
+multiline_align_xoffsets.
+
+diff --git a/libinterp/corefcn/oct-tex-lexer.ll b/libinterp/corefcn/oct-tex-lexer.ll
+--- a/libinterp/corefcn/oct-tex-lexer.ll
++++ b/libinterp/corefcn/oct-tex-lexer.ll
+@@ -101,16 +101,17 @@ NUM	(({D}+\.?{D}*)|(\.{D}+))
+ "\\"		{ BEGIN(COMMAND); return CMD; }
+ <COMMAND>{ID}	{ yylval->ch = yytext[0]; return ID; }
+ <COMMAND>.	{ BEGIN(INITIAL); yyless (0); }
+ 
+ %{
+ // Generic character
+ %}
+ 
++"\n"	|
+ .	{ yylval->ch = yytext[0]; return CH; }
+ 
+ %%
+ 
+ bool
+ text_parser_tex::init_lexer (const std::string& s)
+ {
+   if (! scanner)
+diff --git a/libinterp/corefcn/txt-eng-ft.cc b/libinterp/corefcn/txt-eng-ft.cc
+--- a/libinterp/corefcn/txt-eng-ft.cc
++++ b/libinterp/corefcn/txt-eng-ft.cc
+@@ -297,122 +297,217 @@ ft_manager* ft_manager::instance = 0;
+ 
+ static void
+ ft_face_destroyed (void* object)
+ { ft_manager::font_destroyed (reinterpret_cast<FT_Face> (object)); }
+ 
+ // ---------------------------------------------------------------------------
+ 
+ ft_render::ft_render (void)
+-    : text_processor (), face (0), bbox (1, 4, 0.0),
+-      xoffset (0), yoffset (0), multiline_halign (0),
+-      multiline_align_xoffsets (), mode (MODE_BBOX),
+-      red (0), green (0), blue (0)
++    : text_processor (), fonts (), bbox (1, 4, 0.0), halign (0), xoffset (0),
++      yoffset (0), mode (MODE_BBOX), red (0), green (0), blue (0)
+ {
+ }
+ 
+ ft_render::~ft_render (void)
+ {
+-  if (face)
+-    FT_Done_Face (face);
++  fonts.clear ();
+ }
+ 
+ void
+ ft_render::set_font (const std::string& name, const std::string& weight,
+                      const std::string& angle, double size)
+ {
+-  if (face)
+-    FT_Done_Face (face);
++  if (fonts.size () > 1)
++    ::warning ("ft_render: resetting font parameters while the font stack "
++               "contains more than 1 element.");
++
++  // In all cases, we only replace the first/bottom font in the stack, if any.
++  // Calling this method while there's more than 1 font in the stack does
++  // not make sense: we're not gonna reconstruct the entire font stack.
++
++  if (fonts.size ())
++    fonts.pop_front ();
+ 
+   // FIXME: take "fontunits" into account
+-  face = ft_manager::get_font (name, weight, angle, size);
++  FT_Face face = ft_manager::get_font (name, weight, angle, size);
+ 
+   if (face)
+     {
+       if (FT_Set_Char_Size (face, 0, size*64, 0, 0))
+         ::warning ("ft_render: unable to set font size to %d", size);
++
++      fonts.push_front (ft_font (name, weight, angle, size, face));
+     }
+   else
+     ::warning ("ft_render: unable to load appropriate font");
+ }
+ 
+ void
++ft_render::push_new_line (void)
++{
++  switch (mode)
++    {
++    case MODE_BBOX:
++        {
++          // Create a new bbox entry based on the current font.
++
++          FT_Face face = current_face ();
++
++          if (face)
++            {
++              int asc = face->size->metrics.ascender >> 6;
++              int desc = face->size->metrics.descender >> 6;
++              int h = face->size->metrics.height >> 6;
++
++              Matrix bb (1, 5, 0.0);
++
++              bb(1) = desc;
++              bb(3) = asc - desc;
++              bb(4) = h;
++
++              line_bbox.push_back (bb);
++            }
++        }
++      break;
++
++    case MODE_RENDER:
++        {
++          // Move to the next line bbox, adjust xoffset based on alignment
++          // and yoffset based on the old and new line bbox.
++
++          Matrix old_bbox = line_bbox.front ();
++          line_bbox.pop_front ();
++          Matrix new_bbox = line_bbox.front ();
++
++          xoffset = compute_line_xoffset (new_bbox);
++          yoffset += (old_bbox(1) - (new_bbox(1) + new_bbox(3)));
++        }
++      break;
++    }
++}
++
++int
++ft_render::compute_line_xoffset (const Matrix& lb) const
++{
++  if (! bbox.is_empty ())
++    {
++      switch (halign)
++        {
++        case 0:
++          return 0;
++        case 1:
++          return (bbox(2) - lb(2)) / 2;
++        case 2:
++          return (bbox(2) - lb(2));
++        }
++    }
++
++  return 0;
++}
++
++void
++ft_render::compute_bbox (void)
++{
++  // Stack the various line bbox together and compute the final
++  // bounding box for the entire text string.
++
++  bbox = Matrix ();
++
++  switch (line_bbox.size ())
++    {
++    case 0:
++      break;
++    case 1:
++      bbox = line_bbox.front ().extract (0, 0, 0, 3);
++      break;
++    default:
++      for (std::list<Matrix>::const_iterator it = line_bbox.begin ();
++           it != line_bbox.end (); ++it)
++        {
++          if (bbox.is_empty ())
++            bbox = it->extract (0, 0, 0, 3);
++          else
++            {
++              bbox(1) -= (*it)(3);
++              bbox(3) += (*it)(3);
++              bbox(2) = xmax (bbox(2), (*it)(2));
++            }
++        }
++      break;
++    }
++}
++
++void
+ ft_render::set_mode (int m)
+ {
+   mode = m;
+ 
+   switch (mode)
+     {
+     case MODE_BBOX:
+       xoffset = yoffset = 0;
+       bbox = Matrix (1, 4, 0.0);
++      line_bbox.clear ();
++      push_new_line ();
+       break;
+     case MODE_RENDER:
+       if (bbox.numel () != 4)
+         {
+           ::warning ("ft_render: invalid bounding box, cannot render");
+ 
+           xoffset = yoffset = 0;
+           pixels = uint8NDArray ();
+         }
+       else
+         {
+           pixels = uint8NDArray (dim_vector (4, bbox(2), bbox(3)),
+                                  static_cast<uint8_t> (0));
+-          xoffset = 0;
++          xoffset = compute_line_xoffset (line_bbox.front ());
+           yoffset = -bbox(1)-1;
+         }
+       break;
+     default:
+       ::error ("ft_render: invalid mode '%d'", mode);
+       break;
+     }
+ }
+ 
+ void
+ ft_render::visit (text_element_string& e)
+ {
++  FT_Face face = current_face ();
++
+   if (face)
+     {
+-      int line_index = 0;
+-      FT_UInt box_line_width = 0;
+       std::string str = e.string_value ();
+       FT_UInt glyph_index, previous = 0;
+ 
+-      if (mode == MODE_BBOX)
+-        multiline_align_xoffsets.clear ();
+-      else if (mode == MODE_RENDER)
+-        xoffset += multiline_align_xoffsets[line_index];
+-
+       for (size_t i = 0; i < str.length (); i++)
+         {
+           glyph_index = FT_Get_Char_Index (face, str[i]);
+ 
+           if (str[i] != '\n'
+               && (! glyph_index
+               || FT_Load_Glyph (face, glyph_index, FT_LOAD_DEFAULT)))
+             gripe_missing_glyph (str[i]);
+           else
+             {
+               switch (mode)
+                 {
+                 case MODE_RENDER:
+                   if (str[i] == '\n')
+                     {
+-                    glyph_index = FT_Get_Char_Index (face, ' ');
+-                    if (!glyph_index || FT_Load_Glyph (face, glyph_index, FT_LOAD_DEFAULT))
+-                      {
+-                        gripe_missing_glyph (' ');
+-                      }
+-                    else
+-                      {
+-                        line_index++;
+-                        xoffset = multiline_align_xoffsets[line_index];
+-                        yoffset -= (face->size->metrics.height >> 6);
+-                      }
++                      glyph_index = FT_Get_Char_Index (face, ' ');
++                      if (!glyph_index || FT_Load_Glyph (face, glyph_index, FT_LOAD_DEFAULT))
++                        {
++                          gripe_missing_glyph (' ');
++                        }
++                      else
++                        push_new_line ();
+                     }
+                   else if (FT_Render_Glyph (face->glyph, FT_RENDER_MODE_NORMAL))
+                     {
+                       gripe_glyph_render (str[i]);
+                     }
+                   else
+                     {
+                       FT_Bitmap& bitmap = face->glyph->bitmap;
+@@ -438,17 +533,18 @@ ft_render::visit (text_element_string& e
+ 
+                       for (int r = 0; r < bitmap.rows; r++)
+                         for (int c = 0; c < bitmap.width; c++)
+                           {
+                             unsigned char pix = bitmap.buffer[r*bitmap.width+c];
+                             if (x0+c < 0 || x0+c >= pixels.dim2 ()
+                                 || y0-r < 0 || y0-r >= pixels.dim3 ())
+                               {
+-                                //::error ("out-of-bound indexing!!");
++                                //::warning ("ft_render: pixel out of bound (char=%d, (x,y)=(%d,%d), (w,h)=(%d,%d)",
++                                //           str[i], x0+c, y0-r, pixels.dim2 (), pixels.dim3 ());
+                               }
+                             else if (pixels(3, x0+c, y0-r).value () == 0)
+                               {
+                                 pixels(0, x0+c, y0-r) = red;
+                                 pixels(1, x0+c, y0-r) = green;
+                                 pixels(2, x0+c, y0-r) = blue;
+                                 pixels(3, x0+c, y0-r) = pix;
+                               }
+@@ -459,96 +555,52 @@ ft_render::visit (text_element_string& e
+                   break;
+ 
+                 case MODE_BBOX:
+                   if (str[i] == '\n')
+                     {
+                       glyph_index = FT_Get_Char_Index (face, ' ');
+                       if (! glyph_index
+                           || FT_Load_Glyph (face, glyph_index, FT_LOAD_DEFAULT))
+-                      {
+-                        gripe_missing_glyph (' ');
+-                      }
+-                    else
+-                      {
+-                        multiline_align_xoffsets.push_back (box_line_width);
+-                        // Reset the pixel width for this newline, so we don't
+-                        // allocate a bounding box larger than the horizontal
+-                        // width of the multi-line
+-                        box_line_width = 0;
+-                        bbox(1) -= (face->size->metrics.height >> 6);
+-                      }
++                        {
++                          gripe_missing_glyph (' ');
++                        }
++                      else
++                        push_new_line ();
+                     }
+                   else
+                     {
+-                    // width
+-                    if (previous)
+-                      {
+-                        FT_Vector delta;
++                      Matrix& bb = line_bbox.back ();
+ 
+-                        FT_Get_Kerning (face, previous, glyph_index,
+-                                        FT_KERNING_DEFAULT, &delta);
+-
+-                        box_line_width += (delta.x >> 6);
+-                      }
+-
+-                    box_line_width += (face->glyph->advance.x >> 6);
+-
+-                    int asc, desc;
++                      // If we have a previous glyph, use kerning information.
++                      // This usually means moving a bit backward before adding
++                      // the next glyph. That is, "delta.x" is usually < 0.
++                      if (previous)
++                        {
++                          FT_Vector delta;
+ 
+-                    if (false /*tight*/)
+-                      {
+-                        desc = face->glyph->metrics.horiBearingY - face->glyph->metrics.height;
+-                        asc = face->glyph->metrics.horiBearingY;
+-                      }
+-                    else
+-                      {
+-                        asc = face->size->metrics.ascender;
+-                        desc = face->size->metrics.descender;
+-                      }
++                          FT_Get_Kerning (face, previous, glyph_index,
++                                          FT_KERNING_DEFAULT, &delta);
+ 
+-                    asc = yoffset + (asc >> 6);
+-                    desc = yoffset + (desc >> 6);
++                          bb(2) += (delta.x >> 6);
++                        }
+ 
+-                    if (desc < bbox(1))
+-                      {
+-                        bbox(3) += (bbox(1) - desc);
+-                        bbox(1) = desc;
+-                      }
+-                    if (asc > (bbox(3)+bbox(1)))
+-                      bbox(3) = asc-bbox(1);
+-                    if (bbox(2) < box_line_width)
+-                      bbox(2) = box_line_width;
+-                  }
++                      // Extend current line bounding box by the width of the
++                      // current glyph.
++                      bb(2) += (face->glyph->advance.x >> 6);
++                    }
+                   break;
+                 }
++
+                 if (str[i] == '\n')
+                   previous = 0;
+                 else
+                   previous = glyph_index;
+             }
+         }
+-      if (mode == MODE_BBOX)
+-        {
+-          /* Push last the width associated with the last line */
+-          multiline_align_xoffsets.push_back (box_line_width);
+-
+-          for (unsigned int i = 0; i < multiline_align_xoffsets.size (); i++)
+-            {
+-            /* Center align */
+-            if (multiline_halign == 1)
+-              multiline_align_xoffsets[i] = (bbox(2) - multiline_align_xoffsets[i])/2;
+-            /* Right align */
+-            else if (multiline_halign == 2)
+-              multiline_align_xoffsets[i] = (bbox(2) - multiline_align_xoffsets[i]);
+-            /* Left align */
+-            else
+-              multiline_align_xoffsets[i] = 0;
+-            }
+-        }
+     }
+ }
+ 
+ void
+ ft_render::reset (void)
+ {
+   set_mode (MODE_BBOX);
+   set_color (Matrix (1, 3, 0.0));
+@@ -567,16 +619,17 @@ ft_render::set_color (Matrix c)
+     ::warning ("ft_render::set_color: invalid color");
+ }
+ 
+ uint8NDArray
+ ft_render::render (text_element* elt, Matrix& box, int rotation)
+ {
+   set_mode (MODE_BBOX);
+   elt->accept (*this);
++  compute_bbox ();
+   box = bbox;
+ 
+   set_mode (MODE_RENDER);
+   if (pixels.numel () > 0)
+     {
+       elt->accept (*this);
+ 
+       switch (rotation)
+@@ -633,16 +686,17 @@ ft_render::render (text_element* elt, Ma
+ // y-extent is overly large because it is measured from baseline-to-baseline.
+ // Calling routines, such as ylabel, may need to account for this mismatch.
+ 
+ Matrix
+ ft_render::get_extent (text_element *elt, double rotation)
+ {
+   set_mode (MODE_BBOX);
+   elt->accept (*this);
++  compute_bbox ();
+ 
+   Matrix extent (1, 2, 0.0);
+ 
+   switch (rotation_to_mode (rotation))
+     {
+     case ROTATION_0:
+     case ROTATION_180:
+       extent(0) = bbox(2);
+@@ -681,23 +735,23 @@ ft_render::rotation_to_mode (double rota
+     return ROTATION_270;
+   else
+     return ROTATION_0;
+ }
+ 
+ void
+ ft_render::text_to_pixels (const std::string& txt,
+                            uint8NDArray& pixels_, Matrix& box,
+-                           int halign, int valign, double rotation,
++                           int _halign, int valign, double rotation,
+                            const caseless_str& interpreter)
+ {
+   // FIXME: clip "rotation" between 0 and 360
+   int rot_mode = rotation_to_mode (rotation);
+ 
+-  multiline_halign = halign;
++  halign = _halign;
+ 
+   text_element *elt = text_parser::parse (txt, interpreter);
+   pixels_ = render (elt, box, rot_mode);
+   delete elt;
+ 
+   if (pixels_.numel () == 0)
+     {
+       // nothing to render
+diff --git a/libinterp/corefcn/txt-eng-ft.h b/libinterp/corefcn/txt-eng-ft.h
+--- a/libinterp/corefcn/txt-eng-ft.h
++++ b/libinterp/corefcn/txt-eng-ft.h
+@@ -20,16 +20,17 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if ! defined (txt_eng_ft_h)
+ #define txt_eng_ft_h 1
+ 
+ #if HAVE_FREETYPE
+ 
++#include <list>
+ #include <vector>
+ 
+ #include <ft2build.h>
+ #include FT_FREETYPE_H
+ 
+ #include <dMatrix.h>
+ #include <uint8NDArray.h>
+ #include "txt-eng.h"
+@@ -87,23 +88,105 @@ private:
+   int rotation_to_mode (double rotation) const;
+ 
+   // No copying!
+ 
+   ft_render (const ft_render&);
+ 
+   ft_render& operator = (const ft_render&);
+ 
++  // Class to hold information about fonts and a strong
++  // reference to the font objects loaded by freetype.
++  class ft_font
++    {
++    public:
++      std::string name;
++      std::string weight;
++      std::string angle;
++      double size;
++      FT_Face face;
++
++      ft_font (const std::string& nm, const std::string& wt,
++               const std::string& ang, double sz, FT_Face f)
++        : name (nm), weight (wt), angle (ang), size (sz), face (f) { }
++
++      ft_font (const ft_font& ft)
++        : name (ft.name), weight (ft.weight), angle (ft.angle), size (ft.size)
++        {
++          if (FT_Reference_Face (ft.face) == 0)
++            face = ft.face;
++        }
++
++      ~ft_font (void)
++        {
++          if (face)
++            FT_Done_Face (face);
++        }
++
++      ft_font& operator = (const ft_font& ft)
++        {
++          if (&ft != this)
++            {
++              name = ft.name;
++              weight = ft.weight;
++              angle = ft.angle;
++              size = ft.size;
++              FT_Done_Face (face);
++              if (FT_Reference_Face (ft.face))
++                face = ft.face;
++              else
++                face = 0;
++            }
++
++          return *this;
++        }
++
++    private:
++      ft_font (void);
++    };
++
++  FT_Face current_face (void)
++    { return fonts.size () ? fonts.back ().face : 0; }
++
++  void push_new_line (void);
++
++  void compute_bbox (void);
++
++  int compute_line_xoffset (const Matrix& lb) const;
++
+ private:
+-  FT_Face face;
++  // The stack of fonts currently used by the renderer.
++  std::list<ft_font> fonts;
++
++  // Used to stored the bounding box corresponding to the rendered text.
++  // The bounding box has the form [x, y, w, h] where x and y represent the
++  // coordinates of the bottom left corner relative to the anchor point of
++  // the text (== start of text on the baseline). Due to font descent or
++  // multiple lines, the value y is usually negative.
+   Matrix bbox;
++
++  // Used to stored the rendered text. It's a 3D matrix with size MxNx4
++  // where M and N are the width and height of the bounding box.
+   uint8NDArray pixels;
++
++  // Used to store the bounding box of each line. This is used to layout
++  // multiline text properly.
++  std::list<Matrix> line_bbox;
++
++  // The current horizontal alignment. This is used to align multi-line text.
++  int halign;
++
++  // The current X offset for the next glyph.
+   int xoffset;
++
++  // The current Y offset for the next glyph.
+   int yoffset;
+-  int multiline_halign;
+-  std::vector<int> multiline_align_xoffsets;
++
++  // The current mode of the rendering process (box computing or rendering).
+   int mode;
++
++  // The base color of the rendered text.
+   uint8_t red, green, blue;
+ };
+ 
+ #endif // HAVE_FREETYPE
+ 
+ #endif

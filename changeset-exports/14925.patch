@@ -1,0 +1,669 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1338311246 18000
+#      Tue May 29 12:07:26 2012 -0500
+# Node ID 8697e3e9d77a2534990578f717e049bbbd04ccf8
+# Parent  d4d9a64db6aa78c243e83af853992084fd084849
+Properly cleanup the low level IR
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -611,16 +611,26 @@ jit_typeinfo::new_type (const std::strin
+ // -------------------- jit_use --------------------
+ jit_block *
+ jit_use::user_parent (void) const
+ {
+   return muser->parent ();
+ }
+ 
+ // -------------------- jit_value --------------------
++jit_value::~jit_value (void)
++{
++  while (use_head)
++    {
++      jit_instruction *user = use_head->user ();
++      size_t idx = use_head->index ();
++      user->stash_argument (idx, 0);
++    }
++}
++
+ #define JIT_METH(clname)                                \
+   void                                                  \
+   jit_ ## clname::accept (jit_ir_walker& walker)        \
+   {                                                     \
+     walker.visit (*this);                               \
+   }
+ 
+ JIT_VISIT_IR_NOTEMPLATE
+@@ -728,28 +738,25 @@ jit_block::create_merge (llvm::Function 
+ size_t
+ jit_block::succ_count (void) const
+ {
+   jit_terminator *term = terminator ();
+   return term ? term->sucessor_count () : 0;
+ }
+ 
+ jit_phi *
+-jit_block::search_phi (const std::string& tag_name, jit_value *adefault)
++jit_block::search_phi (const std::string& tag_name)
+ {
+-  jit_phi *ret;
++  jit_phi *ret = 0;
+   for (iterator iter = begin (); iter != end ()
+          && (ret = dynamic_cast<jit_phi *> (*iter)); ++iter)
+     if (ret->tag () == tag_name)
+       return ret;
+ 
+-  ret = new jit_phi (pred_count (), adefault);
+-  ret->stash_tag (tag_name);
+-  prepend (ret);
+-  return ret;
++  return 0;
+ }
+ 
+ llvm::BasicBlock *
+ jit_block::to_llvm (void) const
+ {
+   return llvm::cast<llvm::BasicBlock> (llvm_value);
+ }
+ 
+@@ -783,31 +790,31 @@ jit_call::infer (void)
+   return false;
+ }
+ 
+ // -------------------- jit_convert --------------------
+ jit_convert::jit_convert (llvm::Module *module, tree &tee)
+ {
+   jit_instruction::reset_ids ();
+ 
+-  jit_block *entry_block = new jit_block ("body");
++  jit_block *entry_block = create<jit_block> ("body");
+   block = entry_block;
+   blocks.push_back (block);
+ 
+-  toplevel_map tlevel (block);
++  toplevel_map tlevel (*this, block);
+   variables = &tlevel;
+-  final_block = new jit_block ("final");
++  final_block = create<jit_block> ("final");
+   visit (tee);
+ 
+   blocks.push_back (final_block);
+-  block->append (new jit_break (final_block));
++  block->append (create<jit_break> (final_block));
+ 
+   for (variable_map::iterator iter = variables->begin ();
+        iter != variables->end (); ++iter)
+-    final_block->append (new jit_store_argument (iter->first, iter->second));
++    final_block->append (create<jit_store_argument> (iter->first, iter->second));
+ 
+   // FIXME: Maybe we should remove dead code here?
+ 
+   // initialize the worklist to instructions derived from constants
+   for (std::list<jit_value *>::iterator iter = constants.begin ();
+        iter != constants.end (); ++iter)
+     append_users (*iter);
+ 
+@@ -863,16 +870,23 @@ jit_convert::jit_convert (llvm::Module *
+       std::cout << "-------------------- llvm ir --------------------";
+       llvm::raw_os_ostream llvm_cout (std::cout);
+       function->print (llvm_cout);
+       std::cout << std::endl;
+       llvm::verifyFunction (*function);
+     }
+ }
+ 
++jit_convert::~jit_convert (void)
++{
++  for (std::list<jit_value *>::iterator iter = all_values.begin ();
++       iter != all_values.end (); ++iter)
++    delete *iter;
++}
++
+ void
+ jit_convert::visit_anon_fcn_handle (tree_anon_fcn_handle&)
+ {
+   fail ();
+ }
+ 
+ void
+ jit_convert::visit_argument_list (tree_argument_list&)
+@@ -889,17 +903,17 @@ jit_convert::visit_binary_expression (tr
+ 
+   tree_expression *lhs = be.lhs ();
+   jit_value *lhsv = visit (lhs);
+ 
+   tree_expression *rhs = be.rhs ();
+   jit_value *rhsv = visit (rhs);
+ 
+   const jit_function& fn = jit_typeinfo::binary_op (be.op_type ());
+-  result = block->append (new jit_call (fn, lhsv, rhsv));
++  result = block->append (create<jit_call> (fn, lhsv, rhsv));
+ }
+ 
+ void
+ jit_convert::visit_break_command (tree_break_command&)
+ {
+   fail ();
+ }
+ 
+@@ -972,76 +986,73 @@ jit_convert::visit_simple_for_command (t
+   //  % rest of code
+ 
+   // FIXME: one of these days we will introduce proper lvalues...
+   tree_identifier *lhs = dynamic_cast<tree_identifier *>(cmd.left_hand_side ());
+   if (! lhs)
+     fail ();
+   std::string lhs_name = lhs->name ();
+ 
+-  jit_block *body = new jit_block ("for_body");
++  jit_block *body = create<jit_block> ("for_body");
+   blocks.push_back (body);
+ 
+-  jit_block *tail = new jit_block ("for_tail");
+-  unwind_protect prot_tail;
+-  prot_tail.add_delete (tail); // incase we fail before adding tail to blocks
++  jit_block *tail = create<jit_block> ("for_tail");
+ 
+   // do control expression, iter init, and condition check in prev_block (block)
+   jit_value *control = visit (cmd.control_expr ());
+-  jit_call *init_iter = new jit_call (jit_typeinfo::for_init, control);
++  jit_call *init_iter = create<jit_call> (jit_typeinfo::for_init, control);
+   init_iter->stash_tag ("#iter");
+   block->append (init_iter);
+-  jit_value *check = block->append (new jit_call (jit_typeinfo::for_check,
+-                                                  control, init_iter));
+-  block->append (new jit_cond_break (check, body, tail));
++  jit_value *check = block->append (create<jit_call> (jit_typeinfo::for_check,
++                                                      control, init_iter));
++  block->append (create<jit_cond_break> (check, body, tail));
+ 
+   // we need to do iter phi manually, for_map handles the rest
+-  jit_phi *iter_phi = new jit_phi (2);
++  jit_phi *iter_phi = create<jit_phi> (2);
+   iter_phi->stash_tag ("#iter");
+   iter_phi->stash_argument (0, init_iter);
+   body->append (iter_phi);
+ 
+   variable_map *merge_vars = variables;
+   for_map body_vars (variables, body);
+   variables = &body_vars;
+   block = body;
+ 
+   // first thing we do in the for loop is bind our index from our itertor
+-  jit_call *idx_rhs = new jit_call (jit_typeinfo::for_index, control, iter_phi);
++  jit_call *idx_rhs = create<jit_call> (jit_typeinfo::for_index, control, iter_phi);
+   block->append (idx_rhs);
+   idx_rhs->stash_tag (lhs_name);
+   do_assign (lhs_name, idx_rhs, false);
+   
+   tree_statement_list *pt_body = cmd.body ();
+   pt_body->accept (*this);
+ 
+   // increment iterator, check conditional, and repeat
+   const jit_function& add_fn = jit_typeinfo::binary_op (octave_value::op_add);
+-  jit_call *iter_inc = new jit_call (add_fn, iter_phi,
+-                                     get_const<jit_const_index> (1));
++  jit_call *iter_inc = create<jit_call> (add_fn, iter_phi,
++                                         create<jit_const_index> (1));
+   iter_inc->stash_tag ("#iter");
+   block->append (iter_inc);
+-  check = block->append (new jit_call (jit_typeinfo::for_check, control,
+-                                       iter_inc));
+-  block->append (new jit_cond_break (check, body, tail));
++  check = block->append (create<jit_call> (jit_typeinfo::for_check, control,
++                                           iter_inc));
++  block->append (create<jit_cond_break> (check, body, tail));
+   iter_phi->stash_argument (1, iter_inc);
+   body_vars.finish_phi (*variables);
+   merge (tail, *merge_vars, block, body_vars);
+ 
+   blocks.push_back (tail);
+-  prot_tail.discard ();
+   block = tail;
+   variables = merge_vars;
+ 
+-  iter_phi = new jit_phi (2);
++  iter_phi = create<jit_phi> (2);
+   iter_phi->stash_tag ("#iter");
+   iter_phi->stash_argument (0, init_iter);
+   iter_phi->stash_argument (1, iter_inc);
+   block->append (iter_phi);
+-  block->append (new jit_call (jit_typeinfo::release, iter_phi));
++  block->append (create<jit_call> (jit_typeinfo::release, iter_phi));
+ }
+ 
+ void
+ jit_convert::visit_complex_for_command (tree_complex_for_command&)
+ {
+   fail ();
+ }
+ 
+@@ -1075,17 +1086,17 @@ jit_convert::visit_function_def (tree_fu
+   fail ();
+ }
+ 
+ void
+ jit_convert::visit_identifier (tree_identifier& ti)
+ {
+   const jit_function& fn = jit_typeinfo::grab ();
+   jit_value *var = variables->get (ti.name ());
+-  result = block->append (new jit_call (fn, var));
++  result = block->append (create<jit_call> (fn, var));
+ }
+ 
+ void
+ jit_convert::visit_if_clause (tree_if_clause&)
+ {
+   fail ();
+ }
+ 
+@@ -1144,23 +1155,22 @@ jit_convert::visit_if_command_list (tree
+ 
+   // we need to construct blocks first, because they have jumps to eachother
+   tree_if_command_list::iterator iter = lst.begin ();
+   ++iter;
+   for (size_t i = 1; iter != lst.end (); ++iter, ++i)
+     {
+       tree_if_clause *tic = *iter;
+       if (tic->is_else_clause ())
+-        entry_blocks[i] = new jit_block ("else");
++        entry_blocks[i] = create<jit_block> ("else");
+       else
+-        entry_blocks[i] = new jit_block ("ifelse_cond");
+-      cleanup_blocks.push_back (entry_blocks[i]);
++        entry_blocks[i] = create<jit_block> ("ifelse_cond");
+     }
+ 
+-  jit_block *tail = new jit_block ("if_tail");
++  jit_block *tail = create<jit_block> ("if_tail");
+   if (! last_else)
+     entry_blocks[entry_blocks.size () - 1] = tail;
+ 
+   // actually fill out the contents of our blocks. We store the variable maps
+   // at the end of each branch, this allows us to merge them in the tail
+   variable_map *prev_map = variables;
+   iter = lst.begin ();
+   for (size_t i = 0; iter != lst.end (); ++iter, ++i)
+@@ -1173,35 +1183,35 @@ jit_convert::visit_if_command_list (tree
+       if (i) // the first block is prev_block, so it has already been added
+         blocks.push_back (entry_blocks[i]);
+ 
+       if (! tic->is_else_clause ())
+         {
+           tree_expression *expr = tic->condition ();
+           jit_value *cond = visit (expr);
+ 
+-          jit_block *body = new jit_block (i == 0 ? "if_body" : "ifelse_body");
++          jit_block *body = create<jit_block> (i == 0 ? "if_body" : "ifelse_body");
+           blocks.push_back (body);
+ 
+-          jit_instruction *br = new jit_cond_break (cond, body,
+-                                                    entry_blocks[i + 1]);
++          jit_instruction *br = create<jit_cond_break> (cond, body,
++                                                        entry_blocks[i + 1]);
+           block->append (br);
+           block = body;
+ 
+           variables = new compound_map (variables);
+           branch_variables[i] = variables;
+         }
+ 
+       tree_statement_list *stmt_lst = tic->commands ();
+       assert (stmt_lst); // jwe: Can this be null?
+       stmt_lst->accept (*this);
+ 
+       branch_variables[i] = variables;
+       branch_blocks[i] = block;
+-      block->append (new jit_break (tail));
++      block->append (create<jit_break> (tail));
+     }
+ 
+   blocks.push_back (tail);
+ 
+   // We create phi nodes in the tail to merge blocks
+   for (size_t i = 0; i < branch_variables.size () - last_else; ++i)
+     {
+       merge (tail, *prev_map, branch_blocks[i], *branch_variables[i]);
+@@ -1244,22 +1254,22 @@ jit_convert::visit_no_op_command (tree_n
+ 
+ void
+ jit_convert::visit_constant (tree_constant& tc)
+ {
+   octave_value v = tc.rvalue1 ();
+   if (v.is_real_scalar () && v.is_double_type ())
+     {
+       double dv = v.double_value ();
+-      result = get_const<jit_const_scalar> (dv);
++      result = create<jit_const_scalar> (dv);
+     }
+   else if (v.is_range ())
+     {
+       Range rv = v.range_value ();
+-      result = get_const<jit_const_range> (rv);
++      result = create<jit_const_range> (rv);
+     }
+   else
+     fail ();
+ }
+ 
+ void
+ jit_convert::visit_fcn_handle (tree_fcn_handle&)
+ {
+@@ -1342,18 +1352,18 @@ jit_convert::visit_statement (tree_state
+ 
+       if (do_bind_ans)
+         do_assign ("ans", expr_result, expr->print_result ());
+       else if (expr->is_identifier () && expr->print_result ())
+         {
+           // FIXME: ugly hack, we need to come up with a way to pass
+           // nargout to visit_identifier
+           const jit_function& fn = jit_typeinfo::print_value ();
+-          jit_const_string *name = get_const<jit_const_string> (expr->name ());
+-          block->append (new jit_call (fn, name, expr_result));
++          jit_const_string *name = create<jit_const_string> (expr->name ());
++          block->append (create<jit_call> (fn, name, expr_result));
+         }
+     }
+ }
+ 
+ void
+ jit_convert::visit_statement_list (tree_statement_list& lst)
+ {
+   for (tree_statement_list::iterator iter = lst.begin (); iter != lst.end();
+@@ -1408,24 +1418,24 @@ jit_convert::visit_do_until_command (tre
+   fail ();
+ }
+ 
+ void
+ jit_convert::do_assign (const std::string& lhs, jit_value *rhs, bool print)
+ {
+   const jit_function& release = jit_typeinfo::release ();
+   jit_value *current = variables->get (lhs);
+-  block->append (new jit_call (release, current));
++  block->append (create<jit_call> (release, current));
+   variables->set (lhs, rhs);
+ 
+   if (print)
+     {
+       const jit_function& print_fn = jit_typeinfo::print_value ();
+-      jit_const_string *name = get_const<jit_const_string> (lhs);
+-      block->append (new jit_call (print_fn, name, rhs));
++      jit_const_string *name = create<jit_const_string> (lhs);
++      block->append (create<jit_call> (print_fn, name, rhs));
+     }
+ }
+ 
+ jit_value *
+ jit_convert::visit (tree& tee)
+ {
+   result = 0;
+   tee.accept (*this);
+@@ -1435,30 +1445,37 @@ jit_convert::visit (tree& tee)
+   return ret;
+ }
+ 
+ void
+ jit_convert::merge (jit_block *merge_block, variable_map& merge_vars,
+                     jit_block *incomming_block,
+                     const variable_map& incomming_vars)
+ {
++  size_t pred_count = merge_block->pred_count ();
+   size_t merge_idx = merge_block->pred_index (incomming_block);
+   for (variable_map::const_iterator iter = incomming_vars.begin ();
+        iter != incomming_vars.end (); ++iter)
+     {
+       const std::string& vname = iter->first;
+       jit_value *merge_val = merge_vars.get (vname);
+       jit_value *inc_val = iter->second;
+ 
+       if (merge_val != inc_val)
+         {
+           jit_phi *phi = dynamic_cast<jit_phi *> (merge_val);
+           if (! (phi && phi->parent () == merge_block))
+             {
+-              phi = merge_block->search_phi (vname, merge_val);
++              phi = merge_block->search_phi (vname);
++              if (! phi)
++                {
++                  phi = create<jit_phi> (pred_count, merge_val);
++                  merge_block->prepend (phi);
++                }
++
+               merge_vars.set (vname, phi);
+             }
+ 
+           phi->stash_argument (merge_idx, inc_val);
+         }
+     }
+ }
+ 
+@@ -1466,17 +1483,17 @@ jit_convert::merge (jit_block *merge_blo
+ jit_value *
+ jit_convert::toplevel_map::insert (const std::string& name, jit_value *pval)
+ {
+   assert (pval == 0); // we have no parent
+ 
+   jit_block *entry = block ();
+   octave_value val = symbol_table::find (name);
+   jit_type *type = jit_typeinfo::type_of (val);
+-  jit_instruction *ret = new jit_extract_argument (type, name);
++  jit_instruction *ret = convert.create<jit_extract_argument> (type, name);
+   return vars[name] = entry->prepend (ret);
+ }
+ 
+ // -------------------- jit_convert::convert_llvm --------------------
+ llvm::Function *
+ jit_convert::convert_llvm::convert (llvm::Module *module,
+                                     const std::vector<std::pair< std::string, bool> >& args,
+                                     const std::list<jit_block *>& blocks,
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -508,17 +508,17 @@ class jit_use;
+ 
+ class
+ jit_value
+ {
+   friend class jit_use;
+ public:
+   jit_value (void) : llvm_value (0), ty (0), use_head (0), myuse_count (0) {}
+ 
+-  virtual ~jit_value (void) {}
++  virtual ~jit_value (void);
+ 
+   jit_type *type (void) const { return ty; }
+ 
+   llvm::Type *type_llvm (void) const
+   {
+     return ty ? ty->to_llvm () : 0;
+   }
+ 
+@@ -563,17 +563,16 @@ protected:
+       os << "\t";
+     return os;
+   }
+ 
+   llvm::Value *llvm_value;
+ private:
+   jit_type *ty;
+   jit_use *use_head;
+-  jit_use *use_tail;
+   size_t myuse_count;
+ };
+ 
+ // defnie accept methods for subclasses
+ #define JIT_VALUE_ACCEPT(clname)                \
+   virtual void accept (jit_ir_walker& walker);
+ 
+ template <typename T, jit_type *(*EXTRACT_T)(void), typename PASS_T = T,
+@@ -860,23 +859,16 @@ jit_block : public jit_value
+ public:
+   typedef std::list<jit_instruction *> instruction_list;
+   typedef instruction_list::iterator iterator;
+   typedef instruction_list::const_iterator const_iterator;
+ 
+   jit_block (const std::string& aname) : mname (aname)
+   {}
+ 
+-  virtual ~jit_block ()
+-  {
+-    for (instruction_list::iterator iter = instructions.begin ();
+-         iter != instructions.end (); ++iter)
+-      delete *iter;
+-  }
+-
+   const std::string& name (void) const { return mname; }
+ 
+   jit_instruction *prepend (jit_instruction *instr);
+ 
+   jit_instruction *append (jit_instruction *instr);
+ 
+   jit_terminator *terminator (void) const;
+ 
+@@ -921,18 +913,18 @@ public:
+ 
+   const_iterator begin (void) const { return instructions.begin (); }
+ 
+   iterator end (void) { return instructions.end (); }
+ 
+   const_iterator end (void) const { return instructions.begin (); }
+ 
+   // search for the phi function with the given tag_name, if no function
+-  // exists then a new phi node is created
+-  jit_phi *search_phi (const std::string& tag_name, jit_value *adefault);
++  // exists then null is returned
++  jit_phi *search_phi (const std::string& tag_name);
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent)
+   {
+     print_indent (os, indent) << mname << ":\tpred = ";
+     for (size_t i = 0; i < pred_count (); ++i)
+       {
+         print_pred (os, i);
+         if (i + 1 < pred_count ())
+@@ -1247,16 +1239,18 @@ class
+ jit_convert : public tree_walker
+ {
+ public:
+   typedef std::pair<jit_type *, std::string> type_bound;
+   typedef std::vector<type_bound> type_bound_vector;
+ 
+   jit_convert (llvm::Module *module, tree &tee);
+ 
++  ~jit_convert (void);
++
+   llvm::Function *get_function (void) const { return function; }
+ 
+   const std::vector<std::pair<std::string, bool> >& get_arguments(void) const
+   { return arguments; }
+ 
+   const type_bound_vector& get_bounds (void) const { return bounds; }
+ 
+   void visit_anon_fcn_handle (tree_anon_fcn_handle&);
+@@ -1403,19 +1397,22 @@ private:
+     variable_map *mparent;
+     jit_block *mblock;
+   };
+ 
+   class
+   toplevel_map : public variable_map
+   {
+   public:
+-    toplevel_map (jit_block *aentry) : variable_map (0, aentry) {}
++    toplevel_map (jit_convert& aconvert, jit_block *aentry)
++      : variable_map (0, aentry), convert (aconvert) {}
+   protected:
+     virtual jit_value *insert (const std::string& name, jit_value *pval);
++  private:
++    jit_convert& convert;
+   };
+ 
+   class
+   for_map : public variable_map
+   {
+   public:
+     typedef variable_map::iterator iterator;
+     typedef variable_map::const_iterator const_iterator;
+@@ -1471,42 +1468,74 @@ private:
+ 
+   jit_block *block;
+   jit_block *final_block;
+ 
+   llvm::Function *function;
+ 
+   std::list<jit_block *> blocks;
+ 
+-  std::list<jit_block *> cleanup_blocks;
+-
+   std::list<jit_instruction *> worklist;
+ 
+   std::list<jit_value *> constants;
+ 
++  std::list<jit_value *> all_values;
++
+   void do_assign (const std::string& lhs, jit_value *rhs, bool print);
+ 
+   jit_value *visit (tree *tee) { return visit (*tee); }
+ 
+   jit_value *visit (tree& tee);
+ 
+   void append_users (jit_value *v)
+   {
+     for (jit_use *use = v->first_use (); use; use = use->next ())
+       worklist.push_back (use->user ());
+   }
+ 
+-  template <typename CONST_T>
+-  CONST_T *get_const (typename CONST_T::pass_t v)
++  // this would be easier with variadic templates
++  template <typename T>
++  T *create (void)
++  {
++    T *ret = new T();
++    track_value (ret);
++    return ret;
++  }
++
++  template <typename T, typename ARG0>
++  T *create (const ARG0& arg0)
+   {
+-    CONST_T *ret = new CONST_T (v);
+-    constants.push_back (ret);
++    T *ret = new T(arg0);
++    track_value (ret);
++    return ret;
++  }
++
++  template <typename T, typename ARG0, typename ARG1>
++  T *create (const ARG0& arg0, const ARG1& arg1)
++  {
++    T *ret = new T(arg0, arg1);
++    track_value (ret);
+     return ret;
+   }
+ 
++  template <typename T, typename ARG0, typename ARG1, typename ARG2>
++  T *create (const ARG0& arg0, const ARG1& arg1, const ARG2& arg2)
++  {
++    T *ret = new T(arg0, arg1, arg2);
++    track_value (ret);
++    return ret;
++  }
++
++  void track_value (jit_value *value)
++  {
++    if (value->type ())
++      constants.push_back (value);
++    all_values.push_back (value);
++  }
++
+   // place phi nodes in the current block to merge ref with variables
+   // we assume the same number of deffinitions
+   void merge (jit_block *merge_block, variable_map& merge_vars,
+               jit_block *incomming_block,
+               const variable_map& incomming_vars);
+ 
+   // this case is much simpler, just convert from the jit ir to llvm
+   class

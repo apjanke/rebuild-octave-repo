@@ -1,0 +1,233 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1451811691 -3600
+#      Sun Jan 03 10:01:31 2016 +0100
+# Node ID 8c9755d29d2a7ed882e0d9f51258abcaa04e7c4e
+# Parent  4484384a2959f121d939ee496c8bdb06ed39fab3
+Fix overflowing feedback buffers (bug #46417).
+
+* gl2ps-renderer.h (glps_renderer::draw_axes): handle errors, warnings
+    and overflows after gl2psEndViewport.
+* gl2ps-renderer.h (glps_renderer::buffer_overflow): new bool attribute.
+* gl2ps-renderer.cc (glps_renderer::draw): make use of buffer_overflow to
+    detect overflows and increase buffer size by a factor of 2 instead of a
+    fixed amount of 1Mb.
+* gl2ps-renderer.cc (glps_renderer::draw): pass a temporary file to gl2ps and
+    copy its content to the actual pipe/file stream after successfull run
+* gl2ps-renderer.cc (glps_renderer::draw): remove error checking after
+    gl2psEndPage
+* bootstrap.conf: add gnulib "ftruncate", necessary to discard content of
+    the temporary file
+
+diff --git a/bootstrap.conf b/bootstrap.conf
+--- a/bootstrap.conf
++++ b/bootstrap.conf
+@@ -42,16 +42,17 @@ gnulib_modules="
+   floorf
+   fnmatch
+   fopen
+   fpucw
+   frexp
+   frexpf
+   fseek
+   ftell
++  ftruncate
+   getcwd
+   gethostname
+   getopt-gnu
+   gettimeofday
+   glob
+   isatty
+   largefile
+   link
+diff --git a/libinterp/corefcn/gl2ps-renderer.cc b/libinterp/corefcn/gl2ps-renderer.cc
+--- a/libinterp/corefcn/gl2ps-renderer.cc
++++ b/libinterp/corefcn/gl2ps-renderer.cc
+@@ -33,16 +33,17 @@ along with Octave; see the file COPYING.
+ #include <cstdio>
+ 
+ #include "lo-mappers.h"
+ #include "oct-locbuf.h"
+ #include "unwind-prot.h"
+ 
+ #include "gl2ps.h"
+ #include "sysdep.h"
++#include "unistd.h"
+ 
+ void
+ glps_renderer::draw (const graphics_object& go, const std::string& print_cmd)
+ {
+   static bool in_draw = false;
+   static std::string old_print_cmd;
+ 
+   if (! in_draw)
+@@ -75,21 +76,32 @@ glps_renderer::draw (const graphics_obje
+ 
+       // Default sort order optimizes for 3D plots
+       GLint gl2ps_sort = GL2PS_BSP_SORT;
+ 
+       // For 2D plots we can use a simpler Z-depth sorting algorithm
+       if (term.find ("is2D") != std::string::npos)
+         gl2ps_sort = GL2PS_SIMPLE_SORT;
+ 
+-      GLint state = GL2PS_OVERFLOW;
+-      GLint buffsize = 0;
++      // Use a temporary file in case an overflow happens
++      FILE* tmpf = gnulib::tmpfile ();
++
++      if (! tmpf)
++        error ("glps_renderer::draw: couldn't open temporary file for printing");
+ 
+-      while (state == GL2PS_OVERFLOW)
++      GLint buffsize = 2*1024*1024;
++      buffer_overflow = true;
++
++      while (buffer_overflow)
+         {
++          buffer_overflow = false;
++          buffsize *= 2;
++          gnulib::fseek (tmpf, 0, SEEK_SET);
++          gnulib::ftruncate (fileno (tmpf), 0);
++
+           // For LaTeX output the fltk print process uses 2 drawnow() commands.
+           // The first one is for the pdf/ps/eps graph to be included.  The
+           // print_cmd is saved as old_print_cmd.  Then the second drawnow()
+           // outputs the tex-file and the graphic filename to be included is
+           // extracted from old_print_cmd.
+ 
+           std::string include_graph;
+ 
+@@ -106,53 +118,53 @@ glps_renderer::draw (const graphics_obje
+             {
+               size_t n_end = include_graph.find_last_not_of (" ");
+               include_graph = include_graph.substr (n_begin,
+                                                     n_end - n_begin + 1);
+             }
+           else
+             include_graph = "foobar-inc";
+ 
+-          buffsize += 1024*1024;
+-
+           // GL2PS_SILENT was removed to allow gl2ps printing errors on stderr
+           GLint ret = gl2psBeginPage ("glps_renderer figure", "Octave", 0,
+                                       gl2ps_term, gl2ps_sort,
+                                       (GL2PS_NO_BLENDING
+                                        | GL2PS_OCCLUSION_CULL
+                                        | GL2PS_BEST_ROOT
+                                        | gl2ps_text
+                                        | GL2PS_NO_PS3_SHADING
+                                        | GL2PS_USE_CURRENT_VIEWPORT),
+                                       GL_RGBA, 0, 0, 0, 0, 0,
+-                                      buffsize, fp, include_graph.c_str ());
++                                      buffsize, tmpf, include_graph.c_str ());
+           if (ret == GL2PS_ERROR)
+             {
+               old_print_cmd.clear ();
+               error ("gl2ps-renderer::draw: gl2psBeginPage returned GL2PS_ERROR");
+             }
+ 
+-          old_print_cmd = print_cmd;
+-
+           opengl_renderer::draw (go);
+ 
+-          // Without glFinish () there may be primitives missing in the
+-          // gl2ps output.
+-          glFinish ();
++          if (! buffer_overflow)
++            old_print_cmd = print_cmd;
+ 
+-          state = gl2psEndPage ();
++          // Don't check return value of gl2psEndPage, it is not meaningful.
++          // Errors and warnings are checked after gl2psEndViewport in 
++          // glps_renderer::draw_axes instead.
++          gl2psEndPage ();
++        }
+ 
+-          if (state == GL2PS_ERROR)
+-            {
+-              old_print_cmd.clear ();
+-              error ("gl2ps-renderer::draw: gl2psEndPage returned GL2PS_ERROR");
+-            }
+-
+-          // Don't check state for GL2PS_UNINITIALIZED (should never happen)
+-          // GL2PS_OVERFLOW (see while loop) or GL2PS_SUCCESS
++      // Copy temporary file to pipe
++      gnulib::fseek (tmpf, 0, SEEK_SET);
++      char str[256];
++      int nread = 1;
++      while (! feof (tmpf) && nread)
++        {
++          nread = gnulib::fread (str, 1, 256, tmpf);
++          if (nread)
++            gnulib::fwrite (str, 1, nread, fp);
+         }
+     }
+   else
+     opengl_renderer::draw (go);
+ }
+ 
+ int
+ glps_renderer::alignment_to_mode (int ha, int va) const
+diff --git a/libinterp/corefcn/gl2ps-renderer.h b/libinterp/corefcn/gl2ps-renderer.h
+--- a/libinterp/corefcn/gl2ps-renderer.h
++++ b/libinterp/corefcn/gl2ps-renderer.h
+@@ -32,17 +32,17 @@ along with Octave; see the file COPYING.
+ 
+ class
+ OCTINTERP_API
+ glps_renderer : public opengl_renderer
+ {
+ public:
+   glps_renderer (FILE *_fp, const std::string& _term)
+     : opengl_renderer () , fp (_fp), term (_term), fontsize (),
+-    fontname () { }
++    fontname (), buffer_overflow (false) { }
+ 
+   ~glps_renderer (void) { }
+ 
+   void draw (const graphics_object& go, const std::string& print_cmd);
+ 
+ protected:
+ 
+   Matrix render_text (const std::string& txt,
+@@ -61,17 +61,21 @@ protected:
+     // Draw and  glFinish () or there may primitives missing in the
+     // gl2ps output.
+     opengl_renderer::draw_axes (props);
+     glFinish ();
+ 
+     // Finalize viewport
+     GLint state = gl2psEndViewport ();
+     if (state == GL2PS_NO_FEEDBACK)
+-      warning ("gl2ps-renderer::draw: empty feedback buffer and/or nothing else to print");
++      warning ("glps_renderer::draw_axes: empty feedback buffer and/or nothing else to print");
++    else if (state == GL2PS_ERROR)
++      error ("glps_renderer::draw_axes: gl2psEndPage returned GL2PS_ERROR");
++    
++    buffer_overflow |= (state == GL2PS_OVERFLOW);
+   }
+ 
+   void draw_text (const text::properties& props);
+   void draw_pixels (GLsizei w, GLsizei h, GLenum format,
+                     GLenum type, const GLvoid *data);
+ 
+   void set_linestyle (const std::string& s, bool use_stipple = false)
+   {
+@@ -110,16 +114,17 @@ private:
+                              std::list<ft_render::ft_string>& lst);
+ 
+ private:
+   int alignment_to_mode (int ha, int va) const;
+   FILE *fp;
+   caseless_str term;
+   double fontsize;
+   std::string fontname;
++  bool buffer_overflow;
+ };
+ 
+ #endif
+ 
+ extern OCTINTERP_API void
+ gl2ps_print (const graphics_object& fig, const std::string& cmd,
+              const std::string& term);
+ 

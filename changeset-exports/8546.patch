@@ -1,0 +1,974 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1232482517 -3600
+#      Tue Jan 20 21:15:17 2009 +0100
+# Node ID 3d8a914c580e99d0294568ce00e0bbdb8f52fc88
+# Parent  faccdb98d9539dcc687dce0a3c239dd3bed2f3af
+improve parser indexed assigment code
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,20 @@
++2009-01-19  Jaroslav Hajek  <highegg@gmail.com>
++
++	* ov.h (octave_value::make_unique (int)): New method.
++	* oct-obj.h (octave_value_list::octave_value_list (const Cell&)): New
++	constructor.
++	* ov-cell.cc (octave_cell::subsasgn): Allow composed {} indexing
++	in multi-assignments. Optimize.
++	* ov-struct.cc (octave_struct::subsasgn): Correct composed {} indexing
++	in multi-assignments. Optimize & fix bugs.
++	* pt-idx.cc (tree_index_expression::lvalue): Rewrite to allow
++	specifying cs-list anywhere in index chain, be more robust.
++
+ 2009-01-19  John W. Eaton  <jwe@octave.org>
+ 
+ 	* lex.l (grab_comment_block): If not reading input from a file,
+ 	bail out at first newline inside a comment.
+ 
+ 	* lex.l (lexer_debug_flag): New static variable.
+ 	(F__lexer_debug_flag__): New function.
+ 	(LEXER_DEBUG): New macro.  Use it in all patterns.
+diff --git a/src/oct-obj.cc b/src/oct-obj.cc
+--- a/src/oct-obj.cc
++++ b/src/oct-obj.cc
+@@ -22,16 +22,24 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
+ #include "oct-obj.h"
++#include "Cell.h"
++
++octave_value_list::octave_value_list (const Cell& tc)
++  : data (tc.numel ())
++{
++  for (octave_idx_type i = 0; i < tc.numel (); i++)
++    data[i] = tc(i);
++}
+ 
+ octave_allocator
+ octave_value_list::allocator (sizeof (octave_value_list));
+ 
+ void
+ octave_value_list::resize (octave_idx_type n, const octave_value& val)
+ {
+   octave_idx_type len = length ();
+diff --git a/src/oct-obj.h b/src/oct-obj.h
+--- a/src/oct-obj.h
++++ b/src/oct-obj.h
+@@ -26,32 +26,35 @@ along with Octave; see the file COPYING.
+ 
+ #include <string>
+ #include <vector>
+ 
+ #include "oct-alloc.h"
+ #include "str-vec.h"
+ 
+ #include "ov.h"
++class Cell;
+ 
+ class
+ OCTINTERP_API
+ octave_value_list
+ {
+ public:
+ 
+   octave_value_list (void)
+     : data () { }
+ 
+   octave_value_list (octave_idx_type n, const octave_value& val)
+     : data (n, val) { }
+ 
+   octave_value_list (const octave_value& tc)
+     : data (1, tc) { }
+ 
++  octave_value_list (const Cell& tc);
++
+   octave_value_list (const octave_value_list& obj)
+     : data (obj.data), names (obj.names) { }
+ 
+   ~octave_value_list (void) { }
+ 
+   void *operator new (size_t size)
+     { return allocator.alloc (size); }
+ 
+diff --git a/src/ov-cell.cc b/src/ov-cell.cc
+--- a/src/ov-cell.cc
++++ b/src/ov-cell.cc
+@@ -85,29 +85,17 @@ octave_cell::subsref (const std::string&
+ 
+ 	if (! error_state)
+ 	  {
+ 	    Cell tcell = tmp.cell_value ();
+ 
+ 	    if (tcell.length () == 1)
+ 	      retval(0) = tcell(0,0);
+ 	    else
+-	      {
+-		octave_idx_type n = tcell.numel ();
+-
+-		octave_value_list lst (n, octave_value ());
+-
+-		for (octave_idx_type i = 0; i < n; i++)
+-		  {
+-		    OCTAVE_QUIT;
+-		    lst(i) = tcell(i);
+-		  }
+-
+-		retval(0) = octave_value (lst, true);
+-	      }
++              retval = octave_value (octave_value_list (tcell), true);
+ 	  }
+       }
+       break;
+ 
+     case '.':
+       {
+ 	std::string nm = type_name ();
+ 	error ("%s cannot be indexed with %c", nm.c_str (), type[0]);
+@@ -174,46 +162,69 @@ octave_cell::subsasgn (const std::string
+ 		    t_rhs = tmp.subsasgn (type.substr (1), next_idx, rhs);
+ 		  }
+ 	      }
+ 	  }
+ 	  break;
+ 
+ 	case '{':
+ 	  {
+-	    octave_value tmp = do_index_op (idx.front (), true);
++	    Cell tmpc = matrix.index (idx.front (), true);
+ 
+ 	    if (! error_state)
+ 	      {
+-		if (tmp.numel () == 1)
+-		  {
+-		    tmp = tmp.cell_value ()(0,0);
++                std::list<octave_value_list> next_idx (idx);
++
++                next_idx.erase (next_idx.begin ());
++
++                std::string next_type = type.substr (1);
+ 
+-		    std::list<octave_value_list> next_idx (idx);
++                if (rhs.is_cs_list ())
++                  {
++                    const octave_value_list rhsl = rhs.list_value ();
++                    if (tmpc.numel () == rhsl.length ())
++                      {
++                        for (octave_idx_type k = 0; k < tmpc.numel () && ! error_state; k++)
++                          {
++                            octave_value tmp = tmpc (k);
++                            if (! tmp.is_defined () || tmp.is_zero_by_zero ())
++                              {
++                                tmp = octave_value::empty_conv (next_type, rhs);
++                                tmp.make_unique (); // probably a no-op.
++                              }
++                            else
++                              // optimization: ignore the copy still stored inside our array and in tmpc.
++                              tmp.make_unique (2);
+ 
+-		    next_idx.erase (next_idx.begin ());
++                            tmpc(k) = tmp.subsasgn (next_type, next_idx, rhsl(k));
++                          }
++
++                        t_rhs = octave_value (octave_value_list (tmpc), true);
++                      }
++                    else
++                      error ("invalid cs-list length in assignment");
++                  }
++                else if (tmpc.numel () == 1)
++		  {
++		    octave_value tmp = tmpc(0);
+ 
+ 		    if (! tmp.is_defined () || tmp.is_zero_by_zero ())
+-		      tmp = octave_value::empty_conv (type.substr (1), rhs);
++                      {
++                        tmp = octave_value::empty_conv (type.substr (1), rhs);
++                        tmp.make_unique (); // probably a no-op.
++                      }
+                     else
+-                      {
+-                        // This is a bit of black magic. tmp is a shallow copy
+-                        // of an element inside this cell, and maybe more. To
+-                        // prevent make_unique from always forcing a copy, we
+-                        // temporarily delete the stored value.
+-                        assign (idx.front (), octave_value ());
+-                        tmp.make_unique ();
+-                        assign (idx.front (), Cell (tmp));
+-                      }
++                      // optimization: ignore the copy still stored inside our array and in tmpc.
++                      tmp.make_unique (2);
+ 
+ 		    if (! error_state)
+-		      t_rhs = tmp.subsasgn (type.substr (1), next_idx, rhs);
++		      t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+ 		  }
+                 else
+-                  error ("scalar indices required for {} in assignment.");
++                  error ("invalid assignment to cs-list outside multiple assignment.");
+ 	      }
+ 	  }
+ 	  break;
+ 
+ 	case '.':
+ 	  {
+ 	    std::string nm = type_name ();
+ 	    error ("%s cannot be indexed with %c", nm.c_str (), type[0]);
+@@ -267,17 +278,17 @@ octave_cell::subsasgn (const std::string
+ 		  tmp_cell = tmp_cell.reshape (dims ());
+ 
+ 		octave_base_matrix<Cell>::assign (i, tmp_cell);
+ 	      }
+ 	    else if (i.all_scalars () || do_index_op (i, true).numel () == 1)
+               // Regularize a null matrix if stored into a cell.
+               octave_base_matrix<Cell>::assign (i, Cell (t_rhs.storable_value ()));
+             else if (! error_state)
+-              error ("scalar indices required for {} in assignment.");
++              error ("invalid assignment to cs-list outside multiple assignment.");
+ 
+ 	    if (! error_state)
+ 	      {
+ 		count++;
+ 		retval = octave_value (this);
+ 	      }
+ 	    else
+ 	      gripe_failed_assignment ();
+diff --git a/src/ov-struct.cc b/src/ov-struct.cc
+--- a/src/ov-struct.cc
++++ b/src/ov-struct.cc
+@@ -167,45 +167,43 @@ octave_struct::subsref (const std::strin
+ %!test
+ %! x(1).a.a = 1; x(2).a.a = 2;
+ %! assert (size (x), [1, 2]);
+ %! assert (x(1).a.a, 1);
+ %! assert (x(2).a.a, 2);
+ */
+ 
+ octave_value
+-octave_struct::numeric_conv (const Cell& val,
++octave_struct::numeric_conv (const octave_value& val,
+ 			     const std::string& type)
+ {
+   octave_value retval;
+ 
+-  if (val.length () == 1)
+-    {
+-      retval = val(0);
+-
+-      if (type.length () > 0 && type[0] == '.' && ! retval.is_map ())
+-	retval = Octave_map ();
+-    }
++  if (type.length () > 0 && type[0] == '.' && ! val.is_map ())
++    retval = Octave_map ();
+   else
+-    gripe_invalid_index_for_assignment ();
++    retval = val;
+ 
+   return retval;
+ }
+ 
+ octave_value
+ octave_struct::subsasgn (const std::string& type,
+ 			 const std::list<octave_value_list>& idx,
+ 			 const octave_value& rhs)
+ {
+   octave_value retval;
+ 
+   int n = type.length ();
+ 
+   octave_value t_rhs = rhs;
+ 
++  // This is handy for calling const methods of map.
++  const Octave_map& cmap = const_cast<const Octave_map &> (map);
++
+   if (n > 1 && ! (type.length () == 2 && type[0] == '(' && type[1] == '.'))
+     {
+       switch (type[0])
+ 	{
+ 	case '(':
+ 	  {
+ 	    if (type.length () > 1 && type[1] == '.')
+ 	      {
+@@ -213,103 +211,149 @@ octave_struct::subsasgn (const std::stri
+ 		octave_value_list t_idx = *p;
+ 
+ 		octave_value_list key_idx = *++p;
+ 
+ 		assert (key_idx.length () == 1);
+ 
+ 		std::string key = key_idx(0).string_value ();
+ 
+-		octave_value u;
++                std::list<octave_value_list> next_idx (idx);
++
++                // We handled two index elements, so subsasgn to
++                // needs to skip both of them.
+ 
+-		if (! map.contains (key))
+-		  u = octave_value::empty_conv (type.substr (2), rhs);
+-		else
+-		  {
+-		    Cell& cell_ref = map.contents (key);
++                next_idx.erase (next_idx.begin ());
++                next_idx.erase (next_idx.begin ());
+ 
+-                    octave_value u1 = cell_ref.index (idx.front (), true);
+-                    u = numeric_conv (u1, type.substr (2));
++                std::string next_type = type.substr (2);
++
++                // cast map to const reference to avoid forced key insertion.
++                Cell tmpc = cmap.contents (key).index (idx.front (), true);
++                tmpc.make_unique ();
+ 
+-                    if (u.is_defined () && u.is_copy_of (u1))
++                // FIXME: better code reuse? cf. octave_cell::subsasgn and the case below.
++		if (! error_state)
++		  {
++                    if (rhs.is_cs_list ())
+                       {
+-                        // This is a bit of black magic. u is a shallow copy
+-                        // of an element inside this struct, and maybe more. To
+-                        // prevent make_unique from always forcing a copy, we
+-                        // temporarily delete the stored value.
+-                        u1 = octave_value ();
+-                        cell_ref.assign (idx.front (), Cell (octave_value ()));
+-                        u.make_unique ();
+-                        cell_ref.assign (idx.front (), Cell (u));
++                        octave_value_list rhsl = rhs.list_value ();
++                        if (tmpc.numel () == rhsl.length ())
++                          {
++                            for (octave_idx_type k = 0; k < tmpc.numel () && ! error_state; k++)
++                              {
++                                octave_value tmp = tmpc (k);
++                                if (! tmp.is_defined () || tmp.is_zero_by_zero ())
++                                  {
++                                    tmp = octave_value::empty_conv (next_type, rhs);
++                                    tmp.make_unique (); // probably a no-op.
++                                  }
++                                else
++                                  // optimization: ignore the copy still stored inside our map and in tmpc.
++                                  tmp.make_unique (2);
++
++                                tmpc(k) = tmp.subsasgn (next_type, next_idx, rhsl(k));
++                              }
++
++                            t_rhs = octave_value (octave_value_list (tmpc), true);
++                          }
++                        else
++                          error ("invalid cs-list length in assignment");
++                      }
++                    else if (tmpc.numel () == 1)
++                      {
++                        octave_value tmp = tmpc(0);
++
++                        if (! tmp.is_defined () || tmp.is_zero_by_zero ())
++                          {
++                            tmp = octave_value::empty_conv (type.substr (1), rhs);
++                            tmp.make_unique (); // probably a no-op.
++                          }
++                        else
++                          // optimization: ignore the copy still stored inside our map and in tmpc.
++                          tmp.make_unique (2);
++
++                        if (! error_state)
++                          t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+                       }
+                     else
+-                      // Safe is safe.
+-                      u.make_unique ();
+-
+-		  }
+-
+-		if (! error_state)
+-		  {
+-		    std::list<octave_value_list> next_idx (idx);
+-
+-		    // We handled two index elements, so subsasgn to
+-		    // needs to skip both of them.
+-
+-		    next_idx.erase (next_idx.begin ());
+-		    next_idx.erase (next_idx.begin ());
+-
+-		    t_rhs = u.subsasgn (type.substr (2), next_idx, rhs);
++                      error ("invalid assignment to cs-list outside multiple assignment.");
+ 		  }
+ 	      }
+ 	    else
+ 	      gripe_invalid_index_for_assignment ();
+ 	  }
+ 	  break;
+ 
+ 	case '.':
+ 	  {
+ 	    octave_value_list key_idx = idx.front ();
+ 
+ 	    assert (key_idx.length () == 1);
+ 
+ 	    std::string key = key_idx(0).string_value ();
+ 
+-	    octave_value u;
++            std::list<octave_value_list> next_idx (idx);
++
++            next_idx.erase (next_idx.begin ());
+ 
+-	    if (! map.contains (key))
+-	      u = octave_value::empty_conv (type.substr (1), rhs);
+-	    else
+-	      {
+-        	Cell& cell_ref = map.contents (key);
++            std::string next_type = type.substr (1);
+ 
+-                u = numeric_conv (cell_ref, type.substr (2));
++            Cell tmpc1 = octave_value ();
++            Cell& tmpc = (map.contains (key)) ? map.contents (key) : tmpc1;
++
++            tmpc.make_unique ();
+ 
+-                if (u.is_defined () && u.is_copy_of (cell_ref(0)))
++            // FIXME: better code reuse?
++            if (! error_state)
++              {
++                if (rhs.is_cs_list ())
+                   {
+-                    // This is a bit of black magic. u is a shallow copy
+-                    // of an element inside this struct, and maybe more. To
+-                    // prevent make_unique from always forcing a copy, we
+-                    // temporarily delete the stored value.
+-                    cell_ref(0) = octave_value ();
+-                    u.make_unique ();
+-                    cell_ref(0) = u;
++                    octave_value_list rhsl = rhs.list_value ();
++                    if (tmpc.numel () == rhsl.length ())
++                      {
++                        for (octave_idx_type k = 0; k < tmpc.numel () && ! error_state; k++)
++                          {
++                            octave_value tmp = tmpc (k);
++                            if (! tmp.is_defined () || tmp.is_zero_by_zero ())
++                              {
++                                tmp = octave_value::empty_conv (next_type, rhs);
++                                tmp.make_unique (); // probably a no-op.
++                              }
++                            else
++                              // optimization: ignore the copy still stored inside our map.
++                              tmp.make_unique (1);
++
++                            tmpc(k) = tmp.subsasgn (next_type, next_idx, rhsl(k));
++                          }
++
++                        t_rhs = octave_value (octave_value_list (tmpc), true);
++                      }
++                    else
++                      error ("invalid cs-list length in assignment");
++                  }
++                else if (tmpc.numel () == 1)
++                  {
++                    octave_value tmp = tmpc(0);
++
++                    if (! tmp.is_defined () || tmp.is_zero_by_zero ())
++                      {
++                        tmp = octave_value::empty_conv (type.substr (1), rhs);
++                        tmp.make_unique (); // probably a no-op.
++                      }
++                    else
++                      // optimization: ignore the copy still stored inside our map.
++                      tmp.make_unique (1);
++
++                    if (! error_state)
++                      t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+                   }
+                 else
+-                  // Safe is safe.
+-                  u.make_unique ();
+-	      }
+-
+-	    if (! error_state)
+-	      {
+-		std::list<octave_value_list> next_idx (idx);
+-
+-		next_idx.erase (next_idx.begin ());
+-
+-		t_rhs = u.subsasgn (type.substr (1), next_idx, rhs);
+-	      }
++                  error ("invalid assignment to cs-list outside multiple assignment.");
++              }
+ 	  }
+ 	  break;
+ 
+ 	case '{':
+ 	  gripe_invalid_index_type (type_name (), type[0]);
+ 	  break;
+ 
+ 	default:
+@@ -322,32 +366,54 @@ octave_struct::subsasgn (const std::stri
+       switch (type[0])
+ 	{
+ 	case '(':
+ 	  {
+ 	    if (n > 1 && type[1] == '.')
+ 	      {
+ 		std::list<octave_value_list>::const_iterator p = idx.begin ();
+ 		octave_value_list key_idx = *++p;
++                octave_value_list idx_front = idx.front ();
+ 
+ 		assert (key_idx.length () == 1);
+ 
+ 		std::string key = key_idx(0).string_value ();
+ 
+ 		if (! error_state)
+ 		  {
+-		    map.assign (idx.front (), key, t_rhs);
++                    if (t_rhs.is_cs_list ())
++                      {
++                        map.assign (idx.front (), key, Cell (t_rhs.list_value ()));
+ 
+-		    if (! error_state)
+-		      {
+-			count++;
+-			retval = octave_value (this);
+-		      }
+-		    else
+-		      gripe_failed_assignment ();
++                        if (! error_state)
++                          {
++                            count++;
++                            retval = octave_value (this);
++                          }
++                        else
++                          gripe_failed_assignment ();
++                      }
++                    else 
++                      {
++                        // cast map to const reference to avoid forced key insertion.
++                        if (idx_front.all_scalars () 
++                            || cmap.contents (key).index (idx_front, true).numel () == 1)
++                          {
++                            map.assign (idx_front, key, t_rhs.storable_value ());
++                            if (! error_state)
++                              {
++                                count++;
++                                retval = octave_value (this);
++                              }
++                            else
++                              gripe_failed_assignment ();
++                          }
++                        else if (! error_state)
++                          error ("invalid assignment to cs-list outside multiple assignment.");
++                      }
+ 		  }
+ 		else
+ 		  gripe_failed_assignment ();
+ 	      }
+ 	    else
+ 	      {
+ 		if (t_rhs.is_map())
+ 		  {
+diff --git a/src/ov-struct.h b/src/ov-struct.h
+--- a/src/ov-struct.h
++++ b/src/ov-struct.h
+@@ -70,17 +70,17 @@ public:
+     {
+       octave_value_list tmp = subsref (type, idx, 1);
+       return tmp.length () > 0 ? tmp(0) : octave_value ();
+     }
+ 
+   octave_value_list subsref (const std::string&,
+ 			     const std::list<octave_value_list>&, int);
+ 
+-  static octave_value numeric_conv (const Cell& val,
++  static octave_value numeric_conv (const octave_value& val,
+ 				    const std::string& type);
+ 
+   octave_value subsasgn (const std::string& type,
+ 			 const std::list<octave_value_list>& idx,
+ 			 const octave_value& rhs);
+ 
+   octave_value squeeze (void) const { return map.squeeze (); }
+ 
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -293,16 +293,29 @@ public:
+       if (rep->count > 1)
+ 	{
+ 	  --rep->count;
+ 	  rep = rep->clone ();
+ 	  rep->count = 1;
+ 	}
+     }
+ 
++  // This uniquifies the value if it is referenced by more than a certain
++  // number of shallow copies. This is useful for optimizations where we
++  // know a certain copy, typically within a cell array, to be obsolete.
++  void make_unique (int obsolete_copies)
++    {
++      if (rep->count > obsolete_copies + 1)
++	{
++	  --rep->count;
++	  rep = rep->clone ();
++	  rep->count = 1;
++	}
++    }
++
+   // Simple assignment.
+ 
+   octave_value& operator = (const octave_value& a)
+     {
+       if (rep != a.rep)
+ 	{
+ 	  if (--rep->count == 0)
+ 	    delete rep;
+diff --git a/src/pt-idx.cc b/src/pt-idx.cc
+--- a/src/pt-idx.cc
++++ b/src/pt-idx.cc
+@@ -386,16 +386,22 @@ tree_index_expression::rvalue (void)
+   octave_value_list tmp = rvalue (1);
+ 
+   if (! tmp.empty ())
+     retval = tmp(0);
+ 
+   return retval;
+ }
+ 
++static void
++gripe_invalid_inquiry_subscript (void)
++{
++  error ("invalid dimension inquiry of a non-existent value");
++}
++
+ octave_lvalue
+ tree_index_expression::lvalue (void)
+ {
+   octave_lvalue retval;
+ 
+   std::list<octave_value_list> idx;
+ 
+   int n = args.size ();
+@@ -405,18 +411,16 @@ tree_index_expression::lvalue (void)
+   std::list<tree_expression *>::iterator p_dyn_field = dyn_field.begin ();
+ 
+   retval = expr->lvalue ();
+ 
+   if (! error_state)
+     {
+       bool have_new_struct_field = false;
+ 
+-      octave_idx_type new_struct_field_nel = 0;
+-
+       // I think it is OK to have a copy here.
+ 
+       const octave_value *tro = retval.object ();
+ 
+       octave_value first_retval_object;
+ 
+       if (tro)
+ 	first_retval_object = *tro;
+@@ -436,20 +440,25 @@ tree_index_expression::lvalue (void)
+ 		  //   x{end}.a(end)
+ 		  //
+ 		  // and we are looking at the argument list that
+ 		  // contains the second (or third, etc.) "end" token,
+ 		  // so we must evaluate everything up to the point of
+ 		  // that argument list so we pass the appropriate
+ 		  // value to the built-in __end__ function.
+ 
+-		  octave_value_list tmp_list
+-		    = first_retval_object.subsref (type.substr (0, i), idx, 1);
++                  if (first_retval_object.is_defined ())
++                    {
++                      octave_value_list tmp_list
++                        = first_retval_object.subsref (type.substr (0, i), idx, 1);
+ 
+-		  tmp = tmp_list(0);
++                      tmp = tmp_list(0);
++                    }
++                  else
++                    gripe_invalid_inquiry_subscript ();
+ 
+ 		  if (error_state)
+ 		    break;
+ 		}
+ 	    }
+ 
+ 	  switch (type[i])
+ 	    {
+@@ -459,33 +468,37 @@ tree_index_expression::lvalue (void)
+ 
+ 	    case '{':
+ 	      {
+ 		octave_value_list tidx
+ 		  = make_value_list (*p_args, *p_arg_nm, &tmp);
+ 
+ 		idx.push_back (tidx);
+ 
+-		if (i == n-1)
++		if (! tidx.all_scalars () && retval.numel () == 1)
+ 		  {
+-		    // Last indexing element.  Will this result in a
+-		    // comma-separated list?
++                    // Possible cs-list.
+ 
+ 		    if (tidx.has_magic_colon ())
+ 		      {
+-			octave_value_list tmp_list
+-			  = first_retval_object.subsref (type, idx, 1);
++                        if (first_retval_object.is_defined ())
++                          {
++                            octave_value_list tmp_list
++                              = first_retval_object.subsref (type, idx, 1);
+ 
+-			if (! error_state)
+-			  {
+-			    octave_value val = tmp_list(0);
++                            if (! error_state)
++                              {
++                                octave_value val = tmp_list(0);
+ 
+-			    if (val.is_cs_list ())
+-			      retval.numel (val.numel ());
+-			  }
++                                if (val.is_cs_list ())
++                                  retval.numel (val.numel ());
++                              }
++                          }
++                        else
++                          gripe_invalid_inquiry_subscript ();
+ 		      }
+ 		    else
+ 		      {
+ 			octave_idx_type nel = 1;
+ 
+ 			octave_idx_type nidx = tidx.length ();
+ 
+ 			for (octave_idx_type j = 0; j < nidx; j++)
+@@ -499,120 +512,119 @@ tree_index_expression::lvalue (void)
+ 		      }
+ 		  }
+ 	      }
+ 	      break;
+ 
+ 	    case '.':
+ 	      {
+ 		octave_value tidx = get_struct_index (p_arg_nm, p_dyn_field);
++                if (error_state)
++                  break;
+ 
+-		if (! error_state)
+-		  {
+-		    if (i == n-1)
+-		      {
+-			// Last indexing element.  Will this result in a
+-			// comma-separated list?
++                if (i > 0 && type [i-1] == '(' && retval.numel () == 1 
++                    && ! idx.back ().all_scalars ())
++                  {
++                    // Possible cs-list.
++
++                    std::string ttype = type.substr (0, i);
+ 
+-			if (have_new_struct_field)
+-			  retval.numel (new_struct_field_nel);
+-			else if (i > 0)
+-			  {
+-			    std::string ttype = type.substr (0, i);
++                    octave_value_list xidx = idx.back ();
+ 
+-			    char c = ttype[ttype.length()-1];
+-			    if (c == '(' || c == '{')
+-			      {
+-				octave_idx_type nel = 1;
++                    if (xidx.has_magic_colon ())
++                      {
++                        if (first_retval_object.is_defined () && ! have_new_struct_field)
++                          {
++                            octave_value_list tmp_list
++                              = first_retval_object.subsref (ttype, idx, 1);
+ 
+-				octave_value_list xidx = idx.back ();
++                            if (! error_state)
++                              {
++                                octave_value val = tmp_list(0);
+ 
+-				octave_idx_type nidx = xidx.length ();
++                                if (val.is_map ())
++                                  retval.numel (val.numel ());
++                              }
++                          }
++                        else
++                          gripe_invalid_inquiry_subscript ();
++                      }
++                    else
++                      {
++                        octave_idx_type nel = 1;
+ 
+-				for (octave_idx_type j = 0; j < nidx; j++)
+-				  {
+-				    octave_value val = xidx(j);
+-
+-				    nel *= val.numel ();
+-				  }
++                        octave_idx_type nidx = xidx.length ();
+ 
+-				retval.numel (nel);
+-			      }
+-			    else if (first_retval_object.is_defined ()
+-				     && ! (first_retval_object.is_real_matrix ()
+-					   && first_retval_object.is_zero_by_zero ()))
+-			      {
+-				octave_value_list tmp_list
+-				  = first_retval_object.subsref (ttype, idx, 1);
++                        for (octave_idx_type j = 0; j < nidx; j++)
++                          {
++                            octave_value val = xidx(j);
++
++                            nel *= val.numel ();
++                          }
+ 
+-				if (! error_state)
+-				  {
+-				    octave_value val = tmp_list(0);
++                        retval.numel (nel);
++                      }
++                  }
++                else if (retval.numel () == 1 && first_retval_object.is_defined ())
++                  {
++                    octave_value tobj = first_retval_object;
++
++                    std::string ttype = type.substr (0, i);
+ 
+-				    retval.numel (val.numel ());
+-				  }
+-			      }
+-			    else
+-			      retval.numel (1);
+-			  }
+-			else
+-			  {
+-			    if (first_retval_object.is_defined ()
+-				&& ! (first_retval_object.is_real_matrix ()
+-				      && first_retval_object.is_zero_by_zero ()))
+-			      retval.numel (first_retval_object.numel ());
+-			    else
+-			      retval.numel (1);
+-			  }
+-		      }
+-		    else
+-		      {
+-			octave_value tobj = first_retval_object;
++                    if (i > 0)
++                      {
++                        // Here we need to ensure that keys do exist.
++                        
++                        octave_value_list tmp_list
++                          = first_retval_object.subsref (ttype, idx, 1);
+ 
+-			if (! have_new_struct_field)
+-			  {
+-			    if (i > 0 && first_retval_object.is_defined ()
+-				&& ! (first_retval_object.is_real_matrix ()
+-				      && first_retval_object.is_zero_by_zero ()))
+-			      {
+-				std::string ttype = type.substr (0, i);
++                        if (tmp_list.length () > 0) tobj = tmp_list (0);
++                      }
+ 
+-				char c = ttype[ttype.length()-1];
++
++                    std::string key = tidx.string_value ();
+ 
+-				if (! (c == '(' || c == '{'))
+-				  {
+-				    octave_value_list tmp_list
+-				      = first_retval_object.subsref (ttype, idx, 1);
+-
+-				    if (! error_state)
+-				      tobj = tmp_list(0);
+-				  }
+-			      }
+-
+-			    if (! error_state && tobj.is_map ())
+-			      {
+-				if (tidx.is_string ())
+-				  {
+-				    Octave_map m = tobj.map_value ();
++                    if (! error_state)
++                      {
++                        if (tobj.is_map ())
++                          {
++                            Octave_map map = tobj.map_value ();
++                            if (map.contains (key))
++                              retval.numel (map.contents (key).numel ());
++                            else
++                              {
++                                map.contents (key) = octave_value ();
++                                if (i > 0)
++                                  first_retval_object = 
++                                    first_retval_object.subsasgn (ttype, idx, map);
++                                else
++                                  first_retval_object = map;
+ 
+-				    std::string s = tidx.string_value ();
+-
+-				    if (! m.contains (s))
+-				      {
+-					have_new_struct_field = true;
++                                have_new_struct_field = true;
++                              }
++                          }
++                        else 
++                          {
++                            Octave_map map (key, octave_value ());
++                            if (i > 0)
++                              first_retval_object = 
++                                first_retval_object.subsasgn (ttype, idx, map);
++                            else
++                              first_retval_object = map;
+ 
+-					new_struct_field_nel = m.numel ();
+-				      }
+-				  }
+-			      }
+-			  }
+-		      }
++                            have_new_struct_field = true;
++                          }
++                      }
++                  }
+ 
+-		    idx.push_back (octave_value (tidx));
+-		  }
++                if (! error_state)
++                  idx.push_back (tidx);
++                else
++                  break;
++
+ 	      }
+ 	      break;
+ 
+ 	    default:
+ 	      panic_impossible ();
+ 	    }
+ 
+ 	  if (error_state)
+@@ -620,16 +632,17 @@ tree_index_expression::lvalue (void)
+ 
+ 	  p_args++;
+ 	  p_arg_nm++;
+ 	  p_dyn_field++;
+ 	}
+ 
+       if (! error_state)
+ 	retval.set_index (type, idx);
++
+     }
+ 
+   return retval;
+ }
+ 
+ /*
+ %!test
+ %! x = {1, 2, 3};

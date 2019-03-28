@@ -1,0 +1,648 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1476192035 -7200
+#      Tue Oct 11 15:20:35 2016 +0200
+# Node ID 1b7e49a72c62de66ba7990c0a4886031c23ced45
+# Parent  3645139bd28fe15aff4e36969701faf8d5215753
+improve text rendering in svg printout (bug #48567)
+
+* text-renderer.h (text_renderer::string::family,
+text_renderer::string::xdata): New data members to hold the actual
+font family chosen by fontconfig and the x position of each
+character.  Provide accessor functions.
+
+* ft-text-renderer.cc (ft_renderer::visit (text_element_string&),
+ft_renderer::visit (text_element_symbol&)): Add family and xdata
+imformation in the strlist.
+
+* gl2ps-print.cc (gl2ps_renderer::strlist_to_svg): New private method
+to write an svg text element from the data in an strlist.
+(gl2ps_renderer::strlist_to_ps): Likewise, for ps output.
+(gl2ps_renderer::render_text): For svg and epsformat, directly dump a
+formatted text element in the gl2ps output.
+(gl2ps_renderer::draw): When copying the output file to pipe, insert
+manually a procedure in the prolog of eps files.
+
+diff --git a/libinterp/corefcn/ft-text-renderer.cc b/libinterp/corefcn/ft-text-renderer.cc
+--- a/libinterp/corefcn/ft-text-renderer.cc
++++ b/libinterp/corefcn/ft-text-renderer.cc
+@@ -852,54 +852,59 @@ namespace octave
+ 
+         std::string str = e.string_value ();
+         size_t n = str.length ();
+         size_t curr = 0;
+         size_t idx = 0;
+         mbstate_t ps;
+         memset (&ps, 0, sizeof (ps));  // Initialize state to 0.
+         wchar_t wc;
+-
++        std::string fname = font.get_face ()->family_name;
+         text_renderer::string fs (str, font, xoffset, yoffset);
++        std::vector<double> xdata;
+ 
+         while (n > 0)
+           {
+             size_t r = std::mbrtowc (&wc, str.data () + curr, n, &ps);
+ 
+             if (r > 0
+                 && r != static_cast<size_t> (-1)
+                 && r != static_cast<size_t> (-2))
+               {
+                 n -= r;
+                 curr += r;
+ 
+                 if (wc == L'\n')
+                   {
+-                    // Finish previous string in srtlist before processing
++                    // Finish previous string in strlist before processing
+                     // the newline character
+                     fs.set_y (line_yoffset + yoffset);
+                     fs.set_color (color);
+                     std::string s = str.substr (idx, curr - idx - 1);
+                     if (! s.empty ())
+                       {
+                         fs.set_string (s);
++                        fs.set_xdata (xdata);
++                        fs.set_family (fname);
+                         strlist.push_back (fs);
+                       }
+                   }
++                else
++                  xdata.push_back (xoffset);
+ 
+                 glyph_index = process_character (wc, previous);
+ 
+                 if (wc == L'\n')
+                   {
+                     previous = 0;
+                     // Start a new string in strlist
+                     idx = curr;
++                    xdata.clear ();
+                     fs = text_renderer::string (str.substr (idx), font,
+                                                 line_xoffset, yoffset);
+-
+                   }
+                 else
+                   previous = glyph_index;
+               }
+             else
+               {
+                 if (r != 0)
+                   ::warning ("ft_text_renderer: failed to decode string `%s' with "
+@@ -908,16 +913,18 @@ namespace octave
+                 break;
+               }
+           }
+ 
+         if (! fs.get_string ().empty ())
+           {
+             fs.set_y (line_yoffset + yoffset);
+             fs.set_color (color);
++            fs.set_xdata (xdata);
++            fs.set_family (fname);
+             strlist.push_back (fs);
+           }
+       }
+   }
+ 
+   void
+   ft_text_renderer::visit (text_element_list& e)
+   {
+@@ -1051,30 +1058,33 @@ namespace octave
+       update_line_bbox ();
+   }
+ 
+   void
+   ft_text_renderer::visit (text_element_symbol& e)
+   {
+     uint32_t code = e.get_symbol_code ();
+ 
++    std::vector<double> xdata (1, xoffset);
+     text_renderer::string fs ("-", font, xoffset, yoffset);
+ 
+     if (code != text_element_symbol::invalid_code && font.is_valid ())
+       {
+         process_character (code);
+         fs.set_code (code);
++        fs.set_xdata (xdata);
+       }
+     else if (font.is_valid ())
+       ::warning ("ignoring unknown symbol: %d", e.get_symbol ());
+ 
+     if (fs.get_code ())
+       {
+         fs.set_y (line_yoffset + yoffset);
+         fs.set_color (color);
++        fs.set_family (font.get_face ()->family_name);
+         strlist.push_back (fs);
+       }
+   }
+ 
+   void
+   ft_text_renderer::visit (text_element_combined& e)
+   {
+     int saved_xoffset = xoffset;
+diff --git a/libinterp/corefcn/gl2ps-print.cc b/libinterp/corefcn/gl2ps-print.cc
+--- a/libinterp/corefcn/gl2ps-print.cc
++++ b/libinterp/corefcn/gl2ps-print.cc
+@@ -183,21 +183,31 @@ namespace octave
+     void set_linewidth (float w)
+     {
+       gl2psLineWidth (w);
+     }
+ 
+   private:
+ 
+     // Use xform to compute the coordinates of the string list
+-    // that have been parsed by freetype
++    // that have been parsed by freetype.
+     void fix_strlist_position (double x, double y, double z,
+                                Matrix box, double rotation,
+                                std::list<text_renderer::string>& lst);
+ 
++    // Build an svg text element from a list of parsed strings.
++    std::string strlist_to_svg (double x, double y, double z, Matrix box,
++                                double rotation,
++                                std::list<octave::text_renderer::string>& lst);
++
++    // Build a list of postscript commands from a list of parsed strings.
++    std::string strlist_to_ps (double x, double y, double z, Matrix box,
++                               double rotation,
++                               std::list<octave::text_renderer::string>& lst);
++
+     int alignment_to_mode (int ha, int va) const;
+     FILE *fp;
+     caseless_str term;
+     double fontsize;
+     std::string fontname;
+     bool buffer_overflow;
+   };
+ 
+@@ -356,21 +366,42 @@ namespace octave
+             gl2psEndPage ();
+           }
+ 
+         // Copy temporary file to pipe
+         std::fseek (tmpf, 0, SEEK_SET);
+         char str[8192];  // 8 kB is a common kernel buffersize
+         size_t nread, nwrite;
+         nread = 1;
++
++        // In EPS terminal read the header line by line and insert a
++        // new procedure
++        const char* fcn = "/SRX  { gsave FCT moveto rotate xshow grestore } BD\n";
++        bool header_found = ! (term.find ("eps") != std::string::npos);
++
+         while (! feof (tmpf) && nread)
+           {
+-            nread = std::fread (str, 1, 8192, tmpf);
++            if (! header_found && std::fgets (str, 8192, tmpf))
++              nread = strlen (str);
++            else
++              nread = std::fread (str, 1, 8192, tmpf);
++
+             if (nread)
+               {
++                if (! header_found && std::strncmp (str, "/SBCR", 5) == 0)
++                  {
++                    header_found = true;
++                    nwrite = std::fwrite (fcn, 1, strlen (fcn), fp);
++                    if (nwrite != strlen (fcn))
++                      {
++                        octave::signal_handler ();
++                        error ("gl2ps_renderer::draw: internal pipe error");
++                      }
++                  }
++
+                 nwrite = std::fwrite (str, 1, nread, fp);
+                 if (nwrite != nread)
+                   {
+                     signal_handler ();   // Clear SIGPIPE signal
+                     error ("gl2ps_renderer::draw: internal pipe error");
+                   }
+               }
+           }
+@@ -427,24 +458,22 @@ namespace octave
+ 
+         // Translate and rotate
+         double rot = rotation * 4.0 * atan (1.0) / 180;
+         coord_pix(0) += (txtobj.get_x () + box(0))*cos (rot)
+                         - (txtobj.get_y () + box(1))*sin (rot);
+         coord_pix(1) -= (txtobj.get_y () + box(1))*cos (rot)
+                         + (txtobj.get_x () + box(0))*sin (rot);
+ 
+-        // Turn coordinates back into current gl coordinates
+-        ColumnVector coord = get_transform ().untransform (coord_pix(0),
+-                                                           coord_pix(1),
+-                                                           coord_pix(2),
+-                                                           false);
+-        txtobj.set_x (coord(0));
+-        txtobj.set_y (coord(1));
+-        txtobj.set_z (coord(2));
++        GLint vp[4];
++        glGetIntegerv (GL_VIEWPORT, vp);
++
++        txtobj.set_x (coord_pix(0));
++        txtobj.set_y (vp[3] - coord_pix(1));
++        txtobj.set_z (coord_pix(2));
+       }
+   }
+ }
+ 
+ static std::string
+ code_to_symbol (uint32_t code)
+ {
+   std::string retval;
+@@ -651,109 +680,205 @@ escape_character (const std::string chr,
+     {
+       str.insert (idx, 1, '\\');
+       idx = str.find (chr, idx + 2);
+     }
+ }
+ 
+ namespace octave
+ {
++  std::string
++  gl2ps_renderer::strlist_to_svg (double x, double y, double z,
++                                  Matrix box, double rotation,
++                                  std::list<octave::text_renderer::string>& lst)
++  {
++    if (lst.empty ())
++      return "";
++
++    //Use pixel coordinates to conform to gl2ps
++    ColumnVector coord_pix = get_transform ().transform (x, y, z, false);
++
++    std::ostringstream os;
++    os << "<text xml:space=\"preserve\" ";
++
++    // Rotation and translation are applied to the whole text element
++    os << "transform=\""
++       << "translate(" << coord_pix(0) + box(0) << "," << coord_pix(1) - box(1)
++       << ") rotate(" << -rotation << "," << -box(0) << "," << box(1)
++       << ")\" ";
++
++    // Use the first entry for the base text font
++    auto p = lst.begin ();
++    std::string name = p->get_family ();
++    std::string weight = p->get_weight ();
++    std::string angle = p->get_angle ();
++    double size = p->get_size ();
++
++    os << "font-family=\"" << name << "\" "
++       << "font-weight=\"" << weight << "\" "
++       << "font-style=\"" << angle << "\" "
++       << "font-size=\"" << size << "\">";
++
++
++    // build a tspan for each element in the strlist
++    for (p = lst.begin (); p != lst.end (); p++)
++      {
++        os << "<tspan ";
++
++        if (name.compare (p->get_family ()))
++          os << "font-family=\""  << p->get_family () << "\" ";
++
++        if (weight.compare (p->get_weight ()))
++          os << "font-weight=\"" << p->get_weight () << "\" ";
++
++        if (angle.compare (p->get_angle ()))
++          os << "font-style=\"" << p->get_angle () << "\" ";
++
++        if (size != p->get_size ())
++          os << "font-size=\"" << p->get_size () << "\" ";
++
++        os << "y=\"" << - p->get_y () << "\" ";
++
++        Matrix col = p->get_color ();
++        os << "fill=\"rgb(" << col(0)*255 << ","
++           << col(1)*255 << "," << col(2)*255 << ")\" ";
++
++        // provide an x coordinate for each character in the string
++        os << "x=\"";
++        std::vector<double> xdata =  p->get_xdata ();
++        for (auto q = xdata.begin (); q != xdata.end (); q++)
++          os << (*q) << " ";
++        os << "\"";
++
++        os << ">";
++
++        // translate unicode and special xml characters
++        if (p->get_code ())
++          os << "&#" << p->get_code () <<  ";";
++        else
++          {
++            const std::string str = p->get_string ();
++            for (auto q = str.begin (); q != str.end (); q++)
++              {
++                std::stringstream chr;
++                chr << *q;
++                if (chr.str () == "\"")
++                  os << "&quot;";
++                else if (chr.str () == "'")
++                  os << "&apos;";
++                else if (chr.str () == "&")
++                  os << "&amp;";
++                else if (chr.str () == "<")
++                  os << "&lt;";
++                else if (chr.str () == ">")
++                  os << "&gt;";
++                else
++                  os << chr.str ();
++              }
++          }
++        os << "</tspan>";
++      }
++    os << "</text>";
++
++    return os.str ();
++  }
++
++  std::string
++  gl2ps_renderer::strlist_to_ps (double x, double y, double z,
++                                 Matrix box, double rotation,
++                                 std::list<octave::text_renderer::string>& lst)
++  {
++    // Translate and rotate coordinates in order to use bottom-left alignment
++    fix_strlist_position (x, y, z, box, rotation, lst);
++    Matrix prev_color (1, 3, -1);
++
++    std::ostringstream ss;
++    for (const auto& txtobj : lst)
++      {
++        // Color
++        if (txtobj.get_color () != prev_color)
++          {
++            prev_color = txtobj.get_color ();
++            for (int i = 0; i < 3; i++)
++              ss << prev_color(i) << " ";
++
++            ss << "C\n";
++          }
++
++        // String
++        std::string str;
++        if (txtobj.get_code ())
++          {
++            fontname = "Symbol";
++            str = code_to_symbol (txtobj.get_code ());
++          }
++        else
++          {
++            fontname = select_font (txtobj.get_name (),
++                                    txtobj.get_weight () == "bold",
++                                    txtobj.get_angle () == "italic");
++            str = txtobj.get_string ();
++          }
++
++        escape_character ("(", str);
++        escape_character (")", str);
++
++        ss << "(" << str << ") [";
++
++        std::vector<double> xdata = txtobj.get_xdata ();
++        for (size_t i = 1; i < xdata.size (); i++)
++          ss << xdata[i] - xdata[i-1] << " ";
++
++        ss << "10] " << rotation << " " << txtobj.get_x ()
++           << " " << txtobj.get_y () << " " << txtobj.get_size ()
++           << " /" << fontname << " SRX\n";
++      }
++
++    ss << "\n";
++
++    return ss.str ();
++  }
++
+   Matrix
+   gl2ps_renderer::render_text (const std::string& txt,
+                                double x, double y, double z,
+                                int ha, int va, double rotation)
+   {
+     std::string saved_font = fontname;
+ 
+     if (txt.empty ())
+       return Matrix (1, 4, 0.0);
+ 
+-    // We have no way to get a bounding box from gl2ps, so we parse the raw
+-    // string using freetype
+     Matrix bbox;
+     std::string str = txt;
+     std::list<text_renderer::string> lst;
+ 
+     text_to_strlist (str, lst, bbox, ha, va, rotation);
+-
+-    // When using "tex" or when the string has only one line and no
+-    // special characters, use gl2ps for alignment
+-    if (lst.empty () || term.find ("tex") != std::string::npos
+-        || (lst.size () == 1 && ! lst.front ().get_code ()))
+-      {
+-        std::string name = fontname;
+-        int sz = fontsize;
+-        if (! lst.empty () && term.find ("tex") == std::string::npos)
+-          {
+-            text_renderer::string s = lst.front ();
+-            name = select_font (s.get_name (), s.get_weight () == "bold",
+-                                s.get_angle () == "italic");
+-            set_color (s.get_color ());
+-            str = s.get_string ();
+-            sz = s.get_size ();
+-          }
+-
+-        glRasterPos3d (x, y, z);
+-
+-        // Escape parentheses until gl2ps does it (see bug #45301).
+-        if (term.find ("svg") == std::string::npos
+-            && term.find ("tex") == std::string::npos)
+-          {
+-            escape_character ("(", str);
+-            escape_character (")", str);
+-          }
+-
+-        gl2psTextOpt (str.c_str (), name.c_str (), sz,
+-                      alignment_to_mode (ha, va), rotation);
+-        return bbox;
+-      }
+-
+-    // Translate and rotate coordinates in order to use bottom-left alignment
+-    fix_strlist_position (x, y, z, bbox, rotation, lst);
++    glRasterPos3d (x, y, z);
+ 
+-    for (const auto& txtobj : lst)
++    // For svg/eps directly dump a preformated text element into gl2ps output
++    if (term.find ("svg") != std::string::npos)
++      {
++        std::string elt = strlist_to_svg (x, y, z, bbox, rotation, lst);
++        if (! elt.empty ())
++          gl2psSpecial (GL2PS_SVG, elt.c_str ());
++      }
++    else if (term.find ("eps") != std::string::npos)
+       {
+-        fontname = select_font (txtobj.get_name (),
+-                                txtobj.get_weight () == "bold",
+-                                txtobj.get_angle () == "italic");
+-        if (txtobj.get_code ())
+-          {
+-            // This is only one character represented by a uint32 (utf8) code.
+-            // We replace it by the corresponding character in the
+-            // "Symbol" font except for svg which has built-in utf8 support.
+-            if (term.find ("svg") == std::string::npos)
+-              {
+-                fontname = "Symbol";
+-                str = code_to_symbol (txtobj.get_code ());
+-              }
+-            else
+-              {
+-                std::stringstream ss;
+-                ss << txtobj.get_code ();
+-                str = "&#" + ss.str () + ';';
+-              }
+-          }
+-        else
+-          {
+-            str = txtobj.get_string ();
+-            // Escape parenthesis until gl2ps does it (see bug ##45301).
+-            if (term.find ("svg") == std::string::npos)
+-              {
+-                escape_character ("(", str);
+-                escape_character (")", str);
+-              }
+-          }
++        std::string elt = strlist_to_ps (x, y, z, bbox, rotation, lst);
++        if (! elt.empty ())
++          gl2psSpecial (GL2PS_EPS, elt.c_str ());
+ 
+-        set_color (txtobj.get_color ());
+-        glRasterPos3d (txtobj.get_x (), txtobj.get_y (), txtobj.get_z ());
+-        gl2psTextOpt (str.c_str (), fontname.c_str (), txtobj.get_size (),
+-                      GL2PS_TEXT_BL, rotation);
+       }
++    else
++      gl2psTextOpt (str.c_str (), fontname.c_str (), fontsize,
++                    alignment_to_mode (ha, va), rotation);
+ 
+     fontname = saved_font;
++
+     return bbox;
+   }
+ 
+   void
+   gl2ps_renderer::set_font (const base_properties& props)
+   {
+     opengl_renderer::set_font (props);
+ 
+diff --git a/libinterp/corefcn/text-renderer.h b/libinterp/corefcn/text-renderer.h
+--- a/libinterp/corefcn/text-renderer.h
++++ b/libinterp/corefcn/text-renderer.h
+@@ -23,16 +23,17 @@ along with Octave; see the file COPYING.
+ 
+ #if ! defined (octave_text_renderer_h)
+ #define octave_text_renderer_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <list>
+ #include <string>
++#include <vector>
+ 
+ #include "caseless-str.h"
+ #include "dMatrix.h"
+ #include "uint8NDArray.h"
+ 
+ #include "txt-eng.h"
+ 
+ namespace octave
+@@ -124,58 +125,68 @@ namespace octave
+ 
+     // Container for substrings after parsing.
+ 
+     class string
+     {
+     public:
+ 
+       string (const std::string& s, font& f, const double x0, const double y0)
+-        : str (s), fnt (f), x (x0), y (y0), z (0.0), code (0),
+-          color (Matrix (1,3,0.0))
++        : str (s), family (f.get_name ()), fnt (f), x (x0), y (y0), z (0.0),
++          xdata (), code (0), color (Matrix (1,3,0.0))
+       { }
+ 
+       string (const string& s)
+-        : str (s.str), fnt (s.fnt), x (s.x), y (s.y), code (s.code),
+-          color (s.color)
++        : str (s.str), family (s.family), fnt (s.fnt), x (s.x), y (s.y),
++          xdata (s.xdata), code (s.code), color (s.color)
+       { }
+ 
+       ~string (void) = default;
+ 
+       string& operator = (const string& s)
+       {
+         if (&s != this)
+           {
+             str = s.str;
++            family = s.family;
+             fnt = s.fnt;
+             x = s.x;
+             y = s.y;
++            xdata = s.xdata;
+             code = s.code;
+             color = s.color;
+           }
+ 
+         return *this;
+       }
+ 
+       void set_string (const std::string& s) { str = s; }
+ 
+       std::string get_string (void) const { return str; }
+ 
+       std::string get_name (void) const { return fnt.get_name (); }
+ 
++      std::string get_family (void) const { return family; }
++
++      void set_family (const std::string& nm) { family = nm; }
++
+       std::string get_weight (void) const { return fnt.get_weight (); }
+ 
+       std::string get_angle (void) const { return fnt.get_angle (); }
+ 
+       double get_size (void) const { return fnt.get_size (); }
+ 
+       void set_x (const double x0) { x = x0; }
+ 
+       double get_x (void) const { return x; }
+ 
++      void set_xdata (const std::vector<double>& x0) { xdata = x0; }
++
++      std::vector<double> get_xdata (void) const { return xdata; }
++
+       void set_y (const double y0) { y = y0; }
+ 
+       double get_y (void) const { return y; }
+ 
+       void set_z (const double z0) { z = z0; }
+ 
+       double get_z (void) const { return z; }
+ 
+@@ -190,18 +201,20 @@ namespace octave
+         color(2) = static_cast<double> (c(2)) / 255;
+       }
+ 
+       Matrix get_color (void) const { return color; }
+ 
+     private:
+ 
+       std::string str;
++      std::string family;
+       font fnt;
+       double x, y, z;
++      std::vector<double> xdata;
+       uint32_t code;
+       Matrix color;
+     };
+ 
+     void text_to_strlist (const std::string& txt,
+                           std::list<string>& lst, Matrix& box,
+                           int halign, int valign, double rotation = 0.0,
+                           const caseless_str& interpreter = "tex");

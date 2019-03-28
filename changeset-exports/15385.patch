@@ -1,0 +1,168 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1347624581 21600
+#      Fri Sep 14 06:09:41 2012 -0600
+# Node ID 8ccb187b24e971d246cbc939264ec9626e8640b1
+# Parent  d8d7596fc68d559871d70c7adf643c953d44d94a
+Erase partially created functions on JIT compilation failure (bug #37308)
+
+* pt-jit.cc (tree_jit::optimize): Verify module in debug mode.
+(jit_function_info::jit_function_info): Erase functions on failure.
+
+diff --git a/libinterp/interp-core/jit-typeinfo.cc b/libinterp/interp-core/jit-typeinfo.cc
+--- a/libinterp/interp-core/jit-typeinfo.cc
++++ b/libinterp/interp-core/jit-typeinfo.cc
+@@ -581,16 +581,26 @@ jit_function::jit_function (const jit_fu
+ {
+ }
+ 
+ jit_function::jit_function (const jit_function& fn)
+   : module (fn.module), llvm_function (fn.llvm_function), mresult (fn.mresult),
+     args (fn.args), call_conv (fn.call_conv), mcan_error (fn.mcan_error)
+ {}
+ 
++void
++jit_function::erase (void)
++{
++  if (! llvm_function)
++    return;
++
++  llvm_function->eraseFromParent ();
++  llvm_function = 0;
++}
++
+ std::string
+ jit_function::name (void) const
+ {
+   return llvm_function->getName ();
+ }
+ 
+ llvm::BasicBlock *
+ jit_function::new_block (const std::string& aname,
+diff --git a/libinterp/interp-core/jit-typeinfo.h b/libinterp/interp-core/jit-typeinfo.h
+--- a/libinterp/interp-core/jit-typeinfo.h
++++ b/libinterp/interp-core/jit-typeinfo.h
+@@ -231,16 +231,19 @@ public:
+ 
+   // Use an existing function, but change the argument types. The new argument
+   // types must behave the same for the current calling convention.
+   jit_function (const jit_function& fn, jit_type *aresult,
+                 const std::vector<jit_type *>& aargs);
+ 
+   jit_function (const jit_function& fn);
+ 
++  // erase the interal LLVM function (if it exists). Will become invalid.
++  void erase (void);
++
+   template <typename T>
+   void add_mapping (llvm::ExecutionEngine *engine, T fn)
+   {
+     do_add_mapping (engine, reinterpret_cast<void *> (fn));
+   }
+ 
+   bool valid (void) const { return llvm_function; }
+ 
+diff --git a/libinterp/interp-core/pt-jit.cc b/libinterp/interp-core/pt-jit.cc
+--- a/libinterp/interp-core/pt-jit.cc
++++ b/libinterp/interp-core/pt-jit.cc
+@@ -1860,16 +1860,19 @@ tree_jit::trip_count (const octave_value
+   // unsupported type
+   return 0;
+ }
+ 
+ 
+ void
+ tree_jit::optimize (llvm::Function *fn)
+ {
++  if (Venable_jit_debug)
++    llvm::verifyModule (*module);
++
+   module_pass_manager->run (*module);
+   pass_manager->run (*fn);
+ 
+   if (Venable_jit_debug)
+     {
+       std::string error;
+       llvm::raw_fd_ostream fout ("test.bc", error,
+                                  llvm::raw_fd_ostream::F_Binary);
+@@ -1882,16 +1885,19 @@ jit_function_info::jit_function_info (tr
+                                       octave_user_function& fcn,
+                                       const octave_value_list& ov_args)
+   : argument_types (ov_args.length ()), function (0)
+ {
+   size_t nargs = ov_args.length ();
+   for (size_t i = 0; i < nargs; ++i)
+     argument_types[i] = jit_typeinfo::type_of (ov_args(i));
+ 
++  jit_function raw_fn;
++  jit_function wrapper;
++
+   try
+     {
+       jit_convert conv (fcn, argument_types);
+       jit_infer infer (conv.get_factory (), conv.get_blocks (),
+                        conv.get_variable_map ());
+       infer.infer ();
+ 
+       if (Venable_jit_debug)
+@@ -1907,34 +1913,34 @@ jit_function_info::jit_function_info (tr
+           tpc.visit_statement_list (*fcn.body ());
+           tpc.visit_octave_user_function_trailer (fcn);
+           blocks.print (std::cout, "octave jit ir");
+         }
+ 
+       jit_factory& factory = conv.get_factory ();
+       llvm::Module *module = tjit.get_module ();
+       jit_convert_llvm to_llvm;
+-      jit_function raw_fn = to_llvm.convert_function (module,
+-                                                      infer.get_blocks (),
+-                                                      factory.constants (),
+-                                                      fcn, argument_types);
++      raw_fn = to_llvm.convert_function (module, infer.get_blocks (),
++                                         factory.constants (), fcn,
++                                         argument_types);
+ 
+       if (Venable_jit_debug)
+         {
+           std::cout << "-------------------- raw function ";
+           std::cout << "--------------------\n";
+           std::cout << *raw_fn.to_llvm () << std::endl;
+           llvm::verifyFunction (*raw_fn.to_llvm ());
+         }
+ 
+       std::string wrapper_name = fcn.name () + "_wrapper";
+       jit_type *any_t = jit_typeinfo::get_any ();
+       std::vector<jit_type *> wrapper_args (1, jit_typeinfo::get_any_ptr ());
+-      jit_function wrapper (module, jit_convention::internal, wrapper_name,
+-                            any_t, wrapper_args);
++      wrapper = jit_function (module, jit_convention::internal, wrapper_name,
++                              any_t, wrapper_args);
++
+       llvm::BasicBlock *wrapper_body = wrapper.new_block ();
+       builder.SetInsertPoint (wrapper_body);
+ 
+       llvm::Value *wrapper_arg = wrapper.argument (builder, 0);
+       std::vector<llvm::Value *> raw_args (nargs);
+       for (size_t i = 0; i < nargs; ++i)
+         {
+           llvm::Value *arg;
+@@ -1980,16 +1986,19 @@ jit_function_info::jit_function_info (tr
+     {
+       argument_types.clear ();
+ 
+       if (Venable_jit_debug)
+         {
+           if (e.known ())
+             std::cout << "jit fail: " << e.what () << std::endl;
+         }
++
++      wrapper.erase ();
++      raw_fn.erase ();
+     }
+ }
+ 
+ bool
+ jit_function_info::execute (const octave_value_list& ov_args,
+                             octave_value_list& retval) const
+ {
+   if (! function)

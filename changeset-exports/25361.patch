@@ -1,0 +1,293 @@
+# HG changeset patch
+# User Markus Mützel <markus.muetzel@gmx.de>
+# Date 1525543998 -7200
+#      Sat May 05 20:13:18 2018 +0200
+# Node ID 82445187633e8569c9e47f070e94b1be07e3fdd3
+# Parent  bc5f225bc5783240d02acc81fb59738edfa578a8
+Add support for arbitrary character encodings in m-files (bug #53842).
+
+* input.cc: Add new variable "Vmfile_encoding". Convert from local encoding to
+UTF-8 in file_reader::get_input. Add new function "__mfile_encoding__".
+
+* iconv-wrappers.[c/h]: Add new wrapper files for iconv_open and iconv_close.
+
+* wrappers/module.mk: Add new files.
+
+diff --git a/libinterp/corefcn/input.cc b/libinterp/corefcn/input.cc
+--- a/libinterp/corefcn/input.cc
++++ b/libinterp/corefcn/input.cc
+@@ -32,18 +32,21 @@ along with Octave; see the file COPYING.
+ #include <cassert>
+ 
+ #include <iostream>
+ #include <sstream>
+ #include <string>
+ 
+ #include "cmd-edit.h"
+ #include "file-ops.h"
++#include "iconv-wrappers.h"
++#include "localcharset-wrapper.h"
+ #include "quit.h"
+ #include "str-vec.h"
++#include "uniconv-wrappers.h"
+ 
+ #include "bp-table.h"
+ #include "builtin-defun-decls.h"
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "dirfns.h"
+ #include "error.h"
+ #include "errwarn.h"
+@@ -105,16 +108,23 @@ bool Vtrack_line_num = true;
+ // that we can repeat the previous command if the user just types RET.
+ static std::string last_debugging_command = "\n";
+ 
+ // TRUE if we are running in the Emacs GUD mode.
+ static bool Vgud_mode = false;
+ 
+ static hook_function_list input_event_hook_functions;
+ 
++// Codepage which is used to read .m files
++#if defined (OCTAVE_USE_WINDOWS_API)
++static std::string Vmfile_encoding = "system";
++#else
++static std::string Vmfile_encoding = "utf-8";
++#endif
++
+ // For octave_quit.
+ void
+ remove_input_event_hook_functions (void)
+ {
+   input_event_hook_functions.clear ();
+ }
+ 
+ void
+@@ -772,17 +782,44 @@ namespace octave
+ 
+   std::string
+   file_reader::get_input (bool& eof)
+   {
+     octave_quit ();
+ 
+     eof = false;
+ 
+-    return octave_fgets (m_file, eof);
++    std::string src_str = octave_fgets (m_file, eof);
++    std::string encoding = Vmfile_encoding.compare ("system") == 0
++                           ? octave_locale_charset_wrapper ()
++                           : Vmfile_encoding;
++
++    if (encoding.compare ("utf-8") != 0)
++    {
++      // convert encoding to UTF-8 before returning string
++      const char *src = src_str.c_str ();
++      size_t srclen = src_str.length ();
++
++      size_t length;
++      uint8_t *utf8_str = nullptr;
++
++      utf8_str = octave_u8_conv_from_encoding (encoding.c_str (), src, srclen,
++                                               &length);
++
++      if (! utf8_str)
++        error ("file_reader::get_input: converting from codepage '%s' to UTF-8: %s",
++               encoding.c_str (), std::strerror (errno));
++
++      octave::unwind_protect frame;
++      frame.add_fcn (::free, static_cast<void *> (utf8_str));
++
++      src_str = std::string (reinterpret_cast<char *> (utf8_str), length);
++    }
++
++    return src_str;
+   }
+ 
+   const std::string eval_string_reader::s_in_src ("eval_string");
+ 
+   std::string
+   eval_string_reader::get_input (bool& eof)
+   {
+     octave_quit ();
+@@ -1381,8 +1418,51 @@ Undocumented internal function.
+ 
+   if (nargin == 0)
+     retval = ovl (Vgud_mode);
+   else
+     Vgud_mode = args(0).bool_value ();
+ 
+   return retval;
+ }
++
++DEFUN (__mfile_encoding__, args, ,
++       doc: /* -*- texinfo -*-
++@deftypefn {} {@var{current_encoding} =} __mfile_encoding__ (@var{new_encoding})
++Set and query the codepage that is used for reading .m files.
++@end deftypefn */)
++{
++  int nargin = args.length ();
++
++  if (nargin > 1)
++    print_usage ();
++
++  if (nargin > 0)
++    {
++      std::string str = args(0).xstring_value (
++        "__mfile_encoding__: NEW_ENCODING must be a string designating a valid codepage.");
++      if (str.empty ())
++#if defined (OCTAVE_USE_WINDOWS_API)
++        Vmfile_encoding = "system";
++#else
++        Vmfile_encoding = "utf-8";
++#endif
++      else
++        {
++          std::transform (str.begin (), str.end (), str.begin (), ::tolower);
++
++          std::string codepage = (str.compare ("system") == 0)
++                                 ? octave_locale_charset_wrapper () : str;
++
++          // check if valid codepage
++          void *codec = octave_iconv_open_wrapper (codepage.c_str (), "utf-8");
++
++          if (errno == EINVAL)
++            error ("__mfile_encoding__: Conversion from codepage '%s' not supported", 
++                   codepage.c_str ());
++
++          octave_iconv_close_wrapper (codec);
++
++          Vmfile_encoding = str;
++        }
++    }
++    return ovl (Vmfile_encoding);
++}
+\ No newline at end of file
+diff --git a/liboctave/wrappers/iconv-wrappers.c b/liboctave/wrappers/iconv-wrappers.c
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/iconv-wrappers.c
+@@ -0,0 +1,41 @@
++/*
++
++Copyright (C) 2018 Markus Mützel
++
++This file is part of Octave.
++
++Octave is free software: you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<https://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include "iconv.h"
++
++#include "iconv-wrappers.h"
++
++iconv_t
++octave_iconv_open_wrapper (const char *tocode, const char *fromcode)
++{
++  return iconv_open (tocode, fromcode);
++}
++
++int
++octave_iconv_close_wrapper (iconv_t cd)
++{
++  return iconv_close (cd);
++}
+diff --git a/liboctave/wrappers/iconv-wrappers.h b/liboctave/wrappers/iconv-wrappers.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/iconv-wrappers.h
+@@ -0,0 +1,40 @@
++/*
++
++Copyright (C) 2018 Markus Mützel
++
++This file is part of Octave.
++
++Octave is free software: you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<https://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_iconv_wrappers_h)
++#define octave_iconv_wrappers_h 1
++
++#if defined __cplusplus
++extern "C" {
++#endif
++
++extern void *
++octave_iconv_open_wrapper (const char *tocode, const char *fromcode);
++
++extern int
++octave_iconv_close_wrapper (void *cd);
++
++#if defined __cplusplus
++}
++#endif
++
++#endif
+diff --git a/liboctave/wrappers/module.mk b/liboctave/wrappers/module.mk
+--- a/liboctave/wrappers/module.mk
++++ b/liboctave/wrappers/module.mk
+@@ -6,16 +6,17 @@ NOINSTALL_WRAPPERS_INC = \
+   %reldir%/dirent-wrappers.h \
+   %reldir%/fcntl-wrappers.h \
+   %reldir%/filepos-wrappers.h \
+   %reldir%/fpucw-wrappers.h \
+   %reldir%/gen-tempname-wrapper.h \
+   %reldir%/getopt-wrapper.h \
+   %reldir%/glob-wrappers.h \
+   %reldir%/hash-wrappers.h \
++  %reldir%/iconv-wrappers.h \
+   %reldir%/localcharset-wrapper.h \
+   %reldir%/math-wrappers.h \
+   %reldir%/mkostemp-wrapper.h \
+   %reldir%/nanosleep-wrapper.h \
+   %reldir%/nproc-wrapper.h \
+   %reldir%/octave-popen2.h \
+   %reldir%/putenv-wrapper.h \
+   %reldir%/set-program-name-wrapper.h \
+@@ -43,16 +44,17 @@ WRAPPERS_SRC = \
+   %reldir%/dirent-wrappers.c \
+   %reldir%/fcntl-wrappers.c \
+   %reldir%/filepos-wrappers.c \
+   %reldir%/fpucw-wrappers.c \
+   %reldir%/gen-tempname-wrapper.c \
+   %reldir%/getopt-wrapper.c \
+   %reldir%/glob-wrappers.c \
+   %reldir%/hash-wrappers.c \
++  %reldir%/iconv-wrappers.c \
+   %reldir%/localcharset-wrapper.c \
+   %reldir%/math-wrappers.c \
+   %reldir%/mkostemp-wrapper.c \
+   %reldir%/nanosleep-wrapper.c \
+   %reldir%/nproc-wrapper.c \
+   %reldir%/octave-popen2.c \
+   %reldir%/putenv-wrapper.c \
+   %reldir%/set-program-name-wrapper.c \

@@ -1,0 +1,508 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1209677156 14400
+#      Thu May 01 17:25:56 2008 -0400
+# Node ID 14e05160b99f60a10da250b5fca4baff47c8d4e3
+# Parent  3dc91baee089352a04d96f117af3998b2f7e1315
+reference counting for functions loaded from shared libraries
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,21 @@
++2008-05-01  John W. Eaton  <jwe@octave.org>
++
++	* oct-shlib.h (octave_shlib::number_of_functions_loaded):
++	Return size_t instead of int value.
++	* oct-shlib.cc (octave_base_shlib::number_of_functions_loaded):
++	Likewise.
++	(octave_base_shlib::fcn_names): Now a std::map object.
++	Adjust all uses.
++	(octave_base_shlib::fcn_names_iterator,
++	octave_base_shlib::fcn_names_const_iterator): New typedefs.
++	(octave_base_shlib::add_to_fcn_names, octave_base_shlib::remove):
++	Perform reference counting for functions accessed.
++
+ 2008-04-30  Jaroslav Hajek <highegg@gmail.com>
+ 
+ 	* lo-mappers.cc (xlog2 (double)): Compute log (2), not log2 (2).
+ 	(xlog2 (Complex), xlog2 (double, int&), xlog2 (Complex, int&)):
+ 	New functions.
+ 	* lo-mappers.h: Provide decls.
+ 
+ 2008-04-25  Michael Goffioul <michael.goffioul@gmail.com>
+diff --git a/liboctave/oct-shlib.cc b/liboctave/oct-shlib.cc
+--- a/liboctave/oct-shlib.cc
++++ b/liboctave/oct-shlib.cc
+@@ -19,16 +19,18 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
++#include <map>
++
+ #if defined (HAVE_SHL_LOAD_API)
+ #include <cerrno>
+ #include <cstring>
+ #endif
+ 
+ #if defined (HAVE_DYLD_API)
+ #include <mach-o/dyld.h>
+ #endif
+@@ -72,37 +74,48 @@ public:
+     : octave_shlib (octave_xshlib ()), file (f), fcn_names (),
+       tm_loaded (static_cast<time_t> (0))
+   { count = 1; }
+ 
+   ~octave_base_shlib (void) { }
+ 
+   void open (const std::string&) { }
+ 
++  // FIXME -- instead of returning a direct pointer to a function,
++  // perhaps this should return an object containing the pointer.
++  // Then we could do the reference counting without relying on users
++  // of this class to call remove at the appropriate time.  However,
++  // when users accessed the internal pointer, they would still need
++  // to know that the pointer is only valid while the container is
++  // valid (similar to the std::string::c_str method).
++
+   void *search (const std::string&, name_mangler = 0) { return 0; }
+ 
+   void close (octave_shlib::close_hook = 0) { }
+ 
+   bool remove (const std::string& fcn_name);
+ 
+   bool is_open (void) const { return false; }
+ 
+   bool is_out_of_date (void) const;
+ 
+-  int number_of_functions_loaded (void) const { return fcn_names.length (); }
++  size_t number_of_functions_loaded (void) const { return fcn_names.size (); }
+ 
+   std::string file_name (void) const { return file; }
+ 
+   octave_time time_loaded (void) const { return tm_loaded; }
+ 
+ protected:
+ 
++  typedef std::map<std::string, size_t>::iterator fcn_names_iterator;
++  typedef std::map<std::string, size_t>::const_iterator fcn_names_const_iterator;
++
+   std::string file;
+ 
+-  string_vector fcn_names;
++  std::map<std::string, size_t> fcn_names;
+ 
+   octave_time tm_loaded;
+ 
+   void stamp_time (void);
+ 
+   void add_to_fcn_names (const std::string& name);
+ 
+   void do_close_hook (octave_shlib::close_hook = 0);
+@@ -116,34 +129,24 @@ protected:
+   octave_base_shlib& operator = (const octave_base_shlib&);
+ };
+ 
+ bool
+ octave_base_shlib::remove (const std::string& fcn_name)
+ {
+   bool retval = false;
+ 
+-  int n = number_of_functions_loaded ();
+-
+-  string_vector new_fcn_names (n);
++  fcn_names_iterator p = fcn_names.find (fcn_name);
+ 
+-  int k = 0;
+-
+-  for (int i = 0; i < n; i++)
++  if (--(p->second) == 0)
+     {
+-      if (fcn_names(i) == fcn_name)
+-	retval = true;
+-      else
+-	new_fcn_names(k++) = fcn_names(i);
++      fcn_names.erase (fcn_name);
++      retval = true;
+     }
+ 
+-  new_fcn_names.resize (k);
+-
+-  fcn_names = new_fcn_names;
+-
+   return retval;
+ }
+ 
+ bool
+ octave_base_shlib::is_out_of_date (void) const
+ {
+   file_stat fs (file);
+ 
+@@ -161,42 +164,37 @@ octave_base_shlib::stamp_time (void)
+     (*current_liboctave_warning_with_id_handler)
+       ("Octave:warn-future-time-stamp",
+        "timestamp on file %s is in the future", file.c_str ());
+ }
+ 
+ void
+ octave_base_shlib::add_to_fcn_names (const std::string& name)
+ {
+-  int n = number_of_functions_loaded ();
++  fcn_names_iterator p = fcn_names.find (name);
+ 
+-  for (int i = 0; i < n; i++)
+-    if (fcn_names(i) == name)
+-      return;
+-
+-  fcn_names.resize (n+1);
+-
+-  fcn_names(n) = name;
++  if (p == fcn_names.end ())
++    fcn_names[name] = 1;
++  else
++    ++(p->second);
+ }
+ 
+ void
+ octave_base_shlib::do_close_hook (octave_shlib::close_hook cl_hook)
+ {
+-  int n = number_of_functions_loaded ();
+-
+-  for (int i = 0; i < n; i++)
+-    cl_hook (fcn_names(i));
++  for (fcn_names_iterator p = fcn_names.begin (); p != fcn_names.end (); p++)
++    cl_hook (p->first);
+ }
+ 
+ void
+ octave_base_shlib::tabula_rasa (void)
+ {
+   file = "";
+ 
+-  fcn_names.resize (0);
++  fcn_names.clear ();
+ 
+   tm_loaded = static_cast<time_t> (0);
+ }
+ 
+ #if defined (HAVE_DLOPEN_API)
+ 
+ class
+ octave_dlopen_shlib : public octave_base_shlib
+diff --git a/liboctave/oct-shlib.h b/liboctave/oct-shlib.h
+--- a/liboctave/oct-shlib.h
++++ b/liboctave/oct-shlib.h
+@@ -84,34 +84,34 @@ public:
+     }
+ 
+   bool operator == (const octave_shlib& sl) const
+     { return (rep == sl.rep); }
+ 
+   operator bool () const { return is_open (); }
+ 
+   virtual void open (const std::string& f) { rep->open (f); }
+-  
++
+   virtual void *search (const std::string& nm, name_mangler mangler = 0)
+     { return rep->search (nm, mangler); }
+ 
+   virtual void close (close_hook cl_hook = 0)
+     { rep->close (cl_hook); }
+ 
+   virtual bool remove (const std::string& fcn_name)
+     { return rep->remove (fcn_name); }
+ 
+   virtual bool is_out_of_date (void) const
+     { return rep->is_out_of_date (); }
+ 
+   void mark_relative (void) { relative = true; }
+ 
+   bool is_relative (void) const { return relative; }
+ 
+-  virtual int number_of_functions_loaded (void) const
++  virtual size_t number_of_functions_loaded (void) const
+     { return rep->number_of_functions_loaded (); }
+ 
+   virtual std::string file_name (void) const
+     { return rep->file_name (); }
+ 
+   virtual octave_time time_loaded (void) const
+     { return rep->time_loaded (); }
+ 
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,18 @@
+ 2008-05-01  John W. Eaton  <jwe@octave.org>
+ 
++	* parse.y (load_fcn_from_file): Expect
++	* dynamic-ld.cc (octave_dynamic_loader::do_load_oct):
++	Search currently loaded .oct files by file name.  Don't search
++	currently loaded files for functions.
++	(octave_shlib_list::find_file, octave_shlib_list::do_find_file):
++	New functions.
++	(octave_shlib_list::search, octave_shlib_list::do_search): Delete.
++
+ 	* dynamic-ld.cc (octave_dynamic_loader::do_load_oct): No need to
+ 	do load_path lookups here.
+ 	(octave_shlib_list::iterator, octave_shlib_list::const_iterator):
+ 	New typedefs.
+ 	(octave_shlib_list::do_remove, octave_shlib_list::do_search,
+ 	octave_shlib_list::do_display): Use them.
+ 	(octave_mex_file_list::iterator, octave_mex_file_list::const_iterator):
+ 	New typedefs.
+diff --git a/src/dynamic-ld.cc b/src/dynamic-ld.cc
+--- a/src/dynamic-ld.cc
++++ b/src/dynamic-ld.cc
+@@ -53,33 +53,31 @@ public:
+ 
+   typedef std::list<octave_shlib>::iterator iterator;
+   typedef std::list<octave_shlib>::const_iterator const_iterator;
+ 
+   static void append (const octave_shlib& shl);
+ 
+   static void remove (octave_shlib& shl, octave_shlib::close_hook cl_hook = 0);
+ 
+-  static void *search (const std::string& fcn_name, octave_shlib& shl,
+-		       octave_shlib::name_mangler mangler = 0);
++  static octave_shlib find_file (const std::string& file_name);
+ 
+   static void display (void);
+ 
+ private:
+ 
+   octave_shlib_list (void) { }
+ 
+   ~octave_shlib_list (void) { }
+ 
+   void do_append (const octave_shlib& shl);
+ 
+   void do_remove (octave_shlib& shl, octave_shlib::close_hook cl_hook = 0);
+ 
+-  void *do_search (const std::string& fcn_name, octave_shlib& shl,
+-		   octave_shlib::name_mangler mangler = 0);
++  octave_shlib do_find_file (const std::string& file_name) const;
+ 
+   void do_display (void) const;
+ 
+   static octave_shlib_list *instance;
+ 
+   static bool instance_ok (void);
+ 
+   // List of libraries we have loaded.
+@@ -112,37 +110,31 @@ octave_shlib_list::do_remove (octave_shl
+ 
+ 	  lib_list.erase (p);
+ 
+ 	  break;
+ 	}
+     }
+ }
+ 
+-void *
+-octave_shlib_list::do_search (const std::string& fcn_name, octave_shlib& shl,
+-			      octave_shlib::name_mangler mangler)
++octave_shlib
++octave_shlib_list::do_find_file (const std::string& file_name) const
+ {
+-  void *function = 0;
+-
+-  shl = octave_shlib ();
++  octave_shlib retval;
+ 
+-  for (iterator p = lib_list.begin (); p != lib_list.end (); p++)
++  for (const_iterator p = lib_list.begin (); p != lib_list.end (); p++)
+     {
+-      function = p->search (fcn_name, mangler);
+-
+-      if (function)
++      if (p->file_name () == file_name)
+ 	{
+-	  shl = *p;
+-
++	  retval = *p;
+ 	  break;
+ 	}
+     }
+ 
+-  return function;
++  return retval;
+ }
+ 
+ void
+ octave_shlib_list::do_display (void) const
+ {
+   std::cerr << "current shared libraries:" << std::endl;
+   for (const_iterator p = lib_list.begin (); p != lib_list.end (); p++)
+     std::cerr << "  " << p->file_name () << std::endl;
+@@ -176,21 +168,21 @@ octave_shlib_list::append (const octave_
+ void
+ octave_shlib_list::remove (octave_shlib& shl,
+ 			   octave_shlib::close_hook cl_hook)
+ {
+   if (instance_ok ())
+     instance->do_remove (shl, cl_hook);
+ }
+ 
+-void *
+-octave_shlib_list::search (const std::string& fcn_name, octave_shlib& shl,
+-			   octave_shlib::name_mangler mangler)
++octave_shlib
++octave_shlib_list::find_file (const std::string& file_name)
+ {
+-  return (instance_ok ()) ? instance->do_search (fcn_name, shl, mangler) : 0;
++  return (instance_ok ())
++    ? instance->do_find_file (file_name) : octave_shlib ();
+ }
+ 
+ void
+ octave_shlib_list::display (void)
+ {
+   if (instance_ok ())
+     instance->do_display ();
+ }
+@@ -332,80 +324,61 @@ clear (octave_shlib& oct_file)
+ 
+ octave_function *
+ octave_dynamic_loader::do_load_oct (const std::string& fcn_name,
+ 				    const std::string& file_name,
+ 				    bool relative)
+ {
+   octave_function *retval = 0;
+ 
+-  octave_shlib oct_file;
+-
+   unwind_protect::begin_frame ("octave_dynamic_loader::do_load");
+ 
+   unwind_protect_bool (octave_dynamic_loader::doing_load);
+ 
+   doing_load = true;
+ 
+-  void *function
+-    = octave_shlib_list::search (fcn_name, oct_file, xmangle_name);
++  octave_shlib oct_file = octave_shlib_list::find_file (file_name);
++
++  if (oct_file && oct_file.is_out_of_date ())
++    clear (oct_file);
++
++  if (! oct_file)
++    {
++      oct_file.open (file_name);
++
++      if (! error_state && oct_file)
++	{
++	  octave_shlib_list::append (oct_file);
++
++	  if (relative)
++	    oct_file.mark_relative ();
++	}
++    }
+ 
+   if (! error_state)
+     {
+-      bool reloading = false;
+-
+-      if (function)
+-	{
+-	  // If there is already a function by this name installed
+-	  // from the same file, clear the file so we can reload it.
+-
+-	  // If there is already a function by this name installed
+-	  // from a different file, leave the other file alone and
+-	  // load the function from the new file.
+-
+-	  reloading = same_file (file_name, oct_file.file_name ());
+-
+-	  if (reloading)
+-	    clear (oct_file);
+-
+-	  function = 0;
+-	}
+-
+-      if (! reloading)
+-	oct_file = octave_shlib ();
+-
+-      oct_file.open (file_name);
+-
+-      if (! error_state)
++      if (oct_file)
+ 	{
+-	  if (oct_file)
++	  void *function = oct_file.search (fcn_name, xmangle_name);
++
++	  if (function)
+ 	    {
+-	      if (relative)
+-		oct_file.mark_relative ();
++	      octave_dld_fcn_getter f
++		= FCN_PTR_CAST (octave_dld_fcn_getter, function);
+ 
+-	      octave_shlib_list::append (oct_file);
++	      retval = f (oct_file, relative);
+ 
+-	      function = oct_file.search (fcn_name, xmangle_name);
++	      if (! retval)
++		::error ("failed to install .oct file function `%s'",
++			 fcn_name.c_str ());
+ 	    }
+-	  else
+-	    ::error ("%s is not a valid shared library",
+-		     file_name.c_str ());
+ 	}
+-    }
+-
+-  if (function)
+-    {
+-      octave_dld_fcn_getter f
+-	= FCN_PTR_CAST (octave_dld_fcn_getter, function);
+-
+-      retval = f (oct_file, relative);
+-
+-      if (! retval)
+-	::error ("failed to install .oct file function `%s'",
+-		 fcn_name.c_str ());
++      else
++	::error ("%s is not a valid shared library",
++		 file_name.c_str ());
+     }
+   
+   unwind_protect::run_frame ("octave_dynamic_loader::do_load");
+ 
+   return retval;
+ }
+ 
+ octave_function *
+diff --git a/src/parse.y b/src/parse.y
+--- a/src/parse.y
++++ b/src/parse.y
+@@ -3220,22 +3220,19 @@ load_fcn_from_file (const std::string& f
+     }
+ 
+   if (autoload)
+     {
+       unwind_protect_bool (autoloading);
+       autoloading = true;
+     }
+ 
+-  if (! file.empty ())
+-    {
+-      fcn_file_from_relative_lookup = ! octave_env::absolute_pathname (file);
+-
+-      file = octave_env::make_absolute (file, octave_env::getcwd ());
+-    }
++  fcn_file_from_relative_lookup = ! octave_env::absolute_pathname (file);
++
++  file = octave_env::make_absolute (file, octave_env::getcwd ());
+ 
+   int len = file.length ();
+ 
+   if (len > 4 && file.substr (len-4, len-1) == ".oct")
+     {
+       if (autoload && ! fcn_name.empty ())
+ 	nm = fcn_name;
+ 

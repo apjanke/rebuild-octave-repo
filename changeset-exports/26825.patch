@@ -1,0 +1,1113 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1551608376 0
+#      Sun Mar 03 10:19:36 2019 +0000
+# Node ID 6e9034836239b537b090eae27a11f9f21bdb3fcc
+# Parent  d9770844392e3f4c5f207ee97fd3229625032ae6
+allow handles to nested functions to work (bug #39257)
+
+* stack-frame.h (stack_frame::set_closure_links): New function.
+(usr_fcn_stack_frame::usr_fcn_stack_frame): New optional argument,
+ACCESS_LINK, to allow access link to be set directly when creating
+stack frames for handles to nested functions.
+
+* call-stack.h, call-stack.cc (call_stack::push): New argument,
+CLOSURE_FRAMES, in method to push user function objects on the call
+stack to allow call stack context for handles to nested functions to
+be set.
+
+* symscope.h (symbol_scope::symbol_scope_rep::is_parent,
+symbol_scope::is_parent): New functions.
+
+* ov-fcn-handle.h, ov-fcn-handle.cc
+(octave_fcn_handle::m_closure_frames, octave_fcn_handle::m_is_nested):
+New data members.
+(octave_fcn_handle::is_nested): New function.
+(octave_fcn_handle::~octave_fcn_handle): Delete saved closure frames.
+(octave_fcn_handle::octave_fcn_handle): Mark handles to nested
+functions as nested instead of throwing error.
+(octave_fcn_handle::push_closure_context,
+octave_fcn_handle::workspace): New functions.
+(Ffunctions): Handle nested functions.
+(octave_fcn_handle::call): Pass pointer to first element of
+closure_frames list to feval when executing a function.
+
+* ov-fcn.h, ov-fcn.cc (octave_function::call): New overload with
+pointer to closure_context stack frames as argument.  Provide default
+implementation.
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_function::parent_function):
+New member variable.
+(octave_user_function::is_parent_function): New function.
+(octave_user_function::call): Primary definition is now overload that
+includes closure context.  The other form now forwards to the new
+version.
+
+* pt-eval.cc (tree_evaluator::execute_user_function): New arg,
+CLOSURE_FRAMES.  Pass them to the call stack along with the user function.
+Push current stack frame to any function handles returned from a
+nested function or the parent of a nested function.
+
+* test/nest/nst1.m, test/nest/nst2.m, test/nest/nst3.m: New files.
+* test/nest/nest.tst: New tests.
+
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -432,29 +432,31 @@ namespace octave
+     if (m_curr_frame > static_cast<size_t> (m_max_stack_depth))
+       error ("max_stack_depth exceeded");
+ 
+     stack_frame *slink = get_static_link (prev_frame);
+ 
+     m_cs.push_back (new scope_stack_frame (*this, prev_frame, scope, slink));
+   }
+ 
+-  void call_stack::push (octave_user_function *fcn, unwind_protect *up_frame)
++  void call_stack::push (octave_user_function *fcn, unwind_protect *up_frame,
++                         stack_frame *closure_frames)
+   {
+     size_t prev_frame = m_curr_frame;
+     m_curr_frame = m_cs.size ();
+ 
+     // m_max_stack_depth should never be less than zero.
+     if (m_curr_frame > static_cast<size_t> (m_max_stack_depth))
+       error ("max_stack_depth exceeded");
+ 
+     stack_frame *slink = get_static_link (prev_frame);
+ 
+     m_cs.push_back (new user_fcn_stack_frame (*this, fcn, up_frame,
+-                                              prev_frame, slink));
++                                              prev_frame, slink,
++                                              closure_frames));
+   }
+ 
+   void call_stack::push (octave_user_script *script, unwind_protect *up_frame)
+   {
+     size_t prev_frame = m_curr_frame;
+     m_curr_frame = m_cs.size ();
+ 
+     // m_max_stack_depth should never be less than zero.
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -160,17 +160,18 @@ namespace octave
+ 
+     // Return TRUE if all elements on the call stack are scripts.
+     bool all_scripts (void) const;
+ 
+     stack_frame * get_static_link (size_t prev_frame) const;
+ 
+     void push (const symbol_scope& scope);
+ 
+-    void push (octave_user_function *fcn, unwind_protect *up_frame);
++    void push (octave_user_function *fcn, unwind_protect *up_frame,
++               stack_frame *closure_frames = nullptr);
+ 
+     void push (octave_user_script *script, unwind_protect *up_frame);
+ 
+     void push (octave_function *fcn);
+ 
+     void set_location (int l, int c)
+     {
+       if (! m_cs.empty ())
+diff --git a/libinterp/corefcn/stack-frame.h b/libinterp/corefcn/stack-frame.h
+--- a/libinterp/corefcn/stack-frame.h
++++ b/libinterp/corefcn/stack-frame.h
+@@ -304,16 +304,22 @@ namespace octave
+ 
+       mark_global (sym);
+     }
+ 
+     stack_frame * static_link (void) const {return m_static_link; }
+ 
+     stack_frame * access_link (void) const {return m_access_link; }
+ 
++    void set_closure_links (stack_frame *dup_frame)
++    {
++      m_static_link = dup_frame;
++      m_access_link = dup_frame;
++    }
++
+     virtual size_t size (void) const;
+ 
+     virtual void resize (size_t);
+ 
+     void mark_global (const symbol_record& sym)
+     {
+       mark_scope (sym, GLOBAL);
+     }
+@@ -883,19 +889,22 @@ namespace octave
+   class user_fcn_stack_frame : public base_value_stack_frame
+   {
+   public:
+ 
+     user_fcn_stack_frame (void) = delete;
+ 
+     user_fcn_stack_frame (call_stack& cs, octave_user_function *fcn,
+                           unwind_protect *up_frame, size_t prev,
+-                          stack_frame *static_link)
++                          stack_frame *static_link,
++                          stack_frame *access_link = nullptr)
+       : base_value_stack_frame (cs, get_num_symbols (fcn), prev, static_link,
+-                                get_access_link (fcn, static_link)),
++                                (access_link
++                                 ? access_link
++                                 : get_access_link (fcn, static_link))),
+         m_fcn (fcn), m_unwind_protect_frame (up_frame)
+     { }
+ 
+     user_fcn_stack_frame (const user_fcn_stack_frame& elt) = default;
+ 
+     user_fcn_stack_frame&
+     operator = (const user_fcn_stack_frame& elt) = delete;
+ 
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -91,16 +91,18 @@ namespace octave
+     void insert_symbol_record (symbol_record& sr);
+ 
+     bool is_nested (void) const { return m_nesting_depth > 0; }
+ 
+     size_t nesting_depth (void) const { return m_nesting_depth; }
+ 
+     void set_nesting_depth (size_t depth) { m_nesting_depth = depth; }
+ 
++    bool is_parent (void) const { return ! m_children.empty (); }
++
+     bool is_static (void) const { return m_is_static; }
+ 
+     void mark_static (void) { m_is_static = true; }
+ 
+     std::shared_ptr<symbol_scope_rep> parent_scope_rep (void) const
+     {
+       return m_parent.lock ();
+     }
+@@ -361,16 +363,21 @@ namespace octave
+         m_rep->insert_symbol_record (sr);
+     }
+ 
+     bool is_nested (void) const
+     {
+       return m_rep ? m_rep->is_nested () : false;
+     }
+ 
++    bool is_parent (void) const
++    {
++      return m_rep ? m_rep->is_parent () : false;
++    }
++
+     void set_nesting_depth (size_t depth)
+     {
+       if (m_rep)
+         m_rep->set_nesting_depth (depth);
+     }
+ 
+     size_t nesting_depth (void) const
+     {
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <istream>
+ #include <list>
+ #include <ostream>
+ #include <sstream>
++#include <string>
+ #include <vector>
+ 
+ #include "file-ops.h"
+ #include "oct-locbuf.h"
+ 
+ #include "call-stack.h"
+ #include "defaults.h"
+ #include "defun.h"
+@@ -57,16 +58,17 @@ along with Octave; see the file COPYING.
+ #include "pt-assign.h"
+ #include "pt-cmd.h"
+ #include "pt-eval.h"
+ #include "pt-exp.h"
+ #include "pt-idx.h"
+ #include "pt-misc.h"
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
++#include "syminfo.h"
+ #include "symscope.h"
+ #include "unwind-prot.h"
+ #include "variables.h"
+ 
+ #include "byte-swap.h"
+ #include "ls-ascii-helper.h"
+ #include "ls-hdf5.h"
+ #include "ls-oct-text.h"
+@@ -77,30 +79,48 @@ along with Octave; see the file COPYING.
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_fcn_handle,
+                                      "function handle",
+                                      "function_handle");
+ 
+ const std::string octave_fcn_handle::anonymous ("@<anonymous>");
+ 
+ octave_fcn_handle::octave_fcn_handle (const octave_value& f,
+                                       const std::string& n)
+-  : fcn (f), nm (n), has_overloads (false)
++  : fcn (f), nm (n), has_overloads (false), overloads (),
++    m_is_nested (false), m_closure_frames (nullptr)
+ {
+   octave_user_function *uf = fcn.user_function_value (true);
+ 
+   if (uf && nm != anonymous)
+     {
+       octave::symbol_scope uf_scope = uf->scope ();
+ 
+       if (uf_scope)
+         uf_scope.cache_name (nm);
+     }
+ 
+   if (uf && uf->is_nested_function () && ! uf->is_subfunction ())
+-    error ("handles to nested functions are not yet supported");
++    m_is_nested = true;
++}
++
++octave_fcn_handle::~octave_fcn_handle (void)
++{
++  if (m_closure_frames)
++    {
++      while (m_closure_frames->size () > 0)
++        {
++          octave::stack_frame *elt = m_closure_frames->back ();
++
++          delete elt;
++
++          m_closure_frames->pop_back ();
++        }
++
++      delete m_closure_frames;
++    }
+ }
+ 
+ octave_value_list
+ octave_fcn_handle::subsref (const std::string& type,
+                             const std::list<octave_value_list>& idx,
+                             int nargout)
+ {
+   octave_value_list retval;
+@@ -135,34 +155,32 @@ octave_fcn_handle::subsref (const std::s
+     retval = retval(0).next_subsref (nargout, type, idx);
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_fcn_handle::call (int nargout, const octave_value_list& args)
+ {
+-  octave_value_list retval;
++  octave::out_of_date_check (fcn, "", false);
+ 
+-  octave::out_of_date_check (fcn, "", false);
++  // Possibly overloaded function.
++  octave_value fcn_to_call = fcn;
+ 
+   if (has_overloads)
+     {
+-      // Possibly overloaded function.
+-      octave_value ov_fcn;
+-
+       // Compute dispatch type.
+       builtin_type_t btyp;
+       std::string dispatch_type = octave::get_dispatch_type (args, btyp);
+ 
+       // Retrieve overload.
+       if (btyp != btyp_unknown)
+         {
+           octave::out_of_date_check (builtin_overloads[btyp], dispatch_type, false);
+-          ov_fcn = builtin_overloads[btyp];
++          fcn_to_call = builtin_overloads[btyp];
+         }
+       else
+         {
+           auto it = overloads.find (dispatch_type);
+ 
+           if (it == overloads.end ())
+             {
+               // Try parent classes too.
+@@ -183,58 +201,135 @@ octave_fcn_handle::call (int nargout, co
+ 
+                   octave_value ftmp = symtab.find_method (fnm, pname);
+ 
+                   if (ftmp.is_defined ())
+                     {
+                       set_overload (pname, ftmp);
+ 
+                       octave::out_of_date_check (ftmp, pname, false);
+-                      ov_fcn = ftmp;
++                      fcn_to_call = ftmp;
+ 
+                       break;
+                     }
+ 
+                   pit++;
+                 }
+             }
+           else
+             {
+               octave::out_of_date_check (it->second, dispatch_type, false);
+-              ov_fcn = it->second;
++              fcn_to_call = it->second;
+             }
+         }
+ 
+-      if (ov_fcn.is_defined ())
+-        retval = octave::feval (ov_fcn, args, nargout);
+-      else if (fcn.is_defined ())
+-        retval = octave::feval (fcn, args, nargout);
+-      else
++      if (! fcn_to_call.is_defined ())
+         error ("%s: no method for class %s",
+                nm.c_str (), dispatch_type.c_str ());
+     }
+-  else
+-    {
+-      // Non-overloaded function (anonymous, subfunction, private function).
+-      if (fcn.is_defined ())
+-        retval = octave::feval (fcn, args, nargout);
+-      else
+-        error ("%s: no longer valid function handle", nm.c_str ());
+-    }
++  else if (! fcn_to_call.is_defined ())
++    error ("%s: no longer valid function handle", nm.c_str ());
++
++  octave::stack_frame *closure_context = nullptr;
+ 
+-  return retval;
++  if (m_closure_frames && m_closure_frames->size () > 0)
++    closure_context = m_closure_frames->front ();
++
++  octave::tree_evaluator& tw
++    = octave::__get_evaluator__ ("octave_fcn_handle::call");
++
++  octave_function *of = fcn_to_call.function_value ();
++
++  return of->call (tw, nargout, args, closure_context);
+ }
+ 
+ dim_vector
+ octave_fcn_handle::dims (void) const
+ {
+   static dim_vector dv (1, 1);
+   return dv;
+ }
+ 
++// Save call stack frames for handles to nested functions.
++
++void
++octave_fcn_handle::push_closure_context (octave::tree_evaluator& tw)
++{
++  if (! m_closure_frames)
++    m_closure_frames = new std::list<octave::stack_frame *> ();
++
++  octave::call_stack& main_cs = tw.get_call_stack ();
++
++  octave::stack_frame& curr_frame = main_cs.get_current_stack_frame ();
++
++  octave::stack_frame *dup_frame = curr_frame.dup ();
++
++  if (! m_closure_frames->empty ())
++    {
++      octave::stack_frame *top_frame = m_closure_frames->back ();
++
++      // Arrange for static and access links in the top stack frame (the
++      // last one saved before this one) to point to the new duplicated
++      // frame.  This way we will look up through the duplicated frames
++      // when evaluating the function.
++
++      top_frame->set_closure_links (dup_frame);
++    }
++
++  m_closure_frames->push_back (dup_frame);
++}
++
++octave_value
++octave_fcn_handle::workspace (void) const
++{
++  if (nm == anonymous)
++    {
++      octave_user_function *fu = fcn.user_function_value ();
++
++      octave_scalar_map ws;
++
++      if (fu)
++        {
++          for (const auto& nm_val : fu->local_var_init_vals ())
++            ws.assign (nm_val.first, nm_val.second);
++        }
++
++      return ws;
++    }
++  else if (m_closure_frames)
++    {
++      octave_idx_type num_frames = m_closure_frames->size ();
++
++      Cell ws_frames (num_frames, 1);
++
++      octave_idx_type i = 0;
++
++      for (auto elt : *m_closure_frames)
++        {
++          octave::symbol_info_list symbols = elt->all_variables ();
++
++          octave_scalar_map ws;
++
++          for (auto sym_name : symbols.names ())
++            {
++              octave_value val = symbols.varval (sym_name);
++
++              if (val.is_defined ())
++                ws.assign (sym_name, val);
++            }
++
++          ws_frames(i++) = ws;
++        }
++
++      return ws_frames;
++    }
++
++  return Cell ();
++}
++
+ bool
+ octave_fcn_handle::is_equal_to (const octave_fcn_handle& h) const
+ {
+   bool retval = fcn.is_copy_of (h.fcn) && (has_overloads == h.has_overloads);
+   retval = retval && (overloads.size () == h.overloads.size ());
+ 
+   if (retval && has_overloads)
+     {
+@@ -1699,16 +1794,19 @@ The function overloads an existing funct
+ 
+ @item simple
+ The function is a built-in or m-file function.
+ 
+ @item subfunction
+ The function is a subfunction within an m-file.
+ @end table
+ 
++@item nested
++The function is nested.
++
+ @item file
+ The m-file that will be called to perform the function.  This field is empty
+ for anonymous and built-in functions.
+ @end table
+ 
+ In addition, some function types may return more information in additional
+ fields.
+ 
+@@ -1750,40 +1848,38 @@ particular output format.
+           m.setfield ("type", "subfunction");
+           Cell parentage (dim_vector (1, 2));
+           parentage.elem (0) = fh_nm;
+           parentage.elem (1) = fcn->parent_fcn_name ();
+           m.setfield ("parentage", octave_value (parentage));
+         }
+       else if (fcn->is_private_function ())
+         m.setfield ("type", "private");
++      else if (fh->is_nested ())
++        m.setfield ("type", "nested");
+       else if (fh->is_overloaded ())
+         m.setfield ("type", "overloaded");
+       else
+         m.setfield ("type", "simple");
+     }
+ 
+   std::string nm = fcn->fcn_file_name ();
+ 
+   if (fh_nm == octave_fcn_handle::anonymous)
+     {
+       m.setfield ("file", nm);
+ 
+-      octave_user_function *fu = fh->user_function_value ();
+-
+-      octave_scalar_map ws;
+-      for (const auto& nm_val : fu->local_var_init_vals ())
+-        ws.assign (nm_val.first, nm_val.second);
+-
+-      m.setfield ("workspace", ws);
++      m.setfield ("workspace", fh->workspace ());
+     }
+   else if (fcn->is_user_function () || fcn->is_user_script ())
+     {
+       octave_function *fu = fh->function_value ();
+       m.setfield ("file", fu->fcn_file_name ());
++
++      m.setfield ("workspace", fh->workspace ());
+     }
+   else
+     m.setfield ("file", "");
+ 
+   return ovl (m);
+ }
+ 
+ DEFUN (func2str, args, ,
+diff --git a/libinterp/octave-value/ov-fcn-handle.h b/libinterp/octave-value/ov-fcn-handle.h
+--- a/libinterp/octave-value/ov-fcn-handle.h
++++ b/libinterp/octave-value/ov-fcn-handle.h
+@@ -22,25 +22,28 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if ! defined (octave_ov_fcn_handle_h)
+ #define octave_ov_fcn_handle_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <iosfwd>
++#include <list>
+ #include <string>
+ 
+ #include "ov-base.h"
+ #include "ov-fcn.h"
+ #include "ov-typeinfo.h"
+ 
+ namespace octave
+ {
+   class interpreter;
++  class stack_frame;
++  class tree_evaluator;
+ }
+ 
+ // Function handles.
+ 
+ class
+ OCTINTERP_API
+ octave_fcn_handle : public octave_base_value
+ {
+@@ -48,34 +51,39 @@ private:
+ 
+   typedef std::map<std::string, octave_value> str_ov_map;
+ 
+ public:
+ 
+   static const std::string anonymous;
+ 
+   octave_fcn_handle (void)
+-    : fcn (), nm (), has_overloads (false), overloads () { }
++    : fcn (), nm (), has_overloads (false), overloads (),
++      m_is_nested (false), m_closure_frames (nullptr)
++  { }
+ 
+   octave_fcn_handle (const std::string& n)
+-    : fcn (), nm (n), has_overloads (false), overloads () { }
++    : fcn (), nm (n), has_overloads (false), overloads (),
++      m_is_nested (false), m_closure_frames (nullptr)
++  { }
+ 
+   octave_fcn_handle (const octave_value& f,  const std::string& n = anonymous);
+ 
+   octave_fcn_handle (const octave_fcn_handle& fh)
+     : octave_base_value (fh), fcn (fh.fcn), nm (fh.nm),
+-      has_overloads (fh.has_overloads), overloads ()
++      has_overloads (fh.has_overloads), overloads (),
++      m_is_nested (fh.m_is_nested), m_closure_frames (fh.m_closure_frames)
+   {
+     for (int i = 0; i < btyp_num_types; i++)
+       builtin_overloads[i] = fh.builtin_overloads[i];
+ 
+     overloads = fh.overloads;
+   }
+ 
+-  ~octave_fcn_handle (void) = default;
++  ~octave_fcn_handle (void);
+ 
+   octave_base_value * clone (void) const
+   { return new octave_fcn_handle (*this); }
+   octave_base_value * empty_clone (void) const
+   { return new octave_fcn_handle (); }
+ 
+   octave_value subsref (const std::string& type,
+                         const std::list<octave_value_list>& idx)
+@@ -91,30 +99,40 @@ public:
+   bool is_defined (void) const { return true; }
+ 
+   bool is_function_handle (void) const { return true; }
+ 
+   builtin_type_t builtin_type (void) const { return btyp_func_handle; }
+ 
+   bool is_overloaded (void) const { return has_overloads; }
+ 
++  bool is_nested (void) const { return m_is_nested; }
++
+   dim_vector dims (void) const;
+ 
+   octave_function * function_value (bool = false)
+-  { return fcn.function_value (); }
++  {
++    return fcn.function_value ();
++  }
+ 
+   octave_user_function * user_function_value (bool = false)
+-  { return fcn.user_function_value (); }
++  {
++    return fcn.user_function_value ();
++  }
+ 
+   octave_fcn_handle * fcn_handle_value (bool = false) { return this; }
+ 
+   octave_value fcn_val (void) const { return fcn; }
+ 
+   std::string fcn_name (void) const { return nm; }
+ 
++  void push_closure_context (octave::tree_evaluator& tw);
++
++  octave_value workspace (void) const;
++
+   void set_overload (builtin_type_t btyp, const octave_value& ov_fcn)
+   {
+     if (btyp != btyp_unknown)
+       {
+         has_overloads = true;
+         builtin_overloads[btyp] = ov_fcn;
+       }
+ 
+@@ -169,16 +187,24 @@ protected:
+   bool has_overloads;
+ 
+   // Overloads for builtin types.  We use array to make lookup faster.
+   octave_value builtin_overloads[btyp_num_types];
+ 
+   // Overloads for other classes.
+   str_ov_map overloads;
+ 
++  // TRUE means this is a handle to a nested function.
++  bool m_is_nested;
++
++  // Saved stack frames for handles to nested functions.  This allows us
++  // to access non-locals and other context info when calling nested
++  // functions indirectly through handles.
++  std::list<octave::stack_frame *> *m_closure_frames;
++
+   bool parse_anon_fcn_handle (const std::string& fcn_text);
+ 
+   virtual octave_value_list call (int nargout, const octave_value_list& args);
+ };
+ 
+ namespace octave
+ {
+   extern octave_value
+diff --git a/libinterp/octave-value/ov-fcn.cc b/libinterp/octave-value/ov-fcn.cc
+--- a/libinterp/octave-value/ov-fcn.cc
++++ b/libinterp/octave-value/ov-fcn.cc
+@@ -28,17 +28,26 @@ along with Octave; see the file COPYING.
+ #include "ovl.h"
+ #include "ov-fcn.h"
+ 
+ 
+ octave_base_value *
+ octave_function::clone (void) const
+ {
+   panic_impossible ();
+-  return nullptr;
+ }
+ 
+ octave_base_value *
+ octave_function::empty_clone (void) const
+ {
+   panic_impossible ();
+-  return nullptr;
+ }
++
++octave_value_list
++octave_function::call (octave::tree_evaluator& tw, int nargout,
++                       const octave_value_list& args,
++                       octave::stack_frame *closure_context)
++{
++  if (closure_context)
++    panic_impossible ();
++
++  return call (tw, nargout, args);
++}
+diff --git a/libinterp/octave-value/ov-fcn.h b/libinterp/octave-value/ov-fcn.h
+--- a/libinterp/octave-value/ov-fcn.h
++++ b/libinterp/octave-value/ov-fcn.h
+@@ -32,16 +32,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "ovl.h"
+ #include "ov-base.h"
+ #include "ov-typeinfo.h"
+ #include "symscope.h"
+ 
+ namespace octave
+ {
++  class stack_frame;
+   class tree_evaluator;
+   class tree_walker;
+ }
+ 
+ // Functions.
+ 
+ class
+ OCTINTERP_API
+@@ -215,17 +216,22 @@ public:
+ 
+   virtual bool accepts_postfix_index (char type) const
+   { return (type == '('); }
+ 
+   virtual octave_value_list
+   call (octave::tree_evaluator& tw, int nargout = 0,
+         const octave_value_list& args = octave_value_list ()) = 0;
+ 
+-protected:
++  virtual octave_value_list
++  call (octave::tree_evaluator& tw, int nargout,
++        const octave_value_list& args,
++        octave::stack_frame *closure_context);
++
++ protected:
+ 
+   octave_function (const std::string& nm,
+                    const std::string& ds = "")
+     : relative (false), locked (false), private_function (false),
+       xdispatch_class (), my_name (nm), my_dir_name (), doc (ds) { }
+ 
+   // TRUE if this function was found from a relative path element.
+   bool relative;
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -446,19 +446,20 @@ octave_user_function::all_va_args (const
+   if (n > 0)
+     retval = args.slice (num_named_args, n);
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_user_function::call (octave::tree_evaluator& tw, int nargout,
+-                            const octave_value_list& args)
++                            const octave_value_list& args,
++                            octave::stack_frame *closure_frames)
+ {
+-  return tw.execute_user_function (*this, nargout, args);
++  return tw.execute_user_function (*this, nargout, args, closure_frames);
+ }
+ 
+ void
+ octave_user_function::accept (octave::tree_walker& tw)
+ {
+   tw.visit_octave_user_function (*this);
+ }
+ 
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -322,16 +322,18 @@ public:
+   {
+     return is_inline_function () || is_anonymous_function ();
+   }
+ 
+   void mark_as_nested_function (void) { nested_function = true; }
+ 
+   bool is_nested_function (void) const { return nested_function; }
+ 
++  bool is_parent_function (void) const { return m_scope.is_parent (); }
++
+   void mark_as_legacy_constructor (void) { class_constructor = legacy; }
+ 
+   bool is_legacy_constructor (const std::string& cname = "") const
+   {
+     return (class_constructor == legacy
+             ? (cname.empty () ? true : cname == dispatch_class ()) : false);
+   }
+ 
+@@ -356,17 +358,24 @@ public:
+   bool is_classdef_method (const std::string& cname = "") const
+   {
+     return (class_method == classdef
+             ? (cname.empty () ? true : cname == dispatch_class ()) : false);
+   }
+ 
+   octave_value_list
+   call (octave::tree_evaluator& tw, int nargout = 0,
+-        const octave_value_list& args = octave_value_list ());
++        const octave_value_list& args = octave_value_list ())
++  {
++    return call (tw, nargout, args, nullptr);
++  }
++
++  octave_value_list
++  call (octave::tree_evaluator& tw, int nargout,
++        const octave_value_list& args, octave::stack_frame *);
+ 
+   octave::tree_parameter_list * parameter_list (void) { return param_list; }
+ 
+   octave::tree_parameter_list * return_list (void) { return ret_list; }
+ 
+   octave::comment_list * leading_comment (void) { return lead_comm; }
+ 
+   octave::comment_list * trailing_comment (void) { return trail_comm; }
+@@ -441,19 +450,22 @@ private:
+   bool subfunction;
+ 
+   // TRUE means this is an inline function.
+   bool inline_function;
+ 
+   // TRUE means this is an anonymous function.
+   bool anonymous_function;
+ 
+-  // TRUE means this is a nested function. (either a child or parent)
++  // TRUE means this is a nested function.
+   bool nested_function;
+ 
++  // TRUE means this function contains a nested function.
++  bool parent_function;
++
+   // Enum describing whether this function is the constructor for class object.
+   class_method_type class_constructor;
+ 
+   // Enum describing whether this function is a method for a class.
+   class_method_type class_method;
+ 
+ #if defined (HAVE_LLVM)
+   octave::jit_function_info *jit_info;
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -1758,17 +1758,18 @@ namespace octave
+   {
+     // ??
+     panic_impossible ();
+   }
+ 
+   octave_value_list
+   tree_evaluator::execute_user_function (octave_user_function& user_function,
+                                          int nargout,
+-                                         const octave_value_list& xargs)
++                                         const octave_value_list& xargs,
++                                         stack_frame *closure_frames)
+   {
+     octave_value_list retval;
+ 
+     tree_statement_list *cmd_list = user_function.body ();
+ 
+     if (! cmd_list)
+       return retval;
+ 
+@@ -1798,17 +1799,20 @@ namespace octave
+     unwind_protect frame;
+ 
+     if (m_call_stack.size () >= static_cast<size_t> (m_max_recursion_depth))
+       error ("max_recursion_depth exceeded");
+ 
+     // Save old and set current symbol table context, for
+     // eval_undefined_error().
+ 
+-    m_call_stack.push (&user_function, &frame);
++    //    std::cerr << "eval: " << user_function.name ()
++    //              << " with closure_frames: " << closure_frames << std::endl;
++
++    m_call_stack.push (&user_function, &frame, closure_frames);
+ 
+     frame.protect_var (Vtrack_line_num);
+     // update source line numbers, even if debugging
+     Vtrack_line_num = true;
+ 
+     frame.add_method (m_call_stack, &call_stack::pop);
+ 
+     bind_auto_fcn_vars (xargs.name_tags (), args.length (),
+@@ -1908,16 +1912,38 @@ namespace octave
+             if (varargout_varval.is_defined ())
+               varargout = varargout_varval.xcell_value ("varargout must be a cell array object");
+           }
+ 
+         retval = convert_return_list_to_const_vector (ret_list, nargout,
+                                                       varargout);
+       }
+ 
++    if (user_function.is_nested_function ()
++        || user_function.is_parent_function ())
++      {
++        // Copy current stack frame to handles to nested functions.
++
++        for (octave_idx_type i = 0; i < retval.length (); i++)
++          {
++            octave_value val = retval(i);
++
++            if (val.is_function_handle ())
++              {
++                octave_fcn_handle *fh = val.fcn_handle_value ();
++
++                if (fh && fh->is_nested ())
++                  {
++                    // std::cerr << "pushing closure context" << std::endl;
++                    fh->push_closure_context (*this);
++                  }
++              }
++          }
++      }
++
+     return retval;
+   }
+ 
+   void
+   tree_evaluator::visit_octave_user_function_header (octave_user_function&)
+   {
+     panic_impossible ();
+   }
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -195,18 +195,19 @@ namespace octave
+ 
+     octave_value_list
+     execute_user_script (octave_user_script& user_script, int nargout,
+                          const octave_value_list& args);
+ 
+     void visit_octave_user_function (octave_user_function&);
+ 
+     octave_value_list
+-    execute_user_function (octave_user_function& user_function, int nargout,
+-                           const octave_value_list& args);
++    execute_user_function (octave_user_function& user_function,
++                           int nargout, const octave_value_list& args,
++                           stack_frame *closure_frames = nullptr);
+ 
+     void visit_octave_user_function_header (octave_user_function&);
+ 
+     void visit_octave_user_function_trailer (octave_user_function&);
+ 
+     void visit_function_def (tree_function_def&);
+ 
+     void visit_identifier (tree_identifier&);
+diff --git a/test/nest/nest.tst b/test/nest/nest.tst
+--- a/test/nest/nest.tst
++++ b/test/nest/nest.tst
+@@ -65,8 +65,74 @@
+ %!test <39257>
+ %! f = no_closure (1);
+ %! assert (f(), "nested");
+ %! assert (f("foo"), "nested foo");
+ 
+ %!error <D' undefined near line 7> scope2
+ %!error <can not add variable "y" to a static workspace> nest_eval ("y = 5;", "")
+ %!error <can not add variable "y" to a static workspace> nest_eval ("y;", "")
++
++## Test the way that non-local variables referenced by nested functions
++## work with function handles.
++
++## FH1 and FH2 were created separately so will have distinct
++## closure contexts.handles, FH3 is a copy of FH2 so they will
++## share the same context.
++
++%!test <39257>
++%! fh1 = nst1 (13);
++%! fh2 = nst1 (13);
++%! fh3 = fh2;
++%!
++%! assert (fh1 (), 13);
++%! assert (fh2 (), 13);
++%! assert (fh3 (), 13);
++%!
++%! assert (fh1 (42), 42);
++%! assert (fh2 (), 13);
++%! assert (fh3 (), 13);
++%!
++%! assert (fh2 (pi), pi);
++%! assert (fh1 (), 42);
++%! assert (fh3 (), pi);
++
++## Similar to the test above, but with persistent variables.  These are
++## stored in the function, not the closure context, so are shared among
++## all handles whether they are created separately or copied.
++
++%!test
++%! fh1 = nst2 (13);
++%! fh2 = nst2 (13);
++%! fh3 = fh2;
++%!
++%! assert (fh1 (), 13);
++%! assert (fh2 (), 13);
++%! assert (fh3 (), 13);
++%!
++%! assert (fh1 (42), 42);
++%! assert (fh2 (), 42);
++%! assert (fh3 (), 42);
++%!
++%! assert (fh2 (pi), pi);
++%! assert (fh1 (), pi);
++%! assert (fh3 (), pi);
++
++## And again with global variables.
++
++%!test
++%! fh1 = nst3 (13);
++%! fh2 = nst3 (13);
++%! fh3 = fh2;
++%!
++%! assert (fh1 (), 13);
++%! assert (fh2 (), 13);
++%! assert (fh3 (), 13);
++%!
++%! assert (fh1 (42), 42);
++%! assert (fh2 (), 42);
++%! assert (fh3 (), 42);
++%!
++%! assert (fh2 (pi), pi);
++%! assert (fh1 (), pi);
++%! assert (fh3 (), pi);
++%!
++%! clear -global g;  # cleanup after tests
+diff --git a/test/nest/nst1.m b/test/nest/nst1.m
+new file mode 100644
+--- /dev/null
++++ b/test/nest/nst1.m
+@@ -0,0 +1,12 @@
++function fh = nst1 (xval)
++  if (nargin > 0)
++    x = xval;
++  end
++  fh = @nst;
++  function r = nst (xval)
++    if (nargin > 0)
++      x = xval;
++    end
++    r = x;
++  end
++end
+diff --git a/test/nest/nst2.m b/test/nest/nst2.m
+new file mode 100644
+--- /dev/null
++++ b/test/nest/nst2.m
+@@ -0,0 +1,13 @@
++function fh = nst2 (pval)
++  persistent p
++  if (nargin > 0)
++    p = pval;
++  end
++  fh = @nst;
++  function r = nst (pval)
++    if (nargin > 0)
++      p = pval;
++    end
++    r = p;
++  end
++end
+diff --git a/test/nest/nst3.m b/test/nest/nst3.m
+new file mode 100644
+--- /dev/null
++++ b/test/nest/nst3.m
+@@ -0,0 +1,13 @@
++function fh = nst3 (gval)
++  global g
++  if (nargin > 0)
++    g = gval;
++  end
++  fh = @nst;
++  function r = nst (gval)
++    if (nargin > 0)
++      g = gval;
++    end
++    r = g;
++  end
++end

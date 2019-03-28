@@ -1,0 +1,312 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1497965328 14400
+#      Tue Jun 20 09:28:48 2017 -0400
+# Node ID da89ce0d49ebf182c6c016882e2af3ccaac4a5d3
+# Parent  3bb0a937c071303d46d14cdd364d40a0fd63f026
+avoid possible memory leak in parser
+
+* parse.h, oct-parse.in.yy (base_parser::validate_param_list):
+New function, adapted from tree_parameter_list::validate.
+
+* pt-misc.h, pt-misc.cc (tree_parameter_list::validate): Delete.
+(tree_parameter_list::mark_varargs,
+tree_parameter_list::mark_varargs_only): Now public.
+
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -1327,17 +1327,18 @@ param_list      : param_list_beg param_l
+                   }
+                 ;
+ 
+ param_list1     : // empty
+                   { $$ = 0; }
+                 | param_list2
+                   {
+                     $1->mark_as_formal_parameters ();
+-                    if ($1->validate (octave::tree_parameter_list::in))
++
++                    if (parser.validate_param_list ($1, octave::tree_parameter_list::in))
+                       {
+                         lexer.mark_as_variables ($1->variable_names ());
+                         $$ = $1;
+                       }
+                     else
+                       {
+                         delete $1;
+                         YYABORT;
+@@ -1375,32 +1376,32 @@ return_list     : '[' ']'
+                     lexer.looking_at_return_list = false;
+ 
+                     octave::tree_parameter_list *tmp = new octave::tree_parameter_list ($1);
+ 
+                     // Even though this parameter list can contain only
+                     // a single identifier, we still need to validate it
+                     // to check for varargin or varargout.
+ 
+-                    if (tmp->validate (octave::tree_parameter_list::out))
++                    if (parser.validate_param_list (tmp, octave::tree_parameter_list::out))
+                       $$ = tmp;
+                     else
+                       {
+                         delete tmp;
+                         YYABORT;
+                       }
+                   }
+                 | '[' return_list1 ']'
+                   {
+                     lexer.looking_at_return_list = false;
+ 
+                     // Check for duplicate parameter names, varargin,
+                     // or varargout.
+ 
+-                    if ($2->validate (octave::tree_parameter_list::out))
++                    if (parser.validate_param_list ($2, octave::tree_parameter_list::out))
+                       $$ = $2;
+                     else
+                       {
+                         delete $2;
+                         YYABORT;
+                       }
+                   }
+                 ;
+@@ -3902,16 +3903,77 @@ namespace octave
+         panic_impossible ();
+         break;
+       }
+ 
+     return retval;
+   }
+ 
+   bool
++  base_parser::validate_param_list (tree_parameter_list *lst,
++                                    tree_parameter_list::in_or_out type)
++  {
++    std::set<std::string> dict;
++
++    for (tree_decl_elt *elt : *lst)
++      {
++        tree_identifier *id = elt->ident ();
++
++        if (id)
++          {
++            std::string name = id->name ();
++
++            if (id->is_black_hole ())
++              {
++                if (type != tree_parameter_list::in)
++                  {
++                    bison_error ("invalid use of ~ in output list");
++                    return false;
++                  }
++              }
++            else if (dict.find (name) != dict.end ())
++              {
++                bison_error ("'" + name
++                             + "' appears more than once in parameter list");
++                return false;
++              }
++            else
++              dict.insert (name);
++          }
++      }
++
++    std::string va_type = (type == tree_parameter_list::in
++                           ? "varargin" : "varargout");
++
++    size_t len = lst->length ();
++
++    if (len > 0)
++      {
++        tree_decl_elt *elt = lst->back ();
++
++        tree_identifier *id = elt->ident ();
++
++        if (id && id->name () == va_type)
++          {
++            if (len == 1)
++              lst->mark_varargs_only ();
++            else
++              lst->mark_varargs ();
++
++            tree_parameter_list::iterator p = lst->end ();
++            --p;
++            delete *p;
++            lst->erase (p);
++          }
++      }
++
++    return true;
++  }
++
++  bool
+   base_parser::validate_array_list (tree_expression *e)
+   {
+     bool retval = true;
+ 
+     tree_array_list *al = dynamic_cast<tree_array_list *> (e);
+ 
+     for (tree_argument_list* row : *al)
+       {
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -30,16 +30,17 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include <deque>
+ #include <map>
+ #include <set>
+ 
+ #include "lex.h"
+ #include "symtab.h"
++#include "pt-misc.h"
+ #include "token.h"
+ 
+ class octave_comment_list;
+ class octave_function;
+ class octave_user_function;
+ 
+ namespace octave
+ {
+@@ -353,16 +354,19 @@ namespace octave
+     // Make an indirect reference expression with dynamic field name.
+     tree_index_expression *
+     make_indirect_ref (tree_expression *expr, tree_expression *field);
+ 
+     // Make a declaration command.
+     tree_decl_command *
+     make_decl_command (int tok, token *tok_val, tree_decl_init_list *lst);
+ 
++    // Validate an function parameter list.
++    bool validate_param_list (tree_parameter_list *lst,
++                              tree_parameter_list::in_or_out type);
+     // Validate matrix or cell
+     bool validate_array_list (tree_expression *e);
+ 
+     // Validate matrix object used in "[lhs] = ..." assignments.
+     tree_argument_list * validate_matrix_for_assignment (tree_expression *e);
+ 
+     // Finish building an array_list (common action for finish_matrix
+     // and finish_cell).
+diff --git a/libinterp/parse-tree/pt-misc.cc b/libinterp/parse-tree/pt-misc.cc
+--- a/libinterp/parse-tree/pt-misc.cc
++++ b/libinterp/parse-tree/pt-misc.cc
+@@ -52,71 +52,16 @@ namespace octave
+ 
+   void
+   tree_parameter_list::mark_as_formal_parameters (void)
+   {
+     for (tree_decl_elt *elt : *this)
+       elt->mark_as_formal_parameter ();
+   }
+ 
+-  bool
+-  tree_parameter_list::validate (in_or_out type)
+-  {
+-    bool retval = true;
+-
+-    std::set<std::string> dict;
+-
+-    for (tree_decl_elt *elt : *this)
+-      {
+-        tree_identifier *id = elt->ident ();
+-
+-        if (id)
+-          {
+-            std::string name = id->name ();
+-
+-            if (id->is_black_hole ())
+-              {
+-                if (type != in)
+-                  error ("invalid use of ~ in output list");
+-              }
+-            else if (dict.find (name) != dict.end ())
+-              error ("'%s' appears more than once in parameter list",
+-                     name.c_str ());
+-            else
+-              dict.insert (name);
+-          }
+-      }
+-
+-    std::string va_type = (type == in ? "varargin" : "varargout");
+-
+-    size_t len = length ();
+-
+-    if (len > 0)
+-      {
+-        tree_decl_elt *elt = back ();
+-
+-        tree_identifier *id = elt->ident ();
+-
+-        if (id && id->name () == va_type)
+-          {
+-            if (len == 1)
+-              mark_varargs_only ();
+-            else
+-              mark_varargs ();
+-
+-            iterator p = end ();
+-            --p;
+-            delete *p;
+-            erase (p);
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+   std::list<std::string>
+   tree_parameter_list::variable_names (void) const
+   {
+     std::list<std::string> retval;
+ 
+     for (tree_decl_elt *elt : *this)
+       retval.push_back (elt->name ());
+ 
+diff --git a/libinterp/parse-tree/pt-misc.h b/libinterp/parse-tree/pt-misc.h
+--- a/libinterp/parse-tree/pt-misc.h
++++ b/libinterp/parse-tree/pt-misc.h
+@@ -63,17 +63,19 @@ namespace octave
+     tree_parameter_list (const tree_parameter_list&) = delete;
+ 
+     tree_parameter_list& operator = (const tree_parameter_list&) = delete;
+ 
+     ~tree_parameter_list (void);
+ 
+     void mark_as_formal_parameters (void);
+ 
+-    bool validate (in_or_out type);
++    void mark_varargs (void) { marked_for_varargs = 1; }
++
++    void mark_varargs_only (void) { marked_for_varargs = -1; }
+ 
+     bool takes_varargs (void) const { return marked_for_varargs != 0; }
+ 
+     bool varargs_only (void) { return (marked_for_varargs < 0); }
+ 
+     bool is_defined (void);
+ 
+     std::list<std::string> variable_names (void) const;
+@@ -83,20 +85,16 @@ namespace octave
+     void accept (tree_walker& tw)
+     {
+       tw.visit_parameter_list (*this);
+     }
+ 
+   private:
+ 
+     int marked_for_varargs;
+-
+-    void mark_varargs (void) { marked_for_varargs = 1; }
+-
+-    void mark_varargs_only (void) { marked_for_varargs = -1; }
+   };
+ 
+   // Return lists.  Used to hold the right hand sides of multiple
+   // assignment expressions.
+ 
+   class tree_return_list : public octave::base_list<tree_index_expression *>
+   {
+   public:

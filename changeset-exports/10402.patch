@@ -1,0 +1,768 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1267995607 0
+#      Sun Mar 07 21:00:07 2010 +0000
+# Node ID 9f2bf537a651f3ed8909247ca9dc02668f164317
+# Parent  6d1e49abf95fabe38446aebad5baed3e565272a6
+Implement text extent property
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,41 @@
++2010-03-07  Michael Goffioul  <michael.goffioul@gmail.com>
++
++	* gl-render.cc (draw_figure): disable depth test on the 3rd pass.
++	(draw_text): use get_data_position to get text position.
++	* graphics.h.in (graphics_xform): New zlim field.
++	(graphics_xform::untransform(double,double,bool)): New method.
++	(axes::properties::get_transform): Provide zlim data to graphics_xform
++	constructor.
++	(text::properties::string, text::properties::units,
++	text::properties::rotation, text::properties::fontname,
++	text::properties::fontangle, text::properties::fontsize,
++	text::properties::fontweight, text::properties::interpreter): Add 'u'
++	modified.
++	(text::properties::extent): New property.
++	(text::properties::get_data_position): New method.
++	(text::properties::update_position): Use it.
++	(text::properties::update_text_extent,
++	text::properties::update_string, text::properties::update_rotation,
++	text::properties::update_fontname, text::properties::update_fontsize,
++	text::properties::update_fontangle,
++	text::properties::update_fontweight,
++	text::properties::update_interpreter, text::properties::update_units):
++	New updaters.
++	* graphics.cc (convert_position): Support single point.
++	(convert_text_position): New helper function.
++	(text::properties::get_data_position, text::properties::get_extent,
++	text::properties::update_text_extent, text::properties::update_units):
++	New methods.
++	* txt-eng-ft.h (ft_render::get_extent, ft_render::rotation_to_mode):
++	New methods.
++	* txt-eng-ft.cc (ft_render::get_extent, ft_render::rotation_to_mode):
++	Ditto.
++
+ 2010-03-05  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* data.cc (do_accumdim_sum): New helper function.
+ 	(F__accumdim_sum__): New DEFUN.
+ 
+ 2010-03-04  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* ov-base.h (unary_mapper_t::umap_erfcx): New enum member.
+diff --git a/src/gl-render.cc b/src/gl-render.cc
+--- a/src/gl-render.cc
++++ b/src/gl-render.cc
+@@ -1660,23 +1660,25 @@ opengl_renderer::draw_axes (const axes::
+           it = obj_list.erase (it);
+         }
+       else
+         it++;
+     }
+ 
+   // 3rd pass: draw remaining objects
+ 
++  glDisable (GL_DEPTH_TEST);
+   for (it = obj_list.begin (); it != obj_list.end (); it++)
+     {
+       graphics_object go = (*it);
+ 
+       set_clipping (go.get_properties ().is_clipping ());
+       draw (go);
+     }
++  glEnable (GL_DEPTH_TEST);
+ 
+   set_clipping (false);
+   // FIXME: finalize rendering (transparency processing)
+   // FIXME: draw zoom box, if needed
+ }
+ 
+ void
+ opengl_renderer::draw_line (const line::properties& props)
+@@ -2663,18 +2665,17 @@ void
+ opengl_renderer::draw_text (const text::properties& props)
+ {
+   if (props.get_string ().empty ())
+     return;
+ 
+   set_font (props);
+   set_color (props.get_color_rgb ());
+ 
+-  // FIXME: take "units" into account
+-  const Matrix pos = xform.scale (props.get_position ().matrix_value ());
++  const Matrix pos = xform.scale (props.get_data_position ());
+   int halign = 0, valign = 0;
+ 
+   if (props.horizontalalignment_is ("center"))
+     halign = 1;
+   else if (props.horizontalalignment_is ("right"))
+     halign = 2;
+   
+   if (props.verticalalignment_is ("top"))
+diff --git a/src/graphics.cc b/src/graphics.cc
+--- a/src/graphics.cc
++++ b/src/graphics.cc
+@@ -45,20 +45,23 @@ along with Octave; see the file COPYING.
+ #include "graphics.h"
+ #include "input.h"
+ #include "ov.h"
+ #include "oct-obj.h"
+ #include "oct-map.h"
+ #include "ov-fcn-handle.h"
+ #include "parse.h"
+ #include "toplev.h"
++#include "txt-eng-ft.h"
+ #include "unwind-prot.h"
+ 
+-// forward declaration
++// forward declarations
+ static octave_value xget (const graphics_handle& h, const caseless_str& name);
++static graphics_object xget_ancestor (const graphics_object& go_arg,
++                                      const std::string& type);
+ 
+ static void
+ gripe_set_invalid (const std::string& pname)
+ {
+   error ("set: invalid value for %s property", pname.c_str ());
+ }
+ 
+ // Check to see that PNAME matches just one of PNAMES uniquely.
+@@ -306,45 +309,56 @@ default_figure_paperposition (void)
+   return m;
+ }
+ 
+ static Matrix
+ convert_position (const Matrix& pos, const caseless_str& from_units,
+                   const caseless_str& to_units,
+                   const Matrix& parent_dim = Matrix (1, 2, 0.0))
+ {
+-  Matrix retval (1, 4);
++  Matrix retval (1, pos.numel ());
+   double res = 0;
++  bool is_rectangle = (pos.numel () == 4);
+ 
+   if (from_units.compare ("pixels"))
+     retval = pos;
+   else if (from_units.compare ("normalized"))
+     {
+       retval(0) = pos(0) * parent_dim(0) + 1;
+       retval(1) = pos(1) * parent_dim(1) + 1;
+-      retval(2) = pos(2) * parent_dim(0);
+-      retval(3) = pos(3) * parent_dim(1);
++      if (is_rectangle)
++        {
++          retval(2) = pos(2) * parent_dim(0);
++          retval(3) = pos(3) * parent_dim(1);
++        }
++      else
++        retval(2) = 0;
+     }
+   else if (from_units.compare ("characters"))
+     {
+       if (res <= 0)
+         res = xget (0, "screenpixelsperinch").double_value ();
+ 
+       double f = 0.0;
+ 
+       // FIXME -- this assumes the system font is Helvetica 10pt 
+       //          (for which "x" requires 6x12 pixels at 74.951 pixels/inch)
+       f = 12.0 * res / 74.951;
+ 
+       if (f > 0)
+         {
+           retval(0) = 0.5 * pos(0) * f;
+           retval(1) = pos(1) * f;
+-          retval(2) = 0.5 * pos(2) * f;
+-          retval(3) = pos(3) * f;
++          if (is_rectangle)
++            {
++              retval(2) = 0.5 * pos(2) * f;
++              retval(3) = pos(3) * f;
++            }
++          else
++            retval(2) = 0;
+         }
+     }
+   else
+     {
+       if (res <= 0)
+         res = xget (0, "screenpixelsperinch").double_value ();
+ 
+       double f = 0.0;
+@@ -355,45 +369,60 @@ convert_position (const Matrix& pos, con
+         f = res;
+       else if (from_units.compare ("centimeters"))
+         f = res / 2.54;
+ 
+       if (f > 0)
+         {
+           retval(0) = pos(0) * f + 1;
+           retval(1) = pos(1) * f + 1;
+-          retval(2) = pos(2) * f;
+-          retval(3) = pos(3) * f;
++          if (is_rectangle)
++            {
++              retval(2) = pos(2) * f;
++              retval(3) = pos(3) * f;
++            }
++          else
++            retval(2) = 0;
+         }
+     }
+ 
+   if (! to_units.compare ("pixels"))
+     {
+       if (to_units.compare ("normalized"))
+         {
+           retval(0) = (retval(0) - 1) / parent_dim(0);
+           retval(1) = (retval(1) - 1) / parent_dim(1);
+-          retval(2) /= parent_dim(0);
+-          retval(3) /= parent_dim(1);
++          if (is_rectangle)
++            {
++              retval(2) /= parent_dim(0);
++              retval(3) /= parent_dim(1);
++            }
++          else
++            retval(2) = 0;
+         }
+       else if (to_units.compare ("characters"))
+         {
+           if (res <= 0)
+             res = xget (0, "screenpixelsperinch").double_value ();
+ 
+           double f = 0.0;
+ 
+           f = 12.0 * res / 74.951;
+ 
+           if (f > 0)
+             {
+               retval(0) = 2 * retval(0) / f;
+               retval(1) = retval(1) / f;
+-              retval(2) = 2 * retval(2) / f;
+-              retval(3) = retval(3) / f;
++              if (is_rectangle)
++                {
++                  retval(2) = 2 * retval(2) / f;
++                  retval(3) = retval(3) / f;
++                }
++              else
++                retval(2) = 0;
+             }
+         }
+       else
+         {
+           if (res <= 0)
+             res = xget (0, "screenpixelsperinch").double_value ();
+ 
+           double f = 0.0;
+@@ -404,21 +433,106 @@ convert_position (const Matrix& pos, con
+             f = res;
+           else if (to_units.compare ("centimeters"))
+             f = res / 2.54;
+ 
+           if (f > 0)
+             {
+               retval(0) = (retval(0) - 1) / f;
+               retval(1) = (retval(1) - 1) / f;
+-              retval(2) /= f;
+-              retval(3) /= f;
++              if (is_rectangle)
++                {
++                  retval(2) /= f;
++                  retval(3) /= f;
++                }
++              else
++                retval(2) = 0;
+             }
+         }
+     }
++  else if (! is_rectangle)
++    retval(2) = 0;
++
++  return retval;
++}
++
++static Matrix
++convert_text_position (const Matrix& pos, const text::properties& props,
++                       const caseless_str& from_units,
++                       const caseless_str& to_units)
++{
++  graphics_object go = gh_manager::get_object (props.get___myhandle__ ());
++  graphics_object ax = xget_ancestor (go, "axes");
++
++  Matrix retval (1, pos.numel (), 0);
++
++  if (ax.valid_object ())
++    {
++      const axes::properties& ax_props =
++          dynamic_cast<const axes::properties&> (ax.get_properties ());
++      graphics_xform ax_xform = ax_props.get_transform ();
++      bool is_rectangle = (pos.numel () == 4);
++      Matrix ax_bbox = ax_props.get_boundingbox (true),
++             ax_size = ax_bbox.extract_n (0, 2, 1, 2);
++
++      if (from_units.compare ("data"))
++        {
++          if (is_rectangle)
++            {
++              ColumnVector v1 = ax_xform.transform (pos(0), pos(1), 0),
++                           v2 = ax_xform.transform (pos(0) + pos(2),
++                                                    pos(1) + pos(3), 0);
++
++              retval(0) = v1(0) - ax_bbox(0) + 1;
++              retval(1) = ax_bbox(1) + ax_bbox(3) - v1(1) + 1;
++              retval(2) = v2(0) - v1(0);
++              retval(3) = v1(1) - v2(1);
++            }
++          else
++            {
++              ColumnVector v = ax_xform.transform (pos(0), pos(1), pos(2));
++
++              retval(0) = v(0) - ax_bbox(0) + 1;
++              retval(1) = ax_bbox(1) + ax_bbox(3) - v(1) + 1;
++              retval(2) = 0;
++            }
++        }
++      else
++        retval = convert_position (pos, from_units, "pixels", ax_size);
++
++      if (! to_units.compare ("pixels"))
++        {
++          if (to_units.compare ("data"))
++            {
++              if (is_rectangle)
++                {
++                  ColumnVector v1 = ax_xform.untransform (retval(0) + ax_bbox(0) - 1,
++                                                          ax_bbox(1) + ax_bbox(3)  - retval(1) + 1),
++                               v2 = ax_xform.untransform (retval(0) + retval(2) + ax_bbox(0) - 1,
++                                                          ax_bbox(1) + ax_bbox(3)  - (retval(1) + retval(3)) + 1);
++
++                  retval(0) = v1(0);
++                  retval(1) = v1(1);
++                  retval(2) = v2(0) - v1(0);
++                  retval(3) = v2(1) - v1(1);
++                }
++              else
++                {
++                  ColumnVector v = ax_xform.untransform (retval(0) + ax_bbox(0) - 1,
++                                                         ax_bbox(1) + ax_bbox(3)  - retval(1) + 1);
++
++                  retval(0) = v(0);
++                  retval(1) = v(1);
++                  retval(2) = v(2);
++                }
++            }
++          else
++            retval = convert_position (retval, "pixels", to_units, ax_size);
++        }
++    }
+ 
+   return retval;
+ }
+ 
+ static graphics_object
+ xget_ancestor (const graphics_object& go_arg, const std::string& type)
+ {
+   graphics_object go = go_arg;
+@@ -3373,16 +3487,17 @@ axes::properties::get_boundingbox (bool 
+   Matrix parent_bb = obj.get_properties ().get_boundingbox (true);
+   Matrix pos = (internal ?
+                   get_position ().matrix_value ()
+                   : get_outerposition ().matrix_value ());
+ 
+ 
+   pos = convert_position (pos, get_units (), "pixels",
+                           parent_bb.extract_n (0, 2, 1, 2));
++
+   pos(0)--;
+   pos(1)--;
+   pos(1) = parent_bb(3) - pos(1) - pos(3);
+ 
+   return pos;
+ }
+ 
+ ColumnVector
+@@ -4094,17 +4209,91 @@ line::properties::compute_ylim (void) co
+   m(1) = xmax (ydata.max_val (), xmax (ldata.max_val (), udata.max_val ()));
+   m(2) = xmin (ydata.min_pos (), xmin (ldata.min_pos (), udata.min_pos ()));
+ 
+   return m;
+ }
+ 
+ // ---------------------------------------------------------------------
+ 
+-// Note: "text" code is entirely auto-generated
++Matrix
++text::properties::get_data_position (void) const
++{
++  Matrix pos = get_position ().matrix_value ();
++
++  if (! units_is ("data"))
++    pos = convert_text_position (pos, *this, get_units (), "data");
++
++  return pos;
++}
++
++octave_value
++text::properties::get_extent (void) const
++{
++  Matrix m = extent.get ().matrix_value ();
++
++  return convert_text_position (m, *this, "pixels", get_units ());
++}
++
++void
++text::properties::update_text_extent (void)
++{
++#ifdef HAVE_FREETYPE
++
++  text_element *elt;
++  ft_render text_renderer;
++  Matrix box;
++
++  // FIXME: parsed content should be cached for efficiency
++  
++  elt = text_parser_none ().parse (get_string ());
++  text_renderer.set_font (*this);
++  box = text_renderer.get_extent (elt, get_rotation ());
++
++  Matrix extent (1, 4, 0.0);
++
++  // FIXME: also handle left and bottom components
++
++  extent(0) = extent(1) = 1;
++  extent(2) = box(0);
++  extent(3) = box(1);
++
++  set_extent (extent);
++
++#endif
++}
++
++void
++text::properties::update_units (void)
++{
++  if (! units_is ("data"))
++    {
++      set_xliminclude ("off");
++      set_yliminclude ("off");
++      set_zliminclude ("off");
++    }
++
++  Matrix pos = get_position ().matrix_value ();
++
++  pos = convert_text_position (pos, *this, cached_units, get_units ());
++  // FIXME: if the current axes view is 2D, then one should
++  // probably drop the z-component of "pos" and leave "zliminclude"
++  // to "off".
++  set_position (pos);
++
++  if (units_is ("data"))
++    {
++      set_xliminclude ("on");
++      set_yliminclude ("on");
++      // FIXME: see above
++      set_zliminclude ("off");
++    }
++
++  cached_units = get_units ();
++}
+ 
+ // ---------------------------------------------------------------------
+ 
+ octave_value
+ image::properties::get_color_data (void) const
+ {
+   return convert_cdata (*this, get_cdata (),
+                         cdatamapping_is ("scaled"), 3);
+diff --git a/src/graphics.h.in b/src/graphics.h.in
+--- a/src/graphics.h.in
++++ b/src/graphics.h.in
+@@ -2699,51 +2699,57 @@ private:
+ };
+ 
+ // ---------------------------------------------------------------------
+ 
+ class OCTINTERP_API graphics_xform
+ {
+ public:
+   graphics_xform (void)
+-      : xform (xform_eye ()), xform_inv (xform_eye ())
++      : xform (xform_eye ()), xform_inv (xform_eye ()), zlim (1, 2, 0.0)
+     {
+       sx = sy = sz = "linear";
++      zlim(1) = 1.0;
+     }
+ 
+   graphics_xform (const Matrix& xm, const Matrix& xim,
+-                  const scaler& x, const scaler& y, const scaler& z)
+-      : xform (xm), xform_inv (xim), sx (x), sy (y), sz (z) { }
++                  const scaler& x, const scaler& y, const scaler& z,
++                  const Matrix& zl)
++      : xform (xm), xform_inv (xim), sx (x), sy (y), sz (z), zlim (zl) { }
+ 
+   graphics_xform (const graphics_xform& g)
+       : xform (g.xform), xform_inv (g.xform_inv), sx (g.sx),
+-        sy (g.sy), sz (g.sz) { }
++        sy (g.sy), sz (g.sz), zlim (g.zlim) { }
+ 
+   ~graphics_xform (void) { }
+ 
+   graphics_xform& operator = (const graphics_xform& g)
+     {
+       xform = g.xform;
+       xform_inv = g.xform_inv;
+       sx = g.sx;
+       sy = g.sy;
+       sz = g.sz;
++      zlim = g.zlim;
+ 
+       return *this;
+     }
+ 
+   static ColumnVector xform_vector (double x, double y, double z);
+ 
+   static Matrix xform_eye (void);
+ 
+   ColumnVector transform (double x, double y, double z,
+                           bool scale = true) const;
+   
+   ColumnVector untransform (double x, double y, double z,
+                             bool scale = true) const;
++  
++  ColumnVector untransform (double x, double y, bool scale = true) const
++    { return untransform (x, y, (zlim(0)+zlim(1))/2, scale); }
+ 
+   Matrix xscale (const Matrix& m) const { return sx.scale (m); }
+   Matrix yscale (const Matrix& m) const { return sy.scale (m); }
+   Matrix zscale (const Matrix& m) const { return sz.scale (m); }
+ 
+   Matrix scale (const Matrix& m) const
+     {
+       bool has_z = (m.columns () > 2);
+@@ -2766,16 +2772,17 @@ public:
+ 
+       return retval;
+     }
+ 
+ private:
+   Matrix xform;
+   Matrix xform_inv;
+   scaler sx, sy, sz;
++  Matrix zlim;
+ };
+ 
+ class OCTINTERP_API axes : public base_graphics_object
+ {
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+@@ -2802,17 +2809,17 @@ public:
+     void update_aspectratios (void);
+     void update_transform (void)
+       {
+         update_aspectratios ();
+         update_camera ();
+       }
+ 
+     graphics_xform get_transform (void) const
+-      { return graphics_xform (x_render, x_render_inv, sx, sy, sz); }
++      { return graphics_xform (x_render, x_render_inv, sx, sy, sz, x_zlim); }
+ 
+     Matrix get_transform_matrix (void) const { return x_render; }
+     Matrix get_inverse_transform_matrix (void) const { return x_render_inv; }
+     Matrix get_opengl_matrix_1 (void) const { return x_gl_mat1; }
+     Matrix get_opengl_matrix_2 (void) const { return x_gl_mat2; }
+     Matrix get_transform_zlim (void) const { return x_zlim; }
+ 
+     ColumnVector pixel2coord (double px, double py) const
+@@ -3228,56 +3235,61 @@ class OCTINTERP_API text : public base_g
+ public:
+   class OCTINTERP_API properties : public base_properties
+   {
+   public:
+     // See the genprops.awk script for an explanation of the
+     // properties declarations.
+ 
+     BEGIN_PROPERTIES (text)
+-      string_property string , ""
+-      radio_property units , "{data}|pixels|normalized|inches|centimeters|points"
++      string_property string u , ""
++      radio_property units u , "{data}|pixels|normalized|inches|centimeters|points"
+       array_property position u , Matrix (1, 3, 0.0)
+-      double_property rotation , 0
++      double_property rotation u , 0
+       radio_property horizontalalignment , "{left}|center|right"
+       color_property color , color_values (0, 0, 0)
+-      string_property fontname , OCTAVE_DEFAULT_FONTNAME
+-      double_property fontsize , 10
+-      radio_property fontangle , "{normal}|italic|oblique"
+-      radio_property fontweight , "light|{normal}|demi|bold"
+-      radio_property interpreter , "{tex}|none|latex"
++      string_property fontname u , OCTAVE_DEFAULT_FONTNAME
++      double_property fontsize u , 10
++      radio_property fontangle u , "{normal}|italic|oblique"
++      radio_property fontweight u , "light|{normal}|demi|bold"
++      radio_property interpreter u , "{tex}|none|latex"
+       color_property backgroundcolor , "{none}"
+       string_property displayname , ""
+       color_property edgecolor , "{none}"
+       radio_property erasemode , "{normal}|none|xor|background"
+       bool_property editing , "off"
+       radio_property fontunits , "inches|centimeters|normalized|{points}|pixels"
+       radio_property linestyle , "{-}|--|:|-.|none"
+       double_property linewidth , 0.5
+       double_property margin , 1
+       radio_property verticalalignment , "top|cap|{middle}|baseline|bottom"
++      array_property extent rG , Matrix (1, 4, 0.0)
+       // hidden properties for limit computation
+       row_vector_property xlim hlr , Matrix ()
+       row_vector_property ylim hlr , Matrix ()
+       row_vector_property zlim hlr , Matrix ()
+       bool_property xliminclude hl , "on"
+       bool_property yliminclude hl , "on"
+       bool_property zliminclude hl , "off"
+     END_PROPERTIES
+ 
++    Matrix get_data_position (void) const;
++
+   protected:
+     void init (void)
+       {
++        position.add_constraint (dim_vector (1, 2));
+         position.add_constraint (dim_vector (1, 3));
++        cached_units = get_units ();
+       }
+ 
+   private:
+     void update_position (void)
+       {
+-        Matrix pos = get_position ().matrix_value ();
++        Matrix pos = get_data_position ();
+         Matrix lim;
+ 
+         lim = Matrix (1, 3, pos(0));
+         lim(2) = (lim(2) <= 0 ? octave_Inf : lim(2));
+         set_xlim (lim);
+ 
+         lim = Matrix (1, 3, pos(1));
+         lim(2) = (lim(2) <= 0 ? octave_Inf : lim(2));
+@@ -3288,16 +3300,31 @@ public:
+             lim = Matrix (1, 3, pos(2));
+             lim(2) = (lim(2) <= 0 ? octave_Inf : lim(2));
+             set_zliminclude ("on");
+             set_zlim (lim);
+           }
+         else
+           set_zliminclude ("off");
+       }
++
++    void update_text_extent (void);
++
++    void update_string (void) { update_text_extent (); }
++    void update_rotation (void) { update_text_extent (); }
++    void update_fontname (void) { update_text_extent (); }
++    void update_fontsize (void) { update_text_extent (); }
++    void update_fontangle (void) { update_text_extent (); }
++    void update_fontweight (void) { update_text_extent (); }
++    void update_interpreter (void) { update_text_extent (); }
++
++    void update_units (void);
++
++  private:
++    std::string cached_units;
+   };
+ 
+ private:
+   properties xproperties;
+ 
+ public:
+   text (const graphics_handle& mh, const graphics_handle& p)
+     : base_graphics_object (), xproperties (mh, p)
+diff --git a/src/txt-eng-ft.cc b/src/txt-eng-ft.cc
+--- a/src/txt-eng-ft.cc
++++ b/src/txt-eng-ft.cc
+@@ -438,9 +438,48 @@ ft_render::render (text_element* elt, Ma
+             }
+           break;
+         }
+     }
+ 
+   return pixels;
+ }
+ 
++Matrix
++ft_render::get_extent (text_element *elt, double rotation)
++{
++  set_mode (MODE_BBOX);
++  elt->accept (*this);
++
++  Matrix extent (1, 2, 0.0);
++
++  switch (rotation_to_mode (rotation))
++    {
++    case ROTATION_0:
++    case ROTATION_180:
++      extent(0) = bbox(2);
++      extent(1) = bbox(3);
++      break;
++    case ROTATION_90:
++    case ROTATION_270:
++      extent(0) = bbox(3);
++      extent(1) = bbox(2);
++    }
++
++  return extent;
++}
++
++int
++ft_render::rotation_to_mode (double rotation) const
++{
++  if (rotation == 0.0)
++    return ROTATION_0;
++  else if (rotation == 90.0)
++    return ROTATION_90;
++  else if (rotation == 180.0)
++    return ROTATION_180;
++  else if (rotation == 270.0)
++    return ROTATION_270;
++  else
++    return ROTATION_0;
++}
++
+ #endif // HAVE_FREETYPE
+diff --git a/src/txt-eng-ft.h b/src/txt-eng-ft.h
+--- a/src/txt-eng-ft.h
++++ b/src/txt-eng-ft.h
+@@ -61,23 +61,28 @@ public:
+ 
+   uint8NDArray get_pixels (void) const { return pixels; }
+ 
+   Matrix get_boundingbox (void) const { return bbox; }
+ 
+   uint8NDArray render (text_element* elt, Matrix& box,
+                        int rotation = ROTATION_0);
+ 
++  Matrix get_extent (text_element *elt, double rotation = 0.0);
++
+   void set_font (const base_properties& props);
+ 
+   void set_color (Matrix c);
+ 
+   void set_mode (int m);
+ 
+ private:
++  int rotation_to_mode (double rotation) const;
++
++private:
+   FT_Face face;
+   Matrix bbox;
+   uint8NDArray pixels;
+   int xoffset;
+   int yoffset;  
+   int mode;
+   uint8_t red, green, blue;
+ };

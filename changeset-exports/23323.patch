@@ -1,0 +1,181 @@
+# HG changeset patch
+# User Rik <rik@octave.org>
+# Date 1490163353 25200
+#      Tue Mar 21 23:15:53 2017 -0700
+# Branch stable
+# Node ID 31be59137160242b1bc1c924a8e25c14015f7875
+# Parent  fc344de3afc9320d8fa5cd5b48428d81678c3725
+Don't error out if RANGE specification for dlmread contains large values.
+
+* dlmread.cc (idx_max): Redefine static const variable that holds the maximum
+row or column idx for a range specification to be max octave_idx_type - 1.
+* dlmread.cc (idx_max_dbl): New static const variable that holds the maximum
+possible row or column idx for a range specification as a double value.
+* dlmread.cc (parse_range_spec): Use new idx_max constant.
+Use std::min (x, idx_max_dbl) to eliminate overflow when casting double to
+octave_idx_type.
+* dlmread.cc (Fdlmread): Use new idx_max constant.  After parsing range
+specification, return an empty matrix immediately if range is empty.  When
+skipping lines at beginning of file, look at both the number of lines to skip
+and the output of getline; The EOF may be reached before the number of lines to
+skip.
+
+diff --git a/libinterp/corefcn/dlmread.cc b/libinterp/corefcn/dlmread.cc
+--- a/libinterp/corefcn/dlmread.cc
++++ b/libinterp/corefcn/dlmread.cc
+@@ -37,17 +37,19 @@ along with Octave; see the file COPYING.
+ 
+ #include "defun.h"
+ #include "oct-stream.h"
+ #include "error.h"
+ #include "ovl.h"
+ #include "utils.h"
+ 
+ static const octave_idx_type idx_max =
+-  std::numeric_limits<octave_idx_type>::max ();
++  std::numeric_limits<octave_idx_type>::max () - 1;
++
++static const double idx_max_dbl = double (idx_max);
+ 
+ static bool
+ read_cell_spec (std::istream& is, octave_idx_type& row, octave_idx_type& col)
+ {
+   bool stat = false;
+ 
+   if (is.peek () == std::istream::traits_type::eof ())
+     stat = true;
+@@ -117,18 +119,18 @@ parse_range_spec (const octave_value& ra
+                   ch = is.get ();
+                   if (ch == '.')
+                     {
+                       ch = is.get ();
+                       if (! is || ch != '.')
+                         stat = false;
+                     }
+ 
+-                  rup = idx_max - 1;
+-                  cup = idx_max - 1;
++                  rup = idx_max;
++                  cup = idx_max;
+                 }
+               else
+                 {
+                   rup = rlo;
+                   cup = clo;
+                   if (! is || ! is.eof ())
+                     stat = false;
+                 }
+@@ -138,22 +140,22 @@ parse_range_spec (const octave_value& ra
+       if (stat && is && ! is.eof ())
+         stat = read_cell_spec (is, rup, cup);
+ 
+       if (! is || ! is.eof ())
+         stat = false;
+     }
+   else if (range_spec.is_real_matrix () && range_spec.numel () == 4)
+     {
+-      ColumnVector range(range_spec.vector_value ());
+-      // double --> unsigned int
+-      rlo = static_cast<octave_idx_type> (range(0));
+-      clo = static_cast<octave_idx_type> (range(1));
+-      rup = static_cast<octave_idx_type> (range(2));
+-      cup = static_cast<octave_idx_type> (range(3));
++      ColumnVector range (range_spec.vector_value ());
++      // double --> unsigned int avoiding any overflow
++      rlo = static_cast<octave_idx_type> (std::min (range(0), idx_max_dbl));
++      clo = static_cast<octave_idx_type> (std::min (range(1), idx_max_dbl));
++      rup = static_cast<octave_idx_type> (std::min (range(2), idx_max_dbl));
++      cup = static_cast<octave_idx_type> (std::min (range(3), idx_max_dbl));
+     }
+   else
+     stat = false;
+ 
+   return stat;
+ }
+ 
+ DEFUN (dlmread, args, ,
+@@ -244,33 +246,37 @@ such as text, are also replaced by the @
+         sep = do_string_escapes (args(1).string_value ());
+       else
+         sep = args(1).string_value ();
+     }
+ 
+   // Take a subset if a range was given.
+   octave_idx_type r0 = 0;
+   octave_idx_type c0 = 0;
+-  octave_idx_type r1 = idx_max-1;
+-  octave_idx_type c1 = idx_max-1;
++  octave_idx_type r1 = idx_max;
++  octave_idx_type c1 = idx_max;
+   if (nargin > 2)
+     {
+       if (nargin == 3)
+         {
+           if (! parse_range_spec (args(2), r0, c0, r1, c1))
+             error ("dlmread: error parsing RANGE");
+         }
+       else if (nargin == 4)
+         {
+           r0 = args(2).idx_type_value ();
+           c0 = args(3).idx_type_value ();
+         }
+ 
+       if (r0 < 0 || c0 < 0)
+         error ("dlmread: left & top must be positive");
++
++      // Short-circuit and return if range is empty 
++      if (r1 < r0 || c1 < c0)
++        return ovl (Matrix (0,0));
+     }
+ 
+   octave_idx_type i = 0;
+   octave_idx_type j = 0;
+   octave_idx_type r = 1;
+   octave_idx_type c = 1;
+   octave_idx_type rmax = 0;
+   octave_idx_type cmax = 0;
+@@ -278,20 +284,25 @@ such as text, are also replaced by the @
+   Matrix rdata;
+   ComplexMatrix cdata;
+ 
+   bool iscmplx = false;
+   bool sepflag = false;
+ 
+   std::string line;
+ 
+-  // Skip the r0 leading lines as these might be a header.
+-  for (octave_idx_type m = 0; m < r0; m++)
+-    getline (*input, line);
+-  r1 -= r0;
++  // Skip the r0 leading lines
++  octave_idx_type rcnt = r0;
++  while (rcnt > 0 && getline (*input, line))
++    rcnt--;
++
++  if (rcnt > 0)
++    return ovl (Matrix (0,0));  // Not enough lines in file to satisfy RANGE
++  else
++    r1 -= r0;
+ 
+   std::istringstream tmp_stream;
+ 
+   // Read in the data one field at a time, growing the data matrix
+   // as needed.
+   while (getline (*input, line))
+     {
+       // Skip blank lines for compatibility.
+@@ -504,13 +515,14 @@ such as text, are also replaced by the @
+ %!   assert (dlmread (file, ",", [1, 0, 2, 1]), [4 + 4i, 5; 7, 8]);
+ %!   assert (dlmread (file, ",", "A2..B3"), [4 + 4i, 5; 7, 8]);
+ %!   assert (dlmread (file, ",", "A2:B3"), [4 + 4i, 5; 7, 8]);
+ %!   assert (dlmread (file, ",", "..B3"), [1, 2; 4 + 4i, 5; 7, 8]);
+ %!   assert (dlmread (file, ",", 1, 0), [4 + 4i, 5, 6; 7, 8, 9; 10, 11, 12]);
+ %!   assert (dlmread (file, ",", "A2.."), [4 + 4i, 5, 6; 7, 8, 9; 10, 11, 12]);
+ %!   assert (dlmread (file, ",", 10, 0), []);
+ %!   assert (dlmread (file, ",", 0, 10), []);
++%!   assert (dlmread (file, ",", [0, 4, 0, Inf]), []);
+ %! unwind_protect_cleanup
+ %!   unlink (file);
+ %! end_unwind_protect
+ 
+ */

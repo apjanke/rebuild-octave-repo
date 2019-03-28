@@ -1,0 +1,1300 @@
+# HG changeset patch
+# User Sébastien Villemot <sebastien@debian.org>
+# Date 1526207857 -7200
+#      Sun May 13 12:37:37 2018 +0200
+# Branch stable
+# Node ID da2b38b7a077268bb0043256bd7d85b3bf93d219
+# Parent  e8961d677661fa7db7cc911556a7f839c28d0e56
+Use LAPACK DTGSEN subrouting for ordered-qz computation (bug #53761)
+
+* qz.cc: Use LAPACK's DTGSEN to compute and update generalized
+eigenvalues. Selection of eigenvalue cluster is now done by filling a
+vector of booleans, rather than through a selection function.  New
+tests for the four variants of the ordered QZ.
+
+* lo-lapack-proto.h (DTGSEN): New prototype.
+
+* liboctave/external/ordered-qz: Delete directory.
+* liboctave/external/module.mk: Update.
+
+diff --git a/libinterp/corefcn/qz.cc b/libinterp/corefcn/qz.cc
+--- a/libinterp/corefcn/qz.cc
++++ b/libinterp/corefcn/qz.cc
+@@ -17,17 +17,18 @@ GNU General Public License for more deta
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+ <https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ // Generalized eigenvalue balancing via LAPACK
+ 
+-// Author: A. S. Hodel <scotte@eng.auburn.edu>
++// Originally written by A. S. Hodel <scotte@eng.auburn.edu>, but is
++// substantially different with the change to use LAPACK.
+ 
+ #undef DEBUG
+ #undef DEBUG_SORT
+ #undef DEBUG_EIG
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+@@ -50,89 +51,19 @@ along with Octave; see the file COPYING.
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "ovl.h"
+ #if defined (DEBUG) || defined (DEBUG_SORT)
+ #  include "pr-output.h"
+ #endif
+ 
+-typedef F77_INT (*sort_function) (const F77_INT& LSIZE,
+-                                  const double& ALPHA, const double& BETA,
+-                                  const double& S, const double& P);
+-
+-extern "C"
+-{
+-  // Van Dooren's code (netlib.org: toms/590) for reordering GEP.
+-  // Only processes Z, not Q.
+-  F77_RET_T
+-  F77_FUNC (dsubsp, DSUBSP) (const F77_INT& NMAX, const F77_INT& N,
+-                             F77_DBLE *A, F77_DBLE *B, F77_DBLE *Z,
+-                             sort_function, const F77_DBLE& EPS,
+-                             F77_INT& NDIM, F77_INT& FAIL, F77_INT *IND);
+-}
+-
+-// fcrhp, fin, fout, folhp:
+-// Routines for ordering of generalized eigenvalues.
+-// Return 1 if test is passed, 0 otherwise.
+-//   fin:  |lambda| < 1
+-//   fout: |lambda| >= 1
+-//   fcrhp: real(lambda) >= 0
+-//   folhp: real(lambda) < 0
+-
+-static F77_INT
+-fcrhp (const F77_INT& lsize, const double& alpha, const double& beta,
+-       const double& s, const double&)
+-{
+-  if (lsize == 1)
+-    return (alpha * beta >= 0 ? 1 : -1);
+-  else
+-    return (s >= 0 ? 1 : -1);
+-}
++// FIXME: Matlab does not produce lambda as the first output argument.
++// Compatibility problem?
+ 
+-static F77_INT
+-fin (const F77_INT& lsize, const double& alpha, const double& beta,
+-     const double&, const double& p)
+-{
+-  F77_INT retval;
+-
+-  if (lsize == 1)
+-    retval = (std::abs (alpha) < std::abs (beta) ? 1 : -1);
+-  else
+-    retval = (std::abs (p) < 1 ? 1 : -1);
+-
+-#if defined (DEBUG)
+-  std::cout << "qz: fin: retval=" << retval << std::endl;
+-#endif
+-
+-  return retval;
+-}
+-
+-static F77_INT
+-folhp (const F77_INT& lsize, const double& alpha, const double& beta,
+-       const double& s, const double&)
+-{
+-  if (lsize == 1)
+-    return (alpha * beta < 0 ? 1 : -1);
+-  else
+-    return (s < 0 ? 1 : -1);
+-}
+-
+-static F77_INT
+-fout (const F77_INT& lsize, const double& alpha, const double& beta,
+-      const double&, const double& p)
+-{
+-  if (lsize == 1)
+-    return (std::abs (alpha) >= std::abs (beta) ? 1 : -1);
+-  else
+-    return (std::abs (p) >= 1 ? 1 : -1);
+-}
+-
+-//FIXME: Matlab does not produce lambda as the first output argument.
+-//       Compatibility problem?
+ DEFUN (qz, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{lambda} =} qz (@var{A}, @var{B})
+ @deftypefnx {} {[@var{AA}, @var{BB}, @var{Q}, @var{Z}, @var{V}, @var{W}, @var{lambda}] =} qz (@var{A}, @var{B})
+ @deftypefnx {} {[@var{AA}, @var{BB}, @var{Z}] =} qz (@var{A}, @var{B}, @var{opt})
+ @deftypefnx {} {[@var{AA}, @var{BB}, @var{Z}, @var{lambda}] =} qz (@var{A}, @var{B}, @var{opt})
+ Compute the QZ@tie{}decomposition of a generalized eigenvalue problem.
+ 
+@@ -249,18 +180,18 @@ Note: @code{qz} performs permutation bal
+   if (nargin == 3 && (nargout < 3 || nargout > 4))
+     error ("qz: invalid number of output arguments for form 3 call");
+ 
+ #if defined (DEBUG)
+   std::cout << "qz: determine ordering option" << std::endl;
+ #endif
+ 
+   // Determine ordering option.
+-  // declared volatile to avoid compiler warnings about long jumps vforks.
+-  volatile char ord_job = 'N';
++
++  char ord_job = 'N';
+   double safmin = 0.0;
+ 
+   if (nargin == 3)
+     {
+       std::string opt = args(2).xstring_value ("qz: OPT must be a string");
+ 
+       if (opt.empty ())
+         error ("qz: OPT must be a non-empty string");
+@@ -348,19 +279,17 @@ Note: @code{qz} performs permutation bal
+ 
+   if (args(1).iscomplex ())
+     cbb = args(1).complex_matrix_value ();
+   else
+     bb = args(1).matrix_value ();
+ 
+   // Both matrices loaded, now check whether to calculate complex or real val.
+ 
+-  // declared volatile to avoid compiler warnings about long jumps vforks.
+-  volatile bool complex_case
+-    = (args(0).iscomplex () || args(1).iscomplex ());
++  bool complex_case = (args(0).iscomplex () || args(1).iscomplex ());
+ 
+   if (nargin == 3 && complex_case)
+     error ("qz: cannot re-order complex qz decomposition");
+ 
+   // First, declare variables used in both the real and complex cases.
+   // FIXME: There are a lot of excess variables declared.
+   //        Probably a better way to handle this.
+   Matrix QQ (nn,nn), ZZ (nn,nn), VR (nn,nn), VL (nn,nn);
+@@ -652,204 +581,81 @@ Note: @code{qz} performs permutation bal
+         // Probably not needed, but better be safe.
+         error ("qz: cannot re-order complex QZ decomposition");
+ 
+ #if defined (DEBUG_SORT)
+       std::cout << "qz: ordering eigenvalues: ord_job = "
+                 << ord_job << std::endl;
+ #endif
+ 
+-      // Declared static to avoid vfork/long jump compiler complaints.
+-      static sort_function sort_test;
+-      sort_test = nullptr;
++      Array<F77_LOGICAL> select (dim_vector (nn, 1));
+ 
+-      switch (ord_job)
++      for (int j = 0; j < nn; j++)
+         {
+-        case 'S':
+-          sort_test = &fin;
+-          break;
++          switch (ord_job)
++            {
++            case 'S':
++              select(j) = alphar(j)*alphar(j) + alphai(j)*alphai(j) < betar(j)*betar(j);
++              break;
+ 
+-        case 'B':
+-          sort_test = &fout;
+-          break;
++            case 'B':
++              select(j) = alphar(j)*alphar(j) + alphai(j)*alphai(j) >= betar(j)*betar(j);
++              break;
+ 
+-        case '+':
+-          sort_test = &fcrhp;
+-          break;
++            case '+':
++              select(j) = alphar(j) * betar(j) >= 0;
++              break;
+ 
+-        case '-':
+-          sort_test = &folhp;
+-          break;
++            case '-':
++              select(j) = alphar(j) * betar(j) < 0;
++              break;
+ 
+-        default:
+-          // Invalid order option
+-          // (should never happen since options were checked at the top).
+-          panic_impossible ();
+-          break;
++            default:
++              // Invalid order option
++              // (should never happen since options were checked at the top).
++              panic_impossible ();
++              break;
++            }
+         }
+ 
+-      double inf_norm;
++      F77_LOGICAL wantq = 0, wantz = (comp_z == 'V');
++      F77_INT ijob = 0, mm, lrwork3 = 4*nn+16, liwork = nn;
++      F77_DBLE pl, pr;
++      RowVector rwork3(lrwork3);
++      Array<F77_INT> iwork (dim_vector (liwork, 1));
+ 
+-      F77_XFCN (xdlange, XDLANGE,
+-                (F77_CONST_CHAR_ARG2 ("I", 1),
+-                 nn, nn, aa.data (), nn, work.fortran_vec (), inf_norm
+-                 F77_CHAR_ARG_LEN (1)));
+-
+-      double eps = std::numeric_limits<double>::epsilon () * inf_norm * nn;
++      F77_XFCN (dtgsen, DTGSEN,
++                (ijob, wantq, wantz,
++                 select.fortran_vec (), nn,
++                 aa.fortran_vec (), nn,
++                 bb.fortran_vec (), nn,
++                 alphar.fortran_vec (),
++                 alphai.fortran_vec (),
++                 betar.fortran_vec (),
++                 nullptr, nn,
++                 ZZ.fortran_vec (), nn,
++                 mm,
++                 pl, pr,
++                 nullptr,
++                 rwork3.fortran_vec (), lrwork3,
++                 iwork.fortran_vec (), liwork,
++                 info));
+ 
+ #if defined (DEBUG_SORT)
+-      std::cout << "qz: calling dsubsp: aa=" << std::endl;
+-      octave_print_internal (std::cout, aa, 0);
+-      std::cout << std::endl << "bb="  << std::endl;
+-      octave_print_internal (std::cout, bb, 0);
+-      if (comp_z == 'V')
+-        {
+-          std::cout << std::endl << "ZZ="  << std::endl;
+-          octave_print_internal (std::cout, ZZ, 0);
+-        }
+-      std::cout << std::endl;
+-      std::cout << "alphar = " << std::endl;
+-      octave_print_internal (std::cout, (Matrix) alphar, 0);
+-      std::cout << std::endl << "alphai = " << std::endl;
+-      octave_print_internal (std::cout, (Matrix) alphai, 0);
+-      std::cout << std::endl << "beta = " << std::endl;
+-      octave_print_internal (std::cout, (Matrix) betar, 0);
+-      std::cout << std::endl;
+-#endif
+-
+-      Array<F77_INT> ind (dim_vector (nn, 1));
+-
+-      F77_INT ndim, fail;
+-
+-      F77_XFCN (dsubsp, DSUBSP,
+-                (nn, nn, aa.fortran_vec (), bb.fortran_vec (),
+-                 ZZ.fortran_vec (), sort_test, eps, ndim, fail,
+-                 ind.fortran_vec ()));
+-
+-#if defined (DEBUG)
+-      std::cout << "qz: back from dsubsp: aa=" << std::endl;
+-      octave_print_internal (std::cout, aa, 0);
+-      std::cout << std::endl << "bb="  << std::endl;
+-      octave_print_internal (std::cout, bb, 0);
+-      if (comp_z == 'V')
+-        {
+-          std::cout << std::endl << "ZZ="  << std::endl;
+-          octave_print_internal (std::cout, ZZ, 0);
+-        }
+-      std::cout << std::endl;
+-#endif
+-
+-      // Manually update alphar, alphai, betar.
+-      static F77_INT j;
+-
+-      j = 0;
+-      while (j < nn)
+-        {
+-#if defined (DEBUG_EIG)
+-          std::cout << "computing gen eig #" << j << std::endl;
+-#endif
+-
+-          // Number of zeros in this block.
+-          static F77_INT zcnt;
+-
+-          if (j == (nn-1))
+-            zcnt = 1;
+-          else if (aa(j+1,j) == 0)
+-            zcnt = 1;
+-          else zcnt = 2;
+-
+-          if (zcnt == 1)
+-            {
+-              // Real zero.
+-#if defined (DEBUG_EIG)
+-              std::cout << "  single gen eig:" << std::endl;
+-              std::cout << "  alphar(" << j << ") = " << aa(j,j)
+-                        << std::endl;
+-              std::cout << "  betar(" << j << ") = " << bb(j,j)
+-                        << std::endl;
+-              std::cout << "  alphai(" << j << ") = 0" << std::endl;
+-#endif
+-
+-              alphar(j) = aa(j,j);
+-              alphai(j) = 0;
+-              betar(j) = bb(j,j);
+-            }
+-          else
+-            {
+-              // Complex conjugate pair.
+-#if defined (DEBUG_EIG)
+-              std::cout << "qz: calling dlag2:" << std::endl;
+-              std::cout << "safmin="
+-                        << setiosflags (std::ios::scientific)
+-                        << safmin << std::endl;
+-
+-              for (F77_INT idr = j; idr <= j+1; idr++)
+-                {
+-                  for (F77_INT idc = j; idc <= j+1; idc++)
+-                    {
+-                      std::cout << "aa(" << idr << ',' << idc << ")="
+-                                << aa(idr,idc) << std::endl;
+-                      std::cout << "bb(" << idr << ',' << idc << ")="
+-                                << bb(idr,idc) << std::endl;
+-                    }
+-                }
+-#endif
+-
+-              // FIXME: probably should be using
+-              // fortran_vec instead of &aa(j,j) here.
+-
+-              double scale1, scale2, wr1, wr2, wi;
+-              const double *aa_ptr = aa.data () + j * nn + j;
+-              const double *bb_ptr = bb.data () + j * nn + j;
+-              F77_XFCN (dlag2, DLAG2,
+-                        (aa_ptr, nn, bb_ptr, nn, safmin,
+-                         scale1, scale2, wr1, wr2, wi));
+-
+-#if defined (DEBUG_EIG)
+-              std::cout << "dlag2 returns: scale1=" << scale1
+-                        << "\tscale2=" << scale2 << std::endl
+-                        << "\twr1=" << wr1 << "\twr2=" << wr2
+-                        << "\twi=" << wi << std::endl;
+-#endif
+-
+-              // Just to be safe, check if it's a real pair.
+-              if (wi == 0)
+-                {
+-                  alphar(j) = wr1;
+-                  alphai(j) = 0;
+-                  betar(j) = scale1;
+-                  alphar(j+1) = wr2;
+-                  alphai(j+1) = 0;
+-                  betar(j+1) = scale2;
+-                }
+-              else
+-                {
+-                  alphar(j) = alphar(j+1) = wr1;
+-                  alphai(j) = -(alphai(j+1) = wi);
+-                  betar(j)  = betar(j+1) = scale1;
+-                }
+-            }
+-
+-          // Advance past this block.
+-          j += zcnt;
+-        }
+-
+-#if defined (DEBUG_SORT)
+-      std::cout << "qz: back from dsubsp: aa=" << std::endl;
++      std::cout << "qz: back from dtgsen: aa=" << std::endl;
+       octave_print_internal (std::cout, aa, 0);
+       std::cout << std::endl << "bb="  << std::endl;
+       octave_print_internal (std::cout, bb, 0);
+ 
+       if (comp_z == 'V')
+         {
+           std::cout << std::endl << "ZZ="  << std::endl;
+           octave_print_internal (std::cout, ZZ, 0);
+         }
+-      std::cout << std::endl << "qz: ndim=" << ndim << std::endl
+-                << "fail=" << fail << std::endl;
++      std::cout << std::endl << "qz: info=" << info << std::endl;
+       std::cout << "alphar = " << std::endl;
+       octave_print_internal (std::cout, (Matrix) alphar, 0);
+       std::cout << std::endl << "alphai = " << std::endl;
+       octave_print_internal (std::cout, (Matrix) alphai, 0);
+       std::cout << std::endl << "beta = " << std::endl;
+       octave_print_internal (std::cout, (Matrix) betar, 0);
+       std::cout << std::endl;
+ #endif
+@@ -1117,9 +923,31 @@ Note: @code{qz} performs permutation bal
+ %! assert (q * b * z, bb, norm (bb) * 1e-14);
+ 
+ %!test
+ %! A = [0, 0, -1, 0; 1, 0, 0, 0; -1, 0, -2, -1; 0, -1, 1, 0];
+ %! B = [0, 0, 0, 0; 0, 1, 0, 0; 0, 0, 1, 0; 0, 0, 0, 1];
+ %! [AA, BB, Q, Z1] = qz (A, B);
+ %! [AA, BB, Z2] = qz (A, B, "-");
+ %! assert (Z1, Z2);
++
++%!test
++%! A = [ -1.03428  0.24929  0.43205 -0.12860;
++%!        1.16228  0.27870  2.12954  0.69250;
++%!       -0.51524 -0.34939 -0.77820  2.13721;
++%!       -1.32941  2.11870  0.72005  1.00835 ];
++%! B = [  1.407302 -0.632956 -0.360628  0.068534;
++%!        0.149898  0.298248  0.991777  0.023652;
++%!        0.169281 -0.405205 -1.775834  1.511730;
++%!        0.717770  1.291390 -1.766607 -0.531352 ];
++%! [AA, BB, Z, lambda] = qz (A, B, "+");
++%! assert (all (real (lambda(1:3)) >= 0))
++%! assert (real (lambda(4) < 0))
++%! [AA, BB, Z, lambda] = qz (A, B, "-");
++%! assert (real (lambda(1) < 0))
++%! assert (all (real (lambda(2:4)) >= 0))
++%! [AA, BB, Z, lambda] = qz (A, B, "B");
++%! assert (all (abs (lambda(1:3)) >= 1))
++%! assert (abs (lambda(4) < 1))
++%! [AA, BB, Z, lambda] = qz (A, B, "S");
++%! assert (abs (lambda(1) < 1))
++%! assert (all (abs (lambda(2:4)) >= 1))
+ */
+diff --git a/liboctave/external/module.mk b/liboctave/external/module.mk
+--- a/liboctave/external/module.mk
++++ b/liboctave/external/module.mk
+@@ -12,17 +12,16 @@ include %reldir%/amos/module.mk
+ include %reldir%/blas-xtra/module.mk
+ include %reldir%/daspk/module.mk
+ include %reldir%/dasrt/module.mk
+ include %reldir%/dassl/module.mk
+ include %reldir%/Faddeeva/module.mk
+ include %reldir%/fftpack/module.mk
+ include %reldir%/lapack-xtra/module.mk
+ include %reldir%/odepack/module.mk
+-include %reldir%/ordered-qz/module.mk
+ include %reldir%/quadpack/module.mk
+ include %reldir%/ranlib/module.mk
+ include %reldir%/slatec-err/module.mk
+ include %reldir%/slatec-fn/module.mk
+ 
+ %reldir%/external.def: $(%canon_reldir%_libexternal_la_SOURCES) %reldir%/mk-f77-def.sh
+ 	$(AM_V_GEN)rm -f $@-t $@ && \
+ 	$(SHELL) %reldir%/mk-f77-def.sh $(srcdir) $(%canon_reldir%_libexternal_la_SOURCES) > $@-t && \
+diff --git a/liboctave/external/ordered-qz/README b/liboctave/external/ordered-qz/README
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/README
++++ /dev/null
+@@ -1,2 +0,0 @@
+-Code in this directory is adapted from Paul Van Dooren's toms/590
+-code.  Modifications are listed in the comment header sections.
+diff --git a/liboctave/external/ordered-qz/dsubsp.f b/liboctave/external/ordered-qz/dsubsp.f
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/dsubsp.f
++++ /dev/null
+@@ -1,104 +0,0 @@
+-      SUBROUTINE DSUBSP(NMAX, N, A, B, Z, FTEST, EPS, NDIM, FAIL, IND)
+-      INTEGER NMAX, N, FTEST, NDIM, IND(N)
+-      LOGICAL FAIL
+-      DOUBLE PRECISION A(NMAX,N), B(NMAX,N), Z(NMAX,N), EPS
+-C*
+-C* GIVEN THE UPPER TRIANGULAR MATRIX B AND UPPER HESSENBERG MATRIX A
+-C* WITH 1X1 OR 2X2 DIAGONAL BLOCKS, THIS ROUTINE REORDERS THE DIAGONAL
+-C* BLOCKS ALONG WITH THEIR GENERALIZED EIGENVALUES BY CONSTRUCTING EQUI-
+-C* VALENCE TRANSFORMATIONS QT AND ZT. THE ROW TRANSFORMATION ZT IS ALSO
+-C* PERFORMED ON THE GIVEN (INITIAL) TRANSFORMATION Z (RESULTING FROM A
+-C* POSSIBLE PREVIOUS STEP OR INITIALIZED WITH THE IDENTITY MATRIX).
+-C* AFTER REORDERING, THE EIGENVALUES INSIDE THE REGION SPECIFIED BY THE
+-C* FUNCTION FTEST APPEAR AT THE TOP. IF NDIM IS THEIR NUMBER THEN THE
+-C* NDIM FIRST COLUMNS OF Z SPAN THE REQUESTED SUBSPACE. DSUBSP REQUIRES
+-C* THE SUBROUTINE EXCHQZ AND THE INTEGER FUNCTION FTEST WHICH HAS TO BE
+-C* PROVIDED BY THE USER. THE PARAMETERS IN THE CALLING SEQUENCE ARE :
+-C* (STARRED PARAMETERS ARE ALTERED BY THE SUBROUTINE)
+-C*
+-C*    NMAX     THE FIRST DIMENSION OF A, B AND Z
+-C*    N        THE ORDER OF A, B AND Z
+-C*   *A,*B     THE MATRIX PAIR WHOSE BLOCKS ARE TO BE REORDERED.
+-C*   *Z        UPON RETURN THIS ARRAY IS MULTIPLIED BY THE COLUMN
+-C*             TRANSFORMATION ZT.
+-C*    FTEST(LS,ALPHA,BETA,S,P) AN INTEGER FUNCTION DESCRIBING THE
+-C*             SPECTRUM OF THE DEFLATING SUBSPACE TO BE COMPUTED:
+-C*             WHEN LS=1 FTEST CHECKS IF ALPHA/BETA IS IN THAT SPECTRUM
+-C*             WHEN LS=2 FTEST CHECKS IF THE TWO COMPLEX CONJUGATE
+-C*             ROOTS WITH SUM S AND PRODUCT P ARE IN THAT SPECTRUM
+-C*             IF THE ANSWER IS POSITIVE, FTEST=1, OTHERWISE FTEST=-1
+-C*    EPS      THE REQUIRED ABSOLUTE ACCURACY OF THE RESULT
+-C*   *NDIM     AN INTEGER GIVING THE DIMENSION OF THE COMPUTED
+-C*             DEFLATING SUBSPACE
+-C*   *FAIL     A LOGICAL VARIABLE WHICH IS FALSE ON A NORMAL RETURN,
+-C*             TRUE OTHERWISE (WHEN EXCHQZ FAILS)
+-C*   *IND      AN INTEGER WORKING ARRAY OF DIMENSION AT LEAST N
+-C*
+-      INTEGER L, LS, LS1, LS2, L1, LL, NUM, IS, L2I, L2K, I, K, II,
+-     * ISTEP, IFIRST
+-      DOUBLE PRECISION S, P, D, ALPHA, BETA
+-      FAIL = .TRUE.
+-      NDIM = 0
+-      NUM = 0
+-      L = 0
+-      LS = 1
+-C*** CONSTRUCT ARRAY IND(I) WHERE :
+-C***     IABS(IND(I)) IS THE SIZE OF THE BLOCK I
+-C***     SIGN(IND(I)) INDICATES THE LOCATION OF ITS EIGENVALUES
+-C***                  (AS DETERMINED BY FTEST).
+-C*** NUM IS THE NUMBER OF ELEMENTS IN THIS ARRAY
+-      DO 30 LL=1,N
+-        L = L + LS
+-        IF (L.GT.N) GO TO 40
+-        L1 = L + 1
+-        IF (L1.GT.N) GO TO 10
+-        IF (A(L1,L).EQ.0.) GO TO 10
+-C* HERE A 2X2  BLOCK IS CHECKED *
+-        LS = 2
+-        D = B(L,L)*B(L1,L1)
+-        S = (A(L,L)*B(L1,L1)+A(L1,L1)*B(L,L)-A(L1,L)*B(L,L1))/D
+-        P = (A(L,L)*A(L1,L1)-A(L,L1)*A(L1,L))/D
+-        IS = FTEST(LS,ALPHA,BETA,S,P)
+-        GO TO 20
+-C* HERE A 1X1  BLOCK IS CHECKED *
+-   10   LS = 1
+-        IS = FTEST(LS,A(L,L),B(L,L),S,P)
+-   20   NUM = NUM + 1
+-        IF (IS.EQ.1) NDIM = NDIM + LS
+-        IND(NUM) = LS*IS
+-   30 CONTINUE
+-C***  REORDER BLOCKS SUCH THAT THOSE WITH POSITIVE VALUE
+-C***    OF IND(.) APPEAR FIRST.
+-   40 L2I = 1
+-      DO 100 I=1,NUM
+-        IF (IND(I).GT.0) GO TO 90
+-C* IF A NEGATIVE IND(I) IS ENCOUNTERED, THEN SEARCH FOR THE FIRST
+-C* POSITIVE IND(K) FOLLOWING ON IT
+-        L2K = L2I
+-        DO 60 K=I,NUM
+-          IF (IND(K).LT.0) GO TO 50
+-          GO TO 70
+-   50     L2K = L2K - IND(K)
+-   60   CONTINUE
+-C* IF THERE ARE NO POSITIVE INDICES FOLLOWING ON A NEGATIVE ONE
+-C* THEN STOP
+-        GO TO 110
+-C* IF A POSITIVE IND(K) FOLLOWS ON A NEGATIVE IND(I) THEN
+-C* INTERCHANGE BLOCK K BEFORE BLOCK I BY PERFORMING K-I SWAPS
+-   70   ISTEP = K - I
+-        LS2 = IND(K)
+-        L = L2K
+-        DO 80 II=1,ISTEP
+-          IFIRST = K - II
+-          LS1 = -IND(IFIRST)
+-          L = L - LS1
+-          CALL EXCHQZ(NMAX, N, A, B, Z, L, LS1, LS2, EPS, FAIL)
+-          IF (FAIL) RETURN
+-          IND(IFIRST+1) = IND(IFIRST)
+-   80   CONTINUE
+-        IND(I) = LS2
+-   90   L2I = L2I + IND(I)
+-  100 CONTINUE
+-  110 FAIL = .FALSE.
+-      RETURN
+-      END
+diff --git a/liboctave/external/ordered-qz/exchqz.f b/liboctave/external/ordered-qz/exchqz.f
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/exchqz.f
++++ /dev/null
+@@ -1,263 +0,0 @@
+-      SUBROUTINE EXCHQZ(NMAX, N, A, B, Z, L, LS1, LS2, EPS, FAIL)
+-      INTEGER NMAX, N, L, LS1, LS2
+-      DOUBLE PRECISION A(NMAX,N), B(NMAX,N), Z(NMAX,N), EPS
+-      LOGICAL FAIL
+-c modified july 9, 1998 a.s.hodel@eng.auburn.edu:
+-c     REAL changed to DOUBLE PRECISION
+-c     calls to AMAX1 changed to call MAX instead.
+-c     calls to SROT  changed to DROT  (both in BLAS)
+-c     calls to giv changed to dlartg (LAPACK); required new variable tempr
+-C*
+-C* GIVEN THE UPPER TRIANGULAR MATRIX B AND UPPER HESSENBERG MATRIX A
+-C* WITH CONSECUTIVE LS1XLS1 AND LS2XLS2 DIAGONAL BLOCKS (LS1,LS2.LE.2)
+-C* STARTING AT ROW/COLUMN L, EXCHQZ PRODUCES EQUIVALENCE TRANSFORMA-
+-C* TIONS QT AND ZT THAT EXCHANGE THE BLOCKS ALONG WITH THEIR GENERALIZED
+-C* EIGENVALUES. EXCHQZ REQUIRES THE SUBROUTINES DROT (BLAS) AND GIV.
+-C* THE PARAMETERS IN THE CALLING SEQUENCE ARE (STARRED PARAMETERS ARE
+-C* ALTERED BY THE SUBROUTINE):
+-C*
+-C*    NMAX     THE FIRST DIMENSION OF A, B AND Z
+-C*    N        THE ORDER OF A, B AND Z
+-C*   *A,*B     THE MATRIX PAIR WHOSE BLOCKS ARE TO BE INTERCHANGED
+-C*   *Z        UPON RETURN THIS ARRAY IS MULTIPLIED BY THE COLUMN
+-C*             TRANSFORMATION ZT.
+-C*    L        THE POSITION OF THE BLOCKS
+-C*    LS1      THE SIZE OF THE FIRST BLOCK
+-C*    LS2      THE SIZE OF THE SECOND BLOCK
+-C*    EPS      THE REQUIRED ABSOLUTE ACCURACY OF THE RESULT
+-C*   *FAIL     A LOGICAL VARIABLE WHICH IS FALSE ON A NORMAL RETURN,
+-C*             TRUE OTHERWISE.
+-C*
+-      INTEGER I, J, L1, L2, L3, LI, LJ, LL, IT1, IT2
+-      DOUBLE PRECISION U(3,3), D, E, F, G, SA, SB, A11B11, A21B11,
+-     * A12B22, B12B22,
+-     * A22B22, AMMBMM, ANMBMM, AMNBNN, BMNBNN, ANNBNN, TEMPR
+-      LOGICAL ALTB
+-      FAIL = .FALSE.
+-      L1 = L + 1
+-      LL = LS1 + LS2
+-      IF (LL.GT.2) GO TO 10
+-C*** INTERCHANGE 1X1 AND 1X1 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION       A:=Q*A*Z , B:=Q*B*Z
+-C*** WHERE Q AND Z ARE GIVENS ROTATIONS
+-      F = MAX(ABS(A(L1,L1)),ABS(B(L1,L1)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L1,L1)).GE.F) ALTB = .FALSE.
+-      SA = A(L1,L1)/F
+-      SB = B(L1,L1)/F
+-      F = SA*B(L,L) - SB*A(L,L)
+-C* CONSTRUCT THE COLUMN TRANSFORMATION Z
+-      G = SA*B(L,L1) - SB*A(L,L1)
+-      CALL DLARTG(F, G, D, E,TEMPR)
+-      CALL DROT(L1, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL DROT(L1, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL DROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* CONSTRUCT THE ROW TRANSFORMATION Q
+-      IF (ALTB) CALL DLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL DLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-      A(L1,L) = 0.
+-      B(L1,L) = 0.
+-      RETURN
+-C*** INTERCHANGE 1X1 AND 2X2 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION  A:=Q2*Q1*A*Z1*Z2 , B:=Q2*Q1*B*Z1*Z2
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-   10 L2 = L + 2
+-      IF (LS1.EQ.2) GO TO 60
+-      G = MAX(ABS(A(L,L)),ABS(B(L,L)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L,L)).LT.G) GO TO 20
+-      ALTB = .FALSE.
+-      CALL DLARTG(A(L1,L1), A(L2,L1), D, E,TEMPR)
+-      CALL DROT(N-L, A(L1,L1), NMAX, A(L2,L1), NMAX, D, E)
+-      CALL DROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-C**  EVALUATE THE PENCIL AT THE EIGENVALUE CORRESPONDING
+-C**  TO THE 1X1 BLOCK
+-   20 SA = A(L,L)/G
+-      SB = B(L,L)/G
+-      DO 40 J=1,2
+-        LJ = L + J
+-        DO 30 I=1,3
+-          LI = L + I - 1
+-          U(I,J) = SA*B(LI,LJ) - SB*A(LI,LJ)
+-   30   CONTINUE
+-   40 CONTINUE
+-      CALL DLARTG(U(3,1), U(3,2), D, E,TEMPR)
+-      CALL DROT(3, U(1,1), 1, U(1,2), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q1
+-      CALL DLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-      U(2,2) = -U(1,2)*E + U(2,2)*D
+-      CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z1
+-      IF (ALTB) CALL DLARTG(B(L1,L), B(L1,L1), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL DLARTG(A(L1,L), A(L1,L1), D, E,TEMPR)
+-      CALL DROT(L2, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL DROT(L2, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL DROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q2
+-      CALL DLARTG(U(2,2), U(3,2), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L1,L), NMAX, B(L2,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z2
+-      IF (ALTB) CALL DLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL DLARTG(A(L2,L1), A(L2,L2), D, E,TEMPR)
+-      CALL DROT(L2, A(1,L1), 1, A(1,L2), 1, E, -D)
+-      CALL DROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-      CALL DROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-      IF (ALTB) GO TO 50
+-      CALL DLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO
+-   50 A(L2,L) = 0.
+-      A(L2,L1) = 0.
+-      B(L1,L) = 0.
+-      B(L2,L) = 0.
+-      B(L2,L1) = 0.
+-      RETURN
+-C*** INTERCHANGE 2X2 AND 1X1 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION  A:=Q2*Q1*A*Z1*Z2 , B:=Q2*Q1*B*Z1*Z2
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-   60 IF (LS2.EQ.2) GO TO 110
+-      G = MAX(ABS(A(L2,L2)),ABS(B(L2,L2)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L2,L2)).LT.G) GO TO 70
+-      ALTB = .FALSE.
+-      CALL DLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C**  EVALUATE THE PENCIL AT THE EIGENVALUE CORRESPONDING
+-C**  TO THE 1X1 BLOCK
+-   70 SA = A(L2,L2)/G
+-      SB = B(L2,L2)/G
+-      DO 90 I=1,2
+-        LI = L + I - 1
+-        DO 80 J=1,3
+-          LJ = L + J - 1
+-          U(I,J) = SA*B(LI,LJ) - SB*A(LI,LJ)
+-   80   CONTINUE
+-   90 CONTINUE
+-      CALL DLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-      CALL DROT(3, U(1,1), 3, U(2,1), 3, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z1
+-      CALL DLARTG(U(2,2), U(2,3), D, E,TEMPR)
+-      U(1,2) = U(1,2)*E - U(1,3)*D
+-      CALL DROT(L2, A(1,L1), 1, A(1,L2), 1, E, -D)
+-      CALL DROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-      CALL DROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q1
+-      IF (ALTB) CALL DLARTG(B(L1,L1), B(L2,L1), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL DLARTG(A(L1,L1), A(L2,L1), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L1,L), NMAX, B(L2,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z2
+-      CALL DLARTG(U(1,1), U(1,2), D, E,TEMPR)
+-      CALL DROT(L2, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL DROT(L2, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL DROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q2
+-      IF (ALTB) CALL DLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL DLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-      IF (ALTB) GO TO 100
+-      CALL DLARTG(B(L1,L1), B(L2,L1), D, E,TEMPR)
+-      CALL DROT(N-L, A(L1,L1), NMAX, A(L2,L1), NMAX, D, E)
+-      CALL DROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO
+-  100 A(L1,L) = 0.
+-      A(L2,L) = 0.
+-      B(L1,L) = 0.
+-      B(L2,1) = 0.
+-      B(L2,L1) = 0.
+-      RETURN
+-C*** INTERCHANGE 2X2 AND 2X2 BLOCKS VIA A SEQUENCE OF
+-C*** QZ-STEPS REALIZED BY THE EQUIVALENCE TRANSFORMATIONS
+-C***          A:=Q5*Q4*Q3*Q2*Q1*A*Z1*Z2*Z3*Z4*Z5
+-C***          B:=Q5*Q4*Q3*Q2*Q1*B*Z1*Z2*Z3*Z4*Z5
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-  110 L3 = L + 3
+-C* COMPUTE IMPLICIT SHIFT
+-      AMMBMM = A(L,L)/B(L,L)
+-      ANMBMM = A(L1,L)/B(L,L)
+-      AMNBNN = A(L,L1)/B(L1,L1)
+-      ANNBNN = A(L1,L1)/B(L1,L1)
+-      BMNBNN = B(L,L1)/B(L1,L1)
+-      DO 130 IT1=1,3
+-        U(1,1) = 1.
+-        U(2,1) = 1.
+-        U(3,1) = 1.
+-        DO 120 IT2=1,10
+-C* PERFORM ROW TRANSFORMATIONS Q1 AND Q2
+-          CALL DLARTG(U(2,1), U(3,1), D, E,TEMPR)
+-          CALL DROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-          CALL DROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-          U(2,1) = D*U(2,1) + E*U(3,1)
+-          CALL DLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-          CALL DROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-          CALL DROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C* PERFORM COLUMN TRANSFORMATIONS Z1 AND Z2
+-          CALL DLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-          CALL DROT(L3, A(1,L1), 1, A(1,L2), 1, E, -D)
+-          CALL DROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-          CALL DROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-          CALL DLARTG(B(L1,L), B(L1,L1), D, E,TEMPR)
+-          CALL DROT(L3, A(1,L), 1, A(1,L1), 1, E, -D)
+-          CALL DROT(L1, B(1,L), 1, B(1,L1), 1, E, -D)
+-          CALL DROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM TRANSFORMATIONS Q3,Z3,Q4,Z4,Q5 AND Z5 IN
+-C* ORDER TO REDUCE THE PENCIL TO HESSENBERG FORM
+-          CALL DLARTG(A(L2,L), A(L3,L), D, E,TEMPR)
+-          CALL DROT(N-L+1, A(L2,L), NMAX, A(L3,L), NMAX, D, E)
+-          CALL DROT(N-L1, B(L2,L2), NMAX, B(L3,L2), NMAX, D, E)
+-          CALL DLARTG(B(L3,L2), B(L3,L3), D, E,TEMPR)
+-          CALL DROT(L3, A(1,L2), 1, A(1,L3), 1, E, -D)
+-          CALL DROT(L3, B(1,L2), 1, B(1,L3), 1, E, -D)
+-          CALL DROT(N, Z(1,L2), 1, Z(1,L3), 1, E, -D)
+-          CALL DLARTG(A(L1,L), A(L2,L), D, E,TEMPR)
+-          CALL DROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-          CALL DROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-          CALL DLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-          CALL DROT(L3, A(1,L1), 1, A(1,L2), 1, E, -D)
+-          CALL DROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-          CALL DROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-          CALL DLARTG(A(L2,L1), A(L3,L1), D, E,TEMPR)
+-          CALL DROT(N-L, A(L2,L1), NMAX, A(L3,L1), NMAX, D, E)
+-          CALL DROT(N-L1, B(L2,L2), NMAX, B(L3,L2), NMAX, D, E)
+-          CALL DLARTG(B(L3,L2), B(L3,L3), D, E,TEMPR)
+-          CALL DROT(L3, A(1,L2), 1, A(1,L3), 1, E, -D)
+-          CALL DROT(L3, B(1,L2), 1, B(1,L3), 1, E, -D)
+-          CALL DROT(N, Z(1,L2), 1, Z(1,L3), 1, E, -D)
+-C* TEST OF CONVERGENCE ON THE ELEMENT SEPARATING THE BLOCKS
+-          IF (ABS(A(L2,L1)).LE.EPS) GO TO 140
+-C* COMPUTE A NEW SHIFT IN CASE OF NO CONVERGENCE
+-          A11B11 = A(L,L)/B(L,L)
+-          A12B22 = A(L,L1)/B(L1,L1)
+-          A21B11 = A(L1,L)/B(L,L)
+-          A22B22 = A(L1,L1)/B(L1,L1)
+-          B12B22 = B(L,L1)/B(L1,L1)
+-          U(1,1) = ((AMMBMM-A11B11)*(ANNBNN-A11B11)-AMNBNN*
+-     *     ANMBMM+ANMBMM*BMNBNN*A11B11)/A21B11 + A12B22 - A11B11*B12B22
+-          U(2,1) = (A22B22-A11B11) - A21B11*B12B22 - (AMMBMM-A11B11) -
+-     *     (ANNBNN-A11B11) + ANMBMM*BMNBNN
+-          U(3,1) = A(L2,L1)/B(L1,L1)
+-  120   CONTINUE
+-  130 CONTINUE
+-      FAIL = .TRUE.
+-      RETURN
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO IN
+-C*  CASE OF CONVERGENCE
+-  140 A(L2,L) = 0.
+-      A(L2,L1) = 0.
+-      A(L3,L) = 0.
+-      A(L3,L1) = 0.
+-      B(L1,L) = 0.
+-      B(L2,L) = 0.
+-      B(L2,L1) = 0.
+-      B(L3,L) = 0.
+-      B(L3,L1) = 0.
+-      B(L3,L2) = 0.
+-      RETURN
+-      END
+diff --git a/liboctave/external/ordered-qz/module.mk b/liboctave/external/ordered-qz/module.mk
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/module.mk
++++ /dev/null
+@@ -1,8 +0,0 @@
+-EXTERNAL_SOURCES += \
+-  %reldir%/dsubsp.f \
+-  %reldir%/exchqz.f \
+-  %reldir%/ssubsp.f \
+-  %reldir%/sexchqz.f
+-
+-liboctave_EXTRA_DIST += \
+-  %reldir%/README
+diff --git a/liboctave/external/ordered-qz/sexchqz.f b/liboctave/external/ordered-qz/sexchqz.f
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/sexchqz.f
++++ /dev/null
+@@ -1,261 +0,0 @@
+-      SUBROUTINE SEXCHQZ(NMAX, N, A, B, Z, L, LS1, LS2, EPS, FAIL)
+-      INTEGER NMAX, N, L, LS1, LS2
+-      REAL A(NMAX,N), B(NMAX,N), Z(NMAX,N), EPS
+-      LOGICAL FAIL
+-c modified july 9, 1998 a.s.hodel@eng.auburn.edu:
+-c     calls to AMAX1 changed to call MAX instead.
+-c     calls to giv changed to slartg (LAPACK); required new variable tempr
+-C*
+-C* GIVEN THE UPPER TRIANGULAR MATRIX B AND UPPER HESSENBERG MATRIX A
+-C* WITH CONSECUTIVE LS1XLS1 AND LS2XLS2 DIAGONAL BLOCKS (LS1,LS2.LE.2)
+-C* STARTING AT ROW/COLUMN L, EXCHQZ PRODUCES EQUIVALENCE TRANSFORMA-
+-C* TIONS QT AND ZT THAT EXCHANGE THE BLOCKS ALONG WITH THEIR GENERALIZED
+-C* EIGENVALUES. EXCHQZ REQUIRES THE SUBROUTINES SROT (BLAS) AND GIV.
+-C* THE PARAMETERS IN THE CALLING SEQUENCE ARE (STARRED PARAMETERS ARE
+-C* ALTERED BY THE SUBROUTINE):
+-C*
+-C*    NMAX     THE FIRST DIMENSION OF A, B AND Z
+-C*    N        THE ORDER OF A, B AND Z
+-C*   *A,*B     THE MATRIX PAIR WHOSE BLOCKS ARE TO BE INTERCHANGED
+-C*   *Z        UPON RETURN THIS ARRAY IS MULTIPLIED BY THE COLUMN
+-C*             TRANSFORMATION ZT.
+-C*    L        THE POSITION OF THE BLOCKS
+-C*    LS1      THE SIZE OF THE FIRST BLOCK
+-C*    LS2      THE SIZE OF THE SECOND BLOCK
+-C*    EPS      THE REQUIRED ABSOLUTE ACCURACY OF THE RESULT
+-C*   *FAIL     A LOGICAL VARIABLE WHICH IS FALSE ON A NORMAL RETURN,
+-C*             TRUE OTHERWISE.
+-C*
+-      INTEGER I, J, L1, L2, L3, LI, LJ, LL, IT1, IT2
+-      REAL U(3,3), D, E, F, G, SA, SB, A11B11, A21B11,
+-     * A12B22, B12B22,
+-     * A22B22, AMMBMM, ANMBMM, AMNBNN, BMNBNN, ANNBNN, TEMPR
+-      LOGICAL ALTB
+-      FAIL = .FALSE.
+-      L1 = L + 1
+-      LL = LS1 + LS2
+-      IF (LL.GT.2) GO TO 10
+-C*** INTERCHANGE 1X1 AND 1X1 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION       A:=Q*A*Z , B:=Q*B*Z
+-C*** WHERE Q AND Z ARE GIVENS ROTATIONS
+-      F = MAX(ABS(A(L1,L1)),ABS(B(L1,L1)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L1,L1)).GE.F) ALTB = .FALSE.
+-      SA = A(L1,L1)/F
+-      SB = B(L1,L1)/F
+-      F = SA*B(L,L) - SB*A(L,L)
+-C* CONSTRUCT THE COLUMN TRANSFORMATION Z
+-      G = SA*B(L,L1) - SB*A(L,L1)
+-      CALL SLARTG(F, G, D, E,TEMPR)
+-      CALL SROT(L1, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL SROT(L1, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL SROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* CONSTRUCT THE ROW TRANSFORMATION Q
+-      IF (ALTB) CALL SLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL SLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-      A(L1,L) = 0.
+-      B(L1,L) = 0.
+-      RETURN
+-C*** INTERCHANGE 1X1 AND 2X2 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION  A:=Q2*Q1*A*Z1*Z2 , B:=Q2*Q1*B*Z1*Z2
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-   10 L2 = L + 2
+-      IF (LS1.EQ.2) GO TO 60
+-      G = MAX(ABS(A(L,L)),ABS(B(L,L)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L,L)).LT.G) GO TO 20
+-      ALTB = .FALSE.
+-      CALL SLARTG(A(L1,L1), A(L2,L1), D, E,TEMPR)
+-      CALL SROT(N-L, A(L1,L1), NMAX, A(L2,L1), NMAX, D, E)
+-      CALL SROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-C**  EVALUATE THE PENCIL AT THE EIGENVALUE CORRESPONDING
+-C**  TO THE 1X1 BLOCK
+-   20 SA = A(L,L)/G
+-      SB = B(L,L)/G
+-      DO 40 J=1,2
+-        LJ = L + J
+-        DO 30 I=1,3
+-          LI = L + I - 1
+-          U(I,J) = SA*B(LI,LJ) - SB*A(LI,LJ)
+-   30   CONTINUE
+-   40 CONTINUE
+-      CALL SLARTG(U(3,1), U(3,2), D, E,TEMPR)
+-      CALL SROT(3, U(1,1), 1, U(1,2), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q1
+-      CALL SLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-      U(2,2) = -U(1,2)*E + U(2,2)*D
+-      CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z1
+-      IF (ALTB) CALL SLARTG(B(L1,L), B(L1,L1), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL SLARTG(A(L1,L), A(L1,L1), D, E,TEMPR)
+-      CALL SROT(L2, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL SROT(L2, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL SROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q2
+-      CALL SLARTG(U(2,2), U(3,2), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L1,L), NMAX, B(L2,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z2
+-      IF (ALTB) CALL SLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL SLARTG(A(L2,L1), A(L2,L2), D, E,TEMPR)
+-      CALL SROT(L2, A(1,L1), 1, A(1,L2), 1, E, -D)
+-      CALL SROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-      CALL SROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-      IF (ALTB) GO TO 50
+-      CALL SLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO
+-   50 A(L2,L) = 0.
+-      A(L2,L1) = 0.
+-      B(L1,L) = 0.
+-      B(L2,L) = 0.
+-      B(L2,L1) = 0.
+-      RETURN
+-C*** INTERCHANGE 2X2 AND 1X1 BLOCKS VIA AN EQUIVALENCE
+-C*** TRANSFORMATION  A:=Q2*Q1*A*Z1*Z2 , B:=Q2*Q1*B*Z1*Z2
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-   60 IF (LS2.EQ.2) GO TO 110
+-      G = MAX(ABS(A(L2,L2)),ABS(B(L2,L2)))
+-      ALTB = .TRUE.
+-      IF (ABS(A(L2,L2)).LT.G) GO TO 70
+-      ALTB = .FALSE.
+-      CALL SLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C**  EVALUATE THE PENCIL AT THE EIGENVALUE CORRESPONDING
+-C**  TO THE 1X1 BLOCK
+-   70 SA = A(L2,L2)/G
+-      SB = B(L2,L2)/G
+-      DO 90 I=1,2
+-        LI = L + I - 1
+-        DO 80 J=1,3
+-          LJ = L + J - 1
+-          U(I,J) = SA*B(LI,LJ) - SB*A(LI,LJ)
+-   80   CONTINUE
+-   90 CONTINUE
+-      CALL SLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-      CALL SROT(3, U(1,1), 3, U(2,1), 3, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z1
+-      CALL SLARTG(U(2,2), U(2,3), D, E,TEMPR)
+-      U(1,2) = U(1,2)*E - U(1,3)*D
+-      CALL SROT(L2, A(1,L1), 1, A(1,L2), 1, E, -D)
+-      CALL SROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-      CALL SROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q1
+-      IF (ALTB) CALL SLARTG(B(L1,L1), B(L2,L1), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL SLARTG(A(L1,L1), A(L2,L1), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L1,L), NMAX, B(L2,L), NMAX, D, E)
+-C* PERFORM THE COLUMN TRANSFORMATION Z2
+-      CALL SLARTG(U(1,1), U(1,2), D, E,TEMPR)
+-      CALL SROT(L2, A(1,L), 1, A(1,L1), 1, E, -D)
+-      CALL SROT(L2, B(1,L), 1, B(1,L1), 1, E, -D)
+-      CALL SROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM THE ROW TRANSFORMATION Q2
+-      IF (ALTB) CALL SLARTG(B(L,L), B(L1,L), D, E,TEMPR)
+-      IF (.NOT.ALTB) CALL SLARTG(A(L,L), A(L1,L), D, E,TEMPR)
+-      CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-      CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-      IF (ALTB) GO TO 100
+-      CALL SLARTG(B(L1,L1), B(L2,L1), D, E,TEMPR)
+-      CALL SROT(N-L, A(L1,L1), NMAX, A(L2,L1), NMAX, D, E)
+-      CALL SROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO
+-  100 A(L1,L) = 0.
+-      A(L2,L) = 0.
+-      B(L1,L) = 0.
+-      B(L2,1) = 0.
+-      B(L2,L1) = 0.
+-      RETURN
+-C*** INTERCHANGE 2X2 AND 2X2 BLOCKS VIA A SEQUENCE OF
+-C*** QZ-STEPS REALIZED BY THE EQUIVALENCE TRANSFORMATIONS
+-C***          A:=Q5*Q4*Q3*Q2*Q1*A*Z1*Z2*Z3*Z4*Z5
+-C***          B:=Q5*Q4*Q3*Q2*Q1*B*Z1*Z2*Z3*Z4*Z5
+-C*** WHERE EACH QI AND ZI IS A GIVENS ROTATION
+-  110 L3 = L + 3
+-C* COMPUTE IMPLICIT SHIFT
+-      AMMBMM = A(L,L)/B(L,L)
+-      ANMBMM = A(L1,L)/B(L,L)
+-      AMNBNN = A(L,L1)/B(L1,L1)
+-      ANNBNN = A(L1,L1)/B(L1,L1)
+-      BMNBNN = B(L,L1)/B(L1,L1)
+-      DO 130 IT1=1,3
+-        U(1,1) = 1.
+-        U(2,1) = 1.
+-        U(3,1) = 1.
+-        DO 120 IT2=1,10
+-C* PERFORM ROW TRANSFORMATIONS Q1 AND Q2
+-          CALL SLARTG(U(2,1), U(3,1), D, E,TEMPR)
+-          CALL SROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-          CALL SROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-          U(2,1) = D*U(2,1) + E*U(3,1)
+-          CALL SLARTG(U(1,1), U(2,1), D, E,TEMPR)
+-          CALL SROT(N-L+1, A(L,L), NMAX, A(L1,L), NMAX, D, E)
+-          CALL SROT(N-L+1, B(L,L), NMAX, B(L1,L), NMAX, D, E)
+-C* PERFORM COLUMN TRANSFORMATIONS Z1 AND Z2
+-          CALL SLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-          CALL SROT(L3, A(1,L1), 1, A(1,L2), 1, E, -D)
+-          CALL SROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-          CALL SROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-          CALL SLARTG(B(L1,L), B(L1,L1), D, E,TEMPR)
+-          CALL SROT(L3, A(1,L), 1, A(1,L1), 1, E, -D)
+-          CALL SROT(L1, B(1,L), 1, B(1,L1), 1, E, -D)
+-          CALL SROT(N, Z(1,L), 1, Z(1,L1), 1, E, -D)
+-C* PERFORM TRANSFORMATIONS Q3,Z3,Q4,Z4,Q5 AND Z5 IN
+-C* ORDER TO REDUCE THE PENCIL TO HESSENBERG FORM
+-          CALL SLARTG(A(L2,L), A(L3,L), D, E,TEMPR)
+-          CALL SROT(N-L+1, A(L2,L), NMAX, A(L3,L), NMAX, D, E)
+-          CALL SROT(N-L1, B(L2,L2), NMAX, B(L3,L2), NMAX, D, E)
+-          CALL SLARTG(B(L3,L2), B(L3,L3), D, E,TEMPR)
+-          CALL SROT(L3, A(1,L2), 1, A(1,L3), 1, E, -D)
+-          CALL SROT(L3, B(1,L2), 1, B(1,L3), 1, E, -D)
+-          CALL SROT(N, Z(1,L2), 1, Z(1,L3), 1, E, -D)
+-          CALL SLARTG(A(L1,L), A(L2,L), D, E,TEMPR)
+-          CALL SROT(N-L+1, A(L1,L), NMAX, A(L2,L), NMAX, D, E)
+-          CALL SROT(N-L, B(L1,L1), NMAX, B(L2,L1), NMAX, D, E)
+-          CALL SLARTG(B(L2,L1), B(L2,L2), D, E,TEMPR)
+-          CALL SROT(L3, A(1,L1), 1, A(1,L2), 1, E, -D)
+-          CALL SROT(L2, B(1,L1), 1, B(1,L2), 1, E, -D)
+-          CALL SROT(N, Z(1,L1), 1, Z(1,L2), 1, E, -D)
+-          CALL SLARTG(A(L2,L1), A(L3,L1), D, E,TEMPR)
+-          CALL SROT(N-L, A(L2,L1), NMAX, A(L3,L1), NMAX, D, E)
+-          CALL SROT(N-L1, B(L2,L2), NMAX, B(L3,L2), NMAX, D, E)
+-          CALL SLARTG(B(L3,L2), B(L3,L3), D, E,TEMPR)
+-          CALL SROT(L3, A(1,L2), 1, A(1,L3), 1, E, -D)
+-          CALL SROT(L3, B(1,L2), 1, B(1,L3), 1, E, -D)
+-          CALL SROT(N, Z(1,L2), 1, Z(1,L3), 1, E, -D)
+-C* TEST OF CONVERGENCE ON THE ELEMENT SEPARATING THE BLOCKS
+-          IF (ABS(A(L2,L1)).LE.EPS) GO TO 140
+-C* COMPUTE A NEW SHIFT IN CASE OF NO CONVERGENCE
+-          A11B11 = A(L,L)/B(L,L)
+-          A12B22 = A(L,L1)/B(L1,L1)
+-          A21B11 = A(L1,L)/B(L,L)
+-          A22B22 = A(L1,L1)/B(L1,L1)
+-          B12B22 = B(L,L1)/B(L1,L1)
+-          U(1,1) = ((AMMBMM-A11B11)*(ANNBNN-A11B11)-AMNBNN*
+-     *     ANMBMM+ANMBMM*BMNBNN*A11B11)/A21B11 + A12B22 - A11B11*B12B22
+-          U(2,1) = (A22B22-A11B11) - A21B11*B12B22 - (AMMBMM-A11B11) -
+-     *     (ANNBNN-A11B11) + ANMBMM*BMNBNN
+-          U(3,1) = A(L2,L1)/B(L1,L1)
+-  120   CONTINUE
+-  130 CONTINUE
+-      FAIL = .TRUE.
+-      RETURN
+-C*  PUT THE NEGLECTABLE ELEMENTS EQUAL TO ZERO IN
+-C*  CASE OF CONVERGENCE
+-  140 A(L2,L) = 0.
+-      A(L2,L1) = 0.
+-      A(L3,L) = 0.
+-      A(L3,L1) = 0.
+-      B(L1,L) = 0.
+-      B(L2,L) = 0.
+-      B(L2,L1) = 0.
+-      B(L3,L) = 0.
+-      B(L3,L1) = 0.
+-      B(L3,L2) = 0.
+-      RETURN
+-      END
+diff --git a/liboctave/external/ordered-qz/ssubsp.f b/liboctave/external/ordered-qz/ssubsp.f
+deleted file mode 100644
+--- a/liboctave/external/ordered-qz/ssubsp.f
++++ /dev/null
+@@ -1,104 +0,0 @@
+-      SUBROUTINE SSUBSP(NMAX, N, A, B, Z, FTEST, EPS, NDIM, FAIL, IND)
+-      INTEGER NMAX, N, FTEST, NDIM, IND(N)
+-      LOGICAL FAIL
+-      REAL A(NMAX,N), B(NMAX,N), Z(NMAX,N), EPS
+-C*
+-C* GIVEN THE UPPER TRIANGULAR MATRIX B AND UPPER HESSENBERG MATRIX A
+-C* WITH 1X1 OR 2X2 DIAGONAL BLOCKS, THIS ROUTINE REORDERS THE DIAGONAL
+-C* BLOCKS ALONG WITH THEIR GENERALIZED EIGENVALUES BY CONSTRUCTING EQUI-
+-C* VALENCE TRANSFORMATIONS QT AND ZT. THE ROW TRANSFORMATION ZT IS ALSO
+-C* PERFORMED ON THE GIVEN (INITIAL) TRANSFORMATION Z (RESULTING FROM A
+-C* POSSIBLE PREVIOUS STEP OR INITIALIZED WITH THE IDENTITY MATRIX).
+-C* AFTER REORDERING, THE EIGENVALUES INSIDE THE REGION SPECIFIED BY THE
+-C* FUNCTION FTEST APPEAR AT THE TOP. IF NDIM IS THEIR NUMBER THEN THE
+-C* NDIM FIRST COLUMNS OF Z SPAN THE REQUESTED SUBSPACE. DSUBSP REQUIRES
+-C* THE SUBROUTINE EXCHQZ AND THE INTEGER FUNCTION FTEST WHICH HAS TO BE
+-C* PROVIDED BY THE USER. THE PARAMETERS IN THE CALLING SEQUENCE ARE :
+-C* (STARRED PARAMETERS ARE ALTERED BY THE SUBROUTINE)
+-C*
+-C*    NMAX     THE FIRST DIMENSION OF A, B AND Z
+-C*    N        THE ORDER OF A, B AND Z
+-C*   *A,*B     THE MATRIX PAIR WHOSE BLOCKS ARE TO BE REORDERED.
+-C*   *Z        UPON RETURN THIS ARRAY IS MULTIPLIED BY THE COLUMN
+-C*             TRANSFORMATION ZT.
+-C*    FTEST(LS,ALPHA,BETA,S,P) AN INTEGER FUNCTION DESCRIBING THE
+-C*             SPECTRUM OF THE DEFLATING SUBSPACE TO BE COMPUTED:
+-C*             WHEN LS=1 FTEST CHECKS IF ALPHA/BETA IS IN THAT SPECTRUM
+-C*             WHEN LS=2 FTEST CHECKS IF THE TWO COMPLEX CONJUGATE
+-C*             ROOTS WITH SUM S AND PRODUCT P ARE IN THAT SPECTRUM
+-C*             IF THE ANSWER IS POSITIVE, FTEST=1, OTHERWISE FTEST=-1
+-C*    EPS      THE REQUIRED ABSOLUTE ACCURACY OF THE RESULT
+-C*   *NDIM     AN INTEGER GIVING THE DIMENSION OF THE COMPUTED
+-C*             DEFLATING SUBSPACE
+-C*   *FAIL     A LOGICAL VARIABLE WHICH IS FALSE ON A NORMAL RETURN,
+-C*             TRUE OTHERWISE (WHEN SEXCHQZ FAILS)
+-C*   *IND      AN INTEGER WORKING ARRAY OF DIMENSION AT LEAST N
+-C*
+-      INTEGER L, LS, LS1, LS2, L1, LL, NUM, IS, L2I, L2K, I, K, II,
+-     * ISTEP, IFIRST
+-      REAL S, P, D, ALPHA, BETA
+-      FAIL = .TRUE.
+-      NDIM = 0
+-      NUM = 0
+-      L = 0
+-      LS = 1
+-C*** CONSTRUCT ARRAY IND(I) WHERE :
+-C***     IABS(IND(I)) IS THE SIZE OF THE BLOCK I
+-C***     SIGN(IND(I)) INDICATES THE LOCATION OF ITS EIGENVALUES
+-C***                  (AS DETERMINED BY FTEST).
+-C*** NUM IS THE NUMBER OF ELEMENTS IN THIS ARRAY
+-      DO 30 LL=1,N
+-        L = L + LS
+-        IF (L.GT.N) GO TO 40
+-        L1 = L + 1
+-        IF (L1.GT.N) GO TO 10
+-        IF (A(L1,L).EQ.0.) GO TO 10
+-C* HERE A 2X2  BLOCK IS CHECKED *
+-        LS = 2
+-        D = B(L,L)*B(L1,L1)
+-        S = (A(L,L)*B(L1,L1)+A(L1,L1)*B(L,L)-A(L1,L)*B(L,L1))/D
+-        P = (A(L,L)*A(L1,L1)-A(L,L1)*A(L1,L))/D
+-        IS = FTEST(LS,ALPHA,BETA,S,P)
+-        GO TO 20
+-C* HERE A 1X1  BLOCK IS CHECKED *
+-   10   LS = 1
+-        IS = FTEST(LS,A(L,L),B(L,L),S,P)
+-   20   NUM = NUM + 1
+-        IF (IS.EQ.1) NDIM = NDIM + LS
+-        IND(NUM) = LS*IS
+-   30 CONTINUE
+-C***  REORDER BLOCKS SUCH THAT THOSE WITH POSITIVE VALUE
+-C***    OF IND(.) APPEAR FIRST.
+-   40 L2I = 1
+-      DO 100 I=1,NUM
+-        IF (IND(I).GT.0) GO TO 90
+-C* IF A NEGATIVE IND(I) IS ENCOUNTERED, THEN SEARCH FOR THE FIRST
+-C* POSITIVE IND(K) FOLLOWING ON IT
+-        L2K = L2I
+-        DO 60 K=I,NUM
+-          IF (IND(K).LT.0) GO TO 50
+-          GO TO 70
+-   50     L2K = L2K - IND(K)
+-   60   CONTINUE
+-C* IF THERE ARE NO POSITIVE INDICES FOLLOWING ON A NEGATIVE ONE
+-C* THEN STOP
+-        GO TO 110
+-C* IF A POSITIVE IND(K) FOLLOWS ON A NEGATIVE IND(I) THEN
+-C* INTERCHANGE BLOCK K BEFORE BLOCK I BY PERFORMING K-I SWAPS
+-   70   ISTEP = K - I
+-        LS2 = IND(K)
+-        L = L2K
+-        DO 80 II=1,ISTEP
+-          IFIRST = K - II
+-          LS1 = -IND(IFIRST)
+-          L = L - LS1
+-          CALL SEXCHQZ(NMAX, N, A, B, Z, L, LS1, LS2, EPS, FAIL)
+-          IF (FAIL) RETURN
+-          IND(IFIRST+1) = IND(IFIRST)
+-   80   CONTINUE
+-        IND(I) = LS2
+-   90   L2I = L2I + IND(I)
+-  100 CONTINUE
+-  110 FAIL = .FALSE.
+-      RETURN
+-      END
+diff --git a/liboctave/numeric/lo-lapack-proto.h b/liboctave/numeric/lo-lapack-proto.h
+--- a/liboctave/numeric/lo-lapack-proto.h
++++ b/liboctave/numeric/lo-lapack-proto.h
+@@ -1603,16 +1603,45 @@ extern "C"
+                              const F77_INT& LDVL, F77_DBLE_CMPLX *xVR,
+                              const F77_INT& LDVR,
+                              const F77_INT& MM, F77_INT& M,
+                              F77_DBLE_CMPLX *CWORK, F77_DBLE* RWORK,
+                              F77_INT& INFO
+                              F77_CHAR_ARG_LEN_DECL
+                              F77_CHAR_ARG_LEN_DECL);
+ 
++  // TGSEN
++
++  F77_RET_T
++  F77_FUNC (dtgsen, DTGSEN) (const F77_INT& IJOB,
++                             const F77_LOGICAL& WANTQ,
++                             const F77_LOGICAL& WANTZ,
++                             const F77_LOGICAL *SELECT,
++                             const F77_INT& N,
++                             F77_DBLE *A,
++                             const F77_INT& LDA,
++                             F77_DBLE *B,
++                             const F77_INT& LDB,
++                             F77_DBLE *ALPHAR,
++                             F77_DBLE *ALPHAI,
++                             F77_DBLE *BETA,
++                             F77_DBLE *Q,
++                             const F77_INT& LDQ,
++                             F77_DBLE *Z,
++                             const F77_INT& LDZ,
++                             F77_INT& M,
++                             F77_DBLE& PL,
++                             F77_DBLE& PR,
++                             F77_DBLE *DIF,
++                             F77_DBLE *WORK,
++                             const F77_INT& LWORK,
++                             F77_INT *IWORK,
++                             const F77_INT& LIWORK,
++                             F77_INT& INFO);
++
+   // TRCON
+ 
+   F77_RET_T
+   F77_FUNC (ctrcon, CTRCON) (F77_CONST_CHAR_ARG_DECL,
+                              F77_CONST_CHAR_ARG_DECL,
+                              F77_CONST_CHAR_ARG_DECL,
+                              const F77_INT&, const F77_CMPLX*,
+                              const F77_INT&, F77_REAL&, F77_CMPLX*,

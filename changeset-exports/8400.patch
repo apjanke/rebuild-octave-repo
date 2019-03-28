@@ -1,0 +1,261 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1229082331 -3600
+#      Fri Dec 12 12:45:31 2008 +0100
+# Node ID 7b6e1fc1cb908c57114a8a71a657695cf03efdf0
+# Parent  c1bada868690320b88ca28adccce44d419a585a0
+implement obstack-like optimization of local buffers
+
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,15 @@
++2008-12-12  Jaroslav Hajek  <highegg@gmail.com>
++
++	* oct-locbuf.cc: New source.
++	* oct-locbuf.h (octave_chunk_buffer): New class.
++	(octave_local_buffer): Subclass from octave_chunk_buffer for selected
++	POD types.
++
+ 2008-12-11  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* mx-op-defs.h (DMDM_BIN_OP): Fix invalid buffer length.
+ 
+ 2008-12-10  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* dMatrix.h, dMatrix.cc (Matrix::expm): Remove.
+ 	* fMatrix.h, fMatrix.cc (FloatMatrix::expm): Remove.
+diff --git a/liboctave/Makefile.in b/liboctave/Makefile.in
+--- a/liboctave/Makefile.in
++++ b/liboctave/Makefile.in
+@@ -137,17 +137,17 @@ MATRIX_SRC := Array-util.cc CColVector.c
+ 	floatSCHUR.cc floatSVD.cc floatQR.cc floatQRP.cc
+ 
+ MX_OP_SRC := $(shell $(AWK) -f $(srcdir)/mk-ops.awk prefix=mx list_cc_files=1 $(srcdir)/mx-ops)
+ 
+ VX_OP_SRC := $(shell $(AWK) -f $(srcdir)/mk-ops.awk prefix=vx list_cc_files=1 $(srcdir)/vx-ops)
+ 
+ SPARSE_MX_OP_SRC := $(shell $(AWK) -f $(srcdir)/sparse-mk-ops.awk prefix=smx list_cc_files=1 $(srcdir)/sparse-mx-ops)
+ 
+-LIBOCTAVE_CXX_SOURCES := Bounds.cc CollocWt.cc DASPK.cc DASRT.cc \
++LIBOCTAVE_CXX_SOURCES := oct-locbuf.cc Bounds.cc CollocWt.cc DASPK.cc DASRT.cc \
+ 	DASSL.cc FEGrid.cc LinConst.cc LSODE.cc ODES.cc \
+ 	Quad.cc Range.cc data-conv.cc dir-ops.cc \
+ 	file-ops.cc file-stat.cc glob-match.cc idx-vector.cc \
+ 	lo-ieee.cc lo-mappers.cc lo-specfun.cc lo-sysdep.cc \
+ 	lo-utils.cc mach-info.cc oct-alloc.cc oct-env.cc \
+ 	oct-fftw.cc oct-group.cc oct-mutex.cc oct-md5.cc \
+ 	oct-norm.cc oct-passwd.cc oct-rand.cc \
+ 	oct-shlib.cc oct-spparms.cc oct-syscalls.cc oct-time.cc oct-uname.cc \
+diff --git a/liboctave/oct-locbuf.cc b/liboctave/oct-locbuf.cc
+new file mode 100644
+--- /dev/null
++++ b/liboctave/oct-locbuf.cc
+@@ -0,0 +1,104 @@
++/*
++
++Copyright (C) 2008 Jaroslav Hajek <highegg@gmail.com>
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <iostream>
++#include "oct-locbuf.h"
++
++// Query for configured chunk size, and if not defined, set it to 32 MB.
++// FIXME: 32MB is hard-coded. Maybe we could use something better, like
++// querying for available physical memory.
++#ifndef OCTAVE_LOCBUF_CHUNKSIZE_MB
++#define OCTAVE_LOCBUF_CHUNKSIZE_MB 32
++#endif
++
++// Each chunk will be at least this big. 
++const size_t octave_chunk_buffer::chunk_size = 
++  static_cast<size_t> (OCTAVE_LOCBUF_CHUNKSIZE_MB) << 20;
++
++char *octave_chunk_buffer::top = 0, *octave_chunk_buffer::chunk = 0;
++size_t octave_chunk_buffer::left = 0;
++
++octave_chunk_buffer::octave_chunk_buffer (size_t size) : cnk (0), dat (0) 
++{
++  // Alignment mask. The size of double or long int, whichever is greater.
++  // All data will be aligned to this size. If it's not enough for a type,
++  // that type should not be declared as POD. 
++  static const size_t align_mask = (sizeof (long) < sizeof (double)
++                                    ? sizeof (double)
++                                    : sizeof (long)) - 1;
++
++  if (! size) return;
++  // Align size. Note that size_t is unsigned, so size-1 must correctly
++  // wrap around.
++  size = ((size - 1) | align_mask) + 1;
++
++  if (size > left)
++    {
++      // Big buffers (> 1/8 chunk) will be allocated as stand-alone and
++      // won't disrupt the chain.
++      if (size > chunk_size >> 3)
++        {
++          // Use new [] to get std::bad_alloc if out of memory. Could as
++          // well be std::malloc and handle that ourselves.
++          dat = new char [size];
++          return;
++        }
++
++      dat = new char [chunk_size];
++      chunk = top = dat;
++      left = chunk_size;
++    }
++
++  // Now allocate memory from the chunk and update state.
++  cnk = chunk;
++  dat = top;
++  left -= size;
++  top += size;
++}
++
++octave_chunk_buffer::~octave_chunk_buffer (void)
++{
++  if (cnk == chunk)
++    {
++      // Our chunk is still the active one. Just restore the state.
++      left += top - dat;
++      top = dat;
++    }
++  else if (! cnk)
++    {
++      // We were a stand-alone buffer.
++      delete [] dat;
++    }
++  else
++    {
++      // Responsible for deletion.
++      delete [] chunk;
++      chunk = cnk;
++      top = dat;
++      // FIXME: This will only work if chunk_size is constant.
++      left = chunk_size - (dat - cnk);
++    }
++}
+diff --git a/liboctave/oct-locbuf.h b/liboctave/oct-locbuf.h
+--- a/liboctave/oct-locbuf.h
++++ b/liboctave/oct-locbuf.h
+@@ -19,16 +19,17 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_local_buffer_h)
+ #define octave_local_buffer_h 1
+ 
+ #include <cstddef>
++#include "oct-cmplx.h"
+ 
+ // The default local buffer simply encapsulates an *array* pointer that gets
+ // delete[]d automatically. For common POD types, we provide specializations.
+ 
+ template <class T>
+ class octave_local_buffer
+ {
+ public:
+@@ -39,21 +40,78 @@ public:
+         data = new T[size]; 
+     }
+   ~octave_local_buffer (void) { delete [] data; }
+   operator T *() const { return data; }
+ private:
+   T *data;
+ };
+ 
++// For buffers of POD types, we'll be more smart. There is one thing that
++// differentiates a local buffer from a dynamic array - the local buffers, if
++// not manipulated improperly, have a FIFO semantics, meaning that if buffer B
++// is allocated after buffer A, B *must* be deallocated before A. This is
++// *guaranteed* if you use local buffer exclusively through the
++// OCTAVE_LOCAL_BUFFER macro, because the C++ standard *mandates* explicit
++// local objects be destroyed in reverse order of declaration.
++// Therefore, we can avoid memory fragmentation by allocating fairly large
++// chunks of memory and serving local buffers from them in a stack-like manner.
++// The first returning buffer in previous chunk will be responsible for
++// deallocating the chunk.
+ 
+-// If the compiler supports dynamic stack arrays, we can use the attached hack to 
+-// place small buffer arrays on the stack. 
++class octave_chunk_buffer
++{
++  static const size_t chunk_size;
++
++  static char *top, *chunk;
++  static size_t left;
++
++  char *cnk;
++  char *dat;
++
++public:
++
++  octave_chunk_buffer (size_t size);
++
++  ~octave_chunk_buffer (void);
++
++  char *data (void) const { return dat; }
++};
+ 
+-#ifdef HAVE_DYNAMIC_AUTO_ARRAYS
++// This specializes octave_local_buffer to use the chunked buffer mechanism
++// for POD types.
++#define SPECIALIZE_POD_BUFFER(TYPE) \
++template <> \
++class octave_local_buffer<TYPE> : private octave_chunk_buffer \
++{ \
++public: \
++  octave_local_buffer (size_t size) : octave_chunk_buffer (size * sizeof (TYPE)) { } \
++  operator TYPE *() const { return reinterpret_cast<TYPE *> (this->data ()); } \
++}
++
++SPECIALIZE_POD_BUFFER (bool);
++SPECIALIZE_POD_BUFFER (char);
++SPECIALIZE_POD_BUFFER (unsigned short);
++SPECIALIZE_POD_BUFFER (short);
++SPECIALIZE_POD_BUFFER (int);
++SPECIALIZE_POD_BUFFER (unsigned int);
++SPECIALIZE_POD_BUFFER (long);
++SPECIALIZE_POD_BUFFER (unsigned long);
++SPECIALIZE_POD_BUFFER (float);
++SPECIALIZE_POD_BUFFER (double);
++// FIXME: Are these guaranteed to be POD and satisfy alignment?
++SPECIALIZE_POD_BUFFER (Complex);
++SPECIALIZE_POD_BUFFER (FloatComplex);
++// MORE ?
++
++// If the compiler supports dynamic stack arrays, we can use the attached hack
++// to place small buffer arrays on the stack. It may be even faster than our
++// obstack-like optimization, but is dangerous because stack is a very limited
++// resource, so we disable it.
++#if 0 //defined (HAVE_DYNAMIC_AUTO_ARRAYS)
+ 
+ // Maximum buffer size (in bytes) to be placed on the stack.
+ 
+ #define OCTAVE_LOCAL_BUFFER_MAX_STACK_SIZE 8192
+ 
+ // If we have automatic arrays, we use an automatic array if the size is small
+ // enough.  To avoid possibly evaluating `size' multiple times, we first cache
+ // it.  Note that we always construct both the stack array and the

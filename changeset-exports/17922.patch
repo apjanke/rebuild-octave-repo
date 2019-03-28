@@ -1,0 +1,399 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1384302289 18000
+#      Tue Nov 12 19:24:49 2013 -0500
+# Node ID b5bf26a054bdd2bc240ab4148aaecefebcf435d4
+# Parent  2a4acd6548c60f3d140fc6523423974ad9bd338e
+interrupt interpreter thread in GUI instead of calling "raise (SIGINT)"
+
+* thread-manager.h, thread-manager.cc: New files.
+* libgui/src/module.mk: Update file lists.
+* octave-gui.cc (octave_start_gui): Block SIGINT at startup.
+* octave-interpreter.h, octave-interpreter.cc
+(octave_interpreter::thread_manager):  New data member.
+(octave_interpreter::execute): Register current thread and unblock
+interrupt signal.
+(octave_interpreter::interrupt): Call thread_manager::interrupt
+instead of calling ::raising (SIGINT).
+
+diff --git a/libgui/src/module.mk b/libgui/src/module.mk
+--- a/libgui/src/module.mk
++++ b/libgui/src/module.mk
+@@ -128,16 +128,17 @@ noinst_HEADERS += \
+   src/main-window.h \
+   src/octave-gui.h \
+   src/octave-interpreter.h \
+   src/octave-qt-link.h \
+   src/qtinfo/parser.h \
+   src/qtinfo/webinfo.h \
+   src/resource-manager.h \
+   src/settings-dialog.h \
++  src/thread-manager.h \
+   src/news-dock-widget.h \
+   src/terminal-dock-widget.h \
+   src/color-picker.h \
+   src/welcome-wizard.h \
+   src/find-files-dialog.h \
+   src/find-files-model.h \
+   src/workspace-model.h \
+   src/workspace-view.h
+@@ -155,16 +156,17 @@ src_libgui_src_la_SOURCES = \
+   src/octave-dock-widget.cc \
+   src/octave-gui.cc \
+   src/octave-interpreter.cc \
+   src/octave-qt-link.cc \
+   src/qtinfo/parser.cc \
+   src/qtinfo/webinfo.cc \
+   src/resource-manager.cc \
+   src/settings-dialog.cc \
++  src/thread-manager.cc \
+   src/news-dock-widget.cc \
+   src/terminal-dock-widget.cc \
+   src/color-picker.cc \
+   src/welcome-wizard.cc \
+   src/find-files-dialog.cc \
+   src/find-files-model.cc \
+   src/workspace-model.cc \
+   src/workspace-view.cc
+diff --git a/libgui/src/octave-gui.cc b/libgui/src/octave-gui.cc
+--- a/libgui/src/octave-gui.cc
++++ b/libgui/src/octave-gui.cc
+@@ -46,16 +46,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "octave.h"
+ #include "sighandlers.h"
+ 
+ #include "welcome-wizard.h"
+ #include "resource-manager.h"
+ #include "main-window.h"
+ #include "octave-gui.h"
++#include "thread-manager.h"
+ 
+ // Allow the Octave interpreter to start as in CLI mode with a
+ // QApplication context so that it can use Qt for things like plotting
+ // and UI widgets.
+ 
+ class octave_cli_thread : public QThread
+ {
+ public:
+@@ -113,16 +114,18 @@ void message_handler (QtMsgType type, co
+ }
+ 
+ // If START_GUI is false, we still set up the QApplication so that we
+ // can use Qt widgets for plot windows.
+ 
+ int
+ octave_start_gui (int argc, char *argv[], bool start_gui)
+ {
++  octave_thread_manager::block_interrupt_signal ();
++
+   qInstallMsgHandler (message_handler);
+ 
+   if (start_gui)
+     {
+       QApplication application (argc, argv);
+ 
+       // Set the codec for all strings
+       QTextCodec::setCodecForCStrings (QTextCodec::codecForName ("UTF-8"));
+diff --git a/libgui/src/octave-interpreter.cc b/libgui/src/octave-interpreter.cc
+--- a/libgui/src/octave-interpreter.cc
++++ b/libgui/src/octave-interpreter.cc
+@@ -31,19 +31,23 @@ along with Octave; see the file COPYING.
+ 
+ #include "octave.h"
+ 
+ #include "octave-interpreter.h"
+ 
+ void
+ octave_interpreter::execute (void)
+ {
++  thread_manager.register_current_thread ();
++
++  octave_thread_manager::unblock_interrupt_signal ();
++
+   octave_initialize_interpreter (octave_cmdline_argc, octave_cmdline_argv,
+                                  octave_embedded);
+ 
+   octave_execute_interpreter ();
+ }
+ 
+ void
+ octave_interpreter::interrupt (void)
+ {
+-  ::raise (SIGINT);
++  thread_manager.interrupt ();
+ }
+diff --git a/libgui/src/octave-interpreter.h b/libgui/src/octave-interpreter.h
+--- a/libgui/src/octave-interpreter.h
++++ b/libgui/src/octave-interpreter.h
+@@ -21,28 +21,34 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #ifndef octave_interpreter_h
+ #define octave_interpreter_h 1
+ 
+ #include <QObject>
+ 
++#include "thread-manager.h"
++
+ class octave_interpreter : public QObject
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   // An object to manage the Octave interpreter.
+ 
+-  octave_interpreter (void) : QObject () { }
++  octave_interpreter (void) : QObject (), thread_manager () { }
+ 
+ public slots:
+ 
+   // Initialize and execute the octave interpreter.
+ 
+   void execute (void);
+ 
+   void interrupt (void);
++
++private:
++
++  octave_thread_manager thread_manager;
+ };
+ 
+ #endif
+diff --git a/libgui/src/thread-manager.cc b/libgui/src/thread-manager.cc
+new file mode 100644
+--- /dev/null
++++ b/libgui/src/thread-manager.cc
+@@ -0,0 +1,133 @@
++/*
++
++Copyright (C) 2013 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++#include <windows.h>
++#else
++#include <pthread.h>
++#endif
++
++#include <sys/types.h>
++#include <signal.h>
++
++#include "thread-manager.h"
++
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++
++class windows_thread_manager : public octave_base_thread_manager
++{
++public:
++
++  windows_thread_manager (void) : octave_base_thread_manager () { }
++
++  void register_current_thread (void) { }
++
++  void interrupt (void)
++  {
++    // FIXME: This doesn't work when octave_interrupt_immediately is
++    // true.  Octave crashes, presumably in the call to
++    // octave_jump_to_enclosing_context.  Does this happen because the
++    // jump occurs while Octave is running in the wrong thread?  That
++    // was happening on Unixy systems until we started using
++    // pthread_kill and blocking interrupts from all threads except the
++    // one running the Octave interpreter.
++
++    ::raise (SIGINT);
++  }
++};
++
++#else
++
++class pthread_thread_manager : public octave_base_thread_manager
++{
++public:
++
++  pthread_thread_manager (void)
++    : octave_base_thread_manager (), my_thread (), initialized (false)
++  { }
++
++  void register_current_thread (void)
++  {
++    my_thread = pthread_self ();
++    initialized = true;
++  }
++
++  void interrupt (void)
++  {
++    if (initialized)
++      pthread_kill (my_thread, SIGINT);
++  }
++
++private:
++
++  pthread_t my_thread;
++
++  bool initialized;
++};
++
++#endif
++
++octave_thread_manager::octave_thread_manager (void)
++  : rep (octave_thread_manager::create_rep ())
++{ }
++
++static void
++block_or_unblock_signal (int how, int sig)
++{
++  sigset_t signal_mask;
++
++  sigemptyset (&signal_mask);
++
++  sigaddset (&signal_mask, sig);
++
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  sigprocmask (how, &signal_mask, 0);
++#else
++  pthread_sigmask (how, &signal_mask, 0);
++#endif
++}
++
++void
++octave_thread_manager::block_interrupt_signal (void)
++{
++  block_or_unblock_signal (SIG_BLOCK, SIGINT);
++}
++
++void
++octave_thread_manager::unblock_interrupt_signal (void)
++{
++  block_or_unblock_signal (SIG_UNBLOCK, SIGINT);
++}
++
++octave_base_thread_manager *
++octave_thread_manager::create_rep (void)
++{
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++  return new windows_thread_manager ();
++#else
++  return new pthread_thread_manager ();
++#endif
++}
+diff --git a/libgui/src/thread-manager.h b/libgui/src/thread-manager.h
+new file mode 100644
+--- /dev/null
++++ b/libgui/src/thread-manager.h
+@@ -0,0 +1,92 @@
++/*
++
++Copyright (C) 2013 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if !defined (octave_thread_manager_h)
++#define octave_thread_manager_h 1
++
++class octave_base_thread_manager
++{
++public:
++
++  friend class octave_thread_manager;
++
++  octave_base_thread_manager (void) : count (1) { }
++
++  octave_base_thread_manager (const octave_base_thread_manager&)
++    : count (1)
++  { }
++
++  virtual ~octave_base_thread_manager (void) { }
++
++  virtual void register_current_thread (void) = 0;
++
++  virtual void interrupt (void) = 0;
++
++protected:
++
++  int count;
++};
++
++class octave_thread_manager
++{
++public:
++
++  octave_thread_manager (void);
++
++  ~octave_thread_manager (void)
++  {
++    if (--rep->count == 0)
++      delete rep;
++  }
++
++  octave_thread_manager (const octave_thread_manager& tm) : rep (tm.rep) { }
++
++  octave_thread_manager& operator = (const octave_thread_manager& tm)
++  {
++    if (rep != tm.rep)
++      {
++        if (--rep->count == 0)
++          delete rep;
++
++        rep = tm.rep;
++        rep->count++;
++      }
++
++    return *this;
++  }
++
++  void register_current_thread (void) { rep->register_current_thread (); }
++
++  void interrupt (void) { rep->interrupt (); }
++
++  static void block_interrupt_signal (void);
++
++  static void unblock_interrupt_signal (void);
++
++private:
++
++  octave_base_thread_manager *rep;
++
++  static octave_base_thread_manager *create_rep (void);
++};
++
++#endif

@@ -1,0 +1,652 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1347499131 21600
+#      Wed Sep 12 19:18:51 2012 -0600
+# Node ID 8355fddce8152e9afe4abf0c07a74a06da7ade52
+# Parent  715220d2b511d0a21a1fcc8f286cf70acc3bf543
+Use sret and do not use save/restore stack (bug #37308)
+
+* jit-typeinfo.cc (octave_jit_grab_matrix, octave_jit_cast_matrix_any,
+octave_jit_paren_subsasgn_impl, octave_jit_paren_scalar_subsasgn,
+octave_jit_paren_subsasgn_matrix_range): Return matrix directly.
+(octave_jit_cast_range_any): Return range directly.
+(jit_function::jit_function): Maybe mark llvm function return as sret.
+(jit_function::call): Maybe mark llvm call sret and place allocas at function
+entry.
+(jit_function::do_return): Handle new parameter, verify.
+(jit_typeinfo::jit_typeinfo): Match C++ std::complex type better, pass
+jit_convetion::external explicitly, and disable right complex division.
+(jit_typeinfo::create_identity): Improve name.
+(jit_typeinfo::pack_complex, jit_typeinfo::unpack_complex): Handle changed
+complex format.
+* jit-typeinfo.h (jit_array::jit_array): New overload.
+(jit_type::mark_sret, jit_type::mark_pointer_arg): Remove default convention.
+(jit_function::do_return): Add verify parameter.
+
+* pt-jit.cc (jit_convert_llvm::convert_function): Store the jit_function.
+(jit_convert::visit): Call do_return if converting a function.
+* pt-jit.h (jit_convert_llvm::creating): New member variable.
+
+diff --git a/libinterp/interp-core/jit-typeinfo.cc b/libinterp/interp-core/jit-typeinfo.cc
+--- a/libinterp/interp-core/jit-typeinfo.cc
++++ b/libinterp/interp-core/jit-typeinfo.cc
+@@ -108,58 +108,58 @@ octave_jit_release_matrix (jit_matrix *m
+ 
+ extern "C" octave_base_value *
+ octave_jit_grab_any (octave_base_value *obv)
+ {
+   obv->grab ();
+   return obv;
+ }
+ 
+-extern "C" void
+-octave_jit_grab_matrix (jit_matrix *result, jit_matrix *m)
++extern "C" jit_matrix
++octave_jit_grab_matrix (jit_matrix *m)
+ {
+-  *result = *m->array;
++  return *m->array;
+ }
+ 
+ extern "C" octave_base_value *
+ octave_jit_cast_any_matrix (jit_matrix *m)
+ {
+   octave_value ret (*m->array);
+   octave_base_value *rep = ret.internal_rep ();
+   rep->grab ();
+   delete m->array;
+ 
+   return rep;
+ }
+ 
+-extern "C" void
+-octave_jit_cast_matrix_any (jit_matrix *ret, octave_base_value *obv)
++extern "C" jit_matrix
++octave_jit_cast_matrix_any (octave_base_value *obv)
+ {
+   NDArray m = obv->array_value ();
+-  *ret = m;
+   obv->release ();
++  return m;
+ }
+ 
+ extern "C" octave_base_value *
+ octave_jit_cast_any_range (jit_range *rng)
+ {
+   Range temp (*rng);
+   octave_value ret (temp);
+   octave_base_value *rep = ret.internal_rep ();
+   rep->grab ();
+ 
+   return rep;
+ }
+-extern "C" void
+-octave_jit_cast_range_any (jit_range *ret, octave_base_value *obv)
++extern "C" jit_range
++octave_jit_cast_range_any (octave_base_value *obv)
+ {
+ 
+   jit_range r (obv->range_value ());
+-  *ret = r;
+   obv->release ();
++  return r;
+ }
+ 
+ extern "C" double
+ octave_jit_cast_scalar_any (octave_base_value *obv)
+ {
+   double ret = obv->double_value ();
+   obv->release ();
+   return ret;
+@@ -223,29 +223,29 @@ octave_jit_gindex_range (int nd, int dim
+       gripe_index_out_of_range (nd, dim, iext, ext);
+     }
+   catch (const octave_execution_exception&)
+     {
+       gripe_library_execution_error ();
+     }
+ }
+ 
+-extern "C" void
+-octave_jit_paren_subsasgn_impl (jit_matrix *ret, jit_matrix *mat,
+-                                octave_idx_type index, double value)
++extern "C" jit_matrix
++octave_jit_paren_subsasgn_impl (jit_matrix *mat, octave_idx_type index,
++                                double value)
+ {
+   NDArray *array = mat->array;
+   if (array->nelem () < index)
+     array->resize1 (index);
+ 
+   double *data = array->fortran_vec ();
+   data[index - 1] = value;
+ 
+   mat->update ();
+-  *ret = *mat;
++  return *mat;
+ }
+ 
+ static void
+ make_indices (double *indices, octave_idx_type idx_count,
+               Array<idx_vector>& result)
+ {
+   result.resize (dim_vector (1, idx_count));
+   for (octave_idx_type i = 0; i < idx_count; ++i)
+@@ -267,41 +267,43 @@ octave_jit_paren_scalar (jit_matrix *mat
+     }
+   catch (const octave_execution_exception&)
+     {
+       gripe_library_execution_error ();
+       return 0;
+     }
+ }
+ 
+-extern "C" void
+-octave_jit_paren_scalar_subsasgn (jit_matrix *ret, jit_matrix *mat,
+-                                  double *indices, octave_idx_type idx_count,
+-                                  double value)
++extern "C" jit_matrix
++octave_jit_paren_scalar_subsasgn (jit_matrix *mat, double *indices,
++                                  octave_idx_type idx_count, double value)
+ {
+   // FIXME: Replace this with a more optimal version
++  jit_matrix ret;
+   try
+     {
+       Array<idx_vector> idx;
+       make_indices (indices, idx_count, idx);
+ 
+       Matrix temp (1, 1);
+       temp.xelem(0) = value;
+       mat->array->assign (idx, temp);
+-      ret->update (mat->array);
++      ret.update (mat->array);
+     }
+   catch (const octave_execution_exception&)
+     {
+       gripe_library_execution_error ();
+     }
++
++  return ret;
+ }
+ 
+-extern "C" void
+-octave_jit_paren_subsasgn_matrix_range (jit_matrix *result, jit_matrix *mat,
+-                                        jit_range *index, double value)
++extern "C" jit_matrix
++octave_jit_paren_subsasgn_matrix_range (jit_matrix *mat, jit_range *index,
++                                        double value)
+ {
+   NDArray *array = mat->array;
+   bool done = false;
+ 
+   // optimize for the simple case (no resizing and no errors)
+   if (*array->jit_ref_count () == 1
+       && index->all_elements_are_ints ())
+     {
+@@ -335,17 +337,19 @@ octave_jit_paren_subsasgn_matrix_range (
+   if (! done)
+     {
+       idx_vector idx (*index);
+       NDArray avalue (dim_vector (1, 1));
+       avalue.xelem (0) = value;
+       array->assign (idx, avalue);
+     }
+ 
+-  result->update (array);
++  jit_matrix ret;
++  ret.update (array);
++  return ret;
+ }
+ 
+ extern "C" double
+ octave_jit_end_matrix (jit_matrix *mat, octave_idx_type idx,
+                        octave_idx_type count)
+ {
+   octave_idx_type ndim = mat->dimensions[-1];
+   if (ndim == count)
+@@ -557,16 +561,20 @@ jit_function::jit_function (llvm::Module
+       llvm_args.push_back (argty);
+     }
+ 
+   // we mark all functinos as external linkage because this prevents llvm
+   // from getting rid of always inline functions
+   llvm::FunctionType *ft = llvm::FunctionType::get (rtype, llvm_args, false);
+   llvm_function = llvm::Function::Create (ft, llvm::Function::ExternalLinkage,
+                                           aname, module);
++
++  if (sret ())
++    llvm_function->addAttribute (1, llvm::Attribute::StructRet);
++
+   if (call_conv == jit_convention::internal)
+     llvm_function->addFnAttr (llvm::Attribute::AlwaysInline);
+ }
+ 
+ jit_function::jit_function (const jit_function& fn, jit_type *aresult,
+                             const std::vector<jit_type *>& aargs)
+   : module (fn.module), llvm_function (fn.llvm_function), mresult (aresult),
+     args (aargs), call_conv (fn.call_conv), mcan_error (fn.mcan_error)
+@@ -615,63 +623,65 @@ jit_function::call (llvm::IRBuilderD& bu
+     throw jit_fail_exception ("Call not implemented");
+ 
+   assert (in_args.size () == args.size ());
+   llvm::Function *stacksave
+     = llvm::Intrinsic::getDeclaration (module, llvm::Intrinsic::stacksave);
+   llvm::SmallVector<llvm::Value *, 10> llvm_args;
+   llvm_args.reserve (in_args.size () + sret ());
+ 
+-  llvm::Value *sret_mem = 0;
+-  llvm::Value *saved_stack = 0;
++  llvm::BasicBlock *insert_block = builder.GetInsertBlock ();
++  llvm::Function *parent = insert_block->getParent ();
++  assert (parent);
++
++  // we insert allocas inside the prelude block to prevent stack overflows
++  llvm::BasicBlock& prelude = parent->getEntryBlock ();
++  llvm::IRBuilder<> pre_builder (&prelude, prelude.begin ());
++
++  llvm::AllocaInst *sret_mem = 0;
+   if (sret ())
+     {
+-      saved_stack = builder.CreateCall (stacksave);
+-      sret_mem = builder.CreateAlloca (mresult->packed_type (call_conv));
++      sret_mem = pre_builder.CreateAlloca (mresult->packed_type (call_conv));
+       llvm_args.push_back (sret_mem);
+     }
+ 
+   for (size_t i = 0; i < in_args.size (); ++i)
+     {
+       llvm::Value *arg = in_args[i];
+       jit_type::convert_fn convert = args[i]->pack (call_conv);
+       if (convert)
+         arg = convert (builder, arg);
+ 
+       if (args[i]->pointer_arg (call_conv))
+         {
+-          if (! saved_stack)
+-            saved_stack = builder.CreateCall (stacksave);
+-
+-          arg = builder.CreateAlloca (args[i]->to_llvm ());
+-          builder.CreateStore (in_args[i], arg);
++          llvm::Type *ty = args[i]->packed_type (call_conv);
++          llvm::Value *alloca = pre_builder.CreateAlloca (ty);
++          builder.CreateStore (arg, alloca);
++          arg = alloca;
+         }
+ 
+       llvm_args.push_back (arg);
+     }
+ 
+-  llvm::Value *ret = builder.CreateCall (llvm_function, llvm_args);
+-  if (sret_mem)
+-    ret = builder.CreateLoad (sret_mem);
++  llvm::CallInst *callinst = builder.CreateCall (llvm_function, llvm_args);
++  llvm::Value *ret = callinst;
++
++  if (sret ())
++    {
++      callinst->addAttribute (1, llvm::Attribute::StructRet);
++      ret = builder.CreateLoad (sret_mem);
++    }
+ 
+   if (mresult)
+     {
+       jit_type::convert_fn unpack = mresult->unpack (call_conv);
+       if (unpack)
+         ret = unpack (builder, ret);
+     }
+ 
+-  if (saved_stack)
+-    {
+-      llvm::Function *stackrestore
+-        = llvm::Intrinsic::getDeclaration (module,
+-                                           llvm::Intrinsic::stackrestore);
+-      builder.CreateCall (stackrestore, saved_stack);
+-    }
+-
+   return ret;
+ }
+ 
+ llvm::Value *
+ jit_function::argument (llvm::IRBuilderD& builder, size_t idx) const
+ {
+   assert (idx < args.size ());
+ 
+@@ -686,35 +696,40 @@ jit_function::argument (llvm::IRBuilderD
+ 
+   if (args[idx]->pointer_arg (call_conv))
+     return builder.CreateLoad (iter);
+ 
+   return iter;
+ }
+ 
+ void
+-jit_function::do_return (llvm::IRBuilderD& builder, llvm::Value *rval)
++jit_function::do_return (llvm::IRBuilderD& builder, llvm::Value *rval,
++                         bool verify)
+ {
+   assert (! rval == ! mresult);
+ 
+   if (rval)
+     {
+       jit_type::convert_fn convert = mresult->pack (call_conv);
+       if (convert)
+         rval = convert (builder, rval);
+ 
+       if (sret ())
+-        builder.CreateStore (rval, llvm_function->arg_begin ());
++        {
++          builder.CreateStore (rval, llvm_function->arg_begin ());
++          builder.CreateRetVoid ();
++        }
+       else
+         builder.CreateRet (rval);
+     }
+   else
+     builder.CreateRetVoid ();
+ 
+-  llvm::verifyFunction (*llvm_function);
++  if (verify)
++    llvm::verifyFunction (*llvm_function);
+ }
+ 
+ void
+ jit_function::do_add_mapping (llvm::ExecutionEngine *engine, void *fn)
+ {
+   assert (valid ());
+   engine->addGlobalMapping (llvm_function, fn);
+ }
+@@ -1027,19 +1042,24 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   matrix_contents[3] = index_t->getPointerTo ();
+   matrix_contents[4] = string_t;
+   matrix_t->setBody (llvm::makeArrayRef (matrix_contents, 5));
+ 
+   llvm::Type *complex_t = llvm::VectorType::get (scalar_t, 2);
+ 
+   // complex_ret is what is passed to C functions in order to get calling
+   // convention right
++  llvm::Type *cmplx_inner_cont[] = {scalar_t, scalar_t};
++  llvm::StructType *cmplx_inner = llvm::StructType::create (cmplx_inner_cont);
++
+   complex_ret = llvm::StructType::create (context, "complex_ret");
+-  llvm::Type *complex_ret_contents[] = {scalar_t, scalar_t};
+-  complex_ret->setBody (complex_ret_contents);
++  {
++    llvm::Type *contents[] = {cmplx_inner};
++    complex_ret->setBody (contents);
++  }
+ 
+   // create types
+   any = new_type ("any", 0, any_t);
+   matrix = new_type ("matrix", any, matrix_t);
+   complex = new_type ("complex", any, complex_t);
+   scalar = new_type ("scalar", complex, scalar_t);
+   scalar_ptr = new_type ("scalar_ptr", 0, scalar_t->getPointerTo ());
+   any_ptr = new_type ("any_ptr", 0, any_t->getPointerTo ());
+@@ -1054,28 +1074,28 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   create_int (64);
+ 
+   casts.resize (next_id + 1);
+   identities.resize (next_id + 1);
+ 
+   // specify calling conventions
+   // FIXME: We should detect architecture and do something sane based on that
+   // here we assume x86 or x86_64
+-  matrix->mark_sret ();
+-  matrix->mark_pointer_arg ();
++  matrix->mark_sret (jit_convention::external);
++  matrix->mark_pointer_arg (jit_convention::external);
+ 
+-  range->mark_sret ();
+-  range->mark_pointer_arg ();
++  range->mark_sret (jit_convention::external);
++  range->mark_pointer_arg (jit_convention::external);
+ 
+   complex->set_pack (jit_convention::external, &jit_typeinfo::pack_complex);
+   complex->set_unpack (jit_convention::external, &jit_typeinfo::unpack_complex);
+   complex->set_packed_type (jit_convention::external, complex_ret);
+ 
+   if (sizeof (void *) == 4)
+-    complex->mark_sret ();
++    complex->mark_sret (jit_convention::external);
+ 
+   paren_subsref_fn.initialize (module, engine);
+   paren_subsasgn_fn.initialize (module, engine);
+ 
+   // bind global variables
+   lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
+                                            llvm::GlobalValue::ExternalLinkage,
+                                            0, "error_state");
+@@ -1328,19 +1348,19 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   jit_function complex_div = create_function (jit_convention::external,
+                                               "octave_jit_complex_div",
+                                               complex, complex, complex);
+   complex_div.add_mapping (engine, &octave_jit_complex_div);
+   complex_div.mark_can_error ();
+   binary_ops[octave_value::op_div].add_overload (fn);
+   binary_ops[octave_value::op_ldiv].add_overload (fn);
+ 
+-  fn = mirror_binary (complex_div);
+-  binary_ops[octave_value::op_ldiv].add_overload (fn);
+-  binary_ops[octave_value::op_el_ldiv].add_overload (fn);
++  // fn = mirror_binary (complex_div);
++  // binary_ops[octave_value::op_ldiv].add_overload (fn);
++  // binary_ops[octave_value::op_el_ldiv].add_overload (fn);
+ 
+   fn = create_function (jit_convention::external,
+                         "octave_jit_pow_complex_complex", complex, complex,
+                         complex);
+   fn.add_mapping (engine, &octave_jit_pow_complex_complex);
+   binary_ops[octave_value::op_pow].add_overload (fn);
+   binary_ops[octave_value::op_el_pow].add_overload (fn);
+ 
+@@ -1985,18 +2005,21 @@ jit_function
+ jit_typeinfo::create_identity (jit_type *type)
+ {
+   size_t id = type->type_id ();
+   if (id >= identities.size ())
+     identities.resize (id + 1);
+ 
+   if (! identities[id].valid ())
+     {
+-      jit_function fn = create_function (jit_convention::internal, "id", type,
+-                                         type);
++      std::stringstream name;
++      name << "id_" << type->name ();
++      jit_function fn = create_function (jit_convention::internal, name.str (),
++                                         type, type);
++
+       llvm::BasicBlock *body = fn.new_block ();
+       builder.SetInsertPoint (body);
+       fn.do_return (builder, fn.argument (builder, 0));
+       return identities[id] = fn;
+     }
+ 
+   return identities[id];
+ }
+@@ -2136,27 +2159,34 @@ jit_typeinfo::mirror_binary (const jit_f
+ 
+ llvm::Value *
+ jit_typeinfo::pack_complex (llvm::IRBuilderD& bld, llvm::Value *cplx)
+ {
+   llvm::Type *complex_ret = instance->complex_ret;
+   llvm::Value *real = bld.CreateExtractElement (cplx, bld.getInt32 (0));
+   llvm::Value *imag = bld.CreateExtractElement (cplx, bld.getInt32 (1));
+   llvm::Value *ret = llvm::UndefValue::get (complex_ret);
+-  ret = bld.CreateInsertValue (ret, real, 0);
+-  return bld.CreateInsertValue (ret, imag, 1);
++
++  unsigned int re_idx[] = {0, 0};
++  unsigned int im_idx[] = {0, 1};
++  ret = bld.CreateInsertValue (ret, real, re_idx);
++  return bld.CreateInsertValue (ret, imag, im_idx);
+ }
+ 
+ llvm::Value *
+ jit_typeinfo::unpack_complex (llvm::IRBuilderD& bld, llvm::Value *result)
+ {
++  unsigned int re_idx[] = {0, 0};
++  unsigned int im_idx[] = {0, 1};
++
+   llvm::Type *complex_t = get_complex ()->to_llvm ();
+-  llvm::Value *real = bld.CreateExtractValue (result, 0);
+-  llvm::Value *imag = bld.CreateExtractValue (result, 1);
++  llvm::Value *real = bld.CreateExtractValue (result, re_idx);
++  llvm::Value *imag = bld.CreateExtractValue (result, im_idx);
+   llvm::Value *ret = llvm::UndefValue::get (complex_t);
++
+   ret = bld.CreateInsertElement (ret, real, bld.getInt32 (0));
+   return bld.CreateInsertElement (ret, imag, bld.getInt32 (1));
+ }
+ 
+ llvm::Value *
+ jit_typeinfo::complex_real (llvm::Value *cx)
+ {
+   return builder.CreateExtractElement (cx, builder.getInt32 (0));
+diff --git a/libinterp/interp-core/jit-typeinfo.h b/libinterp/interp-core/jit-typeinfo.h
+--- a/libinterp/interp-core/jit-typeinfo.h
++++ b/libinterp/interp-core/jit-typeinfo.h
+@@ -61,16 +61,18 @@ jit_range
+ 
+ std::ostream& operator<< (std::ostream& os, const jit_range& rng);
+ 
+ // jit_array is compatable with the llvm array/matrix structures
+ template <typename T, typename U>
+ struct
+ jit_array
+ {
++  jit_array () : array (0) {}
++
+   jit_array (T& from) : array (new T (from))
+   {
+     update ();
+   }
+ 
+   void update (void)
+   {
+     ref_count = array->jit_ref_count ();
+@@ -156,25 +158,25 @@ public:
+   // -------------------- Calling Convention information --------------------
+ 
+   // A function declared like: mytype foo (int arg0, int arg1);
+   // Will be converted to: void foo (mytype *retval, int arg0, int arg1)
+   // if mytype is sret. The caller is responsible for allocating space for
+   // retval. (on the stack)
+   bool sret (jit_convention::type cc) const { return msret[cc]; }
+ 
+-  void mark_sret (jit_convention::type cc = jit_convention::external)
++  void mark_sret (jit_convention::type cc)
+   { msret[cc] = true; }
+ 
+   // A function like: void foo (mytype arg0)
+   // Will be converted to: void foo (mytype *arg0)
+   // Basically just pass by reference.
+   bool pointer_arg (jit_convention::type cc) const { return mpointer_arg[cc]; }
+ 
+-  void mark_pointer_arg (jit_convention::type cc = jit_convention::external)
++  void mark_pointer_arg (jit_convention::type cc)
+   { mpointer_arg[cc] = true; }
+ 
+   // Convert into an equivalent form before calling. For example, complex is
+   // represented as two values llvm vector, but we need to pass it as a two
+   // valued llvm structure to C functions.
+   convert_fn pack (jit_convention::type cc) { return mpack[cc]; }
+ 
+   void set_pack (jit_convention::type cc, convert_fn fn) { mpack[cc] = fn; }
+@@ -273,17 +275,18 @@ public:
+   JIT_CALL (3);
+ 
+ #undef JIT_CALL
+ #undef JIT_PARAMS
+ #undef JIT_PARAM_ARGS
+ 
+   llvm::Value *argument (llvm::IRBuilderD& builder, size_t idx) const;
+ 
+-  void do_return (llvm::IRBuilderD& builder, llvm::Value *rval = 0);
++  void do_return (llvm::IRBuilderD& builder, llvm::Value *rval = 0,
++                  bool verify = true);
+ 
+   llvm::Function *to_llvm (void) const { return llvm_function; }
+ 
+   // If true, then the return value is passed as a pointer in the first argument
+   bool sret (void) const { return mresult && mresult->sret (call_conv); }
+ 
+   bool can_error (void) const { return mcan_error; }
+ 
+diff --git a/libinterp/interp-core/pt-jit.cc b/libinterp/interp-core/pt-jit.cc
+--- a/libinterp/interp-core/pt-jit.cc
++++ b/libinterp/interp-core/pt-jit.cc
+@@ -1070,18 +1070,18 @@ jit_convert_llvm::convert_function (llvm
+                                     const std::vector<jit_type *>& args)
+ {
+   converting_function = true;
+ 
+   jit_block *final_block = blocks.back ();
+   jit_return *ret = dynamic_cast<jit_return *> (final_block->back ());
+   assert (ret);
+ 
+-  jit_function creating = jit_function (module, jit_convention::internal,
+-                                        "foobar", ret->result_type (), args);
++  creating = jit_function (module, jit_convention::internal,
++                           "foobar", ret->result_type (), args);
+   function = creating.to_llvm ();
+ 
+   try
+     {
+       prelude = creating.new_block ("prelude");
+       builder.SetInsertPoint (prelude);
+ 
+       tree_parameter_list *plist = fcn.parameter_list ();
+@@ -1275,20 +1275,26 @@ jit_convert_llvm::visit (jit_store_argum
+   llvm::Value *arg = arguments[store.name ()];
+   store.stash_llvm (builder.CreateStore (arg_value, arg));
+ }
+ 
+ void
+ jit_convert_llvm::visit (jit_return& ret)
+ {
+   jit_value *res = ret.result ();
+-  if (res)
+-    builder.CreateRet (res->to_llvm ());
++
++  if (converting_function)
++    creating.do_return (builder, res->to_llvm (), false);
+   else
+-    builder.CreateRetVoid ();
++    {
++      if (res)
++        builder.CreateRet (res->to_llvm ());
++      else
++        builder.CreateRetVoid ();
++    }
+ }
+ 
+ void
+ jit_convert_llvm::visit (jit_phi& phi)
+ {
+   // we might not have converted all incoming branches, so we don't
+   // set incomming branches now
+   llvm::PHINode *node = llvm::PHINode::Create (phi.type_llvm (),
+diff --git a/libinterp/interp-core/pt-jit.h b/libinterp/interp-core/pt-jit.h
+--- a/libinterp/interp-core/pt-jit.h
++++ b/libinterp/interp-core/pt-jit.h
+@@ -271,16 +271,19 @@ private:
+ 
+   std::vector<std::pair<std::string, bool> > argument_vec;
+ 
+   // name -> llvm argument (used for compiling loops)
+   std::map<std::string, llvm::Value *> arguments;
+ 
+   bool converting_function;
+ 
++  // only used if we are converting a function
++  jit_function creating;
++
+   llvm::Function *function;
+   llvm::BasicBlock *prelude;
+ 
+   void convert (const jit_block_list& blocks,
+                 const std::list<jit_value *>& constants);
+ 
+   void finish_phi (jit_phi *phi);
+ 

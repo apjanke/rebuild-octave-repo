@@ -1,0 +1,1813 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1505337051 14400
+#      Wed Sep 13 17:10:51 2017 -0400
+# Node ID 21915520ac7b566d631343c1c18139fce018bb69
+# Parent  2932a325930c5d4d2a5ea518f18739a46bedbd68
+use more direct method for non-local symbol access (bug #38236)
+
+* pt-id.h, pd-id.cc (tree_evaluator::get_current_scope): New function.
+
+* symtab.h, symtab.cc (symbol_table::symbol_reference): Delete class.
+(symbol_table::dummy_symbol_record): Delete static data member.
+
+* oct-lvalue.h, oct-lvalue.cc (octave_lvalue::sym): Use symbol_record,
+not symbol_reference.  Change all uses.
+(octave_lvalue::black_hole): New data member.
+(octave_lvalue:is_black_hole): Use it.
+(octave_lvalue::mark_black_hole): New function.
+
+* pt-eval.cc (tree_identifier::sym): Use symbol_record, not
+symbol_reference.  Change all uses.
+(tree_black_hole::lvalue): Explicitly mark retval as black_hole.
+(tree_evaluator::visit_tree_identifier): Adapt to
+tree_identifier::symbol returning symbol_record, not symbol_reference.
+
+* oct-parse.in.yy (push_script_symtab, begin_file): New non-terminals.
+(file): Use begin_file to start script and classdef files.
+Use separate symbol table scope when parsing scripts.
+
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_code::m_scope): Move here
+from octave_user_fcn.
+(octave_user_code::scope): Likewise.
+(octave_user_script::octave_user_script): New argument scope.
+(octave_user_script::call): Add
+symbol_table::scope::unbind_script_symbols to unwind_protect frame.
+Call scope::bind_script_symbols to access evaluation scope.
+(octave_user_function::octave_user_function): Pass scope argument to
+octave_user_code base class.
+
+* symtab.h, symtab.cc (symbol_record_rep::m_fwd_rep): New data
+member.  Change member functions to forward to secondary rep if it is
+defined.
+(symbol_record::bind_fwd_rep, symbol_record_rep::bind_fwd_rep,
+symbol_record::unbind_fwd_rep, symbol_record_rep::unbind_fwd_rep):
+New functions.
+(scope::bind_script_symbols, scope::unbind_script_symbols): New functions.
+(scope::varval, scope::global_varval, scope::top_level_varval):
+Now const.
+(scope::update_nest): Set forwarding rep for nonlocal symbol.
+(scope::look_nonlocal): Likewise.
+
+diff --git a/libinterp/corefcn/oct-lvalue.cc b/libinterp/corefcn/oct-lvalue.cc
+--- a/libinterp/corefcn/oct-lvalue.cc
++++ b/libinterp/corefcn/oct-lvalue.cc
+@@ -30,19 +30,19 @@ along with Octave; see the file COPYING.
+ #include "ov.h"
+ 
+ void
+ octave_lvalue::assign (octave_value::assign_op op, const octave_value& rhs)
+ {
+   if (! is_black_hole ())
+     {
+       if (idx.empty ())
+-        sym->assign (op, rhs);
++        sym.assign (op, rhs);
+       else
+-        sym->assign (op, type, idx, rhs);
++        sym.assign (op, type, idx, rhs);
+     }
+ }
+ 
+ void
+ octave_lvalue::set_index (const std::string& t,
+                           const std::list<octave_value_list>& i)
+ {
+   if (! idx.empty ())
+@@ -68,30 +68,30 @@ octave_lvalue::index_is_empty (void) con
+ }
+ 
+ void
+ octave_lvalue::do_unary_op (octave_value::unary_op op)
+ {
+   if (! is_black_hole ())
+     {
+       if (idx.empty ())
+-        sym->do_non_const_unary_op (op);
++        sym.do_non_const_unary_op (op);
+       else
+-        sym->do_non_const_unary_op (op, type, idx);
++        sym.do_non_const_unary_op (op, type, idx);
+     }
+ }
+ 
+ octave_value
+ octave_lvalue::value (void) const
+ {
+   octave_value retval;
+ 
+   if (! is_black_hole ())
+     {
+-      octave_value val = sym->varval ();
++      octave_value val = sym.varval ();
+ 
+       if (idx.empty ())
+         retval = val;
+       else
+         {
+           if (val.is_constant ())
+             retval = val.subsref (type, idx);
+           else
+diff --git a/libinterp/corefcn/oct-lvalue.h b/libinterp/corefcn/oct-lvalue.h
+--- a/libinterp/corefcn/oct-lvalue.h
++++ b/libinterp/corefcn/oct-lvalue.h
+@@ -33,55 +33,58 @@ class octave_value_list;
+ #include "ovl.h"
+ #include "symtab.h"
+ 
+ class
+ octave_lvalue
+ {
+ public:
+ 
+-  octave_lvalue (const octave::symbol_table::symbol_reference& s
+-                   = octave::symbol_table::symbol_reference ())
+-    : sym (s), type (), idx (), nel (1)
++  octave_lvalue (const octave::symbol_table::symbol_record& s
++                   = octave::symbol_table::symbol_record ())
++    : sym (s), black_hole (false), type (), idx (), nel (1)
+   { }
+ 
+   octave_lvalue (const octave_lvalue& vr)
+-    : sym (vr.sym), type (vr.type), idx (vr.idx), nel (vr.nel)
++    : sym (vr.sym), black_hole (vr.black_hole), type (vr.type), idx (vr.idx), nel (vr.nel)
+   { }
+ 
+   octave_lvalue& operator = (const octave_lvalue& vr)
+   {
+     if (this != &vr)
+       {
+         sym = vr.sym;
++        black_hole = vr.black_hole;
+         type = vr.type;
+         idx = vr.idx;
+         nel = vr.nel;
+       }
+ 
+     return *this;
+   }
+ 
+   ~octave_lvalue (void) = default;
+ 
+-  bool is_black_hole (void) const { return sym.is_black_hole (); }
++  bool is_black_hole (void) const { return black_hole; }
++
++  void mark_black_hole (void) { black_hole = true; }
+ 
+   bool is_defined (void) const
+   {
+-    return ! is_black_hole () && sym->is_defined ();
++    return ! is_black_hole () && sym.is_defined ();
+   }
+ 
+   bool is_undefined (void) const
+   {
+-    return is_black_hole () || sym->is_undefined ();
++    return is_black_hole () || sym.is_undefined ();
+   }
+ 
+   bool isstruct (void) const { return value().isstruct (); }
+ 
+-  void define (const octave_value& v) { sym->assign (v); }
++  void define (const octave_value& v) { sym.assign (v); }
+ 
+   void assign (octave_value::assign_op, const octave_value&);
+ 
+   void numel (octave_idx_type n) { nel = n; }
+ 
+   octave_idx_type numel (void) const { return nel; }
+ 
+   void set_index (const std::string& t, const std::list<octave_value_list>& i);
+@@ -93,17 +96,19 @@ public:
+   bool index_is_empty (void) const;
+ 
+   void do_unary_op (octave_value::unary_op op);
+ 
+   octave_value value (void) const;
+ 
+ private:
+ 
+-  octave::symbol_table::symbol_reference sym;
++  octave::symbol_table::symbol_record sym;
++
++  bool black_hole;
+ 
+   std::string type;
+ 
+   std::list<octave_value_list> idx;
+ 
+   octave_idx_type nel;
+ };
+ 
+diff --git a/libinterp/corefcn/symtab.cc b/libinterp/corefcn/symtab.cc
+--- a/libinterp/corefcn/symtab.cc
++++ b/libinterp/corefcn/symtab.cc
+@@ -55,16 +55,22 @@ static int Vignore_function_time_stamp =
+ 
+ namespace octave
+ {
+   octave_value symbol_table::dummy_octave_value;
+ 
+   void
+   symbol_table::symbol_record::symbol_record_rep::clear (scope *sid)
+   {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->clear (sid);
++        return;
++      }
++
+     if (! (is_hidden () || is_inherited ())
+         && sid == decl_scope ())
+       {
+         if (is_global ())
+           unmark_global ();
+ 
+         if (is_persistent ())
+           {
+@@ -75,16 +81,22 @@ namespace octave
+ 
+         assign (octave_value ());
+       }
+   }
+ 
+   void
+   symbol_table::symbol_record::symbol_record_rep::init_persistent (void)
+   {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->init_persistent ();
++        return;
++      }
++
+     symbol_table::scope *scope
+       = __require_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::init_persistent");
+ 
+     if (! is_defined ())
+       {
+         mark_persistent ();
+ 
+         assign (scope->persistent_varval (name));
+@@ -92,33 +104,46 @@ namespace octave
+     // FIXME: this causes trouble with recursive calls.
+     // else
+     //   error ("unable to declare existing variable persistent");
+   }
+ 
+   void
+   symbol_table::symbol_record::symbol_record_rep::erase_persistent (void)
+   {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->erase_persistent ();
++        return;
++      }
++
+     unmark_persistent ();
+ 
+     symbol_table::scope *scope
+       = __require_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::erase_persistent");
+ 
+     scope->erase_persistent (name);
+   }
+ 
+   symbol_table::symbol_record::symbol_record_rep *
+   symbol_table::symbol_record::symbol_record_rep::dup (scope *new_scope) const
+   {
++    // FIXME: is this the right thing do to?
++    if (m_fwd_rep)
++      return m_fwd_rep->dup (new_scope);
++
+     return new symbol_record_rep (new_scope, name, varval (), storage_class);
+   }
+ 
+   octave_value
+   symbol_table::symbol_record::symbol_record_rep::dump (void) const
+   {
++    if (m_fwd_rep)
++      return m_fwd_rep->dump ();
++
+     std::map<std::string, octave_value> m
+       = {{ "name", name },
+          { "local", is_local () },
+          { "automatic", is_automatic () },
+          { "formal", is_formal () },
+          { "hidden", is_hidden () },
+          { "inherited", is_inherited () },
+          { "global", is_global () },
+@@ -130,47 +155,59 @@ namespace octave
+       m["value"] = val;
+ 
+     return octave_value (m);
+   }
+ 
+   octave_value&
+   symbol_table::symbol_record::symbol_record_rep::xglobal_varref (void)
+   {
++    if (m_fwd_rep)
++      return m_fwd_rep->xglobal_varref ();
++
+     symbol_table& symtab
+       = __get_symbol_table__ ("symbol_table::symbol_record::symbol_record_rep::xglobal_varref");
+ 
+     symbol_table::global_symbols_iterator p
+       = symtab.m_global_symbols.find (name);
+ 
+     return (p == symtab.m_global_symbols.end ()
+             ? symtab.m_global_symbols[name] : p->second);
+   }
+ 
+   octave_value&
+   symbol_table::symbol_record::symbol_record_rep::xpersistent_varref (void)
+   {
++    if (m_fwd_rep)
++      return m_fwd_rep->xpersistent_varref ();
++
+     symbol_table::scope *scope
+       = __get_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::xpersistent_varref");
+ 
+     return scope ? scope->persistent_varref (name) : dummy_octave_value;
+   }
+ 
+   octave_value
+   symbol_table::symbol_record::symbol_record_rep::xglobal_varval (void) const
+   {
++    if (m_fwd_rep)
++      return m_fwd_rep->xglobal_varval ();
++
+     symbol_table& symtab
+       = __get_symbol_table__ ("symbol_table::symbol_record::symbol_record_rep::xglobal_varval");
+ 
+     return symtab.global_varval (name);
+   }
+ 
+   octave_value
+   symbol_table::symbol_record::symbol_record_rep::xpersistent_varval (void) const
+   {
++    if (m_fwd_rep)
++      return m_fwd_rep->xpersistent_varval ();
++
+     symbol_table::scope *scope
+       = __get_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::xpersistent_varval");
+ 
+     return scope ? scope->persistent_varval (name) : octave_value ();
+   }
+ 
+   symbol_table::symbol_record::symbol_record (void)
+     : rep (new symbol_record_rep (__get_current_scope__ ("symbol_record"),
+@@ -211,40 +248,16 @@ namespace octave
+                 }
+ #endif
+               }
+           }
+       }
+ 
+     return retval;
+   }
+-
+-  symbol_table::symbol_record
+-  symbol_table::dummy_symbol_record (static_cast<symbol_table::scope*> (nullptr));
+-
+-  symbol_table::symbol_reference::symbol_reference (const symbol_record& record)
+-    : m_scope (nullptr), m_context (0), m_sym (record)
+-  {
+-    m_scope = __get_current_scope__ ("symbol_reference");
+-  }
+-
+-  void
+-  symbol_table::symbol_reference::update (void) const
+-  {
+-    symbol_table::scope *curr_scope
+-      = __get_current_scope__ ("symbol_reference::update");
+-
+-    if (curr_scope && (m_scope != curr_scope || ! m_sym.is_valid ()))
+-      {
+-        m_scope = curr_scope;
+-        m_sym = m_scope->insert (m_sym.name ());  // ???
+-      }
+-
+-    m_context = m_scope ? m_scope->current_context () : 0;
+-  }
+ }
+ 
+ static void
+ split_name_with_package (const std::string& name, std::string& fname,
+                          std::string& pname)
+ {
+   size_t pos = name.rfind ('.');
+ 
+@@ -1823,29 +1836,22 @@ namespace octave
+   symbol_table::scope::update_nest (void)
+   {
+     if (m_parent)
+       {
+         // fix bad symbol_records
+         for (auto& nm_sr : m_symbols)
+           {
+             symbol_record& ours = nm_sr.second;
+-            symbol_record parents;
+ 
+             if (! ours.is_formal ()
+-                && m_is_nested && m_parent->look_nonlocal (nm_sr.first, parents))
++                && m_is_nested && m_parent->look_nonlocal (nm_sr.first, ours))
+               {
+                 if (ours.is_global () || ours.is_persistent ())
+                   error ("global and persistent may only be used in the topmost level in which a nested variable is used");
+-
+-                if (! ours.is_formal ())
+-                  {
+-                    ours.invalidate ();
+-                    nm_sr.second = parents;
+-                  }
+               }
+             else
+               ours.set_curr_fcn (m_fcn);
+           }
+ 
+         // The scopes of nested functions are static.
+         m_is_static = true;
+       }
+@@ -1869,22 +1875,36 @@ namespace octave
+     table_iterator p = m_symbols.find (name);
+     if (p == m_symbols.end ())
+       {
+         if (m_is_nested && m_parent)
+           return m_parent->look_nonlocal (name, result);
+       }
+     else if (! p->second.is_automatic ())
+       {
+-        result = p->second;
++        result.bind_fwd_rep (p->second);
+         return true;
+       }
+ 
+     return false;
+   }
++
++  void
++  symbol_table::scope::bind_script_symbols (scope *curr_scope)
++  {
++    for (auto& nm_sr : m_symbols)
++      nm_sr.second.bind_fwd_rep (curr_scope->find_symbol (nm_sr.first));
++  }
++
++  void
++  symbol_table::scope::unbind_script_symbols (void)
++  {
++    for (auto& nm_sr : m_symbols)
++      nm_sr.second.unbind_fwd_rep ();
++  }
+ }
+ 
+ DEFUN (ignore_function_time_stamp, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} ignore_function_time_stamp ()
+ @deftypefnx {} {@var{old_val} =} ignore_function_time_stamp (@var{new_val})
+ Query or set the internal variable that controls whether Octave checks
+ the time stamp on files each time it looks up functions defined in
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -91,62 +91,96 @@ namespace octave
+     private:
+ 
+       class symbol_record_rep
+       {
+       public:
+ 
+         symbol_record_rep (scope *s, const std::string& nm,
+                            const octave_value& v, unsigned int sc)
+-          : m_decl_scope (s), curr_fcn (nullptr), name (nm), value_stack (),
++          : m_decl_scope (s), curr_fcn (nullptr), name (nm),
++            m_fwd_rep (nullptr), value_stack (),
+             storage_class (sc), /* finfo (), */ valid (true), count (1)
+         {
+           value_stack.push_back (v);
+         }
+ 
+         // No copying!
+ 
+         symbol_record_rep (const symbol_record_rep& ov) = delete;
+ 
+         symbol_record_rep& operator = (const symbol_record_rep&) = delete;
+ 
+         ~symbol_record_rep (void) = default;
+ 
+         void assign (const octave_value& value)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->assign (value);
++              return;
++            }
++
+           varref () = value;
+         }
+ 
+         void assign (octave_value::assign_op op,
+                      const std::string& type,
+                      const std::list<octave_value_list>& idx,
+                      const octave_value& value)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->assign (op, type, idx, value);
++              return;
++            }
++
+           varref().assign (op, type, idx, value);
+         }
+ 
+         void assign (octave_value::assign_op op, const octave_value& value)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->assign (op, value);
++              return;
++            }
++
+           varref().assign (op, value);
+         }
+ 
+         void do_non_const_unary_op (octave_value::unary_op op)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->do_non_const_unary_op (op);
++              return;
++            }
++
+           varref().do_non_const_unary_op (op);
+         }
+ 
+         void do_non_const_unary_op (octave_value::unary_op op,
+                                     const std::string& type,
+                                     const std::list<octave_value_list>& idx)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->do_non_const_unary_op (op, type, idx);
++              return;
++            }
++
+           varref().do_non_const_unary_op (op, type, idx);
+         }
+ 
+         octave_value& varref (void)
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->varref ();
++
+           context_id context
+             = m_decl_scope ? m_decl_scope->current_context () : 0;
+ 
+           if (is_global ())
+             return xglobal_varref ();
+           else if (is_persistent ())
+             return xpersistent_varref ();
+           else
+@@ -156,16 +190,19 @@ namespace octave
+                 value_stack.push_back (octave_value ());
+ 
+               return value_stack[context];
+             }
+         }
+ 
+         octave_value varval (void) const
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->varval ();
++
+           context_id context
+             = m_decl_scope ? m_decl_scope->current_context () : 0;
+ 
+           if (is_global ())
+             return xglobal_varval ();
+           else if (is_persistent ())
+             return xpersistent_varval ();
+           else
+@@ -174,16 +211,22 @@ namespace octave
+                 return value_stack[context];
+               else
+                 return octave_value ();
+             }
+         }
+ 
+         void push_context (scope *sid)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->push_context (sid);
++              return;
++            }
++
+           if (! (is_persistent () || is_global ())
+               && sid == decl_scope ())
+             value_stack.push_back (octave_value ());
+         }
+ 
+         // If pop_context returns 0, we are out of values and this element
+         // of the symbol table should be deleted.  This can happen for
+         // functions like
+@@ -195,112 +238,367 @@ namespace octave
+         //       eval ("x = 1");
+         //     endif
+         //   endfunction
+         //
+         // Here, X should only exist in the final stack frame.
+ 
+         size_t pop_context (scope *sid)
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->pop_context (sid);
++
+           size_t retval = 1;
+ 
+           if (! (is_persistent () || is_global ())
+               && sid == decl_scope ())
+             {
+               value_stack.pop_back ();
+               retval = value_stack.size ();
+             }
+ 
+           return retval;
+         }
+ 
+-        void clear (void) { clear (decl_scope ()); }
++        void clear (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->clear ();
++              return;
++            }
++
++          clear (decl_scope ());
++        }
+ 
+         void clear (scope *sid);
+ 
+         bool is_defined (void) const
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_defined ();
++
+           return varval ().is_defined ();
+         }
+ 
+         bool is_valid (void) const
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_valid ();
++
+           return valid;
+         }
+ 
+         bool is_variable (void) const
+         {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_variable ();
++
+           return (! is_local () || is_defined ());
+         }
+ 
+-        bool is_local (void) const { return storage_class & local; }
+-        bool is_automatic (void) const { return storage_class & automatic; }
+-        bool is_formal (void) const { return storage_class & formal; }
+-        bool is_hidden (void) const { return storage_class & hidden; }
+-        bool is_inherited (void) const { return storage_class & inherited; }
+-        bool is_global (void) const { return storage_class & global; }
+-        bool is_persistent (void) const { return storage_class & persistent; }
+-        bool is_added_static (void) const {return storage_class & added_static; }
+-
+-        void mark_local (void) { storage_class |= local; }
+-        void mark_automatic (void) { storage_class |= automatic; }
+-        void mark_formal (void) { storage_class |= formal; }
+-        void mark_hidden (void) { storage_class |= hidden; }
+-        void mark_inherited (void) { storage_class |= inherited; }
++        bool is_local (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_local ();
++
++          return storage_class & local;
++        }
++
++        bool is_automatic (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_automatic ();
++
++          return storage_class & automatic;
++        }
++
++        bool is_formal (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_formal ();
++
++          return storage_class & formal;
++        }
++
++        bool is_hidden (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_hidden ();
++
++          return storage_class & hidden;
++        }
++
++        bool is_inherited (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_inherited ();
++
++          return storage_class & inherited;
++        }
++
++        bool is_global (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_global ();
++
++          return storage_class & global;
++        }
++
++        bool is_persistent (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_persistent ();
++
++          return storage_class & persistent;
++        }
++
++        bool is_added_static (void) const
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->is_added_static ();
++
++          return storage_class & added_static;
++        }
++
++        void mark_local (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_local ();
++              return;
++            }
++
++          storage_class |= local;
++        }
++
++        void mark_automatic (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_automatic ();
++              return;
++            }
++
++          storage_class |= automatic;
++        }
++
++        void mark_formal (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_formal ();
++              return;
++            }
++
++          storage_class |= formal;
++        }
++
++        void mark_hidden (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_hidden ();
++              return;
++            }
++
++          storage_class |= hidden;
++        }
++
++        void mark_inherited (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_inherited ();
++              return;
++            }
++
++          storage_class |= inherited;
++        }
++
+         void mark_global (void)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_global ();
++              return;
++            }
++
+           if (is_persistent ())
+             error ("can't make persistent variable %s global", name.c_str ());
+ 
+           storage_class |= global;
+         }
++
+         void mark_persistent (void)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_persistent ();
++              return;
++            }
++
+           if (is_global ())
+             error ("can't make global variable %s persistent", name.c_str ());
+ 
+           storage_class |= persistent;
+         }
+-        void mark_added_static (void) { storage_class |= added_static; }
+-
+-        void unmark_local (void) { storage_class &= ~local; }
+-        void unmark_automatic (void) { storage_class &= ~automatic; }
+-        void unmark_formal (void) { storage_class &= ~formal; }
+-        void unmark_hidden (void) { storage_class &= ~hidden; }
+-        void unmark_inherited (void) { storage_class &= ~inherited; }
+-        void unmark_global (void) { storage_class &= ~global; }
+-        void unmark_persistent (void) { storage_class &= ~persistent; }
+-        void unmark_added_static (void) { storage_class &= ~added_static; }
++
++        void mark_added_static (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->mark_added_static ();
++              return;
++            }
++
++          storage_class |= added_static;
++        }
++
++        void unmark_local (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_local ();
++              return;
++            }
++
++          storage_class &= ~local;
++        }
++
++        void unmark_automatic (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_automatic ();
++              return;
++            }
++
++          storage_class &= ~automatic;
++        }
++
++        void unmark_formal (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_formal ();
++              return;
++            }
++
++          storage_class &= ~formal;
++        }
++
++        void unmark_hidden (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_hidden ();
++              return;
++            }
++
++          storage_class &= ~hidden;
++        }
++
++        void unmark_inherited (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_inherited ();
++              return;
++            }
++
++          storage_class &= ~inherited;
++        }
++
++        void unmark_global (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_global ();
++              return;
++            }
++
++          storage_class &= ~global;
++        }
++
++        void unmark_persistent (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_persistent ();
++              return;
++            }
++
++          storage_class &= ~persistent;
++        }
++
++        void unmark_added_static (void)
++        {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->unmark_added_static ();
++              return;
++            }
++
++          storage_class &= ~added_static;
++        }
+ 
+         void init_persistent (void);
+ 
+         void invalidate (void)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->invalidate ();
++              return;
++            }
++
+           valid = false;
+         }
+ 
+         void erase_persistent (void);
+ 
+-        scope *decl_scope (void) { return m_decl_scope; }
++        scope *decl_scope (void)
++        {
++          if (m_fwd_rep)
++            return m_fwd_rep->decl_scope ();
++
++          return m_decl_scope;
++        }
+ 
+         void set_curr_fcn (octave_user_function *fcn)
+         {
++          if (m_fwd_rep)
++            {
++              m_fwd_rep->set_curr_fcn (fcn);
++              return;
++            }
++
+           curr_fcn = fcn;
+         }
+ 
++        // We don't forward more than once, so no need to forward the
++        // next two.
++
++        void bind_fwd_rep (symbol_record_rep *rep) { m_fwd_rep = rep; }
++
++        void unbind_fwd_rep (void) { m_fwd_rep = nullptr; }
++
+         symbol_record_rep * dup (scope *new_scope) const;
+ 
+         octave_value dump (void) const;
+ 
+         scope *m_decl_scope;
+ 
+         octave_user_function *curr_fcn;
+ 
+         std::string name;
+ 
++        symbol_record_rep *m_fwd_rep;
++
+         std::deque<octave_value> value_stack;
+ 
+         unsigned int storage_class;
+ 
+         //      fcn_info *finfo;
+ 
+         bool valid;
+ 
+@@ -465,99 +763,39 @@ namespace octave
+       void erase_persistent (void) { rep->erase_persistent (); }
+ 
+       void invalidate (void) { rep->invalidate (); }
+ 
+       scope *decl_scope (void) { return rep->decl_scope (); }
+ 
+       unsigned int xstorage_class (void) const { return rep->storage_class; }
+ 
+-      void set_curr_fcn (octave_user_function *fcn) { rep->set_curr_fcn (fcn); }
++      void set_curr_fcn (octave_user_function *fcn)
++      {
++        rep->set_curr_fcn (fcn);
++      }
++
++      void bind_fwd_rep (const symbol_record& sr)
++      {
++        rep->bind_fwd_rep (sr.rep);
++      }
++
++      void unbind_fwd_rep (void) { rep->unbind_fwd_rep (); }
+ 
+       octave_value dump (void) const { return rep->dump (); }
+ 
+       const symbol_record_rep *xrep (void) const { return rep; }
+ 
+     private:
+ 
+       symbol_record_rep *rep;
+ 
+       symbol_record (symbol_record_rep *new_rep) : rep (new_rep) { }
+     };
+ 
+-    static symbol_record dummy_symbol_record;
+-
+-    // Always access a symbol from the current scope.
+-    // Useful for scripts, as they may be executed in more than one scope.
+-    class
+-      symbol_reference
+-    {
+-    public:
+-
+-      symbol_reference (void) : m_scope (nullptr), m_context (0) { }
+-
+-      symbol_reference (const symbol_record& record);
+-
+-      symbol_reference (const symbol_record& record, scope *curr_scope,
+-                        context_id context)
+-        : m_scope (curr_scope), m_context (context), m_sym (record)
+-      { }
+-
+-      symbol_reference (const symbol_reference& ref) = default;
+-
+-      symbol_reference& operator = (const symbol_reference& ref) = default;
+-
+-      bool is_black_hole (void) const { return ! m_scope; }
+-
+-      symbol_table::scope * scope (void) const
+-      {
+-        update ();
+-        return m_scope;
+-      }
+-
+-      context_id context (void) const
+-      {
+-        update ();
+-        return m_context;
+-      }
+-
+-      // The name is the same regardless of scope.
+-      const std::string& name (void) const { return m_sym.name (); }
+-
+-      symbol_record *operator-> (void)
+-      {
+-        update ();
+-        return &m_sym;
+-      }
+-
+-      symbol_record *operator-> (void) const
+-      {
+-        update ();
+-        return &m_sym;
+-      }
+-
+-      // can be used to place symbol_reference in maps, we don't overload < as
+-      // it doesn't make any sense for symbol_reference
+-      struct comparator
+-      {
+-        bool operator ()(const symbol_reference& lhs,
+-                         const symbol_reference& rhs) const
+-        {
+-          return lhs.name () < rhs.name ();
+-        }
+-      };
+-    private:
+-
+-      void update (void) const;
+-
+-      mutable symbol_table::scope *m_scope;
+-      mutable context_id m_context;
+-      mutable symbol_record m_sym;
+-    };
+-
+     class fcn_info
+     {
+     public:
+ 
+       typedef std::map<std::string, octave_value>::const_iterator
+       str_val_const_iterator;
+       typedef std::map<std::string, octave_value>::iterator str_val_iterator;
+ 
+@@ -964,17 +1202,17 @@ namespace octave
+ 
+     void assign (const std::string& name,
+                  const octave_value& value = octave_value ())
+     {
+       if (m_current_scope)
+         m_current_scope->assign (name, value);
+     }
+ 
+-    octave_value varval (const std::string& name)
++    octave_value varval (const std::string& name) const
+     {
+       return (m_current_scope
+               ? m_current_scope->varval (name) : octave_value ());
+     }
+ 
+     void
+       global_assign (const std::string& name,
+                      const octave_value& value = octave_value ())
+@@ -982,33 +1220,31 @@ namespace octave
+       global_symbols_iterator p = m_global_symbols.find (name);
+ 
+       if (p == m_global_symbols.end ())
+         m_global_symbols[name] = value;
+       else
+         p->second = value;
+     }
+ 
+-    octave_value
+-      global_varval (const std::string& name)
++    octave_value global_varval (const std::string& name) const
+     {
+       global_symbols_const_iterator p = m_global_symbols.find (name);
+ 
+       return (p != m_global_symbols.end ()) ? p->second : octave_value ();
+     }
+ 
+     void
+       top_level_assign (const std::string& name,
+                         const octave_value& value = octave_value ())
+     {
+       m_top_scope->assign (name, value);
+     }
+ 
+-    octave_value
+-      top_level_varval (const std::string& name)
++    octave_value top_level_varval (const std::string& name) const
+     {
+       return m_top_scope->varval (name);
+     }
+ 
+     bool
+       is_built_in_function_name (const std::string& name)
+     {
+       octave_value val = find_built_in_function (name);
+@@ -1760,17 +1996,17 @@ namespace octave
+       octave_value& persistent_varref (const std::string& name)
+       {
+         m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+ 
+         return (p == m_persistent_symbols.end ()
+                 ? m_persistent_symbols[name] : p->second);
+       }
+ 
+-      octave_value persistent_varval (const std::string& name)
++      octave_value persistent_varval (const std::string& name) const
+       {
+         m_persistent_symbols_const_iterator p = m_persistent_symbols.find (name);
+ 
+         return (p != m_persistent_symbols.end ()) ? p->second : octave_value ();
+       }
+ 
+       void erase_persistent (const std::string& name)
+       {
+@@ -2038,16 +2274,20 @@ namespace octave
+ 
+       void set_parent (scope *p);
+ 
+       void update_nest (void);
+ 
+       bool look_nonlocal (const std::string& name,
+                           symbol_table::symbol_record& result);
+ 
++      void bind_script_symbols (scope *curr_scope);
++
++      void unbind_script_symbols (void);
++
+     private:
+ 
+       // Name for this scope (usually the corresponding filename of the
+       // function corresponding to the scope).
+       std::string m_name;
+ 
+       // Map from symbol names to symbol info.
+       std::map<std::string, symbol_table::symbol_record> m_symbols;
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -59,16 +59,17 @@ along with Octave; see the file COPYING.
+ #include "variables.h"
+ #include "ov-fcn-handle.h"
+ 
+ // Whether to optimize subsasgn method calls.
+ static bool Voptimize_subsasgn_calls = true;
+ 
+ octave_user_code::~octave_user_code (void)
+ {
++  delete m_scope;
+   delete m_file_info;
+ }
+ 
+ void
+ octave_user_code::get_file_info (void)
+ {
+   std::string file_name = fcn_file_name ();
+ 
+@@ -126,33 +127,33 @@ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (oct
+ 
+ octave_user_script::octave_user_script (void)
+   : octave_user_code (), cmd_list (nullptr), file_name (),
+     t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     call_depth (-1)
+ { }
+ 
+-octave_user_script::octave_user_script (const std::string& fnm,
+-                                        const std::string& nm,
+-                                        octave::tree_statement_list *cmds,
+-                                        const std::string& ds)
+-  : octave_user_code (nm, ds), cmd_list (cmds), file_name (fnm),
++octave_user_script::octave_user_script
++  (const std::string& fnm, const std::string& nm,
++   octave::symbol_table::scope *scope, octave::tree_statement_list *cmds,
++   const std::string& ds)
++  : octave_user_code (nm, scope, ds), cmd_list (cmds), file_name (fnm),
+     t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     call_depth (-1)
+ {
+   if (cmd_list)
+     cmd_list->mark_as_script_body ();
+ }
+ 
+-octave_user_script::octave_user_script (const std::string& fnm,
+-                                        const std::string& nm,
+-                                        const std::string& ds)
+-  : octave_user_code (nm, ds), cmd_list (nullptr), file_name (fnm),
++octave_user_script::octave_user_script
++  (const std::string& fnm, const std::string& nm,
++   octave::symbol_table::scope *scope, const std::string& ds)
++  : octave_user_code (nm, scope, ds), cmd_list (nullptr), file_name (fnm),
+     t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     call_depth (-1)
+ { }
+ 
+ octave_user_script::~octave_user_script (void)
+ {
+   if (cmd_list)
+@@ -199,16 +200,20 @@ octave_user_script::call (octave::tree_e
+ 
+       frame.protect_var (octave::tree_evaluator::statement_context);
+       octave::tree_evaluator::statement_context = octave::tree_evaluator::script;
+ 
+       octave::profiler& profiler = tw.get_profiler ();
+ 
+       octave::profiler::enter<octave_user_script> block (profiler, *this);
+ 
++      frame.add_method (m_scope,
++                        &octave::symbol_table::scope::unbind_script_symbols);
++      m_scope->bind_script_symbols (tw.get_current_scope ());
++
+       if (tw.echo ())
+         tw.push_echo_state (frame, octave::tree_evaluator::ECHO_SCRIPTS,
+                             file_name);
+ 
+       cmd_list->accept (tw);
+ 
+       if (octave::tree_return_command::returning)
+         octave::tree_return_command::returning = 0;
+@@ -233,17 +238,17 @@ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (oct
+                                      "user-defined function");
+ 
+ // Ugh.  This really needs to be simplified (code/data?
+ // extrinsic/intrinsic state?).
+ 
+ octave_user_function::octave_user_function
+   (octave::symbol_table::scope *scope, octave::tree_parameter_list *pl,
+    octave::tree_parameter_list *rl, octave::tree_statement_list *cl)
+-  : octave_user_code ("", ""), m_scope (scope),
++  : octave_user_code ("", scope, ""),
+     param_list (pl), ret_list (rl), cmd_list (cl),
+     lead_comm (), trail_comm (), file_name (),
+     location_line (0), location_column (0),
+     parent_name (), t_parsed (static_cast<time_t> (0)),
+     t_checked (static_cast<time_t> (0)),
+     system_fcn_file (false), call_depth (-1),
+     num_named_args (param_list ? param_list->length () : 0),
+     subfunction (false), inline_function (false),
+@@ -262,18 +267,16 @@ octave_user_function::octave_user_functi
+ }
+ 
+ octave_user_function::~octave_user_function (void)
+ {
+   // FIXME: shouldn't this happen automatically when deleting cmd_list?
+   if (cmd_list)
+     cmd_list->remove_all_breakpoints (file_name);
+ 
+-  delete m_scope;
+-
+   delete param_list;
+   delete ret_list;
+   delete cmd_list;
+   delete lead_comm;
+   delete trail_comm;
+ 
+ #if defined (HAVE_LLVM)
+   delete jit_info;
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -56,25 +56,28 @@ class jit_function_info;
+ #endif
+ 
+ class
+ octave_user_code : public octave_function
+ {
+ protected:
+ 
+   octave_user_code (const std::string& nm,
++                    octave::symbol_table::scope *scope = nullptr,
+                     const std::string& ds = "")
+-    : octave_function (nm, ds), curr_unwind_protect_frame (nullptr),
+-      m_file_info (nullptr)
++    : octave_function (nm, ds), m_scope (scope), m_file_info (nullptr),
++      curr_unwind_protect_frame (nullptr)
+   { }
+ 
+ public:
+ 
+   octave_user_code (void)
+-    : octave_function () { }
++    : octave_function (), m_scope (nullptr), m_file_info (nullptr),
++      curr_unwind_protect_frame (nullptr)
++  { }
+ 
+   // No copying!
+ 
+   octave_user_code (const octave_user_code& f) = delete;
+ 
+   octave_user_code& operator = (const octave_user_code& f) = delete;
+ 
+   ~octave_user_code (void);
+@@ -89,46 +92,53 @@ public:
+ 
+   std::string get_code_line (size_t line);
+ 
+   std::deque<std::string> get_code_lines (size_t line, size_t num_lines);
+ 
+   void cache_function_text (const std::string& text,
+                             const octave::sys::time& timestamp);
+ 
++  octave::symbol_table::scope *scope (void) { return m_scope; }
++
+   virtual std::map<std::string, octave_value> subfunctions (void) const;
+ 
+   virtual octave::tree_statement_list * body (void) = 0;
+ 
+ protected:
+ 
+   void get_file_info (void);
+ 
+-  // pointer to the current unwind_protect frame of this function.
+-  octave::unwind_protect *curr_unwind_protect_frame;
++  // Our symbol table scope.
++  octave::symbol_table::scope *m_scope;
+ 
+   // Cached text of function or script code with line offsets
+   // calculated.
+   octave::file_info *m_file_info;
++
++  // pointer to the current unwind_protect frame of this function.
++  octave::unwind_protect *curr_unwind_protect_frame;
+ };
+ 
+ // Scripts.
+ 
+ class
+ octave_user_script : public octave_user_code
+ {
+ public:
+ 
+   octave_user_script (void);
+ 
+   octave_user_script (const std::string& fnm, const std::string& nm,
+-                      octave::tree_statement_list *cmds,
++                      octave::symbol_table::scope *scope = nullptr,
++                      octave::tree_statement_list *cmds = nullptr,
+                       const std::string& ds = "");
+ 
+   octave_user_script (const std::string& fnm, const std::string& nm,
++                      octave::symbol_table::scope *scope = nullptr,
+                       const std::string& ds = "");
+ 
+   // No copying!
+ 
+   octave_user_script (const octave_user_script& f) = delete;
+ 
+   octave_user_script& operator = (const octave_user_script& f) = delete;
+ 
+@@ -268,18 +278,16 @@ public:
+ 
+   std::string profiler_name (void) const;
+ 
+   std::string parent_fcn_name (void) const { return parent_name; }
+ 
+   octave::symbol_table::scope *
+   parent_fcn_scope (void) const { return parent_scope; }
+ 
+-  octave::symbol_table::scope *scope (void) { return m_scope; }
+-
+   octave::sys::time time_parsed (void) const { return t_parsed; }
+ 
+   octave::sys::time time_checked (void) const { return t_checked; }
+ 
+   void mark_as_system_fcn_file (void);
+ 
+   bool is_system_fcn_file (void) const { return system_fcn_file; }
+ 
+@@ -406,19 +414,16 @@ private:
+   {
+     none,
+     legacy,
+     classdef
+   };
+ 
+   std::string ctor_type_str (void) const;
+ 
+-  // Our symbol table scope.
+-  octave::symbol_table::scope *m_scope;
+-
+   // List of arguments for this function.  These are local variables.
+   octave::tree_parameter_list *param_list;
+ 
+   // List of parameters we return.  These are also local variables in
+   // this function.
+   octave::tree_parameter_list *ret_list;
+ 
+   // The list of commands that make up the body of this function.
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -225,17 +225,18 @@ static void yyerror (octave::base_parser
+ // Other tokens.
+ %token<dummy_type> END_OF_INPUT
+ %token<dummy_type> INPUT_FILE
+ // %token VARARGIN VARARGOUT
+ 
+ %token<dummy_type> '(' ')' '[' ']' '{' '}' '.' ',' ';' '@' '\n'
+ 
+ // Nonterminals we construct.
+-%type <dummy_type> indirect_ref_op decl_param_init push_fcn_symtab
++%type <dummy_type> indirect_ref_op decl_param_init
++%type <dummy_type> push_fcn_symtab push_script_symtab begin_file
+ %type <dummy_type> param_list_beg param_list_end stmt_begin parse_error
+ %type <dummy_type> parsing_local_fcns
+ %type <comment_type> stash_comment
+ %type <tok_val> function_beg classdef_beg
+ %type <punct_type> sep_no_nl opt_sep_no_nl nl opt_nl sep opt_sep
+ %type <tree_type> input
+ %type <tree_constant_type> string constant magic_colon
+ %type <tree_anon_fcn_handle_type> anon_fcn_handle
+@@ -1433,48 +1434,66 @@ return_list1    : identifier
+ // Script or function file
+ // =======================
+ 
+ parsing_local_fcns
+                 : // empty
+                   { parser.m_parsing_local_functions = true; }
+                 ;
+ 
+-file            : INPUT_FILE opt_nl opt_list END_OF_INPUT
++push_script_symtab : // empty
++                  {
++                    $$ = 0;
++
++                    lexer.symtab_context.push (new octave::symbol_table::scope ());
++                  }
++                ;
++
++begin_file      : push_script_symtab INPUT_FILE
++                  { $$ = 0; }
++                ;
++
++file            : begin_file opt_nl opt_list END_OF_INPUT
+                   {
+                     YYUSE ($2);
+ 
+                     if (lexer.reading_fcn_file)
+                       {
+                         // Delete the dummy statement_list we created
+                         // after parsing the function.  Any function
+                         // definitions found in the file have already
+                         // been stored in the symbol table or in
+                         // base_parser::m_primary_fcn_ptr.
+ 
++                        // Unused symbol table context.
++                        lexer.symtab_context.pop ();
++
+                         delete $3;
+                       }
+                     else
+                       {
+                         octave::tree_statement *end_of_script
+                           = parser.make_end ("endscript", true,
+                                              lexer.input_line_number,
+                                              lexer.current_input_column);
+ 
+                         parser.make_script ($3, end_of_script);
+                       }
+ 
+                     $$ = nullptr;
+                   }
+-                | INPUT_FILE opt_nl classdef parsing_local_fcns opt_sep opt_fcn_list END_OF_INPUT
++                | begin_file opt_nl classdef parsing_local_fcns opt_sep opt_fcn_list END_OF_INPUT
+                   {
+                     YYUSE ($2);
+                     YYUSE ($5);
+                     YYUSE ($6);
+ 
++                    // Unused symbol table context.
++                    lexer.symtab_context.pop ();
++
+                     if (lexer.reading_classdef_file)
+                       parser.m_classdef_object = $3;
+ 
+                     $$ = nullptr;
+                   }
+                 ;
+ 
+ // ===================
+@@ -3211,18 +3230,20 @@ namespace octave
+     if (! cmds)
+       cmds = new tree_statement_list ();
+ 
+     cmds->append (end_script);
+ 
+     octave_user_script *script
+       = new octave_user_script (m_lexer.fcn_file_full_name,
+                                 m_lexer.fcn_file_name,
++                                m_lexer.symtab_context.curr_scope (),
+                                 cmds, m_lexer.help_text);
+ 
++    m_lexer.symtab_context.pop ();
+     m_lexer.help_text = "";
+ 
+     sys::time now;
+ 
+     script->stash_fcn_file_time (now);
+ 
+     m_primary_fcn_ptr = script;
+   }
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -613,16 +613,24 @@ namespace octave
+           }
+         else
+           return val.is_equal (label_value);
+       }
+ 
+     return false;
+   }
+ 
++  symbol_table::scope *
++  tree_evaluator::get_current_scope (void)
++  {
++    symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++    return symtab.current_scope ();
++  }
++
+   void
+   tree_evaluator::visit_decl_command (tree_decl_command& cmd)
+   {
+     if (m_echo_state)
+       {
+         size_t line = cmd.line ();
+         echo_code (line);
+         m_echo_file_pos = line + 1;
+@@ -967,19 +975,19 @@ namespace octave
+       }
+   }
+ 
+   void
+   tree_evaluator::visit_identifier (tree_identifier& expr)
+   {
+     octave_value_list retval;
+ 
+-    symbol_table::symbol_reference sym = expr.symbol ();
+-
+-    octave_value val = sym->find ();
++    symbol_table::symbol_record sym = expr.symbol ();
++
++    octave_value val = sym.find ();
+ 
+     if (val.is_defined ())
+       {
+         // GAGME -- this would be cleaner if we required
+         // parens to indicate function calls.
+         //
+         // If this identifier refers to a function, we need to know
+         // whether it is indexed so that we can do the same thing
+@@ -1009,17 +1017,17 @@ namespace octave
+                 octave_value_list args = ovl (val);
+                 args.stash_name_tags (string_vector (expr.name ()));
+                 feval ("display", args);
+               }
+ 
+             retval = val;
+           }
+       }
+-    else if (sym->is_added_static ())
++    else if (sym.is_added_static ())
+       expr.static_workspace_error ();
+     else
+       expr.eval_undefined_error ();
+ 
+     m_value_stack.push (retval);
+   }
+ 
+   void
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -30,16 +30,17 @@ along with Octave; see the file COPYING.
+ #include <stack>
+ #include <string>
+ 
+ #include "call-stack.h"
+ #include "ovl.h"
+ #include "profiler.h"
+ #include "pt-exp.h"
+ #include "pt-walk.h"
++#include "symtab.h"
+ 
+ namespace octave
+ {
+   class tree_decl_elt;
+   class tree_expression;
+ 
+   class interpreter;
+   class unwind_protect;
+@@ -302,16 +303,18 @@ namespace octave
+ 
+     bool switch_case_label_matches (tree_switch_case *expr,
+                                     const octave_value& val);
+ 
+     call_stack& get_call_stack (void) { return m_call_stack; }
+ 
+     profiler& get_profiler (void) { return m_profiler; }
+ 
++    symbol_table::scope *get_current_scope (void);
++
+     int max_recursion_depth (void) const { return m_max_recursion_depth; }
+ 
+     int max_recursion_depth (int n)
+     {
+       int val = m_max_recursion_depth;
+       m_max_recursion_depth = n;
+       return val;
+     }
+diff --git a/libinterp/parse-tree/pt-id.cc b/libinterp/parse-tree/pt-id.cc
+--- a/libinterp/parse-tree/pt-id.cc
++++ b/libinterp/parse-tree/pt-id.cc
+@@ -55,17 +55,17 @@ namespace octave
+       error_with_id ("Octave:undefined-function",
+                      "'%s' undefined near line %d column %d",
+                      name ().c_str (), l, c);
+   }
+ 
+   octave_lvalue
+   tree_identifier::lvalue (tree_evaluator *)
+   {
+-    if (sym->is_added_static ())
++    if (sym.is_added_static ())
+       static_workspace_error ();
+ 
+     return octave_lvalue (sym);
+   }
+ 
+   tree_identifier *
+   tree_identifier::dup (symbol_table::scope& scope) const
+   {
+diff --git a/libinterp/parse-tree/pt-id.h b/libinterp/parse-tree/pt-id.h
+--- a/libinterp/parse-tree/pt-id.h
++++ b/libinterp/parse-tree/pt-id.h
+@@ -68,19 +68,19 @@ namespace octave
+     bool has_magic_end (void) const { return (name () == "end"); }
+ 
+     bool is_identifier (void) const { return true; }
+ 
+     // The name doesn't change with scope, so use sym instead of
+     // accessing it through sym so that this function may remain const.
+     std::string name (void) const { return sym.name (); }
+ 
+-    bool is_defined (void) { return sym->is_defined (); }
++    bool is_defined (void) { return sym.is_defined (); }
+ 
+-    virtual bool is_variable (void) const { return sym->is_variable (); }
++    virtual bool is_variable (void) const { return sym.is_variable (); }
+ 
+     virtual bool is_black_hole (void) { return false; }
+ 
+     // Try to find a definition for an identifier.  Here's how:
+     //
+     //   * If the identifier is already defined and is a function defined
+     //     in an function file that has been modified since the last time
+     //     we parsed it, parse it again.
+@@ -92,24 +92,24 @@ namespace octave
+     //     function file to parse.
+     //
+     //   * On systems that support dynamic linking, we prefer .oct files,
+     //     then .mex files, then .m files.
+ 
+     octave_value
+     do_lookup (const octave_value_list& args = octave_value_list ())
+     {
+-      return sym->find (args);
++      return sym.find (args);
+     }
+ 
+-    void mark_global (void) { sym->mark_global (); }
++    void mark_global (void) { sym.mark_global (); }
+ 
+-    void mark_persistent (void) { sym->init_persistent (); }
++    void mark_persistent (void) { sym.init_persistent (); }
+ 
+-    void mark_as_formal_parameter (void) { sym->mark_formal (); }
++    void mark_as_formal_parameter (void) { sym.mark_formal (); }
+ 
+     // We really need to know whether this symbol referst to a variable
+     // or a function, but we may not know that yet.
+ 
+     bool lvalue_ok (void) const { return true; }
+ 
+     octave_lvalue lvalue (tree_evaluator *);
+ 
+@@ -123,24 +123,25 @@ namespace octave
+ 
+     tree_identifier * dup (symbol_table::scope& scope) const;
+ 
+     void accept (tree_walker& tw)
+     {
+       tw.visit_identifier (*this);
+     }
+ 
+-    symbol_table::symbol_reference symbol (void) const
++    symbol_table::symbol_record symbol (void) const
+     {
+       return sym;
+     }
++
+   private:
+ 
+     // The symbol record that this identifier references.
+-    symbol_table::symbol_reference sym;
++    symbol_table::symbol_record sym;
+   };
+ 
+   class tree_black_hole : public tree_identifier
+   {
+   public:
+ 
+     tree_black_hole (int l = -1, int c = -1)
+       : tree_identifier (l, c) { }
+@@ -153,17 +154,19 @@ namespace octave
+ 
+     tree_black_hole * dup (symbol_table::scope&) const
+     {
+       return new tree_black_hole;
+     }
+ 
+     octave_lvalue lvalue (tree_evaluator *)
+     {
+-      return octave_lvalue (); // black hole lvalue
++      octave_lvalue retval;
++      retval.mark_black_hole ();
++      return retval;
+     }
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+ OCTAVE_DEPRECATED (4.4, "use 'octave::tree_identifier' instead")
+ typedef octave::tree_identifier tree_identifier;

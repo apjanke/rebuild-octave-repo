@@ -1,0 +1,277 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1542345537 18000
+#      Fri Nov 16 00:18:57 2018 -0500
+# Node ID 661dfb062485435517f4ca0a68c3838f2124dd3d
+# Parent  fb907736f335df181f894146b3f2904ac05cfb71
+use symbol_info_list to gather data for save function
+
+* call-stack.h, call-stack.cc (call_stack::glob_symbol_info,
+call_stack::stack_frame::glob_symbol_info): New functions.
+
+* load-save.cc (do_save): Use them to get data to save from current
+stack frame.
+
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -89,16 +89,40 @@ namespace octave
+     else if (this->fcn_file_name () != rhs.fcn_file_name ())
+       return false;
+     else if (this->fcn_name () != rhs.fcn_name ())
+       return false;
+     else
+       return true;
+   }
+ 
++  symbol_info_list
++  call_stack::stack_frame::glob_symbol_info (const std::string& pat) const
++  {
++    std::list<octave::symbol_record> tmp = m_scope.glob (pat, true);
++
++    octave::symbol_info_list symbol_stats;
++
++    for (const auto& sr : tmp)
++      {
++        octave_value value = sr.varval (m_context);
++
++        if (value.is_defined ())
++          {
++            symbol_info syminf (sr.name (), value, sr.is_automatic (),
++                                value.iscomplex (), sr.is_formal (),
++                                sr.is_global (), sr.is_persistent ());
++
++            symbol_stats.append (syminf);
++          }
++      }
++
++    return symbol_stats;
++  }
++
+   call_stack::call_stack (interpreter& interp)
+     : cs (), curr_frame (0), m_max_stack_depth (1024), m_interpreter (interp)
+   {
+     symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+     push (nullptr, nullptr, symtab.top_scope (), 0);
+   }
+ 
+@@ -653,16 +677,22 @@ namespace octave
+         const stack_frame& new_elt = cs[curr_frame];
+ 
+         symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+         symtab.set_scope_and_context (new_elt.m_scope, new_elt.m_context);
+       }
+   }
+ 
++  symbol_info_list
++  call_stack::glob_symbol_info (const std::string& pat) const
++  {
++    return cs[curr_frame].glob_symbol_info (pat);
++  }
++
+   octave_value
+   call_stack::max_stack_depth (const octave_value_list& args, int nargout)
+   {
+     return set_internal_variable (m_max_stack_depth, args, nargout,
+                                   "max_stack_depth", 0);
+   }
+ }
+ 
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -35,16 +35,17 @@ class octave_user_script;
+ class octave_value;
+ class octave_value_list;
+ 
+ #include "symscope.h"
+ 
+ namespace octave
+ {
+   class interpreter;
++  class symbol_info_list;
+   class unwind_protect;
+ 
+   class
+   OCTINTERP_API
+   call_stack
+   {
+   public:
+ 
+@@ -76,16 +77,18 @@ namespace octave
+       int column (void) const { return m_column; }
+ 
+       std::string fcn_file_name (void) const;
+ 
+       std::string fcn_name (bool print_subfn = true) const;
+ 
+       bool operator == (const stack_frame& rhs) const;
+ 
++      symbol_info_list glob_symbol_info (const std::string& pat) const;
++
+     private:
+ 
+       octave_function *m_fcn;
+       unwind_protect *m_unwind_protect_frame;
+       int m_line;
+       int m_column;
+       symbol_scope m_scope;
+       symbol_record::context_id m_context;
+@@ -255,16 +258,18 @@ namespace octave
+     octave_map backtrace (size_t nskip = 0);
+ 
+     octave_map empty_backtrace (void) const;
+ 
+     void pop (void);
+ 
+     void clear (void) { cs.clear (); }
+ 
++    symbol_info_list glob_symbol_info (const std::string& pat) const;
++
+     octave_value max_stack_depth (const octave_value_list& args, int nargout);
+ 
+   private:
+ 
+     // The current call stack.
+     std::deque<stack_frame> cs;
+ 
+     size_t curr_frame;
+diff --git a/libinterp/corefcn/load-save.cc b/libinterp/corefcn/load-save.cc
+--- a/libinterp/corefcn/load-save.cc
++++ b/libinterp/corefcn/load-save.cc
+@@ -60,16 +60,17 @@ along with Octave; see the file COPYING.
+ #include "interpreter-private.h"
+ #include "load-path.h"
+ #include "load-save.h"
+ #include "oct-hdf5.h"
+ #include "ovl.h"
+ #include "oct-map.h"
+ #include "ov-cell.h"
+ #include "pager.h"
++#include "syminfo.h"
+ #include "symtab.h"
+ #include "sysdep.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ #include "version.h"
+ 
+ #include "ls-hdf5.h"
+@@ -908,28 +909,25 @@ namespace octave
+   // Save variables with names matching PATTERN on stream OS in the
+   // format specified by FMT.
+ 
+   size_t load_save_system::save_vars (std::ostream& os,
+                                       const std::string& pattern,
+                                       const load_save_format& fmt,
+                                       bool save_as_floats)
+   {
+-    symbol_scope scope
+-      = m_interpreter.require_current_scope ("load_save_system::save_vars");
++    call_stack& cs = m_interpreter.get_call_stack ();
+ 
+-    symbol_record::context_id context = scope.current_context ();
+-
+-    std::list<symbol_record> vars = scope.glob (pattern);
++    symbol_info_list syminfo_list = cs.glob_symbol_info (pattern);
+ 
+     size_t saved = 0;
+ 
+-    for (const auto& var : vars)
++    for (const auto& syminfo : syminfo_list)
+       {
+-        do_save (os, var, context, fmt, save_as_floats);
++        do_save (os, syminfo, fmt, save_as_floats);
+ 
+         saved++;
+       }
+ 
+     return saved;
+   }
+ 
+   void load_save_system::do_save (std::ostream& os, const octave_value& tc,
+@@ -977,28 +975,27 @@ namespace octave
+         err_unrecognized_data_fmt ("save");
+         break;
+       }
+   }
+ 
+   // Save the info from SR on stream OS in the format specified by FMT.
+ 
+   void load_save_system::do_save (std::ostream& os,
+-                                  const symbol_record& sr,
+-                                  symbol_record::context_id context,
++                                  const symbol_info& syminfo,
+                                   const load_save_format& fmt,
+                                   bool save_as_floats)
+   {
+-    octave_value val = sr.varval (context);
++    octave_value val = syminfo.value ();
+ 
+     if (val.is_defined ())
+       {
+-        std::string name = sr.name ();
++        std::string name = syminfo.name ();
+         std::string help;
+-        bool global = sr.is_global ();
++        bool global = syminfo.is_global ();
+ 
+         do_save (os, val, name, help, global, fmt, save_as_floats);
+       }
+   }
+ 
+   // save fields of a scalar structure STR matching PATTERN on stream OS
+   // in the format specified by FMT.
+ 
+diff --git a/libinterp/corefcn/load-save.h b/libinterp/corefcn/load-save.h
+--- a/libinterp/corefcn/load-save.h
++++ b/libinterp/corefcn/load-save.h
+@@ -24,25 +24,25 @@ along with Octave; see the file COPYING.
+ #define octave_load_save_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <iosfwd>
+ #include <string>
+ 
+ #include "mach-info.h"
+-#include "symrec.h"
+ 
+ class string_vector;
+ class octave_value;
+ 
+ namespace octave
+ {
+   class interpreter;
+   class load_save_format;
++  class symbol_info;
+ 
+   class load_save_system
+   {
+   public:
+ 
+     // FIXME: maybe MAT5 and MAT7 should be options to MAT_BINARY.
+     // Similarly, save_as_floats may be an option for LS_BINARY,
+     // LS_HDF5 etc.
+@@ -228,18 +228,17 @@ namespace octave
+     size_t save_vars (std::ostream& os, const std::string& pattern,
+                       const load_save_format& fmt, bool save_as_floats);
+ 
+     void do_save (std::ostream& os, const octave_value& tc,
+                   const std::string& name, const std::string& help,
+                   bool global, const load_save_format& fmt,
+                   bool save_as_floats);
+ 
+-    void do_save (std::ostream& os, const symbol_record& sr,
+-                  symbol_record::context_id context,
++    void do_save (std::ostream& os, const symbol_info& syminfo,
+                   const load_save_format& fmt, bool save_as_floats);
+ 
+     size_t save_fields (std::ostream& os, const octave_scalar_map& m,
+                         const std::string& pattern,
+                         const load_save_format& fmt, bool save_as_floats);
+ 
+     void dump_octave_core (std::ostream& os, const char *fname,
+                            const load_save_format& fmt, bool save_as_floats);

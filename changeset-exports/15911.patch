@@ -1,0 +1,353 @@
+# HG changeset patch
+# User Michael Goffioul <michael.goffioul@gmail.com>
+# Date 1357528933 18000
+#      Sun Jan 06 22:22:13 2013 -0500
+# Branch classdef
+# Node ID b18b7e560236e6cab20b2764e2bdb8bcaf266736
+# Parent  dfd0dc594c4ffa1eff638b098a332c9cc2229b6e
+More flexible refcount to account for owned back-references.
+
+* libinterp/octave-value/ov-classdef.h (cdef_object_rep::static_count,
+cdef_object_rep::destroy): New virtual methods.
+(cdef_object_rep::refcount): Use octave_idx_type as counter type.
+(cdef_object_rep::release): New method.
+(cdef_object::~cdef_object, cdef_object::cdef_object (cdef_object)):
+Use it.
+(cdef_class::cdef_class_rep::member_count): New member.
+(cdef_class::cdef_class_rep::cdef_class_rep ()): Initialize it.
+(cdef_class::cdef_class_rep::static_count,
+cdef_class::cdef_class_rep::destroy): New methods.
+(cdef_package::cdef_package_rep::member_count): New member.
+(cdef_package::cdef_package_rep::cdef_package_rep ()): Initialize it.
+(cdef_package::cdef_package_rep::static_count,
+cdef_package::cdef_package_rep::destroy): New methods.
+
+* libinterp/octave-value/ov-classdef.cc
+(octave_classdef_proxy::~octave_classdef_proxy): Remove owned cdef_class
+from all_classes.
+(cdef_class::cdef_class_rep::cdef_class_rep (std::list<cdef_class>)):
+Initialize member_count.
+(cdef_class::cdef_class_rep::install_method,
+cdef_class::cdef_class_rep::install_property): Increment member_count.
+(cdef_package::cdef_package_rep::install_class,
+cdef_package::cdef_package_rep::install_package): Likewise.
+
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -809,17 +809,21 @@ octave_classdef::subsasgn (const std::st
+ //----------------------------------------------------------------------------
+ 
+ class octave_classdef_proxy : public octave_function
+ {
+ public:
+   octave_classdef_proxy (const cdef_class& _klass)
+     : klass (_klass) { }
+ 
+-  ~octave_classdef_proxy (void) { }
++  ~octave_classdef_proxy (void)
++    {
++      // This means the class has been cleared from the symbol table.
++      all_classes.erase (klass.get_name ());
++    }
+ 
+   octave_value_list
+   subsref (const std::string& type,
+            const std::list<octave_value_list>& idx,
+            int nargout)
+     { return klass.subsref_meta (type, idx, nargout); }
+ 
+   octave_value
+@@ -1209,17 +1213,18 @@ handle_cdef_object::~handle_cdef_object 
+ 
+ value_cdef_object::~value_cdef_object (void)
+ {
+   gnulib::printf ("deleting %s object (value)\n",
+                   get_class ().get_name ().c_str ());
+ }
+ 
+ cdef_class::cdef_class_rep::cdef_class_rep (const std::list<cdef_class>& superclasses)
+-     : handle_cdef_object (), handle_class (false), object_count (0)
++     : handle_cdef_object (), member_count (0), handle_class (false),
++       object_count (0)
+ {
+   put ("SuperClasses", to_ov (superclasses));
+   implicit_ctor_list = superclasses;
+ }
+ 
+ cdef_method
+ cdef_class::cdef_class_rep::find_method (const std::string& nm, bool local)
+ {
+@@ -1381,16 +1386,18 @@ private:
+   std::list<cdef_class> ctor_list;
+ };
+ 
+ void
+ cdef_class::cdef_class_rep::install_method (const cdef_method& meth)
+ {
+   method_map[meth.get_name ()] = meth;
+ 
++  member_count++;
++
+   if (meth.is_constructor ())
+     {
+       // Analyze the constructor code to determine what superclass
+       // constructors are called explicitly.
+ 
+       octave_function *of = meth.get_function ().function_value (true);
+ 
+       if (of)
+@@ -1538,16 +1545,18 @@ cdef_class::cdef_class_rep::find_propert
+ 
+   return cdef_property ();
+ }
+ 
+ void
+ cdef_class::cdef_class_rep::install_property (const cdef_property& prop)
+ {
+   property_map[prop.get_name ()] = prop;
++
++  member_count++;
+ }
+ 
+ Cell
+ cdef_class::cdef_class_rep::get_properties (void)
+ {
+   std::map<std::string,cdef_property> props;
+ 
+   find_properties (props, false);
+@@ -2367,30 +2376,34 @@ package_get_packages (const octave_value
+   return retval;
+ }
+ 
+ void
+ cdef_package::cdef_package_rep::install_class (const cdef_class& cls,
+                                                const std::string& nm)
+ {
+   class_map[nm] = cls;
++
++  member_count++;
+ }
+ 
+ void
+ cdef_package::cdef_package_rep::install_function (const octave_value& fcn,
+                                                   const std::string& nm)
+ {
+   function_map[nm] = fcn;
+ }
+ 
+ void
+ cdef_package::cdef_package_rep::install_package (const cdef_package& pack,
+                                                  const std::string& nm)
+ {
+   package_map[nm] = pack;
++
++  member_count++;
+ }
+ 
+ template<class T1, class T2>
+ Cell
+ map2Cell (const std::map<T1, T2>& m)
+ {
+   Cell retval (1, m.size ());
+   int i = 0;
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -124,19 +124,29 @@ public:
+     { gripe_invalid_object ("mark_as_constructed"); }
+ 
+   virtual bool is_constructed (void) const
+     {
+       gripe_invalid_object ("is_constructed");
+       return false;
+     }
+ 
++  virtual octave_idx_type static_count (void) const { return 0; }
++
++  virtual void destroy (void) { delete this; }
++
++  void release (void)
++    {
++      if (--refcount == static_count ())
++        destroy ();
++    }
++
+ protected:
+   /* reference count */
+-  octave_refcount<int> refcount;
++  octave_refcount<octave_idx_type> refcount;
+ 
+ protected:
+   /* Restricted copying */
+   cdef_object_rep (const cdef_object_rep&)
+     : refcount (1) { }
+ 
+ private:
+   /* No assignment */
+@@ -159,27 +169,23 @@ public:
+     {
+       rep->refcount++;
+     }
+ 
+   cdef_object (cdef_object_rep *r)
+       : rep (r) { }
+ 
+   virtual ~cdef_object (void)
+-    {
+-      if (--rep->refcount == 0)
+-	delete rep;
+-    }
++    { rep->release (); }
+ 
+   cdef_object& operator = (const cdef_object& obj)
+     {
+       if (rep != obj.rep)
+ 	{
+-	  if (--rep->refcount == 0)
+-	    delete rep;
++          rep->release ();
+ 
+ 	  rep = obj.rep;
+ 	  rep->refcount++;
+ 	}
+ 
+       return *this;
+     }
+ 
+@@ -400,17 +406,18 @@ cdef_class : public cdef_object
+ {
+ private:
+ 
+   class
+   cdef_class_rep : public handle_cdef_object
+   {
+   public:
+     cdef_class_rep (void)
+-	: handle_cdef_object (), handle_class (false), object_count (0) { }
++	: handle_cdef_object (), member_count (0), handle_class (false),
++          object_count (0) { }
+ 
+     cdef_class_rep (const std::list<cdef_class>& superclasses);
+ 
+     bool is_class (void) const { return true; }
+ 
+     std::string get_name (void) const
+       { return get ("Name").string_value (); }
+ 
+@@ -449,16 +456,33 @@ private:
+     void mark_as_handle_class (void) { handle_class = true; }
+ 
+     bool is_handle_class (void) const { return handle_class; }
+ 
+     void register_object (void) { object_count++; }
+ 
+     void unregister_object (void) { object_count--; }
+ 
++    octave_idx_type static_count (void) const { return member_count; }
++
++    void destroy (void)
++      {
++        if (member_count)
++          {
++            refcount++;
++            cdef_class lock (this);
++
++            member_count = 0;
++            method_map.clear ();
++            property_map.clear ();
++          }
++        else
++          delete this;
++      }
++
+   private:
+     void load_all_methods (void);
+ 
+     void find_names (std::set<std::string>& names, bool all);
+     
+     void find_properties (std::map<std::string,cdef_property>& props,
+                           bool only_inherited);
+ 
+@@ -477,16 +501,19 @@ private:
+     std::string directory;
+ 
+     // The methods defined by this class.
+     std::map<std::string,cdef_method> method_map;
+ 
+     // The properties defined by this class.
+     std::map<std::string,cdef_property> property_map;
+ 
++    // The number of members in this class (methods, properties...)
++    octave_idx_type member_count;
++
+     // TRUE if this class is a handle class. A class is a handle
+     // class when the abstract "handle" class is one of its superclasses.
+     bool handle_class;
+ 
+     // The list of super-class constructors that are called implicitly by the
+     // the classdef engine when creating an object. These constructors are not
+     // called explicitly by the class constructor.
+     std::list<cdef_class> implicit_ctor_list;
+@@ -892,17 +919,17 @@ class
+ cdef_package : public cdef_object
+ {
+ private:
+ 
+   class
+   cdef_package_rep : public handle_cdef_object
+   {
+   public:
+-    cdef_package_rep (void) : handle_cdef_object () { }
++    cdef_package_rep (void) : handle_cdef_object (), member_count (0) { }
+ 
+     bool is_package (void) const { return true; }
+ 
+     std::string get_name (void) const { return get("Name").string_value (); }
+ 
+     void set_name (const std::string& nm) { put ("Name", nm); }
+ 
+     void install_class (const cdef_class& cls, const std::string& nm);
+@@ -912,21 +939,42 @@ private:
+     void install_package (const cdef_package& pack, const std::string& nm);
+ 
+     Cell get_classes (void) const;
+ 
+     Cell get_functions (void) const;
+ 
+     Cell get_packages (void) const;
+ 
++    octave_idx_type static_count (void) const { return member_count; }
++
++    void destroy (void)
++      {
++        if (member_count)
++          {
++            refcount++;
++            cdef_package lock (this);
++
++            member_count = 0;
++            class_map.clear ();
++            package_map.clear ();
++          }
++        else
++          delete this;
++      }
++
+   private:
+     std::map<std::string, cdef_class> class_map;
+     std::map<std::string, octave_value> function_map;
+     std::map<std::string, cdef_package> package_map;
+ 
++    // The number of registered members in this package (classes, packages).
++    // This only accounts for the members that back-reference to this package.
++    octave_idx_type member_count;
++
+     typedef std::map<std::string, cdef_class>::iterator class_iterator;
+     typedef std::map<std::string, cdef_class>::const_iterator class_const_iterator;
+     typedef std::map<std::string, octave_value>::iterator function_iterator;
+     typedef std::map<std::string, octave_value>::const_iterator function_const_iterator;
+     typedef std::map<std::string, cdef_package>::iterator package_iterator;
+     typedef std::map<std::string, cdef_package>::const_iterator package_const_iterator;
+   };
+ 

@@ -1,0 +1,289 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1322731606 18000
+#      Thu Dec 01 04:26:46 2011 -0500
+# Node ID c93b953f7d54306be76072cf40d4d5fc0869f155
+# Parent  3b5afcec526b49bf97af5c5e900fb2ae635720f9
+plug some memory leaks
+
+* oct-parse.yy, parse.h (cleanup_statement_list): New function.
+* toplev.cc (main_loop): Put cleanup_statement_list on the
+unwind_protect stack to delete the command list created by the
+parser instead of deleting it directly.
+* oct-parse.yy (parse_fcn_file, eval_string): Likewise.
+* input.cc (get_debug_input): Likewise.
+
+* pt-loop.cc (tree_simple_for_command::~tree_simple_for_command,
+tree_complex_for_command::~tree_complex_for_command):
+Also delete lhs expression.
+
+* pt-idx.cc (tree_index_expression::~tree_index_expression):
+Also delete contents of dyn_field list.
+
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -744,27 +744,25 @@ get_debug_input (const std::string& prom
+       symbol_table::scope_id scope = symbol_table::top_scope ();
+       frame.add_fcn (symbol_table::unmark_forced_variables, scope);
+ 
+       // This is the same as yyparse in parse.y.
+       int retval = octave_parse ();
+ 
+       if (retval == 0 && global_command)
+         {
+-          global_command->accept (*current_evaluator);
++          unwind_protect inner_frame;
+ 
+-          // FIXME -- To avoid a memory leak, global_command should be
+-          // deleted, I think.  But doing that here causes trouble if
+-          // an error occurs while executing a debugging command
+-          // (dbstep, for example). It's not clear to me why that
+-          // happens.
+-          //
+-          // delete global_command;
+-          //
+-          // global_command = 0;
++          // Use an unwind-protect cleanup function so that the
++          // global_command list will be deleted in the event of an
++          // interrupt.
++
++          inner_frame.add_fcn (cleanup_statement_list, &global_command);
++
++          global_command->accept (*current_evaluator);
+ 
+           if (octave_completion_matches_called)
+             octave_completion_matches_called = false;
+         }
+ 
+       // Unmark forced variables.
+       // Restore previous value of global_command.
+       frame.run_top (2);
+diff --git a/src/oct-parse.yy b/src/oct-parse.yy
+--- a/src/oct-parse.yy
++++ b/src/oct-parse.yy
+@@ -3560,17 +3560,21 @@ parse_fcn_file (const std::string& ff, c
+           lexer_flags.parsing_class_method = ! dispatch_type.empty ();
+ 
+           frame.protect_var (global_command);
+ 
+           global_command = 0;
+ 
+           int status = yyparse ();
+ 
+-          delete global_command;
++          // Use an unwind-protect cleanup function so that the
++          // global_command list will be deleted in the event of an
++          // interrupt.
++
++          frame.add_fcn (cleanup_statement_list, &global_command);
+ 
+           fcn_ptr = primary_fcn_ptr;
+ 
+           if (status != 0)
+             error ("parse error while reading %s file %s",
+                    file_type.c_str(), ff.c_str ());
+           else if (reading_fcn_file && endfunction_found
+                    && max_function_depth > 1)
+@@ -4340,16 +4344,24 @@ eval_string (const std::string& s, bool 
+       // Unmark forced variables.
+       // Restore previous value of global_command.
+       frame.run_top (2);
+ 
+       if (parse_status == 0)
+         {
+           if (command_list)
+             {
++              unwind_protect inner_frame;
++
++              // Use an unwind-protect cleanup function so that the
++              // global_command list will be deleted in the event of an
++              // interrupt.
++
++              inner_frame.add_fcn (cleanup_statement_list, &command_list);
++
+               tree_statement *stmt = 0;
+ 
+               if (command_list->length () == 1
+                   && (stmt = command_list->front ())
+                   && stmt->is_expression ())
+                 {
+                   tree_expression *expr = stmt->expression ();
+ 
+@@ -4376,20 +4388,16 @@ eval_string (const std::string& s, bool 
+                   if (nargout == 0)
+                     retval = octave_value_list ();
+                 }
+               else if (nargout == 0)
+                 command_list->accept (*current_evaluator);
+               else
+                 error ("eval: invalid use of statement list");
+ 
+-              delete command_list;
+-
+-              command_list = 0;
+-
+               if (error_state
+                   || tree_return_command::returning
+                   || tree_break_command::breaking
+                   || tree_continue_command::continuing)
+                 break;
+             }
+           else if (parser_end_of_input)
+             break;
+@@ -4423,16 +4431,26 @@ eval_string (const octave_value& arg, bo
+     {
+       error ("eval: expecting std::string argument");
+       return octave_value (-1);
+     }
+ 
+   return eval_string (s, silent, parse_status, nargout);
+ }
+ 
++void
++cleanup_statement_list (tree_statement_list **lst)
++{
++  if (*lst)
++    {
++      delete *lst;
++      *lst = 0;
++    }
++}
++
+ DEFUN (eval, args, nargout,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} eval (@var{try}, @var{catch})\n\
+ Parse the string @var{try} and evaluate it as if it were an Octave\n\
+ program.  If that fails, evaluate the optional string @var{catch}.\n\
+ The string @var{try} is evaluated in the current context,\n\
+ so any results remain available after @code{eval} returns.\n\
+ \n\
+diff --git a/src/parse.h b/src/parse.h
+--- a/src/parse.h
++++ b/src/parse.h
+@@ -31,16 +31,17 @@ along with Octave; see the file COPYING.
+ 
+ extern void reset_parser (void);
+ extern int octave_lex (void);
+ extern int octave_parse (void);
+ 
+ class tree;
+ class tree_matrix;
+ class tree_identifier;
++class tree_statement_list;
+ class octave_function;
+ 
+ #include "oct-obj.h"
+ 
+ // Nonzero means print parser debugging info (-d).
+ extern int octave_debug;
+ 
+ // The current input line number.
+@@ -108,9 +109,11 @@ extern OCTINTERP_API octave_value_list
+ feval (const octave_value_list& args, int nargout = 0);
+ 
+ extern OCTINTERP_API octave_value_list
+ eval_string (const std::string&, bool silent, int& parse_status, int hargout);
+ 
+ extern OCTINTERP_API octave_value
+ eval_string (const std::string&, bool silent, int& parse_status);
+ 
++extern OCTINTERP_API void cleanup_statement_list (tree_statement_list **lst);
++
+ #endif
+diff --git a/src/pt-idx.cc b/src/pt-idx.cc
+--- a/src/pt-idx.cc
++++ b/src/pt-idx.cc
+@@ -108,16 +108,23 @@ tree_index_expression::~tree_index_expre
+   delete expr;
+ 
+   while (! args.empty ())
+     {
+       std::list<tree_argument_list *>::iterator p = args.begin ();
+       delete *p;
+       args.erase (p);
+     }
++
++  while (! dyn_field.empty ())
++    {
++      std::list<tree_expression *>::iterator p = dyn_field.begin ();
++      delete *p;
++      dyn_field.erase (p);
++    }
+ }
+ 
+ bool
+ tree_index_expression::has_magic_end (void) const
+ {
+   for (std::list<tree_argument_list *>::const_iterator p = args.begin ();
+        p != args.end ();
+        p++)
+diff --git a/src/pt-loop.cc b/src/pt-loop.cc
+--- a/src/pt-loop.cc
++++ b/src/pt-loop.cc
+@@ -86,16 +86,17 @@ tree_do_until_command::accept (tree_walk
+ {
+   tw.visit_do_until_command (*this);
+ }
+ 
+ // For.
+ 
+ tree_simple_for_command::~tree_simple_for_command (void)
+ {
++  delete lhs;
+   delete expr;
+   delete maxproc;
+   delete list;
+   delete lead_comm;
+   delete trail_comm;
+ }
+ 
+ tree_command *
+@@ -114,16 +115,17 @@ tree_simple_for_command::dup (symbol_tab
+ void
+ tree_simple_for_command::accept (tree_walker& tw)
+ {
+   tw.visit_simple_for_command (*this);
+ }
+ 
+ tree_complex_for_command::~tree_complex_for_command (void)
+ {
++  delete lhs;
+   delete expr;
+   delete list;
+   delete lead_comm;
+   delete trail_comm;
+ }
+ 
+ tree_command *
+ tree_complex_for_command::dup (symbol_table::scope_id scope,
+diff --git a/src/toplev.cc b/src/toplev.cc
+--- a/src/toplev.cc
++++ b/src/toplev.cc
+@@ -566,21 +566,23 @@ main_loop (void)
+ 
+           // This is the same as yyparse in parse.y.
+           retval = octave_parse ();
+ 
+           if (retval == 0)
+             {
+               if (global_command)
+                 {
+-                  global_command->accept (*current_evaluator);
++                  // Use an unwind-protect cleanup function so that the
++                  // global_command list will be deleted in the event of
++                  // an interrupt.
+ 
+-                  delete global_command;
++                  frame.add_fcn (cleanup_statement_list, &global_command);
+ 
+-                  global_command = 0;
++                  global_command->accept (*current_evaluator);
+ 
+                   octave_quit ();
+ 
+                   if (! (interactive || forced_interactive))
+                     {
+                       bool quit = (tree_return_command::returning
+                                    || tree_break_command::breaking);
+ 

@@ -1,0 +1,156 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1498520117 14400
+#      Mon Jun 26 19:35:17 2017 -0400
+# Node ID c495549e9a948a4ef72b7f0aed29acb5e1e54c84
+# Parent  6eb5f6199a5a4bcceb3140dabd3c03a16d3eb831
+refactor local protection for internal variables
+
+* ov-usr-fcn.h, ov-usr-fcn.cc
+(octave_user_function::unwind_protect_frame): New function.
+(octave_user_function::local_protect): Delete.
+(octave_user_function::call): Set curr_unwind_protect_frame
+immediately after pushing the current function on the call stack.
+
+* variables.h, variables.cc (curr_fcn_unwind_protect_frame):
+New static function.
+(try_local_protect): Now static.  Implement in terms of
+curr_fcn_unwind_protect_frame and unwind_protect::protect_var.
+
+diff --git a/libinterp/corefcn/variables.cc b/libinterp/corefcn/variables.cc
+--- a/libinterp/corefcn/variables.cc
++++ b/libinterp/corefcn/variables.cc
+@@ -686,28 +686,42 @@ wants_local_change (const octave_value_l
+ 
+       nargin = 1;
+       retval = true;
+     }
+ 
+   return retval;
+ }
+ 
+-template <typename T>
+-bool try_local_protect (T& var)
++static octave::unwind_protect *
++curr_fcn_unwind_protect_frame (void)
+ {
+-  octave::call_stack& cs = octave::__get_call_stack__ ("try_local_protect");
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("curr_fcn_unwind_protect_frame");
+ 
+   octave_user_code *curr_usr_code = cs.caller_user_code ();
+-  octave_user_function *curr_usr_fcn = nullptr;
+-  if (curr_usr_code && curr_usr_code->is_user_function ())
+-    curr_usr_fcn = dynamic_cast<octave_user_function *> (curr_usr_code);
+-
+-  if (curr_usr_fcn && curr_usr_fcn->local_protect (var))
+-    return true;
++
++  octave_user_function *curr_usr_fcn
++    = (curr_usr_code && curr_usr_code->is_user_function ()
++       ? dynamic_cast<octave_user_function *> (curr_usr_code) : nullptr);
++
++  return curr_usr_fcn ? curr_usr_fcn->unwind_protect_frame () : nullptr;
++}
++
++template <typename T>
++static bool
++try_local_protect (T& var)
++{
++  octave::unwind_protect *frame = curr_fcn_unwind_protect_frame ();
++
++  if (frame)
++    {
++      frame->protect_var (var);
++      return true;
++    }
+   else
+     return false;
+ }
+ 
+ octave_value
+ set_internal_variable (bool& var, const octave_value_list& args,
+                        int nargout, const char *nm)
+ {
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -463,16 +463,22 @@ octave_user_function::call (octave::tree
+   // eval_undefined_error().
+ 
+   octave::call_stack& cs
+     = octave::__get_call_stack__ ("octave_user_function::call");
+ 
+   octave::symbol_table::context_id context = anonymous_function ? 0 : call_depth;
+   cs.push (this, m_scope, context);
+ 
++  // Set pointer to the current unwind_protect frame to allow
++  // certain builtins register simple cleanup in a very optimized manner.
++  // This is *not* intended as a general-purpose on-cleanup mechanism,
++  frame.protect_var (curr_unwind_protect_frame);
++  curr_unwind_protect_frame = &frame;
++
+   frame.protect_var (Vtrack_line_num);
+   Vtrack_line_num = true;    // update source line numbers, even if debugging
+   frame.add_method (cs, &octave::call_stack::pop);
+ 
+   if (call_depth > 0 && ! is_anonymous_function ())
+     {
+       m_scope->push_context ();
+ 
+@@ -544,22 +550,16 @@ octave_user_function::call (octave::tree
+ 
+   frame.add_method (this, &octave_user_function::restore_warning_states);
+ 
+   bool echo_commands = (Vecho_executing_commands & ECHO_FUNCTIONS);
+ 
+   if (echo_commands)
+     print_code_function_header ();
+ 
+-  // Set pointer to the current unwind_protect frame to allow
+-  // certain builtins register simple cleanup in a very optimized manner.
+-  // This is *not* intended as a general-purpose on-cleanup mechanism,
+-  frame.protect_var (curr_unwind_protect_frame);
+-  curr_unwind_protect_frame = &frame;
+-
+   // Evaluate the commands that make up the function.
+ 
+   frame.protect_var (octave::tree_evaluator::statement_context);
+   octave::tree_evaluator::statement_context = octave::tree_evaluator::function;
+ 
+   {
+     profile_data_accumulator::enter<octave_user_function>
+       block (profiler, *this);
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -360,26 +360,20 @@ public:
+   // If is_special_expr is true, retrieve the sigular expression that forms the
+   // body.  May be null (even if is_special_expr is true).
+   octave::tree_expression * special_expr (void);
+ 
+   bool subsasgn_optimization_ok (void);
+ 
+   void accept (octave::tree_walker& tw);
+ 
+-  template <typename T>
+-  bool local_protect (T& variable)
++  octave::unwind_protect *
++  unwind_protect_frame (void)
+   {
+-    if (curr_unwind_protect_frame)
+-      {
+-        curr_unwind_protect_frame->protect_var (variable);
+-        return true;
+-      }
+-    else
+-      return false;
++    return curr_unwind_protect_frame;
+   }
+ 
+ #if defined (HAVE_LLVM)
+   jit_function_info * get_info (void) { return jit_info; }
+ 
+   void stash_info (jit_function_info *info) { jit_info = info; }
+ #endif
+ 

@@ -1,0 +1,1260 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1362008956 18000
+#      Wed Feb 27 18:49:16 2013 -0500
+# Node ID 49dfba4fd3c53b0612f57271c3a154a71b6be24a
+# Parent  10abbc493f50f3881428a0cc5cb161893a8ee8ef
+use pure parser and reentrant lexer interfaces
+
+Making the Octave parser and lexer properly reentrant (and perhaps
+eventually thread safe as well) is still a work in progress.  With the
+current set of changes the parser and lexer still use many global
+variables, so these changes alone do NOT make the Octave parser
+reentrant unless you take care to properly save and restore (typically
+with an unwind_protect object) relevant global values before and after
+calling the parser.  Even if global variables are properly saved and
+restored, the parser will NOT be thread safe.
+
+* lex.ll: Use %option reentrant an %option bison-bridge.
+(yylval): Delete macro.
+(YY_EXTRA_TYPE, curr_lexer): New macros.  Undefine curr_lexer
+(YY_FATAL_ERROR): Update decl for reentrant scanner.
+(lexical_feedback::reset): Update call to yyrestart for reentrant
+scanner interface.
+(lexical_feedback::fatal_error): Update call to yy_fatal_error for
+reentrant scanner interface.
+(lexical_feedback::text_yyinput): Update calls to yyinput and yyunput
+for reentrant scanner interface.
+(lexical_feedback::flex_yyleng): Use function interface to access
+yyleng.
+(lexical_feedback::flex_yytext): Use function interface to access
+yytext.
+(lexical_feedback::push_token, lexical_feedback::current_token):
+Use function interface to access yylval.
+
+* oct-parse.yy: Use %define api.pure, %parse-param, and %lex-param
+options.
+(curr_lexer): Define for syntax rules section.
+(scanner): New macro.
+
+* oct-parse.yy: Include oct-parse.h.
+(octave_lex): Declare.
+(yyerror): Update declaration for pure parser.
+* parse.h (octave_lex): Delete decl.
+
+* oct-parse.yy (octave_parser::run): Pass pointer to octave_parser
+object to octave_parse.
+
+* lex.ll (lexical_feedback::octave_read): Call fatal_error directly
+instead of using YY_FATAL_ERROR.
+
+* oct-parse.yy (parse_fcn_file): Pass line and column info for lexter
+to gobble_leading_whitespace.  Access prep_for_script_file,
+prep_for_function_file, parsing_class_method, input_line_number, and
+current_input_column through curr_parser.
+
+* parse.h, oct-parse.yy (YY_BUFFER_STATE, create_buffer,
+current_buffer, switch_to_buffer, delete_buffer, clear_all_buffers):
+Delete.
+* toplev.cc (main_loop): Don't create new buffer for lexer.
+* input.cc (get_debug_input): Likewise.
+* oct-parse.yy (eval_string, parse_fcn_file): Likewise.
+* octave.cc (octave_initialize_interpreter): Likewise.
+* input.cc (get_debug_input): Likewise.
+
+* oct-parse.yy (eval_string, parse_fcn_file): Create parser as needed.
+* octave.cc (octave_initialize_interpreter): Likewise.
+* input.cc (get_debug_input): Likewise.
+
+* input.cc (input_even_hook): Allow function to run even if currently
+defining a function.
+
+* lex.h, lex.ll (curr_lexer): Delete global variable.
+* parse.h, oct-parse.yy (octave_parser::curr_lexer): New data member.
+(octave_parser::octave_parser): Create lexer here.
+(curr_parser): Delete global variable.
+* toplev.cc (main_loop): Don't protect global curr_lexer and
+curr_parser variables.
+* oct-parse.yy (eval_string, parse_fcn_file): Likewise.
+* input.cc (get_debug_input): Likewise.
+
+* lex.h, lex.ll (curr_lexer): Delete global variable.
+* parse.h, oct-parse.yy (CURR_LEXER): New temporary global.
+(octave_parser::octave_parser): Set global CURR_LEXER here.
+* toplev.cc (main_loop): Protect CURR_LEXER prior to constructing
+new parser object.
+* input.cc (get_debug_input): Likewise.
+* oct-parse.yy (eval_string, parse_fcn_file): Likewise.
+
+* lex.h, lex.ll (lexical_feedback::scanner): New data member.
+(lexical_feedback::init): Create it.  Call yylex_set_extra to store
+pointer to lexical_feedback object in scanner data.
+(lexical_feedback::~lexical_feedback): Delete it.
+
+* lex.ll (YYG): New macro.
+(lexical_feedback::reset, lexical_feedback::prep_for_script_file,
+lexical_feedback::prep_for_function_file,
+lexical_feedback::process_comment,
+lexical_feedback::handle_close_bracket,
+lexical_feedback::handle_identifier, lexical_feedback::lexer_debug):
+Use it to access scanner data.
+
+diff --git a/libinterp/interpfcn/input.cc b/libinterp/interpfcn/input.cc
+--- a/libinterp/interpfcn/input.cc
++++ b/libinterp/interpfcn/input.cc
+@@ -662,39 +662,28 @@ get_debug_input (const std::string& prom
+       frame.protect_var (input_from_startup_file);
+       input_from_startup_file = false;
+ 
+       frame.protect_var (input_from_command_line_file);
+       input_from_command_line_file = false;
+ 
+       frame.protect_var (get_input_from_eval_string);
+       get_input_from_eval_string = false;
+-
+-      YY_BUFFER_STATE old_buf = current_buffer ();
+-      YY_BUFFER_STATE new_buf = create_buffer (get_input_from_stdin ());
+-
+-      // FIXME: are these safe?
+-      frame.add_fcn (switch_to_buffer, old_buf);
+-      frame.add_fcn (delete_buffer, new_buf);
+-
+-      switch_to_buffer (new_buf);
+     }
+ 
+-  frame.protect_var (curr_lexer);
+-  curr_lexer = new lexical_feedback ();
+-  frame.add_fcn (lexical_feedback::cleanup, curr_lexer);
+-
+-  frame.protect_var (curr_parser);
+-  curr_parser = new octave_parser ();
+-  frame.add_fcn (octave_parser::cleanup, curr_parser);
+-
+   while (Vdebugging)
+     {
+       unwind_protect middle_frame;
+ 
++      // octave_parser constructor sets this for us.
++      middle_frame.protect_var (CURR_LEXER);
++
++      octave_parser *curr_parser = new octave_parser ();
++      middle_frame.add_fcn (octave_parser::cleanup, curr_parser);
++
+       reset_error_handler ();
+ 
+       curr_parser->reset ();
+ 
+       // Save current value of global_command.
+       middle_frame.protect_var (global_command);
+ 
+       global_command = 0;
+@@ -1194,43 +1183,38 @@ for details.\n\
+ 
+ typedef std::map<std::string, octave_value> hook_fcn_map_type;
+ 
+ static hook_fcn_map_type hook_fcn_map;
+ 
+ static int
+ input_event_hook (void)
+ {
+-  if (! curr_lexer->defining_func)
+-    {
+-      hook_fcn_map_type::iterator p = hook_fcn_map.begin ();
++  hook_fcn_map_type::iterator p = hook_fcn_map.begin ();
+ 
+-      while (p != hook_fcn_map.end ())
+-        {
+-          std::string hook_fcn = p->first;
+-          octave_value user_data = p->second;
++  while (p != hook_fcn_map.end ())
++    {
++      std::string hook_fcn = p->first;
++      octave_value user_data = p->second;
+ 
+-          hook_fcn_map_type::iterator q = p++;
++      hook_fcn_map_type::iterator q = p++;
+ 
+-          if (is_valid_function (hook_fcn))
+-            {
+-              if (user_data.is_defined ())
+-                feval (hook_fcn, user_data, 0);
+-              else
+-                feval (hook_fcn, octave_value_list (), 0);
+-            }
++      if (is_valid_function (hook_fcn))
++        {
++          if (user_data.is_defined ())
++            feval (hook_fcn, user_data, 0);
+           else
+-            hook_fcn_map.erase (q);
++            feval (hook_fcn, octave_value_list (), 0);
+         }
+-
+-      if (hook_fcn_map.empty ())
+-        command_editor::remove_event_hook (input_event_hook);
++      else
++        hook_fcn_map.erase (q);
+     }
+ 
+-  return 0;
++  if (hook_fcn_map.empty ())
++    command_editor::remove_event_hook (input_event_hook);
+ }
+ 
+ DEFUN (add_input_event_hook, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn  {Built-in Function} {} add_input_event_hook (@var{fcn})\n\
+ @deftypefnx {Built-in Function} {} add_input_event_hook (@var{fcn}, @var{data})\n\
+ Add the named function @var{fcn} to the list of functions to call\n\
+ periodically when Octave is waiting for input.  The function should\n\
+diff --git a/libinterp/interpfcn/toplev.cc b/libinterp/interpfcn/toplev.cc
+--- a/libinterp/interpfcn/toplev.cc
++++ b/libinterp/interpfcn/toplev.cc
+@@ -552,34 +552,30 @@ main_loop (void)
+   octave_signal_hook = octave_signal_handler;
+   octave_interrupt_hook = 0;
+   octave_bad_alloc_hook = 0;
+ 
+   octave_catch_interrupts ();
+ 
+   octave_initialized = true;
+ 
+-  unwind_protect frame;
+-
+-  frame.protect_var (curr_lexer);
+-  curr_lexer = new lexical_feedback ();
+-  frame.add_fcn (lexical_feedback::cleanup, curr_lexer);
+-
+-  frame.protect_var (curr_parser);
+-  curr_parser = new octave_parser ();
+-  frame.add_fcn (octave_parser::cleanup, curr_parser);
+-
+   // The big loop.
+ 
+   int retval = 0;
+   do
+     {
+       try
+         {
+-          unwind_protect inner_frame;
++          unwind_protect frame;
++
++          // octave_parser constructor sets this for us.
++          frame.protect_var (CURR_LEXER);
++
++          octave_parser *curr_parser = new octave_parser ();
++          frame.add_fcn (octave_parser::cleanup, curr_parser);
+ 
+           reset_error_handler ();
+ 
+           curr_parser->reset ();
+ 
+           if (symbol_table::at_top_level ())
+             tree_evaluator::reset_debug_state ();
+ 
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -992,19 +992,16 @@ octave_execute_interpreter (void)
+ 
+   // Avoid counting commands executed from startup files.
+ 
+   command_editor::reset_current_command_number (1);
+ 
+   // Now argv should have the full set of args.
+   intern_argv (octave_cmdline_argc, octave_cmdline_argv);
+ 
+-  if (! octave_embedded)
+-    switch_to_buffer (create_buffer (get_input_from_stdin ()));
+-
+   // Force input to be echoed if not really interactive, but the user
+   // has forced interactive behavior.
+ 
+   if (! interactive && forced_interactive)
+     {
+       command_editor::blink_matching_paren (false);
+ 
+       // FIXME -- is this the right thing to do?
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -22,35 +22,16 @@ along with Octave; see the file COPYING.
+ 
+ #if !defined (octave_lex_h)
+ #define octave_lex_h 1
+ 
+ #include <list>
+ #include <set>
+ #include <stack>
+ 
+-// FIXME -- these input buffer things should be members of a
+-// parser input stream class.
+-
+-typedef struct yy_buffer_state *YY_BUFFER_STATE;
+-
+-// Associate a buffer with a new file to read.
+-extern OCTINTERP_API YY_BUFFER_STATE create_buffer (FILE *f);
+-
+-// Report the current buffer.
+-extern OCTINTERP_API YY_BUFFER_STATE current_buffer (void);
+-
+-// Connect to new buffer buffer.
+-extern OCTINTERP_API void switch_to_buffer (YY_BUFFER_STATE buf);
+-
+-// Delete a buffer.
+-extern OCTINTERP_API void delete_buffer (YY_BUFFER_STATE buf);
+-
+-extern OCTINTERP_API void clear_all_buffers (void);
+-
+ extern OCTINTERP_API void cleanup_parser (void);
+ 
+ // Is the given string a keyword?
+ extern bool is_keyword (const std::string& s);
+ 
+ class
+ stream_reader
+ {
+@@ -168,18 +149,18 @@ public:
+     }
+ 
+   private:
+ 
+     std::stack<int> context;
+   };
+ 
+   lexical_feedback (void)
+-    : convert_spaces_to_comma (true), do_comma_insert (false),
+-      at_beginning_of_statement (true),
++    : scanner (0), convert_spaces_to_comma (true),
++      do_comma_insert (false), at_beginning_of_statement (true),
+       looking_at_anon_fcn_args (false), looking_at_return_list (false),
+       looking_at_parameter_list (false), looking_at_decl_list (false),
+       looking_at_initializer_expression (false),
+       looking_at_matrix_or_assign_lhs (false),
+       looking_for_object_index (false), 
+       looking_at_indirect_ref (false), parsing_class_method (false),
+       maybe_classdef_get_set_method (false), parsing_classdef (false),
+       quote_is_transpose (false),
+@@ -190,22 +171,17 @@ public:
+       looking_at_object_index (), parsed_function_name (),
+       pending_local_variables (), nesting_level ()
+   {
+     init ();
+   }
+ 
+   ~lexical_feedback (void);
+ 
+-  void init (void)
+-  {
+-    // The closest paren, brace, or bracket nesting is not an object
+-    // index.
+-    looking_at_object_index.push_front (false);
+-  }
++  void init (void);
+ 
+   void reset (void);
+ 
+   void prep_for_script_file (void);
+ 
+   void prep_for_function_file (void);
+ 
+   int octave_read (char *buf, unsigned int max_size);
+@@ -292,16 +268,19 @@ public:
+   token *current_token (void);
+ 
+   void display_token (int tok);
+ 
+   void fatal_error (const char *msg);
+ 
+   void lexer_debug (const char *pattern, const char *text);
+ 
++  // Internal state of the flex-generated lexer.
++  void *scanner;
++
+   // TRUE means that we should convert spaces to a comma inside a
+   // matrix definition.
+   bool convert_spaces_to_comma;
+ 
+   // GAG.  Stupid kludge so that [[1,2][3,4]] will work.
+   bool do_comma_insert;
+ 
+   // TRUE means we are at the beginning of a statement, where a
+@@ -402,12 +381,9 @@ private:
+ 
+   // No copying!
+ 
+   lexical_feedback (const lexical_feedback&);
+ 
+   lexical_feedback& operator = (const lexical_feedback&);
+ };
+ 
+-// The current state of the lexer.
+-extern lexical_feedback *curr_lexer;
+-
+ #endif
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -15,18 +15,29 @@ FITNESS FOR A PARTICULAR PURPOSE.  See t
+ for more details.
+ 
+ You should have received a copy of the GNU General Public License
+ along with Octave; see the file COPYING.  If not, see
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
++// We are using the pure parser interface and the reentrant lexer
++// interface but the Octave parser and lexer are NOT properly
++// reentrant because both still use many global variables.  It should be
++// safe to create a parser object and call it while anotehr parser
++// object is active (to parse a callback function while the main
++// interactive parser is waiting for input, for example) if you take
++// care to properly save and restore (typically with an unwind_protect
++// object) relevant global values before and after the nested call.
++
+ %option prefix = "octave_"
+ %option noyywrap
++%option reentrant
++%option bison-bridge
+ 
+ %top {
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ }
+ 
+@@ -91,35 +102,34 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #if ! (defined (FLEX_SCANNER) \
+        && defined (YY_FLEX_MAJOR_VERSION) && YY_FLEX_MAJOR_VERSION >= 2 \
+        && defined (YY_FLEX_MINOR_VERSION) && YY_FLEX_MINOR_VERSION >= 5)
+ #error lex.l requires flex version 2.5.4 or later
+ #endif
+ 
+-#define yylval octave_lval
++#define YY_EXTRA_TYPE lexical_feedback *
++#define curr_lexer yyextra
+ 
+ // Arrange to get input via readline.
+ 
+ #ifdef YY_INPUT
+ #undef YY_INPUT
+ #endif
+ #define YY_INPUT(buf, result, max_size) \
+   result = curr_lexer->octave_read (buf, max_size)
+ 
+ // Try to avoid crashing out completely on fatal scanner errors.
+-// The call to yy_fatal_error should never happen, but it avoids a
+-// 'static function defined but not used' warning from gcc.
+ 
+ #ifdef YY_FATAL_ERROR
+ #undef YY_FATAL_ERROR
+ #endif
+ #define YY_FATAL_ERROR(msg) \
+-  curr_lexer->fatal_error (msg)
++  (yyget_extra (yyscanner))->fatal_error (msg)
+ 
+ #define DISPLAY_TOK_AND_RETURN(tok) \
+   do \
+     { \
+       int tok_val = tok; \
+       if (Vdisplay_tokens) \
+         curr_lexer->display_token (tok_val); \
+       if (lexer_debug_flag) \
+@@ -201,19 +211,16 @@ along with Octave; see the file COPYING.
+ #define LEXER_DEBUG(pattern) \
+   do \
+     { \
+       if (lexer_debug_flag) \
+         curr_lexer->lexer_debug (pattern, yytext); \
+     } \
+   while (0)
+ 
+-// The state of the lexer.
+-lexical_feedback *curr_lexer = 0;
+-
+ static bool Vdisplay_tokens = false;
+ 
+ static unsigned int Vtoken_count = 0;
+ 
+ // Internal variable for lexer debugging state.
+ static bool lexer_debug_flag = false;
+ 
+ // Forward declarations for functions defined at the bottom of this
+@@ -1112,80 +1119,19 @@ display_character (char c)
+         break;
+ 
+       case 127:
+         std::cerr << "DEL";
+         break;
+       }
+ }
+ 
+-// Tell us all what the current buffer is.
+-
+-YY_BUFFER_STATE
+-current_buffer (void)
+-{
+-  return YY_CURRENT_BUFFER;
+-}
+-
+-// Create a new buffer.
+-
+-YY_BUFFER_STATE
+-create_buffer (FILE *f)
+-{
+-  return yy_create_buffer (f, YY_BUF_SIZE);
+-}
+-
+-// Start reading a new buffer.
+-
+-void
+-switch_to_buffer (YY_BUFFER_STATE buf)
+-{
+-  yy_switch_to_buffer (buf);
+-}
+-
+-// Delete a buffer.
+-
+-void
+-delete_buffer (YY_BUFFER_STATE buf)
+-{
+-  yy_delete_buffer (buf);
+-
+-  // Prevent invalid yyin from being used by yyrestart.
+-  if (! current_buffer ())
+-    yyin = 0; 
+-}
+-
+-// Delete all buffers from the stack.
+-void
+-clear_all_buffers (void)
+-{                 
+-  while (current_buffer ())
+-    octave_pop_buffer_state ();
+-}
+-
+ void
+ cleanup_parser (void)
+ {
+-  clear_all_buffers ();
+-}
+-
+-// Restore a buffer (for unwind-prot).
+-
+-void
+-restore_input_buffer (void *buf)
+-{
+-  switch_to_buffer (static_cast<YY_BUFFER_STATE> (buf));
+-}
+-
+-// Delete a buffer (for unwind-prot).
+-
+-void
+-delete_input_buffer (void *buf)
+-{
+-  delete_buffer (static_cast<YY_BUFFER_STATE> (buf));
+ }
+ 
+ // Return 1 if the given character matches any character in the given
+ // string.
+ 
+ static bool
+ match_any (char c, const char *s)
+ {
+@@ -1361,21 +1307,48 @@ lexical_feedback::~lexical_feedback (voi
+   // Clear out the stack of token info used to track line and
+   // column numbers.
+ 
+   while (! token_stack.empty ())
+     {
+       delete token_stack.top ();
+       token_stack.pop ();
+     }
++
++  yylex_destroy (scanner);
+ }
+ 
+ void
++lexical_feedback::init (void)
++{
++  // The closest paren, brace, or bracket nesting is not an object
++  // index.
++  looking_at_object_index.push_front (false);
++
++  yylex_init (&scanner);
++
++  // Make lexical_feedback object available through yyextra in
++  // flex-generated lexer.
++  yyset_extra (this, scanner);
++}
++
++// Inside Flex-generated functions, yyg is the scanner cast to its real
++// type.  The BEGIN macro uses yyg and we want to use that in
++// lexical_feedback member functions.  If we could set the start state
++// by calling a function instead of using the BEGIN macro, we could
++// eliminate the OCTAVE_YYG macro.
++
++#define OCTAVE_YYG \
++  struct yyguts_t *yyg = static_cast<struct yyguts_t*> (scanner)
++
++void
+ lexical_feedback::reset (void)
+ {
++  OCTAVE_YYG;
++
+   // Start off on the right foot.
+   BEGIN (INITIAL);
+ 
+   parser_symtab_context.clear ();
+ 
+   // We do want a prompt by default.
+   promptflag = 1;
+ 
+@@ -1384,32 +1357,36 @@ lexical_feedback::reset (void)
+ 
+   if (! quitting_gracefully
+       && (interactive || forced_interactive)
+       && ! (reading_fcn_file
+             || reading_classdef_file
+             || reading_script_file
+             || get_input_from_eval_string
+             || input_from_startup_file))
+-    yyrestart (stdin);
++    yyrestart (stdin, scanner);
+ 
+   // Clear the buffer for help text.
+   while (! help_buf.empty ())
+     help_buf.pop ();
+ }
+ 
+ void
+ lexical_feedback::prep_for_script_file (void)
+ {
++  OCTAVE_YYG;
++
+   BEGIN (SCRIPT_FILE_BEGIN);
+ }
+ 
+ void
+ lexical_feedback::prep_for_function_file (void)
+ {
++  OCTAVE_YYG;
++
+   BEGIN (FUNCTION_FILE_BEGIN);
+ }
+ 
+ int
+ lexical_feedback::octave_read (char *buf, unsigned max_size)
+ {
+   static const char * const eol = "\n";
+   static std::string input_buf;
+@@ -1461,32 +1438,32 @@ lexical_feedback::octave_read (char *buf
+ 
+       status = len;
+     }
+   else
+     {
+       status = YY_NULL;
+ 
+       if (! eof)
+-        YY_FATAL_ERROR ("octave_read () in flex scanner failed");
++        fatal_error ("octave_read () in flex scanner failed");
+     }
+ 
+   return status;
+ }
+ 
+ char *
+ lexical_feedback::flex_yytext (void)
+ {
+-  return yytext;
++  return yyget_text (scanner);
+ }
+ 
+ int
+ lexical_feedback::flex_yyleng (void)
+ {
+-  return yyleng;
++  return yyget_leng (scanner);
+ }
+ 
+ // GAG.
+ //
+ // If we're reading a matrix and the next character is '[', make sure
+ // that we insert a comma ahead of it.
+ 
+ void
+@@ -1503,30 +1480,30 @@ lexical_feedback::do_comma_insert_check 
+ 
+   do_comma_insert = (! looking_at_object_index.front ()
+                      && bracketflag && c == '[');
+ }
+ 
+ int
+ lexical_feedback::text_yyinput (void)
+ {
+-  int c = yyinput ();
++  int c = yyinput (scanner);
+ 
+   if (lexer_debug_flag)
+     {
+       std::cerr << "I: ";
+       display_character (c);
+       std::cerr << std::endl;
+     }
+ 
+   // Convert CRLF into just LF and single CR into LF.
+ 
+   if (c == '\r')
+     {
+-      c = yyinput ();
++      c = yyinput (scanner);
+ 
+       if (lexer_debug_flag)
+         {
+           std::cerr << "I: ";
+           display_character (c);
+           std::cerr << std::endl;
+         }
+ 
+@@ -1551,23 +1528,24 @@ lexical_feedback::xunput (char c, char *
+       std::cerr << "U: ";
+       display_character (c);
+       std::cerr << std::endl;
+     }
+ 
+   if (c == '\n')
+     input_line_number--;
+ 
+-  yyunput (c, buf);
++  yyunput (c, buf, scanner);
+ }
+ 
+ void
+ lexical_feedback::xunput (char c)
+ {
+   char *yytxt = flex_yytext ();
++
+   xunput (c, yytxt);
+ }
+ 
+ // If we read some newlines, we need figure out what column we're
+ // really looking at.
+ 
+ void
+ lexical_feedback::fixup_column_count (char *s)
+@@ -2072,16 +2050,18 @@ lexical_feedback::grab_comment_block (st
+     eof = true;
+ 
+   return buf;
+ }
+ 
+ int
+ lexical_feedback::process_comment (bool start_in_block, bool& eof)
+ {
++  OCTAVE_YYG;
++
+   eof = false;
+ 
+   std::string help_txt;
+ 
+   if (! help_buf.empty ())
+     help_txt = help_buf.top ();
+ 
+   char *yytxt = flex_yytext ();
+@@ -2834,16 +2814,18 @@ lexical_feedback::next_token_is_index_op
+   int c = text_yyinput ();
+   xunput (c);
+   return c == '(' || c == '{';
+ }
+ 
+ int
+ lexical_feedback::handle_close_bracket (bool spc_gobbled, int bracket_type)
+ {
++  OCTAVE_YYG;
++
+   int retval = bracket_type;
+ 
+   if (! nesting_level.none ())
+     {
+       nesting_level.remove ();
+ 
+       if (bracket_type == ']')
+         bracketflag--;
+@@ -3278,16 +3260,18 @@ lexical_feedback::handle_meta_identifier
+ 
+ // Figure out exactly what kind of token to return when we have seen
+ // an identifier.  Handles keywords.  Return -1 if the identifier
+ // should be ignored.
+ 
+ int
+ lexical_feedback::handle_identifier (void)
+ {
++  OCTAVE_YYG;
++
+   bool at_bos = at_beginning_of_statement;
+ 
+   char *yytxt = flex_yytext ();
+ 
+   std::string tok = strip_trailing_whitespace (yytxt);
+ 
+   int c = yytxt[flex_yyleng()-1];
+ 
+@@ -3513,24 +3497,26 @@ lexical_feedback::gripe_matlab_incompati
+   if (t[n-1] == '\n')
+     t.resize (n-1);
+   gripe_matlab_incompatible (t + " used as operator");
+ }
+ 
+ void
+ lexical_feedback::push_token (token *tok)
+ {
+-  yylval.tok_val = tok;
++  YYSTYPE *lval = yyget_lval (scanner);
++  lval->tok_val = tok;
+   token_stack.push (tok);
+ }
+ 
+ token *
+ lexical_feedback::current_token (void)
+ {
+-  return yylval.tok_val;
++  YYSTYPE *lval = yyget_lval (scanner);
++  return lval->tok_val;
+ }
+ 
+ void
+ lexical_feedback::display_token (int tok)
+ {
+   switch (tok)
+     {
+     case '=': std::cerr << "'='\n"; break;
+@@ -3701,21 +3687,23 @@ display_state (int state)
+ 
+ void
+ lexical_feedback::fatal_error (const char *msg)
+ {
+   error (msg);
+ 
+   OCTAVE_QUIT;
+ 
+-  yy_fatal_error (msg);
++  yy_fatal_error (msg, scanner);
+ }
+ 
+ void
+ lexical_feedback::lexer_debug (const char *pattern, const char *text)
+ {
++  OCTAVE_YYG;
++
+   std::cerr << std::endl;
+ 
+   display_state (YY_START);
+ 
+   std::cerr << "P: " << pattern << std::endl;
+   std::cerr << "T: " << text << std::endl;
+ }
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -72,28 +72,34 @@ along with Octave; see the file COPYING.
+ #include "pt-all.h"
+ #include "pt-eval.h"
+ #include "symtab.h"
+ #include "token.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
++// oct-parse.h must be included after pt-all.h
++#include <oct-parse.h>
++
++extern int octave_lex (YYSTYPE *, void *);
++
++// Global access to currently active lexer.
++// FIXME -- to be removed after more parser+lexer refactoring.
++lexical_feedback *CURR_LEXER = 0;
++
+ #if defined (GNULIB_NAMESPACE)
+ // Calls to the following functions appear in the generated output from
+ // Bison without the namespace tag.  Redefine them so we will use them
+ // via the gnulib namespace.
+ #define fclose GNULIB_NAMESPACE::fclose
+ #define fprintf GNULIB_NAMESPACE::fprintf
+ #define malloc GNULIB_NAMESPACE::malloc
+ #endif
+ 
+-// The state of the parser.
+-octave_parser *curr_parser = 0;
+-
+ // Buffer for help text snagged from function files.
+ std::stack<std::string> help_buf;
+ 
+ // Buffer for comments appearing before a function statement.
+ static std::string fcn_comment_header;
+ 
+ // TRUE means we are using readline.
+ // (--no-line-editing)
+@@ -150,17 +156,17 @@ static octave_function *primary_fcn_ptr 
+ static symbol_table::scope_id primary_fcn_scope;
+ 
+ // List of autoloads (function -> file mapping).
+ static std::map<std::string, std::string> autoload_map;
+ 
+ // Forward declarations for some functions defined at the bottom of
+ // the file.
+ 
+-static void yyerror (const char *s);
++static void yyerror (octave_parser *curr_parser, const char *s);
+ 
+ // Finish building a statement.
+ template <class T>
+ static tree_statement *
+ make_statement (T *arg)
+ {
+   octave_comment_list *comment = octave_comment_buffer::get_comment ();
+ 
+@@ -177,25 +183,41 @@ make_statement (T *arg)
+       if ((interactive || forced_interactive)   \
+           && ! get_input_from_eval_string)      \
+         YYACCEPT; \
+       else \
+         YYABORT; \
+     } \
+   while (0)
+ 
++#define curr_lexer curr_parser->curr_lexer
++#define scanner curr_lexer->scanner
++
+ %}
+ 
+ // Bison declarations.
+ 
+ // Don't add spaces around the = here; it causes some versions of
+ // bison to fail to properly recognize the directive.
+ 
+ %name-prefix="octave_"
+ 
++// We are using the pure parser interface and the reentrant lexer
++// interface but the Octave parser and lexer are NOT properly
++// reentrant because both still use many global variables.  It should be
++// safe to create a parser object and call it while anotehr parser
++// object is active (to parse a callback function while the main
++// interactive parser is waiting for input, for example) if you take
++// care to properly save and restore (typically with an unwind_protect
++// object) relevant global values before and after the nested call.
++
++%define api.pure
++%parse-param { octave_parser *curr_parser }
++%lex-param { void *scanner }
++
+ %union
+ {
+   // The type of the basic tokens returned by the lexer.
+   token *tok_val;
+ 
+   // Comment strings that we need to deal with mid-rule.
+   octave_comment_list *comment_type;
+ 
+@@ -1488,26 +1510,28 @@ opt_comma       : // empty
+                 | ','
+                   { $$ = ','; }
+                 ;
+ 
+ %%
+ 
+ // Generic error messages.
+ 
++#undef curr_lexer
++
+ static void
+-yyerror (const char *s)
++yyerror (octave_parser *curr_parser, const char *s)
+ {
+   curr_parser->bison_error (s);
+ }
+ 
+ int
+ octave_parser::run (void)
+ {
+-  return octave_parse ();
++  return octave_parse (this);
+ }
+ 
+ // Error mesages for mismatched end tokens.
+ 
+ void
+ octave_parser::end_error (const char *type, token::end_tok_type ettype,
+                           int l, int c)
+ {
+@@ -3276,17 +3300,17 @@ gobble_leading_white_space (FILE *ffile,
+ 
+   while (true)
+     {
+       eof = skip_white_space (stdio_reader);
+ 
+       if (eof)
+         break;
+ 
+-      txt = curr_lexer->grab_comment_block (stdio_reader, true, eof);
++      txt = CURR_LEXER->grab_comment_block (stdio_reader, true, eof);
+ 
+       if (txt.empty ())
+         break;
+ 
+       if (! (have_help_text || looks_like_copyright (txt)))
+         {
+           help_txt = txt;
+           have_help_text = true;
+@@ -3372,27 +3396,29 @@ parse_fcn_file (const std::string& ff, c
+   FILE *ffile = get_input_from_file (ff, 0);
+ 
+   frame.add_fcn (safe_fclose, ffile);
+ 
+   if (ffile)
+     {
+       bool eof;
+ 
+-      frame.protect_var (curr_lexer);
+-      curr_lexer = new lexical_feedback ();
+-      frame.add_fcn (lexical_feedback::cleanup, curr_lexer);
+-
+-      frame.protect_var (curr_parser);
+-      curr_parser = new octave_parser ();
++      // octave_parser constructor sets this for us.
++      frame.protect_var (CURR_LEXER);
++
++      octave_parser *curr_parser = new octave_parser ();
+       frame.add_fcn (octave_parser::cleanup, curr_parser);
+ 
+       curr_parser->reset ();
+ 
+-      std::string help_txt = gobble_leading_white_space (ffile, eof);
++      std::string help_txt
++        = gobble_leading_white_space
++            (ffile, eof,
++             curr_parser->curr_lexer->input_line_number,
++             curr_parser->curr_lexer->current_input_column);
+ 
+       if (! help_txt.empty ())
+         help_buf.push (help_txt);
+ 
+       if (! eof)
+         {
+           std::string file_type;
+ 
+@@ -3434,42 +3460,34 @@ parse_fcn_file (const std::string& ff, c
+ 
+               Vecho_executing_commands = ECHO_OFF;
+ 
+               reading_classdef_file = false;
+               reading_fcn_file = false;
+               reading_script_file = true;
+             }
+ 
+-          YY_BUFFER_STATE old_buf = current_buffer ();
+-          YY_BUFFER_STATE new_buf = create_buffer (ffile);
+-
+-          frame.add_fcn (switch_to_buffer, old_buf);
+-          frame.add_fcn (delete_buffer, new_buf);
+-
+-          switch_to_buffer (new_buf);
+-
+           frame.protect_var (primary_fcn_ptr);
+           primary_fcn_ptr = 0;
+ 
+           // Do this with an unwind-protect cleanup function so that
+           // the forced variables will be unmarked in the event of an
+           // interrupt.
+           symbol_table::scope_id scope = symbol_table::top_scope ();
+           frame.add_fcn (symbol_table::unmark_forced_variables, scope);
+ 
+           if (! help_txt.empty ())
+             help_buf.push (help_txt);
+ 
+           if (reading_script_file)
+-            curr_lexer->prep_for_script_file ();
++            curr_parser->curr_lexer->prep_for_script_file ();
+           else
+-            curr_lexer->prep_for_function_file ();
+-
+-          curr_lexer->parsing_class_method = ! dispatch_type.empty ();
++            curr_parser->curr_lexer->prep_for_function_file ();
++
++          curr_parser->curr_lexer->parsing_class_method = ! dispatch_type.empty ();
+ 
+           frame.protect_var (global_command);
+ 
+           global_command = 0;
+ 
+           int status = curr_parser->run ();
+ 
+           // Use an unwind-protect cleanup function so that the
+@@ -3481,19 +3499,21 @@ parse_fcn_file (const std::string& ff, c
+           fcn_ptr = primary_fcn_ptr;
+ 
+           if (status != 0)
+             error ("parse error while reading %s file %s",
+                    file_type.c_str (), ff.c_str ());
+         }
+       else
+         {
++          int l = curr_parser->curr_lexer->input_line_number;
++          int c = curr_parser->curr_lexer->current_input_column;
++
+           tree_statement *end_of_script
+-            = curr_parser->make_end ("endscript", curr_lexer->input_line_number,
+-                                     curr_lexer->current_input_column);
++            = curr_parser->make_end ("endscript", l, c);
+ 
+           curr_parser->make_script (0, end_of_script);
+ 
+           fcn_ptr = primary_fcn_ptr;
+         }
+     }
+   else if (require_file)
+     error ("no such file, '%s'", ff.c_str ());
+@@ -4182,22 +4202,20 @@ another function for the given type sign
+ 
+ octave_value_list
+ eval_string (const std::string& s, bool silent, int& parse_status, int nargout)
+ {
+   octave_value_list retval;
+ 
+   unwind_protect frame;
+ 
+-  frame.protect_var (curr_lexer);
+-  curr_lexer = new lexical_feedback ();
+-  frame.add_fcn (lexical_feedback::cleanup, curr_lexer);
+-
+-  frame.protect_var (curr_parser);
+-  curr_parser = new octave_parser ();
++  // octave_parser constructor sets this for us.
++  frame.protect_var (CURR_LEXER);
++
++  octave_parser *curr_parser = new octave_parser ();
+   frame.add_fcn (octave_parser::cleanup, curr_parser);
+ 
+   frame.protect_var (get_input_from_eval_string);
+   frame.protect_var (line_editing);
+   frame.protect_var (current_eval_string);
+   frame.protect_var (current_function_depth);
+   frame.protect_var (function_scopes);
+   frame.protect_var (max_function_depth);
+@@ -4215,24 +4233,16 @@ eval_string (const std::string& s, bool 
+   parsing_subfunctions = false;
+   endfunction_found = false;
+   reading_fcn_file = false;
+   reading_script_file = false;
+   reading_classdef_file = false;
+ 
+   current_eval_string = s;
+ 
+-  YY_BUFFER_STATE old_buf = current_buffer ();
+-  YY_BUFFER_STATE new_buf = create_buffer (0);
+-
+-  frame.add_fcn (switch_to_buffer, old_buf);
+-  frame.add_fcn (delete_buffer, new_buf);
+-
+-  switch_to_buffer (new_buf);
+-
+   do
+     {
+       curr_parser->reset ();
+ 
+       frame.protect_var (global_command);
+ 
+       global_command = 0;
+ 
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -27,18 +27,16 @@ along with Octave; see the file COPYING.
+ 
+ #include <string>
+ 
+ #include <stack>
+ 
+ #include "lex.h"
+ #include "token.h"
+ 
+-extern int octave_lex (void);
+-
+ class octave_comment_list;
+ class octave_function;
+ class octave_user_function;
+ class tree;
+ class tree_anon_fcn_handle;
+ class tree_argument_list;
+ class tree_cell;
+ class tree_colon_expression;
+@@ -127,24 +125,35 @@ feval (const octave_value_list& args, in
+ extern OCTINTERP_API octave_value_list
+ eval_string (const std::string&, bool silent, int& parse_status, int hargout);
+ 
+ extern OCTINTERP_API octave_value
+ eval_string (const std::string&, bool silent, int& parse_status);
+ 
+ extern OCTINTERP_API void cleanup_statement_list (tree_statement_list **lst);
+ 
++// Global access to currently active lexer.
++// FIXME -- to be removed after more parser+lexer refactoring.
++extern lexical_feedback *CURR_LEXER;
++
+ class
+ octave_parser
+ {
+ public:
+ 
+-  octave_parser (void) : end_of_input (false) { }
++  octave_parser (void)
++    : end_of_input (false), curr_lexer (new lexical_feedback ())
++  {
++    CURR_LEXER = curr_lexer;
++  }
+ 
+-  ~octave_parser (void) { }
++  ~octave_parser (void)
++  {
++    delete curr_lexer;
++  }
+ 
+   void reset (void)
+   {
+     curr_lexer->reset ();
+   }
+ 
+   int run (void);
+ 
+@@ -327,24 +336,24 @@ public:
+                          tree_statement *stmt, bool warn_missing_semi);
+ 
+   // Generic error messages.
+   void bison_error (const char *s);
+ 
+   // TRUE means that we have encountered EOF on the input stream.
+   bool end_of_input;
+ 
++  // State of the lexer.
++  lexical_feedback *curr_lexer;
++
+   // For unwind protect.
+   static void cleanup (octave_parser *parser) { delete parser; }
+ 
+ private:
+ 
+   // No copying!
+ 
+   octave_parser (const octave_parser&);
+ 
+   octave_parser& operator = (const octave_parser&);
+ };
+ 
+-// The current state of the parser.
+-extern octave_parser *curr_parser;
+-
+ #endif

@@ -1,0 +1,394 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1452631558 -3600
+#      Tue Jan 12 21:45:58 2016 +0100
+# Node ID 221847e5f4880a72117fe9d11f29508ebd3e6b4a
+# Parent  12e98e5ebd138eeff5cf16f3107f3f042e651d42
+fix issues when restoring breakpoints and closing tabs or whole application
+
+* file-editor-tab.cc (file_editor_tab): clear list of breakpoints;
+  (handle_file_modified_answer): when saving, do not restore breakpoint;
+  (recover_from_exit): new slot for resetting read only state nad restoring
+  breakpoints when this tab was already saved during closing the application
+  and closing was canceled later by the user;
+  (check_restore_breakpoints): new internal function to restore the breakpoints
+  when the breakpoint list is not empty;
+  (save_file): new flag as argument indicating whether breakpoints should be
+  restored (the default) or not (while exiting the application), store list
+  of breakpoint in the new class variable _bp_list, call function for
+  restoring breakpoints only if it is indicated by the new flag
+
+* file-editor-tab.h: new slot recover_from_exit, new function
+  check_restore_breakpoints, function save_file with new argument,
+  new class variable storing the list og breakpoints for restoring
+
+* file-editor.cc (check_closing): reorganized checking tabs for closing, when
+  closing was canceled by the user, emit new signal for the tabs to recover
+  from exit, save session afterwards (when app really is closing);
+  (add_file_editor_tab): connect new signal for recovering from exit to the
+  related new slots of the tabs
+
+* file-editor.h: new signal for recovering from exit
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -85,16 +85,18 @@ file_editor_tab::file_editor_tab (const 
+ 
+   _file_name = "";
+   _file_system_watcher.setObjectName ("_qt_autotest_force_engine_poller");
+ 
+   _edit_area = new octave_qscintilla (this);
+   _line = 0;
+   _col  = 0;
+ 
++  _bp_list.clear ();  // start with an empty list of breakpoints
++
+   connect (_edit_area, SIGNAL (cursorPositionChanged (int, int)),
+            this, SLOT (handle_cursor_moved (int,int)));
+ 
+   connect (_edit_area, SIGNAL (linesChanged ()),
+            this, SLOT (handle_lines_changed ()));
+ 
+   connect (_edit_area, SIGNAL (context_menu_edit_signal (const QString&)),
+            this, SLOT (handle_context_menu_edit (const QString&)));
+@@ -1338,17 +1340,17 @@ file_editor_tab::check_file_modified ()
+ }
+ 
+ void
+ file_editor_tab::handle_file_modified_answer (int decision)
+ {
+   if (decision == QMessageBox::Save)
+     {
+       // Save file, but do not remove from editor.
+-      save_file (_file_name, false);
++      save_file (_file_name, false, false);
+     }
+   else if (decision == QMessageBox::Discard)
+     {
+       // User doesn't want to save, leave tab and remove subsequently.
+     }
+   else
+     {
+       // User canceled, allow editing again.
+@@ -1358,16 +1360,47 @@ file_editor_tab::handle_file_modified_an
+ }
+ 
+ void
+ file_editor_tab::set_modified (bool modified)
+ {
+   _edit_area->setModified (modified);
+ }
+ 
++void
++file_editor_tab::recover_from_exit ()
++{
++  // reset the possibly still existing read only state
++  _edit_area->setReadOnly (false);
++
++  // if we are in this slot and the list of breakpoint is not empty,
++  // then this tab was saved during an exit of the applications (not
++  // restoring the breakpoints and not emptying the list) and the user
++  // canceled this closing late on.
++  check_restore_breakpoints ();
++}
++
++void
++file_editor_tab::check_restore_breakpoints ()
++{
++  if (! _bp_list.isEmpty ())
++    {
++      // At least one breakpoint is present.
++      // Get rid of breakpoints at old (now possibly invalid) linenumbers
++      remove_all_breakpoints (this);
++
++      // and set breakpoints at the new linenumbers
++      for (int i = 0; i < _bp_list.length (); i++)
++        handle_request_add_breakpoint (_bp_list.value (i) + 1);
++
++     // reset the list of breakpoints
++      _bp_list.clear ();
++    }
++}
++
+ QString
+ file_editor_tab::load_file (const QString& fileName)
+ {
+   // get the absolute path
+   QFileInfo file_info = QFileInfo (fileName);
+   QString file_to_load;
+   if (file_info.exists ())
+     file_to_load = file_info.canonicalFilePath ();
+@@ -1531,17 +1564,18 @@ file_editor_tab::new_file (const QString
+ 
+   update_lexer ();
+ 
+   _edit_area->setText (commands);
+   _edit_area->setModified (false); // new file is not modified yet
+ }
+ 
+ void
+-file_editor_tab::save_file (const QString& saveFileName, bool remove_on_success)
++file_editor_tab::save_file (const QString& saveFileName,
++                            bool remove_on_success, bool restore_breakpoints)
+ {
+   // If it is a new file with no name, signal that saveFileAs
+   // should be performed.
+   if (! valid_file_name (saveFileName))
+     {
+       save_file_as (remove_on_success);
+       return;
+     }
+@@ -1550,23 +1584,17 @@ file_editor_tab::save_file (const QStrin
+   QString file_to_save;
+   if (file_info.exists ())
+     file_to_save = file_info.canonicalFilePath ();
+   else
+     file_to_save = saveFileName;
+   QFile file (file_to_save);
+ 
+   // Get a list of all the breakpoint line numbers.
+-  QIntList list;
+-  emit report_editor_linenr (list);
+-  if (! list.isEmpty ())
+-    {
+-      // At least one breakpoint is present.  Get rid of breakpoints.
+-      remove_all_breakpoints (this);
+-    }
++  emit report_editor_linenr (_bp_list);
+ 
+   // stop watching file
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (trackedFiles.contains (file_to_save))
+     _file_system_watcher.removePath (file_to_save);
+ 
+   // open the file for writing
+   if (! file.open (QIODevice::WriteOnly))
+@@ -1628,18 +1656,20 @@ file_editor_tab::save_file (const QStrin
+ 
+   if (remove_on_success)
+     {
+       emit tab_remove_request ();
+       return;  // Don't touch member variables after removal
+     }
+ 
+   // Attempt to restore the breakpoints if that is desired.
+-  for (int i = 0; i < list.length (); i++)
+-    handle_request_add_breakpoint (list.value (i) + 1);
++  // This is only allowed if the tab is not closing since changing
++  // breakpoints would reopen the tab in this case.
++  if (restore_breakpoints)
++    check_restore_breakpoints ();
+ }
+ 
+ void
+ file_editor_tab::save_file_as (bool remove_on_success)
+ {
+   // Simply put up the file chooser dialog box with a slot connection
+   // then return control to the system waiting for a file selection.
+ 
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -124,16 +124,17 @@ public slots:
+   void move_match_brace (const QWidget *ID, bool select);
+   void show_auto_completion (const QWidget *ID);
+ 
+   void insert_debugger_pointer (const QWidget *ID, int line = -1);
+   void delete_debugger_pointer (const QWidget *ID, int line = -1);
+ 
+   void do_breakpoint_marker (bool insert, const QWidget *ID, int line = -1);
+ 
++  void recover_from_exit (void);
+   void set_modified (bool modified = true);
+ 
+   void set_encoding (const QString& new_encoding);
+ 
+   QString load_file (const QString& fileName);
+ 
+   void new_file (const QString& commands = QString ());
+ 
+@@ -217,17 +218,18 @@ private:
+ 
+     int line;
+     std::string file;
+     std::string dir;
+     std::string function_name;
+   };
+ 
+   bool valid_file_name (const QString& file=QString ());
+-  void save_file (const QString& saveFileName, bool remove_on_success = false);
++  void save_file (const QString& saveFileName, bool remove_on_success = false,
++                                               bool restore_breakpoints = true);
+   void save_file_as (bool remove_on_success = false);
+   bool check_valid_identifier (QString file_name);
+   bool check_valid_codec (QTextCodec *codec);
+ 
+   void message_cannot_breakpoint_changed_file (void);
+ 
+   void update_lexer ();
+ 
+@@ -235,16 +237,17 @@ private:
+   int check_file_modified ();
+   void do_comment_selected_text (bool comment);
+   QString comment_string (const QString&);
+   void do_indent_selected_text (bool indent);
+ 
+   void add_breakpoint_callback (const bp_info& info);
+   void remove_breakpoint_callback (const bp_info& info);
+   void remove_all_breakpoints_callback (const bp_info& info);
++  void check_restore_breakpoints (void);
+   void center_current_line (bool always=true);
+ 
+   void add_octave_apis (octave_value_list key_ovl);
+   QString get_function_name ();
+ 
+   void do_smart_indent (void);
+ 
+   QsciScintilla::EolMode detect_eol_mode ();
+@@ -269,16 +272,18 @@ private:
+   bool _long_title;
+   bool _copy_available;
+   bool _is_octave_file;
+   bool _always_reload_changed_files;
+   bool _smart_indent;
+ 
+   QFileSystemWatcher _file_system_watcher;
+ 
++  QIntList _bp_list;
++
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+   QRect _find_dialog_geometry;
+ 
+   QsciAPIs *_lexer_apis;
+   QString _prep_apis_file;
+ 
+   static bool _cancelled;
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -74,30 +74,52 @@ file_editor::~file_editor (void)
+ {
+   if (_mru_file_menu)
+     delete _mru_file_menu;
+ }
+ 
+ bool
+ file_editor::check_closing (void)
+ {
+-  // Save open files for restoring in next session; this only is possible
+-  QSettings *settings = resource_manager::get_settings ();
++  // When the applications is closing all editor tabs are checked whether
++  // they need to be saved. During these ckecked the tabs are not closed
++  // since the user might cancel closing octave during one of these saving
++  // dialogs. Therefore, saving the session for restoring at next start
++  // is not done before the application is definitely closing
+ 
+   // Have all file editor tabs signal what their filenames are.
+   editor_tab_map.clear ();
+   emit fetab_file_name_query (0);
+ 
++  // Save all tabs with confirmation.
++  file_editor_tab::reset_cancel ();
++  emit fetab_check_modified_file ();
++
++  // If there was a cancellation, make the already saved/discarded tabs
++  // recovering from the exit by removing the read-only state and by
++  // recovering the debugger breakpoints. Finally return false in order to
++  // cancel closing the application
++  if (file_editor_tab::was_cancelled ())
++    {
++      emit fetab_recover_from_exit ();
++      return false;
++    }
++
++  // Here, the application will be closed -> store the session
++
++  // Save open files for restoring in next session; this only is possible
++  QSettings *settings = resource_manager::get_settings ();
++
+   // save filenames (even if last session will not be restored next time)
+   // together with encoding and the tab index
+   QStringList fetFileNames;
+   QStringList fet_encodings;
+   QStringList fet_index;
+ 
+-  // over all open tabs
++  // save all open tabs before they are definitely closed
+   for (editor_tab_map_const_iterator p = editor_tab_map.begin ();
+        p != editor_tab_map.end (); p++)
+     {
+       QString file_name = p->first;   // get file name of tab
+       if (! file_name.isEmpty ())      // do not append unnamed files
+         {
+           fetFileNames.append (file_name);
+           fet_encodings.append (editor_tab_map[file_name].encoding);
+@@ -107,24 +129,18 @@ file_editor::check_closing (void)
+         }
+     }
+ 
+   settings->setValue ("editor/savedSessionTabs", fetFileNames);
+   settings->setValue ("editor/saved_session_encodings", fet_encodings);
+   settings->setValue ("editor/saved_session_tab_index", fet_index);
+   settings->sync ();
+ 
+-  // Save all tabs with confirmation.
+-  file_editor_tab::reset_cancel ();
+-  emit fetab_check_modified_file ();
+-
+-  // Close all tabs if there was no cancellation.
+-  if (file_editor_tab::was_cancelled ())
+-    return false;
+-
++  // Finally close all the tabs and return indication that we can exit
++  // the application
+   for (int i = 0; i < _tab_widget->count (); i++)
+     {
+       delete _tab_widget->widget (i);
+       _tab_widget->removeTab (i);
+     }
+ 
+   return true;
+ }
+@@ -1961,16 +1977,19 @@ file_editor::add_file_editor_tab (file_e
+   connect (this, SIGNAL (fetab_save_file (const QWidget*, const QString&,
+                                           bool)),
+            f, SLOT (save_file (const QWidget*, const QString&, bool)));
+ 
+   connect (this, SIGNAL (fetab_check_modified_file (void)),
+            f, SLOT (check_modified_file (void)));
+ 
+   // Signals from the file_editor trivial operations
++  connect (this, SIGNAL (fetab_recover_from_exit (void)),
++           f, SLOT (recover_from_exit (void)));
++
+   connect (this, SIGNAL (fetab_set_directory (const QString&)),
+            f, SLOT (set_current_directory (const QString&)));
+ 
+   connect (this, SIGNAL (fetab_zoom_in (const QWidget*)),
+            f, SLOT (zoom_in (const QWidget*)));
+   connect (this, SIGNAL (fetab_zoom_out (const QWidget*)),
+            f, SLOT (zoom_out (const QWidget*)));
+   connect (this, SIGNAL (fetab_zoom_normal (const QWidget*)),
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -147,16 +147,17 @@ signals:
+   void fetab_set_focus (const QWidget* ID);
+   void fetab_scintilla_command (const QWidget* ID, unsigned int sci_msg);
+ 
+   void fetab_zoom_in (const QWidget* ID);
+   void fetab_zoom_out (const QWidget* ID);
+   void fetab_zoom_normal (const QWidget* ID);
+ 
+   void fetab_set_directory (const QString& dir);
++  void fetab_recover_from_exit (void);
+ 
+   void request_settings_dialog (const QString&);
+   void execute_command_in_terminal_signal (const QString&);
+   void file_loaded_signal ();
+ 
+ public slots:
+ 
+   void focus (void);

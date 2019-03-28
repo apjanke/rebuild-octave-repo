@@ -1,0 +1,337 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1484408008 18000
+#      Sat Jan 14 10:33:28 2017 -0500
+# Node ID 564e959a0e895909e341e6b9fddd5e0b4bd08bd6
+# Parent  b443bfa3bfea2a1d6eb9829aa226b8f945973420
+avoid invalid nested function and subfunctions definitions (bug #50014)
+
+* parse.h, oct-parse.in.yy (base_parser::parent_scope_info): New class.
+(base_parser::function_scopes): Use new parent_scope_info class for
+this data member.
+
+* oct-parse.in.yy: Change all uses of function_scopes for new type.
+(fcn_name): Issue error message and abort parse if duplicate nestted
+function or subfunction name is detect.
+
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -1238,18 +1238,17 @@ push_fcn_symtab : // empty
+ 
+                     parser.curr_fcn_depth++;
+ 
+                     if (parser.max_fcn_depth < parser.curr_fcn_depth)
+                       parser.max_fcn_depth = parser.curr_fcn_depth;
+ 
+                     lexer.symtab_context.push (symbol_table::alloc_scope ());
+ 
+-                    parser.function_scopes.push_back
+-                     (lexer.symtab_context.curr_scope ());
++                    parser.function_scopes.push (lexer.symtab_context.curr_scope ());
+ 
+                     if (! lexer.reading_script_file
+                         && parser.curr_fcn_depth == 1
+                         && ! parser.parsing_subfunctions)
+                       parser.primary_fcn_scope
+                         = lexer.symtab_context.curr_scope ();
+ 
+                     if (lexer.reading_script_file
+@@ -1457,17 +1456,27 @@ function        : function_beg stash_com
+                     $$ = parser.finish_function ($3, $5, $2, $1->line (),
+                                                  $1->column ());
+                     parser.recover_from_parsing_function ();
+                   }
+                 ;
+ 
+ fcn_name        : identifier
+                   {
+-                    std::string id_name = $1->name ();
++                    std::string id = $1->name ();
++
++                    if (! parser.function_scopes.name_current_scope (id))
++                      {
++                        parser.bison_error ("duplicate subfunction or nested function name",
++                                            $1->line (), $1->column ());
++
++                        delete $1;
++
++                        YYABORT;
++                      }
+ 
+                     lexer.parsed_function_name.top () = true;
+                     lexer.maybe_classdef_get_set_method = false;
+ 
+                     $$ = $1;
+                   }
+                 | GET '.' identifier
+                   {
+@@ -2015,16 +2024,100 @@ opt_sep         : // empty
+ static void
+ yyerror (octave::base_parser& parser, const char *s)
+ {
+   parser.bison_error (s);
+ }
+ 
+ namespace octave
+ {
++  size_t
++  base_parser::parent_scope_info::size (void) const
++  {
++    return info.size ();
++  }
++
++  void
++  base_parser::parent_scope_info::push (const value_type& elt)
++  {
++    info.push_back (elt);
++  }
++
++  void
++  base_parser::parent_scope_info::push (symbol_table::scope_id id)
++  {
++    push (value_type (id, ""));
++  }
++
++  void
++  base_parser::parent_scope_info::pop (void)
++  {
++    info.pop_back ();
++  }
++
++  bool
++  base_parser::parent_scope_info::name_ok (const std::string& name)
++  {
++    // Name can't be the same as any parent function or any other
++    // function we've already seen.  We could maintain a complex
++    // tree structure of names, or we can just store the set of
++    // full names of all the functions, which must be unique.
++
++    std::string full_name;
++
++    for (size_t i = 0; i < size()-1; i++)
++      {
++        const value_type& elt = info[i];
++
++        if (name == elt.second)
++          return false;
++
++        full_name += elt.second + ">";
++      }
++
++    full_name += name;
++
++    if (all_names.find (full_name) != all_names.end ())
++      return false;
++
++    all_names.insert (full_name);
++
++    return true;
++  }
++
++  bool
++  base_parser::parent_scope_info::name_current_scope (const std::string& name)
++  {
++    if (! name_ok (name))
++      return false;
++
++    if (size () > 0)
++      info.back().second = name;
++
++    return true;
++  }
++
++  symbol_table::scope_id
++  base_parser::parent_scope_info::parent_scope (void) const
++  {
++    return size () > 1 ? info[size()-2].first : 0;
++  }
++
++  std::string
++  base_parser::parent_scope_info::parent_name (void) const
++  {
++    return info[size()-2].second;
++  }
++
++  void base_parser::parent_scope_info::clear (void)
++  {
++    info.clear ();
++    all_names.clear ();
++  }
++
+   base_parser::base_parser (base_lexer& lxr)
+     : endfunction_found (false), autoloading (false),
+       fcn_file_from_relative_lookup (false), parsing_subfunctions (false),
+       max_fcn_depth (0), curr_fcn_depth (0), primary_fcn_scope (-1),
+       curr_class_name (), curr_package_name (), function_scopes (),
+       primary_fcn_ptr (0), subfunction_names (), classdef_object (0),
+       stmt_list (0), lexer (lxr), parser_state (yypstate_new ())
+   { }
+@@ -3186,17 +3279,17 @@ namespace octave
+         if (fcn_file_from_relative_lookup)
+           fcn->mark_relative ();
+ 
+         if (curr_fcn_depth > 1 || parsing_subfunctions)
+           {
+             fcn->stash_parent_fcn_name (lexer.fcn_file_name);
+ 
+             if (curr_fcn_depth > 1)
+-              fcn->stash_parent_fcn_scope (function_scopes[function_scopes.size ()-2]);
++              fcn->stash_parent_fcn_scope (function_scopes.parent_scope ());
+             else
+               fcn->stash_parent_fcn_scope (primary_fcn_scope);
+           }
+ 
+         if (lexer.parsing_class_method)
+           {
+             if (curr_class_name == id_name)
+               fcn->mark_as_class_constructor ();
+@@ -3269,17 +3362,17 @@ namespace octave
+ 
+         if (curr_fcn_depth > 1 || parsing_subfunctions)
+           {
+             fcn->stash_fcn_location (l, c);
+ 
+             if (endfunction_found && function_scopes.size () > 1)
+               {
+                 symbol_table::scope_id pscope
+-                  = function_scopes[function_scopes.size ()-2];
++                  = function_scopes.parent_scope ();
+ 
+                 symbol_table::install_nestfunction (nm, octave_value (fcn),
+                                                     pscope);
+               }
+             else
+               {
+                 fcn->mark_as_subfunction ();
+                 subfunction_names.push_back (nm);
+@@ -3316,17 +3409,17 @@ namespace octave
+   {
+     lexer.symtab_context.pop ();
+ 
+     if (lexer.reading_fcn_file && curr_fcn_depth == 1
+         && ! parsing_subfunctions)
+       parsing_subfunctions = true;
+ 
+     curr_fcn_depth--;
+-    function_scopes.pop_back ();
++    function_scopes.pop ();
+ 
+     lexer.defining_func--;
+     lexer.parsed_function_name.pop ();
+     lexer.looking_at_return_list = false;
+     lexer.looking_at_parameter_list = false;
+   }
+ 
+   tree_funcall *
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -24,19 +24,19 @@ along with Octave; see the file COPYING.
+ #define octave_parse_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <cstdio>
+ 
+ #include <string>
+ 
+-#include <stack>
+-#include <vector>
++#include <deque>
+ #include <map>
++#include <set>
+ 
+ #include "lex.h"
+ #include "symtab.h"
+ #include "token.h"
+ 
+ class octave_comment_list;
+ class octave_function;
+ class octave_user_function;
+@@ -142,16 +142,62 @@ namespace octave
+ {
+   // Global access to currently active lexer.
+   // FIXME: to be removed after more parser+lexer refactoring.
+   extern base_lexer *LEXER;
+ 
+   class
+   base_parser
+   {
++  private:
++
++    class parent_scope_info
++    {
++    public:
++
++      typedef std::pair<symbol_table::scope_id, std::string> value_type;
++
++      typedef std::deque<value_type>::iterator iterator;
++      typedef std::deque<value_type>::const_iterator const_iterator;
++
++      typedef std::deque<value_type>::reverse_iterator reverse_iterator;
++      typedef std::deque<value_type>::const_reverse_iterator const_reverse_iterator;
++
++      parent_scope_info (void) = default;
++
++      parent_scope_info (const parent_scope_info&) = default;
++
++      parent_scope_info& operator = (const parent_scope_info&) = default;
++
++      ~parent_scope_info (void) = default;
++
++      size_t size (void) const;
++
++      void push (const value_type& elt);
++
++      void push (symbol_table::scope_id id);
++
++      void pop (void);
++
++      bool name_ok (const std::string& name);
++
++      bool name_current_scope (const std::string& name);
++
++      symbol_table::scope_id parent_scope (void) const;
++
++      std::string parent_name (void) const;
++
++      void clear (void);
++
++    private:
++
++      std::deque<value_type> info;
++      std::set<std::string> all_names;
++    };
++
+   public:
+ 
+     base_parser (base_lexer& lxr);
+ 
+     // No copying!
+ 
+     base_parser (const base_parser&) = delete;
+ 
+@@ -437,20 +483,18 @@ namespace octave
+     // Name of the current class when we are parsing class methods or
+     // constructors.
+     std::string curr_class_name;
+ 
+     // Name of the current package when we are parsing an element contained
+     // in a package directory (+-directory).
+     std::string curr_package_name;
+ 
+-    // A stack holding the nested function scopes being parsed.
+-    // We don't use std::stack, because we want the clear method.  Also, we
+-    // must access one from the top
+-    std::vector<symbol_table::scope_id> function_scopes;
++    // Nested function scopes and names currently being parsed.
++    parent_scope_info function_scopes;
+ 
+     // Pointer to the primary user function or user script function.
+     octave_function *primary_fcn_ptr;
+ 
+     // List of subfunction names, initially in the order they are
+     // installed in the symbol table, then ordered as they appear in the
+     // file.  Eventually stashed in the primary function object.
+     std::list<std::string> subfunction_names;

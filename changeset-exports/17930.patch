@@ -1,0 +1,459 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1384465941 18000
+#      Thu Nov 14 16:52:21 2013 -0500
+# Node ID ffdbb82a0c78dfd625d4621aaa90aa13e3958714
+# Parent  97bde75d4119acf27413d5b9315046015403dad8
+allow welcome wizard dialog to be canceled
+
+* resource-manager.h, resource-manager.cc (class resource_manager):
+Cache settings directory and file, but not first_run.
+(resource_manager::get_gui_translation_dir,
+resource_manager::do_update_network_settings):
+Only access settings if it is valid.
+(resource_manager::do_reload_settings): Don't set first_run.
+(resource_manager::do_get_home_path): Delete.
+
+* welcome-wizard.cc (welcome_wizard::welcome_wizard):
+Provide cancel button.
+
+* octave-gui.cc (octave_start_gui): Don't loop over welcome wizard.
+Run welcome wizard once if settings file is missing and exit Octave if
+welcome wizard returns a rejected status.  Otherwise, load resources
+and start Octave.
+
+diff --git a/libgui/src/octave-gui.cc b/libgui/src/octave-gui.cc
+--- a/libgui/src/octave-gui.cc
++++ b/libgui/src/octave-gui.cc
+@@ -127,62 +127,68 @@ octave_start_gui (int argc, char *argv[]
+ 
+   if (start_gui)
+     {
+       QApplication application (argc, argv);
+ 
+       // Set the codec for all strings
+       QTextCodec::setCodecForCStrings (QTextCodec::codecForName ("UTF-8"));
+ 
++      if (resource_manager::is_first_run ())
++        {
++          welcome_wizard welcomeWizard;
++
++          if (welcomeWizard.exec () == QDialog::Rejected)
++            exit (1);
++        }
++
++      resource_manager::reload_settings ();
++
+       // install translators for the gui and qt text
+       QTranslator gui_tr, qt_tr, qsci_tr;
+-      resource_manager::config_translators (&qt_tr,&qsci_tr,&gui_tr);
++
++      resource_manager::config_translators (&qt_tr, &qsci_tr, &gui_tr);
++
+       application.installTranslator (&qt_tr);
+       application.installTranslator (&qsci_tr);
+       application.installTranslator (&gui_tr);
+ 
+-      while (true)
+-        {
+-          if (resource_manager::is_first_run ())
+-            {
+-              welcome_wizard welcomeWizard;
+-              welcomeWizard.exec ();
+-              resource_manager::reload_settings ();
+-            }
+-          else
+-            {
+-              // update network-settings
+-              resource_manager::update_network_settings ();
++      // update network-settings
++      resource_manager::update_network_settings ();
+ 
+ #if ! defined (__WIN32__) || defined (__CYGWIN__)
+-              // If we were started from a launcher, TERM might not be
+-              // defined, but we provide a terminal with xterm
+-              // capabilities.
++      // If we were started from a launcher, TERM might not be
++      // defined, but we provide a terminal with xterm
++      // capabilities.
+ 
+-              std::string term = octave_env::getenv ("TERM");
++      std::string term = octave_env::getenv ("TERM");
+ 
+-              if (term.empty ())
+-                octave_env::putenv ("TERM", "xterm");
++      if (term.empty ())
++        octave_env::putenv ("TERM", "xterm");
+ #else
+-              std::string term = octave_env::getenv ("TERM");
++      std::string term = octave_env::getenv ("TERM");
+ 
+-              if (term.empty ())
+-                octave_env::putenv ("TERM", "cygwin");
++      if (term.empty ())
++        octave_env::putenv ("TERM", "cygwin");
+ #endif
+ 
+-              // create main window, read settings, and show window
+-              main_window w;
+-              w.read_settings ();  // get widget settings and window layout
+-              w.focus_command_window ();
+-              w.connect_visibility_changed (); // connect signals for changes
+-                                               // in visibility not before w
+-                                               // is shown
+-              return application.exec ();
+-            }
+-        }
++      // Create and show main window.
++
++      main_window w;
++
++      w.read_settings ();
++
++      w.focus_command_window ();
++
++      // Connect signals for changes in visibility not before w
++      // is shown.
++
++      w.connect_visibility_changed ();
++
++      return application.exec ();
+     }
+   else
+     {
+       QCoreApplication application (argc, argv);
+ 
+       octave_cli_thread main_thread (argc, argv);
+ 
+       main_thread.start ();
+diff --git a/libgui/src/resource-manager.cc b/libgui/src/resource-manager.cc
+--- a/libgui/src/resource-manager.cc
++++ b/libgui/src/resource-manager.cc
+@@ -52,31 +52,38 @@ default_qt_settings_file (void)
+ 
+   if (dsf.empty ())
+     dsf = Voct_etc_dir + file_ops::dir_sep_str () + "default-qt-settings";
+ 
+   return QString::fromStdString (dsf);
+ }
+ 
+ resource_manager::resource_manager (void)
+-  : settings (0), home_path (), first_run (false)
++  : settings_directory (), settings_file (), settings (0),
++    default_settings (0)
+ {
+-  do_reload_settings ();
++  QDesktopServices desktopServices;
++
++  QString home_path
++    = desktopServices.storageLocation (QDesktopServices::HomeLocation);
++
++  settings_directory = home_path + "/.config/octave/";
++
++  settings_file = settings_directory + "/qt-settings";
+ 
+   default_settings = new QSettings (default_qt_settings_file (),
+                                     QSettings::IniFormat);
+ }
+ 
+ resource_manager::~resource_manager (void)
+ {
+   delete settings;
+   delete default_settings;
+ }
+ 
+-
+ QString
+ resource_manager::get_gui_translation_dir (void)
+ {
+   // get environment variable for the locale dir (e.g. from run-octave)
+   std::string dldir = octave_env::getenv ("OCTAVE_LOCALE_DIR");
+   if (dldir.empty ())
+     dldir = Voct_locale_dir; // env-var empty, load the default location
+   return QString::fromStdString (dldir);
+@@ -86,36 +93,46 @@ void
+ resource_manager::config_translators (QTranslator *qt_tr,
+                                       QTranslator *qsci_tr,
+                                       QTranslator *gui_tr)
+ {
+   bool loaded;
+ 
+   QString qt_trans_dir
+     = QLibraryInfo::location (QLibraryInfo::TranslationsPath);
++
+   QSettings *settings = resource_manager::get_settings ();
+-  // FIXME: what should happen if settings is 0?
+ 
+-  // get the locale from the settings
+-  QString language = settings->value ("language","SYSTEM").toString ();
+-  if (language == "SYSTEM")
+-    language = QLocale::system ().name ();    // get system wide locale
++  if (settings)
++    {
++      // get the locale from the settings
++      QString language = settings->value ("language","SYSTEM").toString ();
++
++      if (language == "SYSTEM")
++        language = QLocale::system ().name ();    // get system wide locale
++
++      // load the translator file for qt strings
++      loaded = qt_tr->load ("qt_" + language, qt_trans_dir);
+ 
+-  // load the translator file for qt strings
+-  loaded = qt_tr->load ("qt_" + language, qt_trans_dir);
+-  if (!loaded) // try lower case
+-    qt_tr->load ("qt_" + language.toLower (), qt_trans_dir);
++      if (!loaded) // try lower case
++        qt_tr->load ("qt_" + language.toLower (), qt_trans_dir);
++
++      // load the translator file for qscintilla settings
++      loaded = qsci_tr->load ("qscintilla_" + language, qt_trans_dir);
+ 
+-  // load the translator file for qscintilla settings
+-  loaded = qsci_tr->load ("qscintilla_" + language, qt_trans_dir);
+-  if (!loaded) // try lower case
+-    qsci_tr->load ("qscintilla_" + language.toLower (), qt_trans_dir);
++      if (!loaded) // try lower case
++        qsci_tr->load ("qscintilla_" + language.toLower (), qt_trans_dir);
+ 
+-  // load the translator file for gui strings
+-  gui_tr->load (language, get_gui_translation_dir ());
++      // load the translator file for gui strings
++      gui_tr->load (language, get_gui_translation_dir ());
++    }
++  else
++    {
++      // FIXME: Is this an error?  If so, what should we do?
++    }
+ }
+ 
+ bool
+ resource_manager::instance_ok (void)
+ {
+   bool retval = true;
+ 
+   if (! instance)
+@@ -144,93 +161,83 @@ resource_manager::do_get_settings (void)
+ 
+ QSettings *
+ resource_manager::do_get_default_settings (void) const
+ {
+   return default_settings;
+ }
+ 
+ QString
+-resource_manager::do_get_home_path (void) const
++resource_manager::do_get_settings_directory (void)
+ {
+-  return home_path;
+-}
+-
+-QString
+-resource_manager::do_get_settings_path (void)
+-{
+-  QDesktopServices desktopServices;
+-  home_path = desktopServices.storageLocation (QDesktopServices::HomeLocation);
+-  QString settings_path = home_path + "/.config/octave/";
+-  return settings_path;
++  return settings_directory;
+ }
+ 
+ QString
+ resource_manager::do_get_settings_file (void)
+ {
+-  return do_get_settings_path ()  + "qt-settings";
++  return settings_file;
+ }
+ 
+ void
+ resource_manager::do_reload_settings (void)
+ {
+-  QDesktopServices desktopServices;
+-  home_path = desktopServices.storageLocation (QDesktopServices::HomeLocation);
+-  QString settings_path = do_get_settings_path ();
+-  QString settings_file = do_get_settings_file ();
+-
+-  if (!QFile::exists (settings_file))
++  if (! QFile::exists (settings_file))
+     {
+-      QDir ("/").mkpath (settings_path);
++      QDir ("/").mkpath (settings_directory);
+       QFile::copy (default_qt_settings_file (), settings_file);
+-      first_run = true;
+     }
+-  else
+-    first_run = false;
+ 
+   do_set_settings (settings_file);
+ }
+ 
+ void
+ resource_manager::do_set_settings (const QString& file)
+ {
+   delete settings;
+   settings = new QSettings (file, QSettings::IniFormat);
+ }
+ 
+ bool
+ resource_manager::do_is_first_run (void) const
+ {
+-  return first_run;
++  return ! QFile::exists (settings_file);
+ }
+ 
+ void
+ resource_manager::do_update_network_settings (void)
+ {
+-  QNetworkProxy::ProxyType proxyType = QNetworkProxy::NoProxy;
+-
+-  if (settings->value ("useProxyServer",false).toBool ())
++  if (settings)
+     {
+-      QString proxyTypeString = settings->value ("proxyType").toString ();
++      QNetworkProxy::ProxyType proxyType = QNetworkProxy::NoProxy;
++
++      if (settings->value ("useProxyServer",false).toBool ())
++        {
++          QString proxyTypeString = settings->value ("proxyType").toString ();
+ 
+-      if (proxyTypeString == "Socks5Proxy")
+-        proxyType = QNetworkProxy::Socks5Proxy;
+-      else if (proxyTypeString == "HttpProxy")
+-        proxyType = QNetworkProxy::HttpProxy;
++          if (proxyTypeString == "Socks5Proxy")
++            proxyType = QNetworkProxy::Socks5Proxy;
++          else if (proxyTypeString == "HttpProxy")
++            proxyType = QNetworkProxy::HttpProxy;
++        }
++
++      QNetworkProxy proxy;
++
++      proxy.setType (proxyType);
++      proxy.setHostName (settings->value ("proxyHostName").toString ());
++      proxy.setPort (settings->value ("proxyPort",80).toInt ());
++      proxy.setUser (settings->value ("proxyUserName").toString ());
++      proxy.setPassword (settings->value ("proxyPassword").toString ());
++
++      QNetworkProxy::setApplicationProxy (proxy);
+     }
+-
+-  QNetworkProxy proxy;
+-
+-  proxy.setType (proxyType);
+-  proxy.setHostName (settings->value ("proxyHostName").toString ());
+-  proxy.setPort (settings->value ("proxyPort",80).toInt ());
+-  proxy.setUser (settings->value ("proxyUserName").toString ());
+-  proxy.setPassword (settings->value ("proxyPassword").toString ());
+-
+-  QNetworkProxy::setApplicationProxy (proxy);
++  else
++    {
++      // FIXME: Is this an error?  If so, what should we do?
++    }
+ }
+ 
+ QStringList
+ resource_manager::storage_class_names (void)
+ {
+   return workspace_model::storage_class_names ();
+ }
+ 
+diff --git a/libgui/src/resource-manager.h b/libgui/src/resource-manager.h
+--- a/libgui/src/resource-manager.h
++++ b/libgui/src/resource-manager.h
+@@ -44,21 +44,16 @@ public:
+     return instance_ok () ? instance->do_get_settings () : 0;
+   }
+ 
+   static QSettings *get_default_settings (void)
+   {
+     return instance_ok () ? instance->do_get_default_settings () : 0;
+   }
+ 
+-  static QString get_home_path (void)
+-  {
+-    return instance_ok () ? instance->do_get_home_path () : QString ();
+-  }
+-
+   static QString get_settings_file (void)
+   {
+     return instance_ok () ? instance->do_get_settings_file () : QString ();
+   }
+ 
+   static void reload_settings (void)
+   {
+     if (instance_ok ())
+@@ -103,33 +98,31 @@ private:
+   // No copying!
+ 
+   resource_manager (const resource_manager&);
+ 
+   resource_manager& operator = (const resource_manager&);
+ 
+   static bool instance_ok (void);
+ 
++  QString settings_directory;
++
++  QString settings_file;
++
+   QSettings *settings;
+ 
+   QSettings *default_settings;
+ 
+-  QString home_path;
+-
+-  bool first_run;
+-
+   QSettings *do_get_settings (void) const;
+ 
+   QSettings *do_get_default_settings (void) const;
+ 
+-  QString do_get_home_path (void) const;
+-
+   QString do_get_settings_file (void);
+ 
+-  QString do_get_settings_path (void);
++  QString do_get_settings_directory (void);
+ 
+   void do_reload_settings (void);
+ 
+   void do_set_settings (const QString& file);
+ 
+   void do_update_network_settings (void);
+ 
+   bool do_is_first_run (void) const;
+diff --git a/libgui/src/welcome-wizard.cc b/libgui/src/welcome-wizard.cc
+--- a/libgui/src/welcome-wizard.cc
++++ b/libgui/src/welcome-wizard.cc
+@@ -100,26 +100,31 @@ welcome_wizard::welcome_wizard (QWidget 
+   links->setOpenExternalLinks (true);
+ 
+   QSpacerItem *hfill = new QSpacerItem (40, 20, QSizePolicy::Expanding,
+                                         QSizePolicy::Minimum);
+ 
+   QPushButton *finish_button = new QPushButton;
+   finish_button->setText (tr ("Finish"));
+ 
++  QPushButton *cancel_button = new QPushButton;
++  cancel_button->setText (tr ("Cancel"));
++
+   QSpacerItem *vspace = new QSpacerItem (20, 40, QSizePolicy::Minimum);
+ 
+   QHBoxLayout *button_bar = new QHBoxLayout;
+ 
+   button_bar->addItem (hfill);
+   button_bar->addWidget (finish_button);
++  button_bar->addWidget (cancel_button);
+ 
+   QSpacerItem *vfill = new QSpacerItem (20, 40, QSizePolicy::Minimum,
+                                         QSizePolicy::Expanding);
+ 
+   page_layout->addLayout (message_and_logo);
+   page_layout->addWidget (links);
+   page_layout->addItem (vspace);
+   page_layout->addLayout (button_bar);
+   page_layout->addItem (vfill);
+ 
+   connect (finish_button, SIGNAL (clicked ()), this, SLOT (accept ()));
++  connect (cancel_button, SIGNAL (clicked ()), this, SLOT (reject ()));
+ }

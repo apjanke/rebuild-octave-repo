@@ -1,0 +1,801 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1323323559 18000
+#      Thu Dec 08 00:52:39 2011 -0500
+# Node ID 1734ebe2713407974b19fa7b19887bc71d7a3820
+# Parent  4faef552363d8871b3604099dd73248e5192c4ee
+move onCleanup function and class to liboctinterp
+
+* ov-oncleanup.h, ov-oncleanup.cc: Move onCleanup class and function here.
+* onCleanup.cc: From here.
+* DLD-FUNCTIONS/module-list: Delete onCleanup.cc from the list.
+* src/Makefile.am (OV_INCLUDES): Add ov-oncleanup.h to the list.
+(OV_SRC): add ov-oncleanup.cc to the list.
+* ov.cc (register_types): Register octave_oncleanup here.
+* ov-typeinfo.cc (octave_value_typeinfo::instance_ok): Do register
+cleanup function.
+
+diff --git a/src/DLD-FUNCTIONS/module-files b/src/DLD-FUNCTIONS/module-files
+--- a/src/DLD-FUNCTIONS/module-files
++++ b/src/DLD-FUNCTIONS/module-files
+@@ -52,17 +52,16 @@ lookup.cc
+ lsode.cc
+ lu.cc
+ luinc.cc
+ matrix_type.cc
+ max.cc
+ md5sum.cc
+ mgorth.cc
+ nproc.cc
+-onCleanup.cc
+ pinv.cc
+ qr.cc|$(QRUPDATE_CPPFLAGS) $(SPARSE_XCPPFLAGS)|$(QRUPDATE_LDFLAGS) $(SPARSE_XLDFLAGS)|$(QRUPDATE_LIBS) $(SPARSE_XLIBS)
+ quad.cc
+ quadcc.cc
+ qz.cc|||$(LAPACK_LIBS) $(BLAS_LIBS)
+ rand.cc
+ rcond.cc
+ regexp.cc|$(REGEX_CPPFLAGS)|$(REGEX_LDFLAGS)|$(REGEX_LIBS)
+diff --git a/src/DLD-FUNCTIONS/onCleanup.cc b/src/DLD-FUNCTIONS/onCleanup.cc
+deleted file mode 100644
+--- a/src/DLD-FUNCTIONS/onCleanup.cc
++++ /dev/null
+@@ -1,292 +0,0 @@
+-/*
+-
+-Copyright (C) 2010-2011 VZLU Prague
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by the
+-Free Software Foundation; either version 3 of the License, or (at your
+-option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but WITHOUT
+-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#ifdef HAVE_CONFIG_H
+-#include <config.h>
+-#endif
+-
+-#include "defun-dld.h"
+-#include "ov-base.h"
+-#include "ov.h"
+-#include "ov-fcn.h"
+-#include "ov-usr-fcn.h"
+-#include "pt-misc.h"
+-#include "toplev.h"
+-
+-static void gripe_internal (void)
+-{
+-  error ("onCleanup: internal error: cloning nonempty object");
+-}
+-
+-class octave_oncleanup : public octave_base_value, octave_auto_shlib
+-{
+-public:
+-  octave_oncleanup (void) : fcn () { }
+-  octave_oncleanup (const octave_value& fcn);
+-
+-  octave_base_value *clone (void) const
+-    {
+-      if (fcn.is_defined ())
+-        gripe_internal ();
+-      return empty_clone ();
+-    }
+-
+-  octave_base_value *empty_clone (void) const { return new octave_oncleanup (); }
+-
+-  ~octave_oncleanup (void);
+-
+-  bool is_defined (void) const { return true; }
+-
+-  bool is_object (void) const { return true; } // do we want this?
+-
+-  octave_map map_value (void) const
+-    { return scalar_map_value (); }
+-
+-  octave_scalar_map scalar_map_value (void) const;
+-
+-  dim_vector dims (void) const { static dim_vector dv (1, 1); return dv; }
+-
+-  bool save_ascii (std::ostream& os);
+-
+-  bool load_ascii (std::istream& is);
+-
+-  bool save_binary (std::ostream& os, bool& save_as_floats);
+-
+-  bool load_binary (std::istream& is, bool swap,
+-                    oct_mach_info::float_format fmt);
+-
+-#if defined (HAVE_HDF5)
+-  bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
+-
+-  bool load_hdf5 (hid_t loc_id, const char *name);
+-#endif
+-
+-  void print (std::ostream& os, bool pr_as_read_syntax = false) const;
+-
+-  void print_raw (std::ostream& os, bool pr_as_read_syntax = false) const;
+-
+-private:
+-
+-  DECLARE_OV_TYPEID_FUNCTIONS_AND_DATA
+-
+-protected:
+-
+-    octave_value fcn;
+-
+-};
+-
+-DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_oncleanup, "onCleanup", "onCleanup");
+-
+-octave_oncleanup::octave_oncleanup (const octave_value& f)
+-  : fcn (f)
+-{
+-  if (f.is_function_handle ())
+-    {
+-      octave_function *fptr = f.function_value (true);
+-      if (fptr)
+-        {
+-          octave_user_function *uptr = dynamic_cast<octave_user_function *> (fptr);
+-          if (uptr != 0)
+-            {
+-              tree_parameter_list *pl = uptr->parameter_list ();
+-              if (pl != 0 && pl->length () > 0)
+-                warning ("onCleanup: cleanup action takes parameters");
+-            }
+-        }
+-      else
+-        error ("onCleanup: no default dispatch for function handle");
+-    }
+-  else
+-    {
+-      fcn = octave_value ();
+-      error ("onCleanup: argument must be a function handle");
+-    }
+-}
+-
+-octave_oncleanup::~octave_oncleanup (void)
+-{
+-  if (fcn.is_undefined ())
+-    return;
+-
+-  unwind_protect frame;
+-
+-  // Clear interrupts.
+-  frame.protect_var (octave_interrupt_state);
+-  octave_interrupt_state = 0;
+-
+-  // Disallow quit().
+-  frame.protect_var (quit_allowed);
+-  quit_allowed = false;
+-
+-  // Clear errors.
+-  frame.protect_var (error_state);
+-  error_state = 0;
+-
+-  try
+-    {
+-      // Run the actual code.
+-      fcn.do_multi_index_op (0, octave_value_list ());
+-    }
+-  catch (octave_interrupt_exception)
+-    {
+-      // Swallow the interrupt.
+-      warning ("onCleanup: interrupt occured in cleanup action");
+-    }
+-  catch (std::bad_alloc)
+-    {
+-      // Swallow the exception.
+-      warning ("onCleanup: out of memory occured in cleanup action");
+-    }
+-  catch (...) // Yes, the black hole. We're in a d-tor.
+-    {
+-      // This shouldn't happen, in theory.
+-      error ("onCleanup: internal error: unhandled exception in cleanup action");
+-    }
+-
+-  // We don't want to ignore errors that occur in the cleanup code, so
+-  // if an error is encountered there, leave error_state alone.
+-  // Otherwise, set it back to what it was before.
+-  if (error_state)
+-    {
+-      frame.discard_top ();
+-      octave_call_stack::backtrace_error_message ();
+-    }
+-}
+-
+-octave_scalar_map
+-octave_oncleanup::scalar_map_value (void) const
+-{
+-  octave_scalar_map retval;
+-  retval.setfield ("task", fcn);
+-  return retval;
+-}
+-
+-static void
+-warn_save_load (void)
+-{
+-  warning ("onCleanup: load and save not supported");
+-}
+-
+-bool
+-octave_oncleanup::save_ascii (std::ostream& /* os */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-
+-bool
+-octave_oncleanup::load_ascii (std::istream& /* is */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-
+-bool
+-octave_oncleanup::save_binary (std::ostream& /* os */, bool& /* save_as_floats */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-
+-
+-bool
+-octave_oncleanup::load_binary (std::istream& /* is */, bool /* swap */,
+-                               oct_mach_info::float_format /* fmt */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-
+-#if defined (HAVE_HDF5)
+-bool
+-octave_oncleanup::save_hdf5 (hid_t /* loc_id */, const char * /* name */,
+-                             bool /* save_as_floats */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-
+-bool
+-octave_oncleanup::load_hdf5 (hid_t /* loc_id */, const char * /* name */)
+-{
+-  warn_save_load ();
+-  return true;
+-}
+-#endif
+-
+-void
+-octave_oncleanup::print (std::ostream& os, bool pr_as_read_syntax) const
+-{
+-  print_raw (os, pr_as_read_syntax);
+-  newline (os);
+-}
+-
+-void
+-octave_oncleanup::print_raw (std::ostream& os, bool pr_as_read_syntax) const
+-{
+-  os << "onCleanup (";
+-  if (fcn.is_defined ())
+-    fcn.print_raw (os, pr_as_read_syntax);
+-  os << ")";
+-}
+-
+-DEFUN_DLD (onCleanup, args, ,
+-  "-*- texinfo -*-\n\
+-@deftypefn {Loadable Function} {@var{c} =} onCleanup (@var{action})\n\
+-Create a special object that executes a given function upon destruction.\n\
+-If the object is copied to multiple variables (or cell or struct array\n\
+-elements) or returned from a function, @var{action} will be executed after\n\
+-clearing the last copy of the object.  Note that if multiple local onCleanup\n\
+-variables are created, the order in which they are called is unspecified.\n\
+-For similar functionality @xref{The @code{unwind_protect} Statement}.\n\
+-@end deftypefn")
+-{
+-  octave_value retval;
+-
+-  if (args.length () == 1)
+-    {
+-      if (octave_oncleanup::static_type_id () < 0)
+-        octave_oncleanup::register_type ();
+-
+-      retval = new octave_oncleanup (args(0));
+-    }
+-  else
+-    print_usage ();
+-
+-  return retval;
+-}
+-
+-/*
+-
+-%!test
+-%! old_wstate = warning ("query");
+-%! unwind_protect
+-%!   trigger = onCleanup (@() warning ("on", "__MY_WARNING__"));
+-%!   warning ("off", "__MY_WARNING__");
+-%!   assert ((warning ("query", "__MY_WARNING__")).state, "off");
+-%!   clear trigger
+-%!   assert ((warning ("query", "__MY_WARNING__")).state, "on");
+-%! unwind_protect_cleanup
+-%!   warning (old_wstate);
+-%! end_unwind_protect
+-
+-*/
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -174,16 +174,17 @@ OV_INCLUDES = \
+   ov-flt-complex.h \
+   ov-flt-cx-diag.h \
+   ov-flt-cx-mat.h \
+   ov-flt-re-diag.h \
+   ov-flt-re-mat.h \
+   ov-lazy-idx.h \
+   ov-mex-fcn.h \
+   ov-null-mat.h \
++  ov-oncleanup.h \
+   ov-perm.h \
+   ov-range.h \
+   ov-re-diag.h \
+   ov-re-mat.h \
+   ov-scalar.h \
+   ov-str-mat.h \
+   ov-struct.h \
+   ov-type-conv.h \
+@@ -352,16 +353,17 @@ OV_SRC = \
+   ov-flt-complex.cc \
+   ov-flt-cx-diag.cc \
+   ov-flt-cx-mat.cc \
+   ov-flt-re-diag.cc \
+   ov-flt-re-mat.cc \
+   ov-lazy-idx.cc \
+   ov-mex-fcn.cc \
+   ov-null-mat.cc \
++  ov-oncleanup.cc \
+   ov-perm.cc \
+   ov-range.cc \
+   ov-re-diag.cc \
+   ov-re-mat.cc \
+   ov-scalar.cc \
+   ov-str-mat.cc \
+   ov-struct.cc \
+   ov-typeinfo.cc \
+diff --git a/src/ov-base.h b/src/ov-base.h
+--- a/src/ov-base.h
++++ b/src/ov-base.h
+@@ -162,19 +162,19 @@ DEF_CLASS_TO_BTYP (char, btyp_char);
+ 
+ 
+ #define DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA(t, n, c) \
+   int t::t_id (-1); \
+   const std::string t::t_name (n); \
+   const std::string t::c_name (c); \
+   void t::register_type (void) \
+     { \
+-      t_id = octave_value_typeinfo::register_type (t::t_name, \
+-                                                   t::c_name, \
+-                                                   octave_value (new t ())); \
++      static t exemplar; \
++      octave_value v (&exemplar, true); \
++      t_id = octave_value_typeinfo::register_type (t::t_name, t::c_name, v); \
+     }
+ 
+ // A base value type, so that derived types only have to redefine what
+ // they need (if they are derived from octave_base_value instead of
+ // octave_value).
+ 
+ class
+ OCTINTERP_API
+diff --git a/src/ov-oncleanup.cc b/src/ov-oncleanup.cc
+new file mode 100644
+--- /dev/null
++++ b/src/ov-oncleanup.cc
+@@ -0,0 +1,227 @@
++/*
++
++Copyright (C) 2010-2011 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "defun.h"
++#include "ov-cleanup.h"
++#include "ov-fcn.h"
++#include "ov-usr-fcn.h"
++#include "pt-misc.h"
++#include "toplev.h"
++
++DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_oncleanup, "onCleanup",
++                                     "onCleanup");
++
++octave_oncleanup::octave_oncleanup (const octave_value& f)
++  : fcn (f)
++{
++  if (f.is_function_handle ())
++    {
++      octave_function *fptr = f.function_value (true);
++      if (fptr)
++        {
++          octave_user_function *uptr
++            = dynamic_cast<octave_user_function *> (fptr);
++
++          if (uptr != 0)
++            {
++              tree_parameter_list *pl = uptr->parameter_list ();
++
++              if (pl != 0 && pl->length () > 0)
++                warning ("onCleanup: cleanup action takes parameters");
++            }
++        }
++      else
++        error ("onCleanup: no default dispatch for function handle");
++    }
++  else
++    {
++      fcn = octave_value ();
++      error ("onCleanup: argument must be a function handle");
++    }
++}
++
++octave_oncleanup::~octave_oncleanup (void)
++{
++  if (fcn.is_undefined ())
++    return;
++
++  unwind_protect frame;
++
++  // Clear interrupts.
++  frame.protect_var (octave_interrupt_state);
++  octave_interrupt_state = 0;
++
++  // Disallow quit().
++  frame.protect_var (quit_allowed);
++  quit_allowed = false;
++
++  // Clear errors.
++  frame.protect_var (error_state);
++  error_state = 0;
++
++  try
++    {
++      // Run the actual code.
++      fcn.do_multi_index_op (0, octave_value_list ());
++    }
++  catch (octave_interrupt_exception)
++    {
++      // Swallow the interrupt.
++      warning ("onCleanup: interrupt occured in cleanup action");
++    }
++  catch (std::bad_alloc)
++    {
++      // Swallow the exception.
++      warning ("onCleanup: out of memory occured in cleanup action");
++    }
++  catch (...) // Yes, the black hole. We're in a d-tor.
++    {
++      // This shouldn't happen, in theory.
++      error ("onCleanup: internal error: unhandled exception in cleanup action");
++    }
++
++  // We don't want to ignore errors that occur in the cleanup code, so
++  // if an error is encountered there, leave error_state alone.
++  // Otherwise, set it back to what it was before.
++  if (error_state)
++    {
++      frame.discard_top ();
++      octave_call_stack::backtrace_error_message ();
++    }
++}
++
++octave_scalar_map
++octave_oncleanup::scalar_map_value (void) const
++{
++  octave_scalar_map retval;
++  retval.setfield ("task", fcn);
++  return retval;
++}
++
++static void
++warn_save_load (void)
++{
++  warning ("onCleanup: load and save not supported");
++}
++
++bool
++octave_oncleanup::save_ascii (std::ostream& /* os */)
++{
++  warn_save_load ();
++  return true;
++}
++
++bool
++octave_oncleanup::load_ascii (std::istream& /* is */)
++{
++  warn_save_load ();
++  return true;
++}
++
++bool
++octave_oncleanup::save_binary (std::ostream& /* os */, bool& /* save_as_floats */)
++{
++  warn_save_load ();
++  return true;
++}
++
++bool
++octave_oncleanup::load_binary (std::istream& /* is */, bool /* swap */,
++                               oct_mach_info::float_format /* fmt */)
++{
++  warn_save_load ();
++  return true;
++}
++
++#if defined (HAVE_HDF5)
++bool
++octave_oncleanup::save_hdf5 (hid_t /* loc_id */, const char * /* name */,
++                             bool /* save_as_floats */)
++{
++  warn_save_load ();
++  return true;
++}
++
++bool
++octave_oncleanup::load_hdf5 (hid_t /* loc_id */, const char * /* name */)
++{
++  warn_save_load ();
++  return true;
++}
++#endif
++
++void
++octave_oncleanup::print (std::ostream& os, bool pr_as_read_syntax) const
++{
++  print_raw (os, pr_as_read_syntax);
++  newline (os);
++}
++
++void
++octave_oncleanup::print_raw (std::ostream& os, bool pr_as_read_syntax) const
++{
++  os << "onCleanup (";
++  if (fcn.is_defined ())
++    fcn.print_raw (os, pr_as_read_syntax);
++  os << ")";
++}
++
++DEFUN (onCleanup, args, ,
++  "-*- texinfo -*-\n\
++@deftypefn {Loadable Function} {@var{c} =} onCleanup (@var{action})\n\
++Create a special object that executes a given function upon destruction.\n\
++If the object is copied to multiple variables (or cell or struct array\n\
++elements) or returned from a function, @var{action} will be executed after\n\
++clearing the last copy of the object.  Note that if multiple local onCleanup\n\
++variables are created, the order in which they are called is unspecified.\n\
++For similar functionality @xref{The @code{unwind_protect} Statement}.\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  if (args.length () == 1)
++    retval = octave_value (new octave_oncleanup (args(0)));
++  else
++    print_usage ();
++
++  return retval;
++}
++
++/*
++
++%!test
++%! old_wstate = warning ("query");
++%! unwind_protect
++%!   trigger = onCleanup (@() warning ("on", "__MY_WARNING__"));
++%!   warning ("off", "__MY_WARNING__");
++%!   assert ((warning ("query", "__MY_WARNING__")).state, "off");
++%!   clear trigger
++%!   assert ((warning ("query", "__MY_WARNING__")).state, "on");
++%! unwind_protect_cleanup
++%!   warning (old_wstate);
++%! end_unwind_protect
++
++*/
+diff --git a/src/ov-oncleanup.h b/src/ov-oncleanup.h
+new file mode 100644
+--- /dev/null
++++ b/src/ov-oncleanup.h
+@@ -0,0 +1,101 @@
++/*
++
++Copyright (C) 2010-2011 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <iosfwd>
++
++#include "ov-base.h"
++#include "ov-struct.h"
++#include "ov.h"
++
++static void
++gripe_internal (void)
++{
++  error ("onCleanup: internal error: cloning nonempty object");
++}
++
++class octave_oncleanup : public octave_base_value
++{
++public:
++  octave_oncleanup (void) : fcn () { }
++
++  octave_oncleanup (const octave_value& fcn);
++
++  octave_base_value *clone (void) const
++  {
++    if (fcn.is_defined ())
++      gripe_internal ();
++
++    return empty_clone ();
++  }
++
++  octave_base_value *empty_clone (void) const
++  {
++    return new octave_oncleanup ();
++  }
++
++  ~octave_oncleanup (void);
++
++  bool is_defined (void) const { return true; }
++
++  bool is_object (void) const { return true; } // do we want this?
++
++  octave_map map_value (void) const { return scalar_map_value (); }
++
++  octave_scalar_map scalar_map_value (void) const;
++
++  dim_vector dims (void) const
++  {
++    static dim_vector dv (1, 1);
++    return dv;
++  }
++
++  bool save_ascii (std::ostream& os);
++
++  bool load_ascii (std::istream& is);
++
++  bool save_binary (std::ostream& os, bool& save_as_floats);
++
++  bool load_binary (std::istream& is, bool swap,
++                    oct_mach_info::float_format fmt);
++
++#if defined (HAVE_HDF5)
++  bool save_hdf5 (hid_t loc_id, const char *name, bool save_as_floats);
++
++  bool load_hdf5 (hid_t loc_id, const char *name);
++#endif
++
++  void print (std::ostream& os, bool pr_as_read_syntax = false) const;
++
++  void print_raw (std::ostream& os, bool pr_as_read_syntax = false) const;
++
++private:
++
++  DECLARE_OV_TYPEID_FUNCTIONS_AND_DATA
++
++protected:
++
++  octave_value fcn;
++};
+diff --git a/src/ov-typeinfo.cc b/src/ov-typeinfo.cc
+--- a/src/ov-typeinfo.cc
++++ b/src/ov-typeinfo.cc
+@@ -41,20 +41,18 @@ bool
+ octave_value_typeinfo::instance_ok (void)
+ {
+   bool retval = true;
+ 
+   if (! instance)
+     {
+       instance = new octave_value_typeinfo ();
+ 
+-#if 0
+       if (instance)
+         singleton_cleanup_list::add (cleanup_instance);
+-#endif
+     }
+ 
+   if (! instance)
+     {
+       ::error ("unable to create value type info object!");
+ 
+       retval = false;
+     }
+diff --git a/src/ov.cc b/src/ov.cc
+--- a/src/ov.cc
++++ b/src/ov.cc
+@@ -60,16 +60,17 @@ along with Octave; see the file COPYING.
+ #include "ov-flt-cx-mat.h"
+ #include "ov-cx-diag.h"
+ #include "ov-flt-cx-diag.h"
+ #include "ov-ch-mat.h"
+ #include "ov-str-mat.h"
+ #include "ov-range.h"
+ #include "ov-struct.h"
+ #include "ov-class.h"
++#include "ov-cleanup.h"
+ #include "ov-cs-list.h"
+ #include "ov-colon.h"
+ #include "ov-builtin.h"
+ #include "ov-dld-fcn.h"
+ #include "ov-usr-fcn.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-fcn-inline.h"
+ #include "ov-typeinfo.h"
+@@ -2684,16 +2685,17 @@ install_types (void)
+   octave_float_diag_matrix::register_type ();
+   octave_float_complex_matrix::register_type ();
+   octave_float_complex_diag_matrix::register_type ();
+   octave_perm_matrix::register_type ();
+   octave_null_matrix::register_type ();
+   octave_null_str::register_type ();
+   octave_null_sq_str::register_type ();
+   octave_lazy_index::register_type ();
++  octave_oncleanup::register_type ();
+ }
+ 
+ DEFUN (sizeof, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} sizeof (@var{val})\n\
+ Return the size of @var{val} in bytes.\n\
+ @seealso{whos}\n\
+ @end deftypefn")

@@ -1,0 +1,341 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1464663112 -36000
+#      Tue May 31 12:51:52 2016 +1000
+# Node ID 12e7456f76197426be29f84c3dd01880469d6183
+# Parent  e5f083f9704e6eac11aa156b01cc037aecf93d08
+Tab completion of multiple directory levels. (bug #44095)
+
+* cmd-edit.h, cmd-edit.cc (gnu_readline::completer_quote_characters):
+New static data member.
+(gnu_readline::completion_hook_fcn): New typedef.
+(looks_like_filename): New static function.
+(gnu_readline::do_set_completer_quote_characters): Set
+octave_quote_characters instead of calling
+octave_rl_set_completer_quote_characters directly.
+(gnu_readline::do_completer_word_break_hook): New static function.
+(gnu_readline::do_set_completer_word_break_hook): New function.
+(gnu_readline::do_set_completer_word_break_characters):
+Also set completer_word_break_hook.
+
+* oct-rl-edit.h, oct-rl-edit.c (rl_completion_hook_fcn_ptr):
+New typedef.
+(octave_rl_get_completer_word_break_characters,
+octave_rl_set_completion_word_break_hook): New functions.
+
+diff --git a/liboctave/util/cmd-edit.cc b/liboctave/util/cmd-edit.cc
+--- a/liboctave/util/cmd-edit.cc
++++ b/liboctave/util/cmd-edit.cc
+@@ -32,32 +32,35 @@ along with Octave; see the file COPYING.
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+ #include "quit.h"
+ 
+ #include "cmd-edit.h"
+ #include "cmd-hist.h"
+ #include "file-ops.h"
++#include "file-stat.h"
+ #include "lo-error.h"
+ #include "lo-utils.h"
+ #include "oct-env.h"
+ #include "oct-mutex.h"
+ #include "oct-time.h"
+ #include "singleton-cleanup.h"
+ 
+ #if defined (USE_READLINE)
+ #include <cstdio>
+ #include <cstdlib>
+ 
+ #include "oct-rl-edit.h"
+ #endif
+ 
+ namespace octave
+ {
++  char *do_completer_word_break_hook ();
++
+   command_editor *command_editor::instance = 0;
+ 
+   std::set<command_editor::startup_hook_fcn> command_editor::startup_hook_set;
+ 
+   std::set<command_editor::pre_input_hook_fcn> command_editor::pre_input_hook_set;
+ 
+   std::set<command_editor::event_hook_fcn> command_editor::event_hook_set;
+ 
+@@ -212,28 +215,34 @@ namespace octave
+     quoting_fcn quoting_function;
+ 
+     dequoting_fcn dequoting_function;
+ 
+     char_is_quoted_fcn char_is_quoted_function;
+ 
+     user_accept_line_fcn user_accept_line_function;
+ 
++    static std::string completer_quote_characters;
++
+     static char *command_generator (const char *text, int state);
+ 
+     static char *command_quoter (char *text, int match_type, char *quote_pointer);
+     static char *command_dequoter (char *text, int match_type);
+ 
+     static int command_char_is_quoted (char *text, int index);
+ 
+     static int command_accept_line (int count, int key);
+ 
+     static char **command_completer (const char *text, int start, int end);
++
++    static char *do_completer_word_break_hook ();
+   };
+ 
++  std::string gnu_readline::completer_quote_characters = "";
++
+   gnu_readline::gnu_readline ()
+     : command_editor (), previous_startup_hook (0),
+       previous_pre_input_hook (0),
+       previous_event_hook (0), completion_function (0),
+       quoting_function (0), dequoting_function (0),
+       char_is_quoted_function (0), user_accept_line_function (0)
+   {
+     // FIXME: need interface to rl_add_defun, rl_initialize, and
+@@ -396,16 +405,20 @@ namespace octave
+   {
+     ::octave_rl_set_basic_word_break_characters (s.c_str ());
+   }
+ 
+   void
+   gnu_readline::do_set_completer_word_break_characters (const std::string& s)
+   {
+     ::octave_rl_set_completer_word_break_characters (s.c_str ());
++
++    ::octave_rl_set_completion_word_break_hook
++      (gnu_readline::do_completer_word_break_hook);
++
+   }
+ 
+   void
+   gnu_readline::do_set_basic_quote_characters (const std::string& s)
+   {
+     ::octave_rl_set_basic_quote_characters (s.c_str ());
+   }
+ 
+@@ -413,17 +426,17 @@ namespace octave
+   gnu_readline::do_set_filename_quote_characters (const std::string& s)
+   {
+     ::octave_rl_set_filename_quote_characters (s.c_str ());
+   }
+ 
+   void
+   gnu_readline::do_set_completer_quote_characters (const std::string& s)
+   {
+-    ::octave_rl_set_completer_quote_characters (s.c_str ());
++    completer_quote_characters = s;
+   }
+ 
+   void
+   gnu_readline::do_set_completion_append_character (char c)
+   {
+     ::octave_rl_set_completion_append_character (c);
+   }
+ 
+@@ -509,16 +522,85 @@ namespace octave
+   }
+ 
+   gnu_readline::user_accept_line_fcn
+   gnu_readline::do_get_user_accept_line_function (void) const
+   {
+     return user_accept_line_function;
+   }
+ 
++  // True if the last "word" of the string line (delimited by delim) is
++  // an existing directory.  Used by do_completer_word_break_hook.
++
++  static bool
++  looks_like_filename (const char *line, char delim)
++  {
++    bool retval = false;
++
++    const char *s = strrchr (line, delim);
++
++    if (s)
++      {
++        // Remove incomplete component.
++        const char *f = strrchr (line, octave::sys::file_ops::dir_sep_char ());
++
++        if (s[1] == '~' || (f && f != s))
++          {
++            // For something like "A /b", f==s; don't assume a file.
++
++            std::string candidate_filename = s+1;
++
++            candidate_filename = candidate_filename.substr (0, f - s);
++
++            // Handles any complete ~<username>, but doesn't expand usernames.
++
++            if (candidate_filename[0] == '~')
++              candidate_filename
++                = octave::sys::file_ops::tilde_expand (candidate_filename);
++
++            octave::sys::file_stat fs (candidate_filename);
++
++            retval = fs.is_dir ();
++          }
++      }
++
++    return retval;
++  }
++
++  // Decide whether to interpret partial commands like "abc/def" as a
++  // filename or division.  Return the set of delimiters appropriate for
++  // the decision.
++
++  char *
++  gnu_readline::do_completer_word_break_hook ()
++  {
++    static char *dir_sep = strdup (" '\"");
++
++    std::string word;
++    std::string line = get_line_buffer ();
++
++    // For now, assume space or quote delimiter for file names.
++    const char *l = line.c_str ();
++
++    if (looks_like_filename (l, ' ') || looks_like_filename (l, '\'')
++        || looks_like_filename (l, '"'))
++      {
++        ::octave_rl_set_completer_quote_characters (completer_quote_characters.c_str ());
++
++        return dir_sep;
++      }
++    else
++      {
++        ::octave_rl_set_completer_quote_characters ("");
++
++        return octave_rl_get_completer_word_break_characters ();
++      }
++  }
++
++
+   string_vector
+   gnu_readline::do_generate_filename_completions (const std::string& text)
+   {
+     string_vector retval;
+ 
+     int n = 0;
+     int count = 0;
+ 
+diff --git a/liboctave/util/cmd-edit.h b/liboctave/util/cmd-edit.h
+--- a/liboctave/util/cmd-edit.h
++++ b/liboctave/util/cmd-edit.h
+@@ -48,16 +48,18 @@ namespace octave
+     typedef int (*startup_hook_fcn) (void);
+ 
+     typedef int (*pre_input_hook_fcn) (void);
+ 
+     typedef int (*event_hook_fcn) (void);
+ 
+     typedef std::string (*completion_fcn) (const std::string&, int);
+ 
++    typedef char * (*completion_hook_fcn) ();
++
+     typedef std::string (*quoting_fcn) (const std::string&, int, char);
+ 
+     typedef std::string (*dequoting_fcn) (const std::string&, int);
+ 
+     typedef int (*char_is_quoted_fcn) (const std::string&, int);
+ 
+     typedef void (*user_accept_line_fcn) (const std::string&);
+ 
+@@ -271,16 +273,18 @@ namespace octave
+     virtual void do_blink_matching_paren (bool) { }
+ 
+     virtual bool do_erase_empty_line (bool) { return false; }
+ 
+     virtual void do_set_basic_word_break_characters (const std::string&) { }
+ 
+     virtual void do_set_completer_word_break_characters (const std::string&) { }
+ 
++    virtual void do_set_completer_word_break_hook (completion_hook_fcn) { }
++
+     virtual void do_set_basic_quote_characters (const std::string&) { }
+ 
+     virtual void do_set_filename_quote_characters (const std::string&) { }
+ 
+     virtual void do_set_completer_quote_characters (const std::string&) { }
+ 
+     virtual void do_set_completion_append_character (char) { }
+ 
+diff --git a/liboctave/util/oct-rl-edit.c b/liboctave/util/oct-rl-edit.c
+--- a/liboctave/util/oct-rl-edit.c
++++ b/liboctave/util/oct-rl-edit.c
+@@ -292,16 +292,28 @@ octave_rl_set_basic_word_break_character
+ void
+ octave_rl_set_completer_word_break_characters (const char *s)
+ {
+   OCTAVE_RL_SAVE_STRING (ss, s);
+ 
+   rl_completer_word_break_characters = ss;
+ }
+ 
++char *
++octave_rl_get_completer_word_break_characters (void)
++{
++  return rl_completer_word_break_characters;
++}
++
++void
++octave_rl_set_completion_word_break_hook (rl_completion_hook_fcn_ptr f)
++{
++  rl_completion_word_break_hook = f;
++}
++
+ void
+ octave_rl_set_basic_quote_characters (const char *s)
+ {
+   OCTAVE_RL_SAVE_STRING (ss, s);
+ 
+   rl_basic_quote_characters = ss;
+ }
+ 
+diff --git a/liboctave/util/oct-rl-edit.h b/liboctave/util/oct-rl-edit.h
+--- a/liboctave/util/oct-rl-edit.h
++++ b/liboctave/util/oct-rl-edit.h
+@@ -32,16 +32,18 @@ typedef int (*rl_pre_input_hook_fcn_ptr)
+ typedef int (*rl_event_hook_fcn_ptr) (void);
+ 
+ typedef int (*rl_fcn_ptr) (int, int);
+ 
+ typedef char ** (*rl_attempted_completion_fcn_ptr) (const char *, int, int);
+ 
+ typedef char * (*rl_completer_fcn_ptr) (const char *, int);
+ 
++typedef char * (*rl_completion_hook_fcn_ptr) (void);
++
+ typedef char * (*rl_quoting_fcn_ptr) (char *, int, char *);
+ 
+ typedef char * (*rl_dequoting_fcn_ptr) (char *, int);
+ 
+ typedef int (*rl_char_is_quoted_fcn_ptr) (char *, int);
+ 
+ typedef int (*rl_command_fcn_ptr) (int, int);
+ 
+@@ -113,16 +115,20 @@ extern int octave_rl_prefer_env_winsize 
+ extern void octave_rl_done (int);
+ 
+ extern char *octave_rl_filename_completion_function (const char *, int);
+ 
+ extern void octave_rl_set_basic_word_break_characters (const char *);
+ 
+ extern void octave_rl_set_completer_word_break_characters (const char *);
+ 
++extern char *octave_rl_get_completer_word_break_characters (void);
++
++extern void octave_rl_set_completion_word_break_hook (rl_completion_hook_fcn_ptr);
++
+ extern void octave_rl_set_basic_quote_characters (const char *);
+ 
+ extern void octave_rl_set_filename_quote_characters (const char *);
+ 
+ extern void octave_rl_set_completer_quote_characters (const char *);
+ 
+ extern void octave_rl_set_completion_append_character (char);
+ 

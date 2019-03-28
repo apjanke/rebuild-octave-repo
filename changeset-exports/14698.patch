@@ -1,0 +1,735 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1338294545 -7200
+#      Tue May 29 14:29:05 2012 +0200
+# Branch gui
+# Node ID 79c9a6d0659096c3145521a455f3d42d8b8ed638
+# Parent  55f88d2236b668489ca968678e576ead2aa85ab7
+Wrote SymbolInformation struct and refactored code that updates the symbol table.
+
+* OctaveGUI: Commented out activateWindow call.
+* WorkspaceModel: Complete rewrite of symbol table update code.
+* OctaveLink: Added code for updating the symbol table.
+* MainWindow: Added dummy central widget to meet Qt specifications.
+* src.pro: Added includepath to be able to compile with standalone Qt SDK.
+
+diff --git a/gui/src/MainWindow.cpp b/gui/src/MainWindow.cpp
+--- a/gui/src/MainWindow.cpp
++++ b/gui/src/MainWindow.cpp
+@@ -167,17 +167,16 @@ MainWindow::showAboutOctave ()
+ 
+   QMessageBox::about (this, tr ("About Octave"), message);
+ }
+ 
+ void
+ MainWindow::closeEvent (QCloseEvent * closeEvent)
+ {
+   reportStatusMessage (tr ("Saving data and shutting down."));
+-  writeSettings ();
+   m_closing = true;  // inform editor window that whole application is closed
+   OctaveLink::instance ()->terminateOctave ();
+ 
+   QMainWindow::closeEvent (closeEvent);
+ }
+ 
+ void
+ MainWindow::readSettings ()
+@@ -223,23 +222,22 @@ MainWindow::construct ()
+   m_currentDirectoryUpToolButton = new QToolButton (this);
+   m_currentDirectoryUpToolButton->setIcon (style->standardIcon (QStyle::SP_FileDialogToParent));
+ 
+   // Octave Terminal subwindow.
+   m_terminal = new QTerminal(this);
+   m_terminal->setObjectName ("OctaveTerminal");
+   m_terminalDockWidget = new TerminalDockWidget (m_terminal, this);
+ 
+-  /*
+   QWidget *dummyWidget = new QWidget ();
+-  dummyWidget->setObjectName ("DummyWidget");
+-  dummyWidget->setFixedSize (100, 100);
++  dummyWidget->setObjectName ("CentralDummyWidget");
++  dummyWidget->resize (10, 10);
+   dummyWidget->setSizePolicy (QSizePolicy::Minimum, QSizePolicy::Minimum);
+-  setCentralWidget (dummyWidget);*/
+-  //dummyWidget->hide ();
++  dummyWidget->hide ();
++  setCentralWidget (dummyWidget);
+ 
+   m_fileEditor = new FileEditor (m_terminal, this);
+ 
+   QMenu *fileMenu = menuBar ()->addMenu (tr ("&File"));
+   QAction *newFileAction
+     = fileMenu->addAction (QIcon::fromTheme ("document-new",
+       style->standardIcon (QStyle::SP_FileIcon)), tr ("New File"));
+ 
+@@ -360,15 +358,15 @@ MainWindow::construct ()
+   connect (pasteAction, SIGNAL (triggered()), m_terminal, SLOT(pasteClipboard ()));
+   setWindowTitle ("Octave");
+ 
+   setDockOptions(QMainWindow::AnimatedDocks | QMainWindow::AllowNestedDocks | QMainWindow::AllowTabbedDocks);
+ 
+   addDockWidget (Qt::LeftDockWidgetArea, m_workspaceView);
+   addDockWidget (Qt::LeftDockWidgetArea, m_historyDockWidget);
+   addDockWidget (Qt::RightDockWidgetArea, m_filesDockWidget);
+-  addDockWidget (Qt::BottomDockWidgetArea, m_fileEditor);
++  addDockWidget (Qt::RightDockWidgetArea, m_fileEditor);
+   addDockWidget (Qt::BottomDockWidgetArea, m_terminalDockWidget);
+   setStatusBar (m_statusBar);
+ 
+   readSettings ();
+ }
+ 
+diff --git a/gui/src/OctaveGUI.cpp b/gui/src/OctaveGUI.cpp
+--- a/gui/src/OctaveGUI.cpp
++++ b/gui/src/OctaveGUI.cpp
+@@ -78,13 +78,13 @@ main (int argc, char *argv[])
+           translator.load (translatorFile);
+           application.installTranslator (&translator);
+ 
+           ResourceManager::instance ()->updateNetworkSettings ();
+           ResourceManager::instance ()->loadIcons ();
+ 
+           MainWindow w;
+           w.show ();
+-          w.activateWindow();
++          //w.activateWindow();
+           return application.exec ();
+         }
+     }
+ }
+diff --git a/gui/src/WorkspaceModel.cpp b/gui/src/WorkspaceModel.cpp
+--- a/gui/src/WorkspaceModel.cpp
++++ b/gui/src/WorkspaceModel.cpp
+@@ -13,24 +13,24 @@
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #include "WorkspaceModel.h"
+ #include <QTreeWidget>
+ #include <QTime>
++#include "OctaveLink.h"
+ 
+ WorkspaceModel::WorkspaceModel(QObject *parent)
+   : QAbstractItemModel(parent)
+ {
+   QList<QVariant> rootData;
+   rootData << tr ("Name") << tr ("Type") << tr ("Value");
+   _rootItem = new TreeItem(rootData);
+-  _cachedSymbolTableSemaphore = new QSemaphore (1);
+ }
+ 
+ WorkspaceModel::~WorkspaceModel()
+ {
+   delete _rootItem;
+ }
+ 
+ QModelIndex
+@@ -133,152 +133,40 @@ WorkspaceModel::data(const QModelIndex &
+ 
+   TreeItem *item = static_cast<TreeItem*>(index.internalPointer());
+ 
+   return item->data(index.column());
+ }
+ 
+ 
+ void
+-WorkspaceModel::cacheSymbolTable ()
+-{
+-  std::list < symbol_table::symbol_record > symbolTable = symbol_table::all_variables ();
+-
+-  _cachedSymbolTableSemaphore->acquire (1);
+-  _cachedSymbolTable.clear();
+-  for (std::list < symbol_table::symbol_record > ::iterator iterator = symbolTable.begin ();
+-       iterator != symbolTable.end (); iterator++)
+-    {
+-      _cachedSymbolTable.push_back((*iterator).dup(symbol_table::global_scope()));
+-    }
+-  _cachedSymbolTableSemaphore->release (1);
+-}
+-
+-void
+ WorkspaceModel::updateFromSymbolTable ()
+ {
+-  // Split the symbol table into its different categories.
+-  QList < symbol_table::symbol_record* > localSymbolTable;
+-  QList < symbol_table::symbol_record* > globalSymbolTable;
+-  QList < symbol_table::symbol_record* > persistentSymbolTable;
+-  QList < symbol_table::symbol_record* > hiddenSymbolTable;
++  topLevelItem (0)->deleteChildItems ();
++  topLevelItem (1)->deleteChildItems ();
++  topLevelItem (2)->deleteChildItems ();
++  topLevelItem (3)->deleteChildItems ();
++
++  OctaveLink::instance ()-> acquireSymbolInformation();
++  const QList <SymbolInformation>& symbolInformation = OctaveLink::instance() ->symbolInformation ();
+ 
+-  _cachedSymbolTableSemaphore->acquire (1);
+-  for (std::list < symbol_table::symbol_record > ::iterator iterator = _cachedSymbolTable.begin ();
+-       iterator != _cachedSymbolTable.end (); iterator++)
++  foreach (const SymbolInformation& s, symbolInformation)
+     {
+-      // It's true that being global or hidden includes it's can mean it's also locally visible,
+-      // but we want to distinguish that here.
+-      if (iterator->is_local () && !iterator->is_global () && !iterator->is_hidden ())
++      TreeItem *child = new TreeItem ();
++
++      child->setData (0, s._symbol);
++      child->setData (1, s._type);
++      child->setData (2, s._value);
++
++      switch (s._scope)
+         {
+-          localSymbolTable.append (&(*iterator));
+-        }
+-
+-      if (iterator->is_global ())
+-        {
+-          globalSymbolTable.append (&(*iterator));
+-        }
+-
+-      if (iterator->is_persistent ())
+-        {
+-          persistentSymbolTable.append (&(*iterator));
+-        }
+-
+-      if (iterator->is_hidden ())
+-        {
+-          hiddenSymbolTable.append (&(*iterator));
++          case SymbolInformation::Local:       topLevelItem (0)->addChild (child); break;
++          case SymbolInformation::Global:      topLevelItem (1)->addChild (child); break;
++          case SymbolInformation::Persistent:  topLevelItem (2)->addChild (child); break;
++          case SymbolInformation::Hidden:      topLevelItem (3)->addChild (child); break;
+         }
+     }
+ 
+-  updateCategory (0, localSymbolTable);
+-  updateCategory (1, globalSymbolTable);
+-  updateCategory (2, persistentSymbolTable);
+-  updateCategory (3, hiddenSymbolTable);
+- _cachedSymbolTableSemaphore->release (1);
++  OctaveLink::instance ()-> releaseSymbolInformation();
++
+   reset();
+   emit expandRequest();
+ }
+-
+-void
+-WorkspaceModel::updateCategory (int topLevelItemIndex, const QList < symbol_table::symbol_record* > &symbolTable)
+-{
+-  TreeItem *treeItem = topLevelItem (topLevelItemIndex);
+-
+-  QModelIndex mi = index(treeItem->row(), 0);
+-  treeItem->deleteChildItems();
+-
+-  int symbolTableSize = symbolTable.size ();
+-  for(int j = 0; j < symbolTableSize; j++)
+-    {
+-      TreeItem *child = new TreeItem ();
+-      updateTreeEntry (child, symbolTable[j]);
+-      treeItem->addChild (child);
+-    }
+-}
+-
+-void
+-WorkspaceModel::updateTreeEntry (TreeItem * treeItem, symbol_table::symbol_record *symbolRecord)
+-{
+-  treeItem->setData (0, QString (symbolRecord->name ().c_str ()));
+-  treeItem->setData (1, QString (symbolRecord->varval ().type_name ().c_str ()));
+-  treeItem->setData (2, octaveValueAsQString (symbolRecord->varval ()));
+-}
+-
+-QString
+-WorkspaceModel::octaveValueAsQString (const octave_value& octaveValue)
+-{
+-  // Convert single qouted string.
+-  if (octaveValue.is_sq_string ())
+-    {
+-      return QString ("\'%1\'").arg (octaveValue.string_value ().c_str ());
+-
+-      // Convert double qouted string.
+-    }
+-  else if (octaveValue.is_dq_string ())
+-    {
+-      return QString ("\"%1\"").arg (octaveValue.string_value ().c_str ());
+-
+-      // Convert real scalar.
+-    }
+-  else if (octaveValue.is_real_scalar ())
+-    {
+-      return QString ("%1").arg (octaveValue.scalar_value ());
+-
+-      // Convert complex scalar.
+-    }
+-  else if (octaveValue.is_complex_scalar ())
+-    {
+-      return QString ("%1 + %2i").arg (octaveValue.scalar_value ()).
+-          arg (octaveValue.complex_value ().imag ());
+-
+-      // Convert range.
+-    }
+-  else if (octaveValue.is_range ())
+-    {
+-      return QString ("%1 : %2 : %3").arg (octaveValue.range_value ().
+-                                           base ()).arg (octaveValue.
+-                                                         range_value ().
+-                                                         inc ()).
+-          arg (octaveValue.range_value ().limit ());
+-
+-      // Convert real matrix.
+-    }
+-  else if (octaveValue.is_real_matrix ())
+-    {
+-      return QString ("%1x%2")
+-          .arg (octaveValue.rows ())
+-          .arg (octaveValue.columns ());
+-
+-      // Convert complex matrix.
+-    }
+-  else if (octaveValue.is_complex_matrix ())
+-    {
+-      return QString ("%1x%2")
+-          .arg (octaveValue.rows ())
+-          .arg (octaveValue.columns ());
+-
+-      // If everything else does not fit, we could not recognize the type.
+-    }
+-  else
+-    {
+-      return QString ("<Type not recognized>");
+-    }
+-}
+diff --git a/gui/src/WorkspaceModel.h b/gui/src/WorkspaceModel.h
+--- a/gui/src/WorkspaceModel.h
++++ b/gui/src/WorkspaceModel.h
+@@ -13,52 +13,16 @@
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #ifndef WORKSPACEMODEL_H
+ #define WORKSPACEMODEL_H
+ 
+-// Octave includes
+-#undef PACKAGE_BUGREPORT
+-#undef PACKAGE_NAME
+-#undef PACKAGE_STRING
+-#undef PACKAGE_TARNAME
+-#undef PACKAGE_VERSION
+-#undef PACKAGE_URL
+-#include "octave/config.h"
+-#include "octave/cmd-edit.h"
+-#include "octave/error.h"
+-#include "octave/file-io.h"
+-#include "octave/input.h"
+-#include "octave/lex.h"
+-#include "octave/load-path.h"
+-#include "octave/octave.h"
+-#include "octave/oct-hist.h"
+-#include "octave/oct-map.h"
+-#include "octave/oct-obj.h"
+-#include "octave/ops.h"
+-#include "octave/ov.h"
+-#include "octave/ov-usr-fcn.h"
+-#include "octave/symtab.h"
+-#include "octave/pt.h"
+-#include "octave/pt-eval.h"
+-#include "octave/config.h"
+-#include "octave/Range.h"
+-#include "octave/toplev.h"
+-#include "octave/procstream.h"
+-#include "octave/sighandlers.h"
+-#include "octave/debug.h"
+-#include "octave/sysdep.h"
+-#include "octave/ov.h"
+-#include "octave/unwind-prot.h"
+-#include "octave/utils.h"
+-#include "octave/variables.h"
+-
+ // Qt includes
+ #include <QAbstractItemModel>
+ #include <QVector>
+ #include <QSemaphore>
+ 
+ class TreeItem
+ {
+ public:
+@@ -154,27 +118,20 @@ public:
+                     const QModelIndex &parent = QModelIndex()) const;
+   QModelIndex parent(const QModelIndex &index) const;
+   int rowCount(const QModelIndex &parent = QModelIndex()) const;
+   int columnCount(const QModelIndex &parent = QModelIndex()) const;
+ 
+   void insertTopLevelItem (int at, TreeItem *treeItem);
+   TreeItem *topLevelItem (int at);
+ 
+-
+-  void cacheSymbolTable ();
+-  void updateTreeEntry (TreeItem * treeItem, symbol_table::symbol_record *symbolRecord);
+-  void updateCategory (int topLevelItemIndex, const QList < symbol_table::symbol_record *> &symbolTable);
+-  QString octaveValueAsQString (const octave_value &octaveValue);
+-
+ public slots:
+   void updateFromSymbolTable ();
+ 
+ signals:
+   void expandRequest();
+ 
+ private:
+-  QSemaphore *_cachedSymbolTableSemaphore;
+-  std::list < symbol_table::symbol_record > _cachedSymbolTable;
++
+   TreeItem *_rootItem;
+ };
+ 
+ #endif // WORKSPACEMODEL_H
+diff --git a/gui/src/backend/OctaveLink.cpp b/gui/src/backend/OctaveLink.cpp
+--- a/gui/src/backend/OctaveLink.cpp
++++ b/gui/src/backend/OctaveLink.cpp
+@@ -18,17 +18,17 @@
+ #include "OctaveLink.h"
+ #include "load-path.h"
+ #include <QDir>
+ #include <QApplication>
+ 
+ int octave_readline_hook ()
+ {
+   OctaveLink::instance ()->triggerUpdateHistoryModel ();
+-  OctaveLink::instance ()->triggerCacheSymbolTable ();
++  OctaveLink::instance ()->buildSymbolInformation ();
+   QDir::setCurrent (load_path::get_command_line_path ().c_str ());
+   return 0;
+ }
+ 
+ void octave_exit_hook (int status)
+ {
+   Q_UNUSED (status);
+   OctaveLink::instance ()->terminateOctave ();
+@@ -45,16 +45,18 @@ OctaveLink::OctaveLink ():QObject ()
+   m_workspaceModel->insertTopLevelItem(1, new TreeItem ("Global"));
+   m_workspaceModel->insertTopLevelItem(2, new TreeItem ("Persistent"));
+   m_workspaceModel->insertTopLevelItem(3, new TreeItem ("Hidden"));
+ 
+   _updateWorkspaceModelTimer.setInterval (1000);
+   _updateWorkspaceModelTimer.setSingleShot (false);
+   connect(&_updateWorkspaceModelTimer, SIGNAL (timeout ()),
+     m_workspaceModel, SLOT (updateFromSymbolTable ()));
++
++  _symbolInformationSemaphore = new QSemaphore (1);
+ }
+ 
+ OctaveLink::~OctaveLink ()
+ {
+ }
+ 
+ void
+ OctaveLink::launchOctave ()
+@@ -89,19 +91,48 @@ OctaveLink::triggerUpdateHistoryModel ()
+         {
+           m_historyModel->insertRow (0);
+           m_historyModel->setData (m_historyModel->index (0), QString (command_history::get_entry (i).c_str ()));
+         }
+     }
+ }
+ 
+ void
+-OctaveLink::triggerCacheSymbolTable ()
++OctaveLink::acquireSymbolInformation ()
++{
++  _symbolInformationSemaphore->acquire (1);
++}
++
++void
++OctaveLink::releaseSymbolInformation ()
++{
++  _symbolInformationSemaphore->release (1);
++}
++
++void
++OctaveLink::buildSymbolInformation ()
+ {
+-  m_workspaceModel->cacheSymbolTable();
++  std::list < symbol_table::symbol_record > symbolTable = symbol_table::all_variables ();
++
++  acquireSymbolInformation ();
++  _symbolInformation.clear ();
++  for (std::list < symbol_table::symbol_record > ::iterator iterator = symbolTable.begin ();
++     iterator != symbolTable.end (); iterator++)
++  {
++    SymbolInformation symbolInformation;
++    symbolInformation.fromSymbolRecord (*iterator);
++    _symbolInformation.push_back (symbolInformation);
++  }
++  releaseSymbolInformation ();
++}
++
++const QList <SymbolInformation>&
++OctaveLink::symbolInformation () const
++{
++  return _symbolInformation;
+ }
+ 
+ QStringListModel *
+ OctaveLink::historyModel ()
+ {
+   return m_historyModel;
+ }
+ 
+diff --git a/gui/src/backend/OctaveLink.h b/gui/src/backend/OctaveLink.h
+--- a/gui/src/backend/OctaveLink.h
++++ b/gui/src/backend/OctaveLink.h
+@@ -70,16 +70,17 @@
+ #include <QVector>
+ #include <QSemaphore>
+ #include <QObject>
+ #include <QStringListModel>
+ #include <QTimer>
+ 
+ #include "WorkspaceModel.h"
+ #include "OctaveMainThread.h"
++#include "SymbolInformation.h"
+ 
+ /**
+   * \class OctaveLink
+   * Manages a link to an octave instance.
+   */
+ class OctaveLink:public QObject
+ {
+   Q_OBJECT
+@@ -91,24 +92,31 @@ public:
+   }
+ 
+   void launchOctave ();
+   void terminateOctave ();
+   QStringListModel *historyModel ();
+   WorkspaceModel *workspaceModel ();
+ 
+   void triggerUpdateHistoryModel ();
+-  void triggerCacheSymbolTable ();
++
++  void acquireSymbolInformation ();
++  void releaseSymbolInformation ();
++  void buildSymbolInformation ();
++  const QList <SymbolInformation>& symbolInformation () const;
+ 
+ private:
+   OctaveLink ();
+   ~OctaveLink ();
+ 
+   QStringListModel *m_historyModel;
+   WorkspaceModel *m_workspaceModel;
+ 
+   // Threads for running octave and managing the data interaction.
+   OctaveMainThread *m_octaveMainThread;
+   QTimer _updateWorkspaceModelTimer;
+ 
++  QSemaphore *_symbolInformationSemaphore;
++  QList <SymbolInformation> _symbolInformation;
++
+   static OctaveLink m_singleton;
+ };
+ #endif // OCTAVELINK_H
+diff --git a/gui/src/backend/SymbolInformation.h b/gui/src/backend/SymbolInformation.h
+new file mode 100644
+--- /dev/null
++++ b/gui/src/backend/SymbolInformation.h
+@@ -0,0 +1,138 @@
++/* OctaveGUI - A graphical user interface for Octave
++ * Copyright (C) 2011 Jacob Dawid (jacob.dawid@googlemail.com)
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation, either version 3 of the
++ * License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program. If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#ifndef SYMBOLINFORMATION_H
++#define SYMBOLINFORMATION_H
++
++#include <QString>
++#include <QHash>
++
++// Octave includes
++#undef PACKAGE_BUGREPORT
++#undef PACKAGE_NAME
++#undef PACKAGE_STRING
++#undef PACKAGE_TARNAME
++#undef PACKAGE_VERSION
++#undef PACKAGE_URL
++#include "octave/config.h"
++#include "octave/cmd-edit.h"
++#include "octave/error.h"
++#include "octave/file-io.h"
++#include "octave/input.h"
++#include "octave/lex.h"
++#include "octave/load-path.h"
++#include "octave/octave.h"
++#include "octave/oct-hist.h"
++#include "octave/oct-map.h"
++#include "octave/oct-obj.h"
++#include "octave/ops.h"
++#include "octave/ov.h"
++#include "octave/ov-usr-fcn.h"
++#include "octave/symtab.h"
++#include "octave/pt.h"
++#include "octave/pt-eval.h"
++#include "octave/config.h"
++#include "octave/Range.h"
++#include "octave/toplev.h"
++#include "octave/procstream.h"
++#include "octave/sighandlers.h"
++#include "octave/debug.h"
++#include "octave/sysdep.h"
++#include "octave/ov.h"
++#include "octave/unwind-prot.h"
++#include "octave/utils.h"
++#include "octave/variables.h"
++
++typedef struct SymbolInformation
++{
++  enum Scope
++  {
++    Local       = 0,
++    Global      = 1,
++    Persistent  = 2,
++    Hidden      = 3
++  };
++
++  QString _symbol;
++  QString _type;
++  QString _value;
++  Scope   _scope;
++
++  int
++  hash () const
++  {
++    return qHash (_symbol) + qHash (_type) + qHash (_value) + (int)_scope;
++  }
++
++  bool
++  equals (const SymbolInformation& other) const
++  {
++    if (hash () == other.hash ())
++      {
++        return _symbol == other._symbol
++            && _type   == other._type
++            && _value  == other._value
++            && _scope  == other._scope;
++      }
++  }
++
++  bool
++  fromSymbolRecord (const symbol_table::symbol_record& symbolRecord)
++  {
++    if (symbolRecord.is_local () && !symbolRecord.is_global () && !symbolRecord.is_hidden ())
++      _scope = Local;
++    else if (symbolRecord.is_global ())
++      _scope = Global;
++    else if (symbolRecord.is_persistent ())
++      _scope = Persistent;
++    else if (symbolRecord.is_hidden ())
++      _scope = Hidden;
++
++    _symbol = QString (symbolRecord.name ().c_str ());
++    _type   = QString (symbolRecord.varval ().type_name ().c_str ());
++    octave_value octaveValue = symbolRecord.varval ();
++
++    // For every type, convert to a human readable string.
++    if (octaveValue.is_sq_string ())
++      _value = QString ("\'%1\'").arg (octaveValue.string_value ().c_str ());
++    else if (octaveValue.is_dq_string ())
++      _value = QString ("\"%1\"").arg (octaveValue.string_value ().c_str ());
++    else if (octaveValue.is_real_scalar ())
++      _value = QString ("%1").arg (octaveValue.scalar_value ());
++    else if (octaveValue.is_complex_scalar ())
++      _value = QString ("%1 + %2i").arg (octaveValue.scalar_value ())
++                                   .arg (octaveValue.complex_value ().imag ());
++    else if (octaveValue.is_range ())
++      _value =  QString ("%1 : %2 : %3").arg (octaveValue.range_value ().base ())
++                                        .arg (octaveValue.range_value ().inc ())
++                                        .arg (octaveValue.range_value ().limit ());
++    else if (octaveValue.is_real_matrix ())
++      _value = QString ("%1x%2").arg (octaveValue.rows ())
++                                .arg (octaveValue.columns ());
++    else if (octaveValue.is_complex_matrix ())
++      _value = QString ("%1x%2").arg (octaveValue.rows ())
++                                .arg (octaveValue.columns ());
++    else
++      _value = QString ("<Type not recognized>");
++
++    return true;
++  }
++} SymbolInformation;
++
++
++
++#endif // SYMBOLINFORMATION_H
+diff --git a/gui/src/editor/lexeroctavegui.h b/gui/src/editor/lexeroctavegui.h
+--- a/gui/src/editor/lexeroctavegui.h
++++ b/gui/src/editor/lexeroctavegui.h
+@@ -15,17 +15,16 @@
+  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #ifndef LEXEROCTAVE_H
+ #define LEXEROCTAVE_H
+ 
+ #include "ResourceManager.h"
+ #include <QObject>
+-
+ #include <Qsci/qsciglobal.h>
+ #include <Qsci/qscilexer.h>
+ 
+ 
+ class LexerOctaveGui : public QsciLexer
+ {
+     Q_OBJECT
+ 
+diff --git a/gui/src/src.pro b/gui/src/src.pro
+--- a/gui/src/src.pro
++++ b/gui/src/src.pro
+@@ -35,17 +35,17 @@ LIBS                += -lqscintilla2  \
+                         $$system(mkoctfile -p LIBS) \
+                         $$system(mkoctfile -p OCTAVE_LIBS)
+ 
+ mac {
+     CONFIG -= app_bundle
+ }
+ 
+ # Includepaths and libraries to link against:
+-INCLUDEPATH         += . backend editor ../qterminal/libqterminal \
++INCLUDEPATH         += . backend editor ../qterminal/libqterminal /usr/include/qt4 \
+                        $$system(mkoctfile -p INCFLAGS)
+ INCFLAGS            += $$system(mkoctfile -p INCFLAGS)
+ mac {
+     INCFLAGS += -I/opt/local/include
+ }
+ 
+ QMAKE_LIBDIR        += $$system(octave-config -p OCTLIBDIR)
+ unix {
+@@ -100,13 +100,14 @@ HEADERS += \
+     ResourceManager.h \
+     backend/OctaveLink.h \
+     backend/OctaveMainThread.h \
+     WelcomeWizard.h \
+     editor/FileEditor.h \
+     WorkspaceModel.h \
+     editor/FileEditorInterface.h \
+     editor/FileEditorTab.h \
+-    TerminalDockWidget.h
++    TerminalDockWidget.h \
++    backend/SymbolInformation.h
+ 
+ FORMS += \
+     SettingsDialog.ui \
+     WelcomeWizard.ui

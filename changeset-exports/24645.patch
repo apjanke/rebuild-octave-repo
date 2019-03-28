@@ -1,0 +1,953 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1517062010 18000
+#      Sat Jan 27 09:06:50 2018 -0500
+# Node ID f61502510d0898b59f77abd15d5f2791795542f9
+# Parent  e04a56630c8a7cfdfc081b951625fbfccca5d3fa
+restore ability to select variables for editing from workspace widget
+
+* octave-qt-link.h, octave-qt-link.cc: Declare octave::symbol_scope as
+a Qt metatype.
+(octave_qt_link::set_workspace_signal): Pass scope instead of
+individual lists of scope things.  Change all uses.
+(octave_qt_link::do_set_workspace): Pass scope instead of list of
+workspace_element objects.
+
+* octave-link.h, octave-link.cc (octave_link::set_workspace,
+octave_link::do_set_workspace): Pass scope instead of list of
+workspace_element objects.  Change all uses.
+
+* workspace-model.h, workspace-model.cc (workspace_model::m_scope):
+New data member.
+(workspace_model::set_workspace): Pass and store scope instead of
+individual lists of scope things.  Change all uses.
+(workspace_model::clear_data): Also invalidate m_scope.
+(workspace_model::update_table): Unpack scope info here without using
+an intermediate list of workspace elements.
+(workspace_model::scope): New function.
+
+* workspace-view.h, workspace-view.cc
+(workspace_view::edit_variable_signal): Also pass value object.
+Change all uses.
+(workspace_view::setModel): Also extract value from scope.
+
+* workspace-element.h: Delete.
+* libinterp/corefcn/module.mk: Update.
+
+* symscope.h, symscope.cc (symbol_scope::workspace_info,
+symbol_scope::symbol_scope_rep::workspace_info): Delete.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -1972,25 +1972,20 @@ main_window::construct_octave_qt_link (v
+ 
+   connect (m_octave_qt_link,
+            SIGNAL (copy_image_to_clipboard_signal (const QString&, bool)),
+            this, SLOT (copy_image_to_clipboard (const QString&, bool)));
+ 
+   if (m_start_gui)
+     {
+       connect (m_octave_qt_link,
+-               SIGNAL (set_workspace_signal
+-                       (bool, bool, const QString&, const QStringList&,
+-                        const QStringList&, const QStringList&,
+-                        const QStringList&, const QIntList&)),
++               SIGNAL (set_workspace_signal (bool, bool,
++                                             const octave::symbol_scope&)),
+                m_workspace_model,
+-               SLOT (set_workspace
+-                     (bool, bool, const QString&, const QStringList&,
+-                      const QStringList&, const QStringList&,
+-                      const QStringList&, const QIntList&)));
++               SLOT (set_workspace (bool, bool, const octave::symbol_scope&)));
+ 
+       connect (m_octave_qt_link, SIGNAL (clear_workspace_signal (void)),
+                m_workspace_model, SLOT (clear_workspace (void)));
+ 
+       connect (m_octave_qt_link, SIGNAL (change_directory_signal (QString)),
+                this, SLOT (change_directory (QString)));
+ 
+       connect (m_octave_qt_link, SIGNAL (change_directory_signal (QString)),
+@@ -2545,32 +2540,32 @@ main_window::load_workspace_callback (co
+   // INTERPRETER THREAD
+ 
+   Fload (ovl (file));
+ 
+   octave::symbol_scope scope
+    = octave::__get_current_scope__ ("main_window::load_workspace_callback");
+ 
+   if (scope)
+-    octave_link::set_workspace (true, scope.workspace_info ());
++    octave_link::set_workspace (true, scope);
+ }
+ 
+ void
+ main_window::rename_variable_callback (const main_window::name_pair& names)
+ {
+   // INTERPRETER THREAD
+ 
+   octave::symbol_scope scope
+     = octave::__get_current_scope__ ("main_window::rename_variable_callback");
+ 
+   if (scope)
+     {
+       scope.rename (names.first, names.second);
+ 
+-      octave_link::set_workspace (true, scope.workspace_info ());
++      octave_link::set_workspace (true, scope);
+     }
+ 
+   // FIXME: if this action fails, do we need a way to display that info
+   // in the GUI?
+ }
+ 
+ void
+ main_window::command_window_undo_callback (void)
+@@ -2629,17 +2624,17 @@ void
+ main_window::refresh_workspace_callback (void)
+ {
+   // INTERPRETER THREAD
+ 
+   octave::symbol_scope scope
+    = octave::__get_current_scope__ ("main_window::force_refresh_workspace");
+ 
+   if (scope)
+-    octave_link::set_workspace (true, scope.workspace_info (), false);
++    octave_link::set_workspace (true, scope, false);
+ }
+ 
+ bool
+ main_window::focus_console_after_command (void)
+ {
+   QSettings *settings = resource_manager::get_settings ();
+   return settings->value ("terminal/focus_after_command",false).toBool ();
+ }
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -36,28 +36,32 @@ along with Octave; see the file COPYING.
+ #include "str-vec.h"
+ 
+ #include "builtin-defun-decls.h"
+ #include "dialog.h"
+ #include "error.h"
+ #include "interpreter-private.h"
+ #include "load-path.h"
+ #include "ov.h"
++#include "symscope.h"
+ #include "utils.h"
+ 
+ #include "octave-gui.h"
+ #include "octave-qt-link.h"
+ #include "resource-manager.h"
+-#include "workspace-element.h"
++
++Q_DECLARE_METATYPE (octave_value)
++Q_DECLARE_METATYPE (octave::symbol_scope)
+ 
+ octave_qt_link::octave_qt_link (QWidget *,
+                                 octave::gui_application *app_context)
+   : octave_link (), m_app_context (app_context)
+ {
+   qRegisterMetaType<octave_value> ("octave_value");
++  qRegisterMetaType<octave::symbol_scope> ("symbol_scope");
+ }
+ 
+ bool
+ octave_qt_link::do_confirm_shutdown (void)
+ {
+   // Lock the mutex before emitting signal.
+   lock ();
+ 
+@@ -417,42 +421,23 @@ octave_qt_link::do_change_directory (con
+ void
+ octave_qt_link::do_execute_command_in_terminal (const std::string& command)
+ {
+   emit execute_command_in_terminal_signal (QString::fromStdString (command));
+ }
+ 
+ void
+ octave_qt_link::do_set_workspace (bool top_level, bool debug,
+-                                  const std::list<workspace_element>& ws,
++                                  const octave::symbol_scope& scope,
+                                   bool update_variable_editor)
+ {
+   if (! top_level && ! debug)
+     return;
+ 
+-  QString scopes;
+-  QStringList symbols;
+-  QStringList class_names;
+-  QStringList dimensions;
+-  QStringList values;
+-  QIntList complex_flags;
+-
+-  for (std::list<workspace_element>::const_iterator it = ws.begin ();
+-       it != ws.end (); it++)
+-    {
+-      scopes.append (it->scope ());
+-      symbols.append (QString::fromStdString (it->symbol ()));
+-      class_names.append (QString::fromStdString (it->class_name ()));
+-      dimensions.append (QString::fromStdString (it->dimension ()));
+-      values.append (QString::fromStdString (it->value ()));
+-      complex_flags.append (it->complex_flag ());
+-    }
+-
+-  emit set_workspace_signal (top_level, debug, scopes, symbols, class_names,
+-                             dimensions, values, complex_flags);
++  emit set_workspace_signal (top_level, debug, scope);
+ 
+   if (update_variable_editor)
+     emit refresh_variable_editor_signal ();
+ }
+ 
+ void
+ octave_qt_link::do_clear_workspace (void)
+ {
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -37,16 +37,21 @@ along with Octave; see the file COPYING.
+ #include "octave-gui.h"
+ #include "octave-link.h"
+ 
+ // Defined for purposes of sending QList<int> as part of signal.
+ typedef QList<int> QIntList;
+ 
+ class octave_value;
+ 
++namespace octave
++{
++  class symbol_scope;
++}
++
+ //! Provides threadsafe access to octave.
+ //! @author Jacob Dawid
+ //!
+ //! This class is a wrapper around octave and provides thread safety by
+ //! buffering access operations to octave and executing them in the
+ //! readline event hook, which lives in the octave thread.
+ 
+ class octave_qt_link : public QObject, public octave_link
+@@ -107,17 +112,17 @@ public:
+                                 const std::string& dir,
+                                 bool addpath_option);
+ 
+   void do_change_directory (const std::string& dir);
+ 
+   void do_execute_command_in_terminal (const std::string& command);
+ 
+   void do_set_workspace (bool top_level, bool debug,
+-                         const std::list<workspace_element>& ws,
++                         const octave::symbol_scope& scope,
+                          bool update_variable_editor);
+ 
+   void do_clear_workspace (void);
+ 
+   void do_set_history (const string_vector& hist);
+   void do_append_history (const std::string& hist_entry);
+   void do_clear_history (void);
+ 
+@@ -166,24 +171,18 @@ signals:
+   void copy_image_to_clipboard_signal (const QString& file, bool remove_file);
+ 
+   void edit_file_signal (const QString& file);
+ 
+   void change_directory_signal (const QString& dir);
+ 
+   void execute_command_in_terminal_signal (const QString& command);
+ 
+-  void set_workspace_signal (bool top_level,
+-                             bool debug,
+-                             const QString& scopes,
+-                             const QStringList& symbols,
+-                             const QStringList& class_names,
+-                             const QStringList& dimensions,
+-                             const QStringList& values,
+-                             const QIntList& complex_flags);
++  void set_workspace_signal (bool top_level, bool debug,
++                             const octave::symbol_scope& scope);
+ 
+   void clear_workspace_signal (void);
+ 
+   void set_history_signal (const QStringList& hist);
+   void append_history_signal (const QString& hist_entry);
+   void clear_history_signal (void);
+ 
+   void enter_debugger_signal (void);
+diff --git a/libgui/src/workspace-model.cc b/libgui/src/workspace-model.cc
+--- a/libgui/src/workspace-model.cc
++++ b/libgui/src/workspace-model.cc
+@@ -23,17 +23,19 @@ along with Octave; see the file COPYING.
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <QTreeWidget>
+ #include <QSettings>
+ 
++#include "symscope.h"
+ #include "utils.h"
++
+ #include "resource-manager.h"
+ #include "workspace-model.h"
+ 
+ workspace_model::workspace_model (QObject *p)
+   : QAbstractTableModel (p)
+ {
+   m_columnNames.append (tr ("Name"));
+   m_columnNames.append (tr ("Class"));
+@@ -220,32 +222,23 @@ workspace_model::setData (const QModelIn
+           retval = true;
+         }
+     }
+ 
+   return retval;
+ }
+ 
+ void
+-workspace_model::set_workspace (bool top_level,
+-                                bool /* debug */,
+-                                const QString& scopes,
+-                                const QStringList& symbols,
+-                                const QStringList& class_names,
+-                                const QStringList& dimensions,
+-                                const QStringList& values,
+-                                const QIntList& complex_flags)
++workspace_model::set_workspace (bool top_level, bool /* debug */,
++                                const octave::symbol_scope& scope)
+ {
++  clear_data ();
++
+   m_top_level = top_level;
+-  m_scopes = scopes;
+-  m_symbols = symbols;
+-  m_class_names = class_names;
+-  m_dimensions = dimensions;
+-  m_values = values;
+-  m_complex_flags = complex_flags;
++  m_scope = scope;
+ 
+   update_table ();
+ }
+ 
+ void
+ workspace_model::clear_workspace (void)
+ {
+   clear_data ();
+@@ -268,27 +261,70 @@ workspace_model::notice_settings (const 
+       m_storage_class_colors.replace (i,setting_color);
+     }
+ }
+ 
+ void
+ workspace_model::clear_data (void)
+ {
+   m_top_level = false;
++  m_scope = octave::symbol_scope ();
+   m_scopes = QString ();
+   m_symbols = QStringList ();
+   m_class_names = QStringList ();
+   m_dimensions = QStringList ();
+   m_values = QStringList ();
+   m_complex_flags = QIntList ();
+ }
+ 
+ void
+ workspace_model::update_table (void)
+ {
+   beginResetModel ();
+ 
+-  // Nothing to do except tell the world to recalc.
++  std::list<octave::symbol_record> sr_list = m_scope.all_variables ();
++
++  octave::symbol_record::context_id context = m_scope.current_context ();
++
++  for (const auto& sr : sr_list)
++    {
++      std::string nm = sr.name ();
++
++      octave_value val = sr.varval (context);
++
++      // FIXME: fix size for objects, see kluge in variables.cc
++      //dim_vector dv = val.dims ();
++      octave_value tmp = val;
++      Matrix sz = tmp.size ();
++      dim_vector dv = dim_vector::alloc (sz.numel ());
++      for (octave_idx_type i = 0; i < dv.ndims (); i++)
++        dv(i) = sz(i);
++
++      char storage = ' ';
++      if (sr.is_global ())
++        storage = 'g';
++      else if (sr.is_persistent ())
++        storage = 'p';
++      else if (sr.is_automatic ())
++        storage = 'a';
++      else if (sr.is_formal ())
++        storage = 'f';
++      else if (sr.is_hidden ())
++        storage = 'h';
++      else if (sr.is_inherited ())
++        storage = 'i';
++
++      std::ostringstream buf;
++      val.short_disp (buf);
++      std::string short_disp_str = buf.str ();
++
++      m_scopes.append (storage);
++      m_symbols.append (QString::fromStdString (nm));
++      m_class_names.append (QString::fromStdString (val.class_name ()));
++      m_dimensions.append (QString::fromStdString (dv.str ()));
++      m_values.append (QString::fromStdString (short_disp_str));
++      m_complex_flags.append (val.iscomplex ());
++    }
+ 
+   endResetModel ();
+ 
+   emit model_changed ();
+ }
+diff --git a/libgui/src/workspace-model.h b/libgui/src/workspace-model.h
+--- a/libgui/src/workspace-model.h
++++ b/libgui/src/workspace-model.h
+@@ -28,16 +28,18 @@ along with Octave; see the file COPYING.
+ #include <QVector>
+ #include <QSemaphore>
+ #include <QStringList>
+ #include <QChar>
+ #include <QList>
+ #include <QColor>
+ #include <QSettings>
+ 
++#include "symscope.h"
++
+ // Defined for purposes of sending QList<int> as part of signal.
+ typedef QList<int> QIntList;
+ 
+ class workspace_model
+   : public QAbstractTableModel
+ {
+   Q_OBJECT
+ 
+@@ -67,26 +69,22 @@ public:
+ 
+   bool is_top_level (void) const { return m_top_level; }
+ 
+   QColor storage_class_color (int s_class)
+   {
+     return m_storage_class_colors.at (s_class);
+   }
+ 
++  octave::symbol_scope scope (void) const { return m_scope; }
++
+ public slots:
+ 
+-  void set_workspace (bool top_level,
+-                      bool debug,
+-                      const QString& scopes,
+-                      const QStringList& symbols,
+-                      const QStringList& class_names,
+-                      const QStringList& dimensions,
+-                      const QStringList& values,
+-                      const QIntList& complex_flags);
++  void set_workspace (bool top_level, bool debug,
++                      const octave::symbol_scope& scope);
+ 
+   void clear_workspace (void);
+ 
+   void notice_settings (const QSettings *);
+ 
+ signals:
+ 
+   void model_changed (void);
+@@ -95,16 +93,17 @@ signals:
+   void rename_variable (const QString& old_name, const QString& new_name);
+ 
+ private:
+ 
+   void clear_data (void);
+   void update_table (void);
+ 
+   bool m_top_level;
++  octave::symbol_scope m_scope;
+   QString m_scopes;
+   QStringList m_symbols;
+   QStringList m_class_names;
+   QStringList m_dimensions;
+   QStringList m_values;
+   QIntList m_complex_flags;
+ 
+   QStringList m_columnNames;
+diff --git a/libgui/src/workspace-view.cc b/libgui/src/workspace-view.cc
+--- a/libgui/src/workspace-view.cc
++++ b/libgui/src/workspace-view.cc
+@@ -150,18 +150,19 @@ workspace_view::workspace_view (QWidget 
+            this, SLOT (contextmenu_requested (const QPoint&)));
+ 
+   connect (m_view, SIGNAL (doubleClicked (QModelIndex)),
+            this, SLOT (handle_contextmenu_edit (void)));
+ 
+   connect (this, SIGNAL (command_requested (const QString&)),
+            p, SLOT (execute_command_in_terminal (const QString&)));
+ 
+-  connect (this, SIGNAL (edit_variable_signal (const QString&)),
+-           p, SLOT (edit_variable (const QString&)));
++  connect (this,
++           SIGNAL (edit_variable_signal (const QString&, const octave_value&)),
++           p, SLOT (edit_variable (const QString&, const octave_value&)));
+ }
+ 
+ void workspace_view::setModel (workspace_model *model)
+ {
+   m_filter_model.setSourceModel (model);
+   m_filter_model.setFilterKeyColumn(0);
+ 
+   m_view->setModel (&m_filter_model);
+@@ -454,23 +455,27 @@ void
+ workspace_view::handle_contextmenu_edit (void)
+ {
+   QModelIndex index = m_view->currentIndex ();
+ 
+   if (index.isValid ())
+     {
+       index = index.sibling (index.row (), 0);
+ 
+-      QAbstractItemModel *m = m_view->model ();
+-
+-      QMap<int, QVariant> item_data = m->itemData (index);
++      QMap<int, QVariant> item_data = m_model->itemData (index);
+ 
+       QString var_name = item_data[0].toString ();
+ 
+-      emit edit_variable_signal (var_name);
++      octave::symbol_scope scope = m_model->scope ();
++
++      octave_value val;
++      if (scope)
++        val = scope.varval (var_name.toStdString ());
++
++      emit edit_variable_signal (var_name, val);
+     }
+ }
+ 
+ void
+ workspace_view::handle_contextmenu_disp (void)
+ {
+   relay_contextmenu_command ("disp");
+ }
+diff --git a/libgui/src/workspace-view.h b/libgui/src/workspace-view.h
+--- a/libgui/src/workspace-view.h
++++ b/libgui/src/workspace-view.h
+@@ -27,16 +27,18 @@ along with Octave; see the file COPYING.
+ #include <QItemDelegate>
+ #include <QTableView>
+ #include <QSemaphore>
+ #include <QComboBox>
+ #include <QSortFilterProxyModel>
+ #include <QCheckBox>
+ #include <QSignalMapper>
+ 
++#include "ov.h"
++
+ #include "octave-dock-widget.h"
+ #include "workspace-model.h"
+ 
+ class workspace_view : public octave_dock_widget
+ {
+   Q_OBJECT
+ 
+ public:
+@@ -56,17 +58,17 @@ public slots:
+ signals:
+ 
+   //! Signal that user had requested a command on a variable.
+ 
+   void command_requested (const QString& cmd);
+ 
+   //! Signal that user wants to edit a variable.
+ 
+-  void edit_variable_signal (const QString&);
++  void edit_variable_signal (const QString&, const octave_value&);
+ 
+ protected:
+ 
+   void closeEvent (QCloseEvent *event);
+ 
+ protected slots:
+ 
+   void filter_update (const QString& expression);
+diff --git a/libinterp/corefcn/module.mk b/libinterp/corefcn/module.mk
+--- a/libinterp/corefcn/module.mk
++++ b/libinterp/corefcn/module.mk
+@@ -86,17 +86,16 @@ COREFCN_INC = \
+   %reldir%/symtab.h \
+   %reldir%/sysdep.h \
+   %reldir%/text-renderer.h \
+   %reldir%/toplev.h \
+   %reldir%/txt-eng.h \
+   %reldir%/url-handle-manager.h \
+   %reldir%/utils.h \
+   %reldir%/variables.h \
+-  %reldir%/workspace-element.h \
+   %reldir%/xdiv.h \
+   %reldir%/xnorm.h \
+   %reldir%/xpow.h \
+   %reldir%/zfstream.h
+ 
+ NOINSTALL_COREFCN_INC = \
+   %reldir%/interpreter-private.h \
+   %reldir%/oct-hdf5.h \
+diff --git a/libinterp/corefcn/octave-link.cc b/libinterp/corefcn/octave-link.cc
+--- a/libinterp/corefcn/octave-link.cc
++++ b/libinterp/corefcn/octave-link.cc
+@@ -66,23 +66,20 @@ octave_link::~octave_link (void)
+ void
+ octave_link::set_workspace (void)
+ {
+   if (enabled ())
+     {
+       octave::symbol_table& symtab
+         = octave::__get_symbol_table__ ("octave_link::set_workspace");
+ 
+-      std::list<workspace_element> workspace_info;
+       octave::symbol_scope scope = symtab.current_scope ();
+-      if (scope)
+-        workspace_info = scope.workspace_info ();
+ 
+       instance->do_set_workspace (symtab.at_top_level (),
+-                                  instance->debugging, workspace_info, true);
++                                  instance->debugging, scope, true);
+     }
+ }
+ 
+ // OBJ should be an object of a class that is derived from the base
+ // class octave_link, or 0 to disconnect the link.  It is the
+ // responsibility of the caller to delete obj.
+ 
+ void
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -31,17 +31,21 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include "oct-mutex.h"
+ 
+ #include "event-queue.h"
+ 
+ class octave_value;
+ class string_vector;
+-class workspace_element;
++
++namespace octave
++{
++  class symbol_scope;
++}
+ 
+ //! Provides threadsafe access to octave.
+ //! @author Jacob Dawid
+ //!
+ //! This class is a wrapper around octave and provides thread safety by
+ //! buffering access operations to octave and executing them in the
+ //! readline event hook, which lives in the octave thread.
+ 
+@@ -256,21 +260,21 @@ public:
+   {
+     if (enabled ())
+       instance->do_execute_command_in_terminal (command);
+   }
+ 
+   static void set_workspace (void);
+ 
+   static void set_workspace (bool top_level,
+-                             const std::list<workspace_element>& ws,
++                             const octave::symbol_scope& scope,
+                              bool update_variable_editor = true)
+   {
+     if (enabled ())
+-      instance->do_set_workspace (top_level, instance->debugging, ws,
++      instance->do_set_workspace (top_level, instance->debugging, scope,
+                                   update_variable_editor);
+   }
+ 
+   static void clear_workspace (void)
+   {
+     if (enabled ())
+       instance->do_clear_workspace ();
+   }
+@@ -543,17 +547,17 @@ protected:
+                                 bool addpath_option) = 0;
+ 
+   virtual void do_change_directory (const std::string& dir) = 0;
+ 
+   virtual void do_execute_command_in_terminal (const std::string& command) = 0;
+ 
+   virtual void
+   do_set_workspace (bool top_level, bool debug,
+-                    const std::list<workspace_element>& ws,
++                    const octave::symbol_scope& scope,
+                     bool update_variable_editor) = 0;
+ 
+   virtual void do_clear_workspace (void) = 0;
+ 
+   virtual void do_set_history (const string_vector& hist) = 0;
+   virtual void do_append_history (const std::string& hist_entry) = 0;
+   virtual void do_clear_history (void) = 0;
+ 
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -102,70 +102,16 @@ namespace octave
+ 
+             return m_symbols[name] = ret;
+           }
+       }
+     else
+       return p->second;
+   }
+ 
+-  std::list<workspace_element>
+-  symbol_scope_rep::workspace_info (void) const
+-  {
+-    std::list<workspace_element> retval;
+-
+-    for (const auto& nm_sr : m_symbols)
+-      {
+-        std::string nm = nm_sr.first;
+-        symbol_record sr = nm_sr.second;
+-
+-        if (! sr.is_hidden ())
+-          {
+-            octave_value val = sr.varval (m_context);
+-
+-            if (val.is_defined ())
+-              {
+-                // FIXME: fix size for objects, see kluge in variables.cc
+-                //dim_vector dv = val.dims ();
+-                octave_value tmp = val;
+-                Matrix sz = tmp.size ();
+-                dim_vector dv = dim_vector::alloc (sz.numel ());
+-                for (octave_idx_type i = 0; i < dv.ndims (); i++)
+-                  dv(i) = sz(i);
+-
+-                char storage = ' ';
+-                if (sr.is_global ())
+-                  storage = 'g';
+-                else if (sr.is_persistent ())
+-                  storage = 'p';
+-                else if (sr.is_automatic ())
+-                  storage = 'a';
+-                else if (sr.is_formal ())
+-                  storage = 'f';
+-                else if (sr.is_hidden ())
+-                  storage = 'h';
+-                else if (sr.is_inherited ())
+-                  storage = 'i';
+-
+-                std::ostringstream buf;
+-                val.short_disp (buf);
+-                std::string short_disp_str = buf.str ();
+-
+-                workspace_element elt (storage, nm, val.class_name (),
+-                                       short_disp_str, dv.str (),
+-                                       val.iscomplex ());
+-
+-                retval.push_back (elt);
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+   octave_value
+   symbol_scope_rep::dump (void) const
+   {
+     std::map<std::string, octave_value> m
+       = {{ "name", m_name },
+          { "symbols", dump_symbols_map () },
+          { "subfunctions", dump_function_map (m_subfunctions) }};
+ 
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -39,17 +39,16 @@ along with Octave; see the file COPYING.
+ #include "oct-refcount.h"
+ 
+ class tree_argument_list;
+ class octave_user_function;
+ 
+ #include "ov.h"
+ #include "ovl.h"
+ #include "symrec.h"
+-#include "workspace-element.h"
+ 
+ namespace octave
+ {
+   class symbol_scope;
+ 
+   class symbol_scope_rep
+   {
+   public:
+@@ -494,18 +493,16 @@ namespace octave
+       m_subfunction_names = names;
+     }
+ 
+     std::list<std::string> subfunction_names (void) const
+     {
+       return m_subfunction_names;
+     }
+ 
+-    std::list<workspace_element> workspace_info (void) const;
+-
+     octave_value dump (void) const;
+ 
+     std::string name (void) const { return m_name; }
+ 
+     void cache_name (const std::string& name) { m_name = name; }
+ 
+     octave_user_function *function (void) { return m_fcn; }
+ 
+@@ -866,23 +863,16 @@ namespace octave
+         m_rep->stash_subfunction_names (names);
+     }
+ 
+     std::list<std::string> subfunction_names (void) const
+     {
+       return m_rep ? m_rep->subfunction_names () : std::list<std::string> ();
+     }
+ 
+-    std::list<workspace_element> workspace_info (void) const
+-    {
+-      return (m_rep
+-              ? m_rep->workspace_info ()
+-              : std::list<workspace_element> ());
+-    }
+-
+     octave_value dump (void) const
+     {
+       return m_rep ? m_rep->dump () : octave_value ();
+     }
+ 
+     std::string name (void) const
+     {
+       return m_rep ? m_rep->name () : "";
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -39,17 +39,16 @@ along with Octave; see the file COPYING.
+ 
+ class tree_argument_list;
+ class octave_user_function;
+ 
+ #include "fcn-info.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "symscope.h"
+-#include "workspace-element.h"
+ 
+ namespace octave
+ {
+   class OCTINTERP_API symbol_table
+   {
+   public:
+ 
+     typedef octave::symbol_record symbol_record;
+diff --git a/libinterp/corefcn/workspace-element.h b/libinterp/corefcn/workspace-element.h
+deleted file mode 100644
+--- a/libinterp/corefcn/workspace-element.h
++++ /dev/null
+@@ -1,91 +0,0 @@
+-/*
+-
+-Copyright (C) 2013-2017 John W. Eaton
+-
+-This file is part of Octave.
+-
+-Octave is free software: you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by
+-the Free Software Foundation, either version 3 of the License, or
+-(at your option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but
+-WITHOUT ANY WARRANTY; without even the implied warranty of
+-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-GNU General Public License for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<https://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if ! defined (octave_workspace_element_h)
+-#define octave_workspace_element_h 1
+-
+-#include "octave-config.h"
+-
+-#include <string>
+-
+-class workspace_element
+-{
+-public:
+-
+-  workspace_element (char scope_arg = 'l',
+-                     const std::string& symbol_arg = "<name>",
+-                     const std::string& class_name_arg = "<class>",
+-                     const std::string& value_arg = "<value>",
+-                     const std::string& dimension_arg = "<dimension>",
+-                     bool complex_flag_arg = false)
+-    : xscope (scope_arg), xsymbol (symbol_arg),
+-      xclass_name (class_name_arg), xvalue (value_arg),
+-      xdimension (dimension_arg), xcomplex_flag (complex_flag_arg)
+-  { }
+-
+-  workspace_element (const workspace_element& ws_elt)
+-    : xscope (ws_elt.xscope), xsymbol (ws_elt.xsymbol),
+-      xclass_name (ws_elt.xclass_name), xvalue (ws_elt.xvalue),
+-      xdimension (ws_elt.xdimension), xcomplex_flag (ws_elt.xcomplex_flag)
+-  { }
+-
+-  workspace_element operator = (const workspace_element& ws_elt)
+-  {
+-    if (this != &ws_elt)
+-      {
+-        xscope = ws_elt.xscope;
+-        xsymbol = ws_elt.xsymbol;
+-        xclass_name = ws_elt.xclass_name;
+-        xvalue = ws_elt.xvalue;
+-        xdimension = ws_elt.xdimension;
+-        xcomplex_flag = ws_elt.xcomplex_flag;
+-      }
+-
+-    return *this;
+-  }
+-
+-  ~workspace_element (void) = default;
+-
+-  char scope (void) const { return xscope; }
+-
+-  std::string symbol (void) const { return xsymbol; }
+-
+-  std::string class_name (void) const { return xclass_name; }
+-
+-  std::string value (void) const { return xvalue; }
+-
+-  std::string dimension (void) const { return xdimension; }
+-
+-  bool complex_flag (void) const { return xcomplex_flag; }
+-
+-private:
+-
+-  // [g]lobal, [p]ersistent, [l]ocal
+-  char xscope;
+-  std::string xsymbol;
+-  std::string xclass_name;
+-  std::string xvalue;
+-  std::string xdimension;
+-  bool xcomplex_flag;
+-};
+-
+-#endif

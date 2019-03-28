@@ -1,0 +1,220 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1362066807 18000
+#      Thu Feb 28 10:53:27 2013 -0500
+# Node ID 335041cc657a21c69094712c4d7f2791f6df1550
+# Parent  236be61797850ab411dd6fe6ebf0837b08ede631
+optionally use push parser interface
+
+* configure.ac (USE_PUSH_PARSER): New config variable.  Display
+setting in config summary.  Provide --enable-push-parser option.
+* oct-parse.yy: Use "%define api.push-pull both" bison option.
+* parse.h, oct-parse.yy (octave_parser::parser_state): New member
+variable.
+(octave_parser::init): Initialize it if USE_PUSH_PARSER is defined.
+(octave_parser::~octave_parser): Delete it if USE_PUSH_PARSER.
+(octave_parser::run): Use push parser interface if USE_PUSH_PARSER.
+
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -185,16 +185,27 @@ BOUNDS_CHECKING=no
+ AC_ARG_ENABLE([bounds-check],
+   [AS_HELP_STRING([--enable-bounds-check],
+     [enable bounds checking for indexing in internal array classes])],
+   [if test "$enableval" = yes; then BOUNDS_CHECKING=yes; fi], [])
+ if test $BOUNDS_CHECKING = yes; then
+   AC_DEFINE(BOUNDS_CHECKING, 1, [Define to 1 to use internal bounds checking.])
+ fi
+ 
++### Enable experimental push parser.
++
++OCTAVE_USE_PUSH_PARSER=no
++AC_ARG_ENABLE([push-parser],
++  [AS_HELP_STRING([--enable-push-parser],
++    [enable experimental push parser])],
++  [if test "$enableval" = yes; then OCTAVE_USE_PUSH_PARSER=yes; fi], [])
++if test $OCTAVE_USE_PUSH_PARSER = yes; then
++  AC_DEFINE(OCTAVE_USE_PUSH_PARSER, 1, [Define to 1 to use experimental push parser.])
++fi
++
+ ### Use Octave's built-in memory allocator rather than straightforward malloc.
+ ### Disabled by default.
+ 
+ USE_OCTAVE_ALLOCATOR=no
+ AC_ARG_ENABLE([octave-allocator],
+   [AS_HELP_STRING([--enable-octave-allocator],
+     [use the obsolete octave_allocator class for many of Octave's objects (mostly octave_value types).  You probably do NOT want to enable this feature.])],
+   [if test "$enableval" = yes; then USE_OCTAVE_ALLOCATOR=yes; fi], [])
+@@ -2969,16 +2980,17 @@ Octave is now configured for $canonical_
+   Default pager:               $DEFAULT_PAGER
+   gnuplot:                     $GNUPLOT
+ 
+   Build Octave GUI:                   $build_gui
+   JIT compiler for loops:             $build_jit
+   Build Java interface:               $build_java
+   Do internal array bounds checking:  $BOUNDS_CHECKING
+   Use octave_allocator:               $USE_OCTAVE_ALLOCATOR
++  Use push parser:                    $OCTAVE_USE_PUSH_PARSER
+   Build static libraries:             $STATIC_LIBS
+   Build shared libraries:             $SHARED_LIBS
+   Dynamic Linking:                    $ENABLE_DYNAMIC_LINKING $DL_API_MSG
+   Include support for GNU readline:   $USE_READLINE
+   64-bit array dims and indexing:     $USE_64_BIT_IDX_T
+ ])
+ 
+ warn_msg_printed=false
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -161,16 +161,17 @@ make_statement (T *arg)
+ // reentrant because both still use many global variables.  It should be
+ // safe to create a parser object and call it while anotehr parser
+ // object is active (to parse a callback function while the main
+ // interactive parser is waiting for input, for example) if you take
+ // care to properly save and restore (typically with an unwind_protect
+ // object) relevant global values before and after the nested call.
+ 
+ %define api.pure
++%define api.push-pull both
+ %parse-param { octave_parser *curr_parser }
+ %lex-param { void *scanner }
+ 
+ %union
+ {
+   // The type of the basic tokens returned by the lexer.
+   token *tok_val;
+ 
+@@ -1474,20 +1475,76 @@ opt_comma       : // empty
+ #undef curr_lexer
+ 
+ static void
+ yyerror (octave_parser *curr_parser, const char *s)
+ {
+   curr_parser->bison_error (s);
+ }
+ 
++octave_parser::~octave_parser (void)
++{
++#if defined (USE_PUSH_PARSER)
++  yypstate_delete (parser_state);
++#endif
++
++delete curr_lexer;
++}
++void octave_parser::init (void)
++{
++#if defined (USE_PUSH_PARSER)
++  parser_state = yypstate_new ();
++#endif
++
++  CURR_LEXER = curr_lexer;
++}
++
+ int
+ octave_parser::run (void)
+ {
+-  return octave_parse (this);
++  int status = 0;
++
++#if defined (USE_PUSH_PARSER)
++
++  for (;;)
++    {
++      unwind_protect frame;
++
++      frame.protect_var (current_input_line);
++
++      bool eof = false;
++
++      get_user_input (eof);
++
++      do
++        {
++          octave_char = eof ? END_OF_INPUT : octave_lex ();
++
++          if (octave_char == 0)
++            {
++              // Attempt to get more input.
++              status = -1;
++              break;
++            }
++
++          status = octave_push_parse (pstate);
++        }
++      while (status == YYPUSH_MORE);
++
++      if (status >= 0)
++        break;
++    }
++
++#else
++
++  status = octave_parse (this);
++
++#endif
++
++  return status;
+ }
+ 
+ // Error mesages for mismatched end tokens.
+ 
+ void
+ octave_parser::end_error (const char *type, token::end_tok_type ettype,
+                           int l, int c)
+ {
+diff --git a/libinterp/parse-tree/parse.h b/libinterp/parse-tree/parse.h
+--- a/libinterp/parse-tree/parse.h
++++ b/libinterp/parse-tree/parse.h
+@@ -139,25 +139,24 @@ octave_parser
+ public:
+ 
+   octave_parser (void)
+     : end_of_input (false), endfunction_found (false),
+       autoloading (false), fcn_file_from_relative_lookup (false),
+       parsing_subfunctions (false), max_fcn_depth (0),
+       curr_fcn_depth (0), primary_fcn_scope (-1),
+       curr_class_name (), function_scopes (), primary_fcn_ptr (0),
+-      curr_lexer (new lexical_feedback ())
++      curr_lexer (new lexical_feedback ()), parser_state (0)
+   {
+-    CURR_LEXER = curr_lexer;
++    init ();
+   }
+ 
+-  ~octave_parser (void)
+-  {
+-    delete curr_lexer;
+-  }
++  ~octave_parser (void);
++
++  void init (void);
+ 
+   void reset (void)
+   {
+     curr_lexer->reset ();
+   }
+ 
+   int run (void);
+ 
+@@ -384,16 +383,20 @@ public:
+   std::vector<symbol_table::scope_id> function_scopes;
+ 
+   // Pointer to the primary user function or user script function.
+   octave_function *primary_fcn_ptr;
+ 
+   // State of the lexer.
+   lexical_feedback *curr_lexer;
+ 
++  // Internal state of the parser.  Only used if USE_PUSH_PARSER is
++  // defined.
++  void *parser_state;
++
+   // For unwind protect.
+   static void cleanup (octave_parser *parser) { delete parser; }
+ 
+ private:
+ 
+   // No copying!
+ 
+   octave_parser (const octave_parser&);

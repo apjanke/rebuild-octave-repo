@@ -1,0 +1,3089 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1517916008 18000
+#      Tue Feb 06 06:20:08 2018 -0500
+# Node ID 21d6d80ed42770192221c516df89e6736b9bc866
+# Parent  344832a898ad646777285033ca34bc1e548ad90f
+refactor variable editor model internal representation (bug #53054)
+
+* variable-editor-model.h, variable-editor-model.cc:
+Rewrite to use pointer to base class instead of opaque pointer to
+implementation.  This change will allow simpler classes to manage
+editing of each type of data we can edit (numeric array, string, cell,
+scalar struct, vector struct, 2-d struct array).
+
+* variable-editor.h, variable-editor.cc: Use stacked widget to allow
+switching between a table-based edit view (for variables that may be
+edited) and a text-edit based view (for variables that we can't edit).
+
+diff --git a/libgui/src/variable-editor-model.cc b/libgui/src/variable-editor-model.cc
+--- a/libgui/src/variable-editor-model.cc
++++ b/libgui/src/variable-editor-model.cc
+@@ -38,878 +38,1154 @@ along with Octave; see the file COPYING.
+ #include "variable-editor-model.h"
+ 
+ #include "ov.h"
+ #include "parse.h"
+ #include "pr-flt-fmt.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+-// Pimpl/Dpointer for variable_editor_model.
+-
+-static QString
+-make_label (const std::string& name, const octave_value& val)
++static bool
++cell_is_editable (const octave_value& val)
+ {
+-  QString lbl_txt = QString::fromStdString (name);
+-
+-  if (val.is_defined ())
+-    {
+-      if (! lbl_txt.isEmpty ())
+-        lbl_txt += " ";
++  if ((val.isnumeric () || val.islogical ()) && val.numel () == 1)
++    return true;
+ 
+-      dim_vector dv = val.dims ();
++  if (val.is_string () && (val.rows () == 1 || val.is_zero_by_zero ()))
++    return true;
+ 
+-      lbl_txt += ("["
+-                  + QString::fromStdString (dv.str ())
+-                  + " "
+-                  + QString::fromStdString (val.class_name ())
+-                  + "]");
+-    }
+-  else
+-    lbl_txt += " [undefined]";
+-
+-  return lbl_txt;
++  return false;
+ }
+ 
+ static char
+ get_quote_char (const octave_value& val)
+ {
+   if (val.is_sq_string ())
+     return '\'';
+ 
+   if (val.is_dq_string ())
+     return '"';
+ 
+   return 0;
+ }
+ 
+-static void
+-get_data_rows_and_columns (const octave_value& val,
+-                           octave_idx_type& rows, octave_idx_type& cols)
+-{
+-  if (val.is_string ())
+-    {
+-      // VAL will either be "" or a char array with a single row.
+-      // Either way, edit it as a single string.
+-
+-      rows = 1;
+-      cols = 1;
+-    }
+-  else if (val.isstruct ())
+-    {
+-      if (val.numel () == 1)
+-        {
+-          // Scalar struct.  Rows are fields, single column for
+-          // values.
+-
+-          rows = val.nfields ();
+-          cols = 1;
+-        }
+-      else if (val.rows () == 1 || val.columns () == 1)
+-        {
+-          // Vector struct.  Columns are fields, rows are values.
+-
+-          rows = val.numel ();
+-          cols = val.nfields ();
+-        }
+-      else
+-        {
+-          // 2-d struct array.  Rows and columns index individual
+-          // scalar structs.
+-
+-          rows = val.rows ();
+-          cols = val.columns ();
+-        }
+-    }
+-  else
+-    {
+-      rows = val.rows ();
+-      cols = val.columns ();
+-    }
+-}
+-
+-static QVariant
+-checkelem_edit_display (const float_display_format& fmt,
+-                        const octave_value& val, int row, int col)
+-{
+-  if (row >= val.rows () || col >= val.columns ())
+-    return QVariant ();
+-
+-  return QString::fromStdString (val.edit_display (fmt, row, col));
+-}
+-
+-static QVariant
+-do_edit_display_sub (const float_display_format& fmt, const octave_value& val,
+-                     const octave_value& elt, int row, int col)
+-{
+-  if ((elt.numel () == 1 && (elt.isnumeric () || elt.islogical ()))
+-      || (elt.is_string () && (elt.rows () == 1 || elt.isempty ())))
+-    return checkelem_edit_display (fmt, elt, 0, 0);
+-  else
+-    return checkelem_edit_display (fmt, val, row, col);
+-}
+-
+-static QVariant
+-do_edit_display (const float_display_format& fmt, octave_value& val,
+-                 int row, int col)
+-{
+-  QVariant data;
+-
+-  if (val.iscell ())
+-    {
+-      Cell cval = val.cell_value ();
+-
+-      octave_value ov = cval(row,col);
+-
+-      data = do_edit_display_sub (fmt, val, cval(row,col), row, col);
+-    }
+-  else if (val.isstruct ())
+-    {
+-      if (val.numel () == 1)
+-        {
+-          // Scalar struct.  Rows are fields, single column for
+-          // values.
+-
+-          octave_scalar_map m = val.scalar_map_value ();
+-
+-          data = do_edit_display_sub (fmt, val, m.contents (row), row, col);
+-        }
+-      else if (val.rows () == 1 || val.columns () == 1)
+-        {
+-          // Vector struct.  Columns are fields, rows are values.
+-
+-          octave_map m = val.map_value ();
+-
+-          Cell cval = m.contents (col);
+-
+-          data = do_edit_display_sub (fmt, val, cval(row), row, col);
+-        }
+-      else
+-        {
+-          // 2-d struct array.  Rows and columns index individual
+-          // scalar structs.
+-
+-          octave_map m = val.map_value ();
+-
+-          data = do_edit_display_sub (fmt, val, m(row,col), row, col);
+-        }
+-    }
+-  else
+-    data = checkelem_edit_display (fmt, val, row, col);
+-
+-  return data;
+-}
+-
+ static float_display_format
+ get_edit_display_format (const octave_value& val)
+ {
+   // FIXME: make this limit configurable.
+ 
+   return (val.numel () > 250000
+           ? float_display_format () : val.get_edit_display_format ());
+ }
+ 
+ static bool
+ do_requires_sub_editor_sub (const octave_value& elt)
+ {
+   return (! ((elt.numel () == 1 && (elt.isnumeric () || elt.islogical ()))
+              || (elt.is_string () && (elt.rows () == 1 || elt.isempty ()))));
+ }
+ 
+-static bool
+-do_requires_sub_editor (octave_value& val, int row, int col)
++base_ve_model::base_ve_model (const QString& expr, const octave_value& val)
++  : m_name (expr.toStdString ()),
++    m_value (val),
++    m_data_rows (m_value.rows ()),
++    m_data_cols (m_value.columns ()),
++    m_display_rows (m_data_rows),
++    m_display_cols (m_data_cols),
++    m_update_pending (),
++    m_valid (m_value.is_defined ()),
++    m_display_fmt (get_edit_display_format (m_value))
++{ }
++
++std::string
++base_ve_model::name (void) const
+ {
+-  if (val.iscell ())
+-    {
+-      Cell cval = val.cell_value ();
++  return m_name;
++}
++
++bool
++base_ve_model::index_ok (const QModelIndex& idx, int& row, int& col) const
++{
++  row = 0;
++  col = 0;
+ 
+-      octave_value ov = cval(row,col);
++  if (! idx.isValid ())
++    return false;
++
++  row = idx.row ();
++  col = idx.column ();
++
++  return (row < data_rows () && col < data_columns ());
++}
+ 
+-      return do_requires_sub_editor_sub (cval(row,col));
+-    }
+-  else if (val.isstruct ())
++int
++base_ve_model::column_width (void) const
++{
++  int width = 0;
++
++  float_format r_fmt = m_display_fmt.real_format ();
++  float_format i_fmt = m_display_fmt.imag_format ();
++
++  int rw = r_fmt.fw;
++  int iw = i_fmt.fw;
++
++  if (rw > 0)
+     {
+-      if (val.numel () == 1)
++      if (m_value.iscomplex ())
+         {
+-          // Scalar struct.  Rows are fields, single column for
+-          // values.
+-
+-          octave_scalar_map m = val.scalar_map_value ();
+-
+-          return do_requires_sub_editor_sub (m.contents (row));
+-        }
+-      else if (val.rows () == 1 || val.columns () == 1)
+-        {
+-          // Vector struct.  Columns are fields, rows are values.
+-
+-          octave_map m = val.map_value ();
+-
+-          Cell cval = m.contents (col);
+-
+-          return do_requires_sub_editor_sub (cval(row));
++          if (iw > 0)
++            width = rw + iw + 5;
+         }
+       else
+-        {
+-          // 2-d struct array.  Rows and columns index individual
+-          // scalar structs.
++        width = rw + 2;
++    }
++
++  return width;
++}
++
++int
++base_ve_model::rowCount (const QModelIndex&) const
++{
++  return m_valid ? m_display_rows : 1;
++}
++
++int
++base_ve_model::columnCount (const QModelIndex&) const
++{
++  return m_valid ? m_display_cols : 1;
++}
+ 
+-          octave_map m = val.map_value ();
++QString
++base_ve_model::edit_display_sub (const octave_value& elt) const
++{
++  std::string str;
++
++  if (cell_is_editable (elt))
++    str = elt.edit_display (m_display_fmt, 0, 0);
++  else
++    {
++      dim_vector dv = elt.dims ();
++      str = "[" + dv.str () + " " + elt.class_name () + "]";
++    }
++
++  return QString::fromStdString (str);
++}
++
++QVariant
++base_ve_model::edit_display (const QModelIndex& idx) const
++{
++  int row;
++  int col;
++
++  if (! index_ok (idx, row, col))
++    return QVariant ();
+ 
+-          return do_requires_sub_editor_sub (m(row,col));
+-        }
++  std::string str = m_value.edit_display (m_display_fmt, row, col);
++  return QString::fromStdString (str);
++}
++
++QVariant
++base_ve_model::data (const QModelIndex& idx, int role) const
++{
++  if (idx.isValid () && role == Qt::DisplayRole && update_pending (idx))
++    return QVariant (update_pending_data (idx));
++
++  if (! m_valid)
++    {
++      if (role == Qt::DisplayRole)
++        return QVariant (QString ("Variable %d not found")
++                         .arg (QString::fromStdString (m_name)));
++
++      return QVariant (QString ("x"));
+     }
+-  else
+-    return false;
++
++  switch (role)
++    {
++    case Qt::DisplayRole:
++    case Qt::EditRole:
++      return edit_display (idx);
++
++#if 0
++    case Qt::StatusTipRole:
++      return elem (idx).m_status_tip;
++
++    case Qt::ToolTipRole:
++      return elem (idx).m_tool_tip;
++
++    case Qt::BackgroundRole:
++      return elem (idx).m_background;
++#endif
++    }
++
++  // Invalid.
++  return QVariant ();
++}
++
++bool
++base_ve_model::requires_sub_editor (const QModelIndex&) const
++{
++  return false;
+ }
+ 
+-struct variable_editor_model::impl
++void
++base_ve_model::set_update_pending (const QModelIndex& idx, const QString& str)
++{
++  m_update_pending[idx] = str;
++}
++
++bool
++base_ve_model::update_pending (const QModelIndex& idx) const
++{
++  return m_update_pending.contains (idx);
++}
++
++QString
++base_ve_model::update_pending_data (const QModelIndex& idx) const
+ {
+-  impl (void) = delete;
++  return m_update_pending[idx];
++}
++
++void
++base_ve_model::clear_update_pending (void)
++{
++  return m_update_pending.clear ();
++}
++
++char
++base_ve_model::quote_char (const QModelIndex&) const
++{
++  return 0;
++}
++
++QVariant
++base_ve_model::header_data (int section, Qt::Orientation, int role) const
++{
++
++  if (role != Qt::DisplayRole)
++    return QVariant ();
++
++  return QString::number (section+1);
++}
+ 
+-  impl (const QString& name, const octave_value& val, QLabel *label)
+-    : m_name (name.toStdString ()), m_value (val),
+-      m_data_rows (0), m_data_cols (0),
+-      m_display_rows (32), m_display_cols (16),
+-      m_update_pending (), m_validity (true),
+-      m_validtext (make_label (m_name, m_value)),
+-      m_label (label),
+-      m_display_fmt (get_edit_display_format (m_value))
++QString
++base_ve_model::subscript_expression (const QModelIndex&) const
++{
++  return "";
++}
++
++QString
++base_ve_model::make_label_text (void) const
++{
++  QString lbl_txt = QString::fromStdString (m_name);
++
++  if (m_value.is_defined ())
++    {
++      if (! lbl_txt.isEmpty ())
++        lbl_txt += " ";
++
++      dim_vector dv = m_value.dims ();
++
++      lbl_txt += ("["
++                  + QString::fromStdString (dv.str ())
++                  + " "
++                  + QString::fromStdString (m_value.class_name ())
++                  + "]");
++    }
++  else
++    lbl_txt += " [undefined]";
++
++  return lbl_txt;
++}
++
++// Private slots.
++
++octave_value
++base_ve_model::value_at (const QModelIndex&) const
++{
++  return octave_value ();
++}
++
++class numeric_model : public base_ve_model
++{
++public:
++
++  numeric_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
+   {
+-    m_label->setText (m_validtext);
++    // FIXME: should fill the window and expand on scrolling or
++    // resizing.
++
++    m_display_rows = m_data_rows + 16;
++    m_display_cols = m_data_cols + 16;
+   }
+ 
+-  impl (const impl&) = delete;
++  ~numeric_model (void) = default;
++
++  // No copying!
++
++  numeric_model (const numeric_model&) = delete;
++
++  numeric_model& operator = (const numeric_model&) = delete;
+ 
+-  impl& operator = (const impl&) = delete;
++  QVariant edit_display (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
+ 
+-  octave_idx_type data_rows (void) const { return m_data_rows; }
+-  octave_idx_type data_columns (void) const { return m_data_cols; }
++    if (! index_ok (idx, row, col))
++      return QVariant ();
++
++    std::string str = m_value.edit_display (m_display_fmt, row, col);
++    return QString::fromStdString (str);
++  }
+ 
+-  int display_rows (void) const { return m_display_rows; }
+-  int display_columns (void) const { return m_display_cols; }
++  QString subscript_expression (const QModelIndex& idx) const
++  {
++    if (! idx.isValid ())
++      return "";
++
++    return (QString ("(%1,%2)")
++            .arg (idx.row () + 1)
++            .arg (idx.column () + 1));
++  }
++};
+ 
+-  void set_update_pending (const QModelIndex& idx, const QString& str)
++class string_model : public base_ve_model
++{
++public:
++
++  string_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
+   {
+-    m_update_pending[idx] = str;
++    m_data_rows = 1;
++    m_data_cols = 1;
++
++    m_display_rows = 1;
++    m_display_cols = 1;
+   }
+ 
+-  bool update_pending (const QModelIndex& idx) const
++  ~string_model (void) = default;
++
++  // No copying!
++
++  string_model (const string_model&) = delete;
++
++  string_model& operator = (const string_model&) = delete;
++
++  QVariant edit_display (const QModelIndex&) const
+   {
+-    return m_update_pending.contains (idx);
++    std::string str = m_value.edit_display (m_display_fmt, 0, 0);
++    return QString::fromStdString (str);
+   }
+ 
+-  QString update_pending_data (const QModelIndex& idx) const
++  char quote_char (const QModelIndex&) const
+   {
+-    return m_update_pending[idx];
++    return get_quote_char (m_value);
++  }
++};
++
++class cell_model : public base_ve_model
++{
++public:
++
++  cell_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
++  {
++    // FIXME: should fill the window and expand on scrolling or
++    // resizing.
++
++    m_display_rows = m_data_rows + 16;
++    m_display_cols = m_data_cols + 16;
+   }
+ 
+-  void clear_update_pending (void)
++  ~cell_model (void) = default;
++
++  // No copying!
++
++  cell_model (const cell_model&) = delete;
++
++  cell_model& operator = (const cell_model&) = delete;
++
++  QVariant edit_display (const QModelIndex& idx) const
+   {
+-    return m_update_pending.clear ();
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return QVariant ();
++
++    Cell cval = m_value.cell_value ();
++
++    return edit_display_sub (cval(row,col));
+   }
+ 
+-  int column_width (void) const
++  bool requires_sub_editor (const QModelIndex& idx) const
+   {
+-    int width = 0;
++    int row;
++    int col;
+ 
+-    float_format r_fmt = m_display_fmt.real_format ();
+-    float_format i_fmt = m_display_fmt.imag_format ();
++    if (! index_ok (idx, row, col))
++      return false;
+ 
+-    int rw = r_fmt.fw;
+-    int iw = i_fmt.fw;
++    Cell cval = m_value.cell_value ();
++
++    return do_requires_sub_editor_sub (cval(row,col));
++  }
+ 
+-    if (rw > 0)
+-      {
+-        if (m_value.iscomplex ())
+-          {
+-            if (iw > 0)
+-              width = rw + iw + 5;
+-          }
+-        else
+-          width = rw + 2;
+-      }
++  char quote_char (const QModelIndex& idx) const
++  {
++    octave_value ov = value_at (idx);
++
++    if (ov.is_string ())
++      return get_quote_char (ov);
+ 
+-    return width;
++    return 0;
++  }
++
++  QString subscript_expression (const QModelIndex& idx) const
++  {
++    if (! idx.isValid ())
++      return "";
++
++    return (QString ("{%1,%2}")
++            .arg (idx.row () + 1)
++            .arg (idx.column () + 1));
+   }
+ 
+-  char quote_char (int row, int col) const
++  octave_value value_at (const QModelIndex& idx) const
+   {
+-    if (m_value.is_string ())
+-      return get_quote_char (m_value);
+-    else if (m_value.iscell ())
+-      {
+-        octave_value ov = value_at (row, col);
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return octave_value ();
++
++    Cell cval = m_value.cell_value ();
++
++    return cval(row,col);
++  }
++};
++
++// Scalar struct.  Rows are fields, single column for values.
++
++class scalar_struct_model : public base_ve_model
++{
++public:
++
++  scalar_struct_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
++  {
++    // No extra cells.  We currently don't allow new fields or
++    // additional values to be inserted.  If we allow additional values,
++    // then the object becomes a vector structure and the display flips
++    // (see the vector struct model below).  Do we want that?
++
++    m_data_rows = val.nfields ();
++    m_data_cols = 1;
++
++    m_display_rows = m_data_rows;
++    m_display_cols = 1;
++  }
++
++  ~scalar_struct_model (void) = default;
+ 
+-        if (ov.is_string ())
+-          return get_quote_char (ov);
+-      }
+-    else if (m_value.isstruct ())
+-      {
+-        octave_value ov = value_at (row, col);
++  // No copying!
++
++  scalar_struct_model (const scalar_struct_model&) = delete;
++
++  scalar_struct_model& operator = (const scalar_struct_model&) = delete;
++
++  QVariant edit_display (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return QVariant ();
++
++    octave_scalar_map m = m_value.scalar_map_value ();
++
++    return edit_display_sub (m.contents (row));
++  }
+ 
+-        if (ov.is_string ())
+-          return get_quote_char (ov);
+-      }
++  bool requires_sub_editor (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return false;
++
++    octave_scalar_map m = m_value.scalar_map_value ();
++
++    return do_requires_sub_editor_sub (m.contents (row));
++  }
++
++  char quote_char (const QModelIndex& idx) const
++  {
++    octave_value ov = value_at (idx);
++
++    if (ov.is_string ())
++      return get_quote_char (ov);
+ 
+     return 0;
+   }
+ 
+   QVariant header_data (int section, Qt::Orientation orientation,
+                         int role) const
+   {
+     if (role != Qt::DisplayRole)
+       return QVariant ();
+ 
+-    if (m_value.isstruct ())
++    switch (orientation)
+       {
+-        if (m_value.numel () == 1)
+-          {
+-            // Scalar struct.  Rows are fields, single column for
+-            // values.
+-
+-            if (orientation == Qt::Horizontal)
+-              return QString ("Values");
+-            else
+-              {
+-                octave_scalar_map m = m_value.scalar_map_value ();
+-
+-                string_vector fields = m.fieldnames ();
++      case Qt::Horizontal:
++        return QString ("Values");
+ 
+-                return QString::fromStdString (fields(section));
+-              }
+-          }
+-        else if (m_value.rows () == 1 || m_value.columns () == 1)
+-          {
+-            // Vector struct.  Columns are fields, rows are values.
++      case Qt::Vertical:
++        {
++          octave_scalar_map m = m_value.scalar_map_value ();
+ 
+-            if (orientation == Qt::Horizontal)
+-              {
+-                octave_map m = m_value.map_value ();
+-
+-                string_vector fields = m.fieldnames ();
++          string_vector fields = m.fieldnames ();
+ 
+-                return QString::fromStdString (fields(section));
+-              }
+-            else
+-              return QString::number (section+1);
+-          }
+-        else
+-          {
+-            // 2-d struct array.  Rows and columns index individual
+-            // scalar structs.
++          return QString::fromStdString (fields(section));
++        }
+ 
+-            return QString::number (section+1);
+-          }
++      default:
++        break;
+       }
+ 
+-    return QString::number (section+1);
++    return QVariant ();
+   }
+ 
+-  QString subscript_expression (int row, int col) const
++  QString subscript_expression (const QModelIndex& idx) const
+   {
+-    if (m_value.is_string ())
+-      return "";
+-    else if (m_value.iscell ())
+-      return (QString ("{%1, %2}")
+-              .arg (row + 1)
+-              .arg (col + 1));
+-    else if (m_value.isstruct ())
+-      {
+-        if (m_value.numel () == 1)
+-          {
+-            // Scalar struct.  Rows are fields, single column for
+-            // values.
+-
+-            octave_scalar_map m = m_value.scalar_map_value ();
+-
+-            string_vector fields = m.fieldnames ();
++    // Display size and data size match, so all valid indices should
++    // also be valid indices for the existing struct.
+ 
+-            return QString (".%1").arg (QString::fromStdString (fields(row)));
+-          }
+-        else if (m_value.rows () == 1 || m_value.columns () == 1)
+-          {
+-            // Vector struct.  Columns are fields, rows are values.
+-
+-            octave_map m = m_value.map_value ();
+-
+-            string_vector fields = m.fieldnames ();
+-
+-            return (QString ("(%1).%2")
+-                    .arg (row + 1)
+-                    .arg (QString::fromStdString (fields(col))));
+-          }
+-        else
+-          {
+-            // 2-d struct array.  Rows and columns index individual
+-            // scalar structs.
+-
+-            octave_map m = m_value.map_value ();
++    int row;
++    int col;
+ 
+-            return (QString ("(%1,%2)")
+-                    .arg (row + 1)
+-                    .arg (col + 1));
+-          }
+-      }
+-    else
+-      return (QString ("(%1, %2)")
+-              .arg (row + 1)
+-              .arg (col + 1));
+-  }
+-
+-  octave_value value_at (int row, int col) const
+-  {
+-    if (m_value.iscell ())
+-      {
+-        Cell cval = m_value.cell_value ();
+-
+-        return cval(row,col);
+-      }
+-    else if (m_value.isstruct ())
+-      {
+-        if (m_value.numel () == 1)
+-          {
+-            // Scalar struct.  Rows are fields, single column for
+-            // values.
++    if (! index_ok (idx, row, col))
++      return "";
+ 
+-            octave_scalar_map m = m_value.scalar_map_value ();
+-
+-            return m.contents (row);
+-          }
+-        else if (m_value.rows () == 1 || m_value.columns () == 1)
+-          {
+-            // Vector struct.  Columns are fields, rows are values.
+-
+-            octave_map m = m_value.map_value ();
+-
+-            Cell cval = m.contents (col);
++    octave_scalar_map m = m_value.scalar_map_value ();
+ 
+-            return cval(row);
+-          }
+-        else
+-          {
+-            // 2-d struct array.  Rows and columns index individual
+-            // scalar structs.
++    string_vector fields = m.fieldnames ();
+ 
+-            octave_map m = m_value.map_value ();
+-
+-            return m(row,col);
+-          }
+-      }
+-    else
+-      return octave_value ();
++    return QString (".%1").arg (QString::fromStdString (fields(row)));
+   }
+ 
+   octave_value value_at (const QModelIndex& idx) const
+   {
+-    return value_at (idx.row (), idx.column ());
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return octave_value ();
++
++    octave_scalar_map m = m_value.scalar_map_value ();
++
++    return m.contents (row);
++  }
++};
++
++class display_only_model : public base_ve_model
++{
++public:
++
++  display_only_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
++  {
++    m_data_rows = 0;
++    m_data_cols = 0;
++
++    m_display_rows = m_data_rows;
++    m_display_cols = m_data_cols;
+   }
+ 
+-  bool requires_sub_editor (const QModelIndex& idx)
++  ~display_only_model (void) = default;
++
++  // No copying!
++
++  display_only_model (const display_only_model&) = delete;
++
++  display_only_model& operator = (const display_only_model&) = delete;
++
++  bool is_editable (void) const { return false; }
++
++  QVariant edit_display (const QModelIndex&) const
+   {
+-    return (idx.isValid ()
+-            && do_requires_sub_editor (m_value, idx.row (), idx.column ()));
++    if (m_value.is_undefined ())
++      return QVariant ();
++
++    std::ostringstream buf;
++
++    octave_value tval = m_value;
++
++    tval.print_with_name (buf, m_name);
++
++    return QString::fromStdString (buf.str ());
+   }
+ 
+-  void reset (const octave_value& val)
++  QString make_label_text (void) const
+   {
+-    m_validity = false;
+-
+-    m_value = val;
++    return (QString ("unable to edit %1")
++            .arg (base_ve_model::make_label_text ()));
++  }
++};
+ 
+-    m_display_fmt = get_edit_display_format (m_value);
++// Vector struct.  Columns are fields, rows are values.
+ 
+-    if (m_value.is_defined ())
+-      {
+-        m_validity = true;
+-
+-        get_data_rows_and_columns (m_value, m_data_rows, m_data_cols);
++class vector_struct_model : public base_ve_model
++{
++public:
+ 
+-        m_display_rows = (m_data_rows > (m_display_rows - 8)
+-                          ? m_data_rows + 16 : m_display_rows);
++  vector_struct_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
++  {
++    // FIXME: should fill the window vertically and expand on scrolling
++    // or resizing.  No extra cells horizontally.  New fields must be
++    // added specially.
+ 
+-        m_display_cols = (m_data_cols > (m_display_cols - 8)
+-                          ? m_data_cols + 16 : m_display_cols);
+-      }
+-    else
+-      {
+-        m_data_rows = 0;
+-        m_data_cols = 0;
+-      }
++    m_data_rows = val.numel ();
++    m_data_cols = val.nfields ();
+ 
+-    m_label->setTextFormat (Qt::PlainText);
+-
+-    m_validtext = make_label (m_name, m_value);
++    m_display_rows = m_data_rows + 16;
++    m_display_cols = m_data_cols;
+   }
+ 
+-  void invalidate (void)
++  ~vector_struct_model (void) = default;
++
++  // No copying!
++
++  vector_struct_model (const vector_struct_model&) = delete;
++
++  vector_struct_model& operator = (const vector_struct_model&) = delete;
++
++  QVariant edit_display (const QModelIndex& idx) const
+   {
+-    reset (octave_value ());
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return QVariant ();
++
++    octave_map m = m_value.map_value ();
++
++    Cell cval = m.contents (col);
++
++    return edit_display_sub (cval(row));
+   }
+ 
+-  QVariant data (const QModelIndex& idx, int role)
++  bool requires_sub_editor (const QModelIndex& idx) const
+   {
+-    if (idx.isValid ())
+-      {
+-        switch (role)
+-          {
+-          case Qt::DisplayRole:
+-          case Qt::EditRole:
+-            return do_edit_display (m_display_fmt, m_value,
+-                                    idx.row (), idx.column ());
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return false;
++
++    octave_map m = m_value.map_value ();
++
++    Cell cval = m.contents (col);
++
++    return do_requires_sub_editor_sub (cval(row));
++  }
++
++  char quote_char (const QModelIndex& idx) const
++  {
++    octave_value ov = value_at (idx);
++
++    if (ov.is_string ())
++      return get_quote_char (ov);
+ 
+-#if 0
+-          case Qt::StatusTipRole:
+-            return elem (idx).m_status_tip;
++    return 0;
++  }
++
++  QVariant header_data (int section, Qt::Orientation orientation,
++                        int role) const
++  {
++    if (role != Qt::DisplayRole)
++      return QVariant ();
+ 
+-          case Qt::ToolTipRole:
+-            return elem (idx).m_tool_tip;
++    switch (orientation)
++      {
++      case Qt::Horizontal:
++        {
++          octave_map m = m_value.map_value ();
++
++          string_vector fields = m.fieldnames ();
+ 
+-          case Qt::BackgroundRole:
+-            return elem (idx).m_background;
+-#endif
+-          }
++          return QString::fromStdString (fields(section));
++        }
++
++      case Qt::Vertical:
++        return QString::number (section+1);
++
++      default:
++        break;
+       }
+ 
+     return QVariant ();
+   }
+ 
+-  const std::string m_name;
++  QString subscript_expression (const QModelIndex& idx) const
++  {
++    if (! idx.isValid ())
++      return "";
++
++    octave_map m = m_value.map_value ();
++
++    string_vector fields = m.fieldnames ();
++
++    return (QString ("(%1).%2")
++            .arg (idx.row () + 1)
++            .arg (QString::fromStdString (fields(idx.column ()))));
++  }
+ 
+-  octave_value m_value;
++  octave_value value_at (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return octave_value ();
++
++    octave_map m = m_value.map_value ();
++
++    Cell cval = m.contents (col);
++
++    return cval(row);
++  }
++};
++
++// 2-d struct array.  Rows and columns index individual scalar structs.
+ 
+-  octave_idx_type m_data_rows;
+-  octave_idx_type m_data_cols;
++class struct_model : public base_ve_model
++{
++public:
++
++  struct_model (const QString& expr, const octave_value& val)
++    : base_ve_model (expr, val)
++  {
++    // FIXME: should fill the window and expand on scrolling or
++    // resizing.
++
++    m_display_rows = m_data_rows + 16;
++    m_display_cols = m_data_cols + 16;
++  }
++
++  ~struct_model (void) = default;
++
++  // No copying!
+ 
+-  // Qt table widget limits the size to int.
+-  int m_display_rows;
+-  int m_display_cols;
++  struct_model (const struct_model&) = delete;
++
++  struct_model& operator = (const struct_model&) = delete;
++
++  QVariant edit_display (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return QVariant ();
++
++    std::string str = m_value.edit_display (m_display_fmt, row, col);
++    return QString::fromStdString (str);
++  }
++
++  bool requires_sub_editor (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
+ 
+-  QMap<QModelIndex, QString> m_update_pending;
++    if (! index_ok (idx, row, col))
++      return false;
++
++    octave_map m = m_value.map_value ();
++
++    return do_requires_sub_editor_sub (m(row,col));
++  }
++
++  char quote_char (const QModelIndex& idx) const
++  {
++    octave_value ov = value_at (idx);
++
++    if (ov.is_string ())
++      return get_quote_char (ov);
++
++    return 0;
++  }
+ 
+-  bool m_validity;
++  QString subscript_expression (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
++
++    if (! index_ok (idx, row, col))
++      return "";
++
++    return (QString ("(%1,%2)")
++            .arg (row + 1)
++            .arg (col + 1));
++  }
++
++  octave_value value_at (const QModelIndex& idx) const
++  {
++    int row;
++    int col;
+ 
+-  QString m_validtext;
++    if (! index_ok (idx, row, col))
++      return octave_value ();
++
++    octave_map m = m_value.map_value ();
++
++    return m(row,col);
++  }
++};
++
++base_ve_model *
++variable_editor_model::create (const QString& expr, const octave_value& val)
++{
++  // Choose specific model based on type of val.
+ 
+-  QLabel *m_label;
++  if ((val.isnumeric () || val.islogical ()) && val.ndims () == 2)
++    return new numeric_model (expr, val);
++  else if (val.is_string () && (val.rows () == 1 || val.is_zero_by_zero ()))
++    return new string_model (expr, val);
++  else if (val.iscell ())
++    return new cell_model (expr, val);
++  else if (val.isstruct ())
++    {
++      if (val.numel () == 1)
++        return new scalar_struct_model (expr, val);
++      else if (val.ndims () == 2)
++        {
++          if (val.rows () == 1 || val.columns () == 1)
++            return new vector_struct_model (expr, val);
++          else
++            return new struct_model (expr, val);
++        }
++    }
+ 
+-  float_display_format m_display_fmt;
+-};
++  return new display_only_model (expr, val);
++}
+ 
+ variable_editor_model::variable_editor_model (const QString& expr,
+                                               const octave_value& val,
+                                               QLabel *label,
+                                               QObject *parent)
+-  : QAbstractTableModel (parent), m_parent (parent),
+-    m_d (new impl (expr, val, label))
++  : QAbstractTableModel (parent), m_label (label),
++    rep (create (expr, val))
+ {
+-  connect (this, SIGNAL (user_error_signal (const QString&, const QString&)),
+-           this, SLOT (user_error (const QString&, const QString&)));
+-
+-  connect (this, SIGNAL (update_data_signal (const octave_value&)),
+-           this, SLOT (update_data (const octave_value&)));
+-
+-  connect (this, SIGNAL (data_error_signal (const QString&)),
+-           this, SLOT (data_error (const QString&)));
+-
+-  connect (this, SIGNAL (maybe_resize_columns_signal (void)),
+-           parent, SLOT (maybe_resize_columns (void)));
+-
+-  if (! type_is_editable (val))
+-    return;
+-
+-  // Initializes everything.
++  update_label ();
+ 
+-  m_d->reset (val);
+-
+-  beginInsertRows (QModelIndex (), 0, m_d->display_rows () - 1);
+-  endInsertRows ();
+-
+-  beginInsertColumns (QModelIndex (), 0, m_d->display_columns () - 1);
+-  endInsertColumns ();
+-}
+-
+-variable_editor_model::~variable_editor_model (void)
+-{
+-  delete m_d;
+-}
+-
+-octave_value
+-variable_editor_model::value_at (const QModelIndex& idx) const
+-{
+-  return m_d->value_at (idx);
+-}
++  if (is_editable ())
++    {
++      connect (this, SIGNAL (user_error_signal (const QString&, const QString&)),
++               this, SLOT (user_error (const QString&, const QString&)));
+ 
+-int
+-variable_editor_model::column_width (void) const
+-{
+-  return m_d->column_width  ();
+-}
++      connect (this, SIGNAL (update_data_signal (const octave_value&)),
++               this, SLOT (update_data (const octave_value&)));
+ 
+-int
+-variable_editor_model::rowCount (const QModelIndex&) const
+-{
+-  return m_d->m_validity ? m_d->display_rows () : 1;
+-}
+-
+-int
+-variable_editor_model::columnCount (const QModelIndex&) const
+-{
+-  return m_d->m_validity ? m_d->display_columns () : 1;
+-}
++      connect (this, SIGNAL (data_error_signal (const QString&)),
++               this, SLOT (data_error (const QString&)));
+ 
+-QVariant
+-variable_editor_model::data (const QModelIndex& idx, int role) const
+-{
+-  if (role == Qt::DisplayRole && update_pending (idx))
+-    return QVariant (update_pending_data (idx));
++      beginInsertRows (QModelIndex (), 0, display_rows () - 1);
++      endInsertRows ();
+ 
+-  if (! m_d->m_validity)
+-    {
+-      if (idx.isValid ())
+-        {
+-          if (role == Qt::DisplayRole)
+-            return QVariant (QString ("Variable %d not found")
+-                             .arg (QString::fromStdString (m_d->m_name)));
+-        }
+-
+-      return QVariant (QString ("x"));
++      beginInsertColumns (QModelIndex (), 0, display_columns () - 1);
++      endInsertColumns ();
+     }
+-
+-  if (idx.isValid ())
+-    return m_d->data (idx, role);
+-
+-  // Invalid.
+-  return QVariant ();
+ }
+ 
+ bool
+-variable_editor_model::setData (const QModelIndex& idx, const QVariant& v,
+-                                int role)
++variable_editor_model::setData (const QModelIndex& idx,
++                                const QVariant& v_user_input, int role)
+ {
+-  if (role != Qt::EditRole || v.type () != QVariant::String
+-      || ! idx.isValid () || requires_sub_editor (idx))
++  if (role != Qt::EditRole || v_user_input.type () != QVariant::String
++      || ! idx.isValid ())
+     return false;
+ 
+   // Initially, set value to whatever the user entered.
+ 
+-  int row = idx.row ();
+-  int col = idx.column ();
++  QString user_input = v_user_input.toString ();
++
++  set_update_pending (idx, user_input);
++
++  std::ostringstream os;
+ 
+-  QString vstr = v.toString ();
++  std::string nm = name ();
++  os << nm;
++
++  QString tmp = subscript_expression (idx);
++  os << tmp.toStdString () << "=";
+ 
+-  set_update_pending (idx, vstr);
++  char qc = quote_char (idx);
++  if (qc)
++    os << qc;
++
++  os << user_input.toStdString ();
+ 
+-  // Evaluate the string that the user entered.  If that fails, we
+-  // will restore previous value.
++  if (qc)
++    os << qc;
+ 
+-  octave_link::post_event<variable_editor_model, int, int, std::string>
+-    (this, &variable_editor_model::set_data_oct, row, col, vstr.toStdString ());
++  std::string expr = os.str ();
++
++  octave_link::post_event<variable_editor_model, std::string, std::string, QModelIndex>
++    (this, &variable_editor_model::set_data_oct, nm, expr, idx);
+ 
+   return true;
+ }
+ 
+ bool
+ variable_editor_model::clear_content (const QModelIndex& idx)
+ {
+-  octave_idx_type data_rows = m_d->data_rows ();
+-  octave_idx_type data_cols = m_d->data_columns ();
+-
+   int row = idx.row ();
+   int col = idx.column ();
+ 
+-  if (row < data_rows && col < data_cols)
++  if (row < data_rows () && col < data_columns ())
+     return setData (idx, QVariant ("0"));
+ 
+   return false;
+ }
+ 
+ Qt::ItemFlags
+ variable_editor_model::flags (const QModelIndex& idx) const
+ {
+-  if (! m_d->m_validity)
++  if (! is_valid ())
+     return Qt::NoItemFlags;
+ 
+   Qt::ItemFlags retval = QAbstractTableModel::flags (idx);
+ 
+   if (! requires_sub_editor (idx))
+     retval |= Qt::ItemIsEditable;
+ 
+   return retval;
+ }
+ 
+ bool
+ variable_editor_model::insertRows (int row, int count, const QModelIndex&)
+ {
+   // FIXME: cells?
+ 
+   octave_link::post_event <variable_editor_model, std::string, std::string>
+-    (this, &variable_editor_model::eval_oct, m_d->m_name,
++    (this, &variable_editor_model::eval_oct, name (),
+      QString ("%1 = [ %1(1:%2,:) ; zeros(%3, columns(%1)) ; %1(%2+%3:end,:) ]")
+-     .arg (QString::fromStdString (m_d->m_name))
++     .arg (QString::fromStdString (name ()))
+      .arg (row)
+      .arg (count)
+      .toStdString ());
+ 
+   return true;
+ }
+ 
+ bool
+ variable_editor_model::removeRows (int row, int count, const QModelIndex&)
+ {
+-  if (row + count > m_d->data_rows ())
++  if (row + count > data_rows ())
+     {
+       qDebug () << "Tried to remove too many rows "
+-                << m_d->data_rows () << " "
++                << data_rows () << " "
+                 << count << " (" << row << ")";
+       return false;
+     }
+ 
+   octave_link::post_event <variable_editor_model, std::string, std::string>
+-    (this, &variable_editor_model::eval_oct, m_d->m_name,
++    (this, &variable_editor_model::eval_oct, name (),
+      QString ("%1(%2:%3, :) = []")
+-     .arg (QString::fromStdString (m_d->m_name))
++     .arg (QString::fromStdString (name ()))
+      .arg (row)
+      .arg (row + count)
+      .toStdString ());
+ 
+   return true;
+ }
+ 
+ bool
+ variable_editor_model::insertColumns (int col, int count, const QModelIndex&)
+ {
+   octave_link::post_event <variable_editor_model, std::string, std::string>
+-    (this, &variable_editor_model::eval_oct, m_d->m_name,
++    (this, &variable_editor_model::eval_oct, name (),
+      QString ("%1 = [ %1(:,1:%2) ; zeros(rows(%1), %3) %1(:,%2+%3:end) ]")
+-     .arg (QString::fromStdString (m_d->m_name))
++     .arg (QString::fromStdString (name ()))
+      .arg (col)
+      .arg (count)
+      .toStdString ());
+ 
+   return true;
+ }
+ 
+ bool
+ variable_editor_model::removeColumns (int col, int count, const QModelIndex&)
+ {
+-  if (col + count > m_d->data_columns ())
++  if (col + count > data_columns ())
+     {
+       qDebug () << "Tried to remove too many cols "
+-                << m_d->data_columns () << " "
++                << data_columns () << " "
+                 << count << " (" << col << ")";
+       return false;
+     }
+ 
+   octave_link::post_event <variable_editor_model, std::string, std::string>
+-    (this, &variable_editor_model::eval_oct, m_d->m_name,
++    (this, &variable_editor_model::eval_oct, name (),
+      QString ("%1(:, %2:%3) = []")
+-     .arg (QString::fromStdString (m_d->m_name))
++     .arg (QString::fromStdString (name ()))
+      .arg (col)
+      .arg (col + count)
+      .toStdString ());
+ 
+   return true;
+ }
+ 
+ void
+-variable_editor_model::update_data_cache (void)
++variable_editor_model::set_data_oct (const std::string& name,
++                                     const std::string& expr,
++                                     const QModelIndex& idx)
+ {
+-  octave_link::post_event
+-    (this, &variable_editor_model::init_from_oct, m_d->m_name);
+-}
++  // INTERPRETER THREAD
++
++  try
++    {
++      int parse_status = 0;
++
++      octave::eval_string (expr, true, parse_status);
++
++      octave_value val = retrieve_variable (name);
+ 
+-bool
+-variable_editor_model::requires_sub_editor (const QModelIndex& idx) const
+-{
+-  return m_d->requires_sub_editor (idx);
++      emit update_data_signal (val);
++    }
++  catch (octave::execution_exception&)
++    {
++      clear_update_pending ();
++
++      evaluation_error (expr);
++
++      // This will cause the data in the cell to be reset
++      // from the cached octave_value object.
++
++      emit dataChanged (idx, idx);
++    }
+ }
+ 
+ void
+-variable_editor_model::set_update_pending (const QModelIndex& idx,
+-                                           const QString& str)
++variable_editor_model::init_from_oct (const std::string& name)
+ {
+-  m_d->set_update_pending (idx, str);
+-}
++  // INTERPRETER THREAD
++
++  try
++    {
++      octave_value val = retrieve_variable (name);
+ 
+-bool
+-variable_editor_model::update_pending (const QModelIndex& idx) const
+-{
+-  return m_d->update_pending (idx);
+-}
++      emit update_data_signal (val);
++    }
++  catch (octave::execution_exception&)
++    {
++      QString msg = (QString ("variable '%1' is invalid or undefined")
++                     .arg (QString::fromStdString (name)));
+ 
+-QString
+-variable_editor_model::update_pending_data (const QModelIndex& idx) const
+-{
+-  return m_d->update_pending_data (idx);
++      emit data_error_signal (msg);
++    }
+ }
+ 
+ void
+-variable_editor_model::clear_update_pending (void)
++variable_editor_model::eval_oct (const std::string& name,
++                                 const std::string& expr)
+ {
+-  m_d->clear_update_pending ();
+-}
++  // INTERPRETER THREAD
++
++  try
++    {
++      int parse_status = 0;
+ 
+-char
+-variable_editor_model::quote_char (int row, int col) const
+-{
+-  return m_d->quote_char (row, col);
++      octave::eval_string (expr, true, parse_status);
++
++      init_from_oct (name);
++    }
++  catch  (octave::execution_exception&)
++    {
++      evaluation_error (expr);
++    }
+ }
+ 
+-QVariant
+-variable_editor_model::headerData (int section, Qt::Orientation orientation,
+-                                   int role) const
++// If the variable exists, load it into the data model.  If it doesn't
++// exist, flag the data model as referring to a nonexistent variable.
++// This allows the variable to be opened before it is created.
++
++// This function should only be called within other functions that
++// execute in the interpreter thread.  It should also be called in a
++// try-catch block that catches execution exceptions.
++
++octave_value
++variable_editor_model::retrieve_variable (const std::string& x)
+ {
+-  return m_d->header_data (section, orientation, role);
++  // INTERPRETER THREAD
++
++  std::string name = x;
++
++  name = name.substr (0, name.find ("."));
++
++  if (name.back () == ')' || name.back () == '}')
++    name = name.substr (0, name.find (name.back () == ')' ? "(" : "{"));
++
++  if (symbol_exist (name, "var") > 0)
++    {
++      int parse_status = 0;
++
++      return octave::eval_string (x, true, parse_status);
++    }
++
++  return octave_value ();
+ }
+ 
+-QString
+-variable_editor_model::subscript_expression (int row, int col) const
++void
++variable_editor_model::evaluation_error (const std::string& expr) const
+ {
+-  return m_d->subscript_expression (row, col);
++  emit user_error_signal ("Evaluation failed",
++                          QString ("failed to evaluate expression: '%1'")
++                          .arg (QString::fromStdString (expr)));
+ }
+ 
+-QString
+-variable_editor_model::subscript_expression (const QModelIndex& idx) const
+-{
+-  return subscript_expression (idx.row (), idx.column ());
+-}
+-
+-// Private slots.
+-
+ void
+ variable_editor_model::user_error (const QString& title, const QString& msg)
+ {
+   QMessageBox::critical (nullptr, title, msg);
+ }
+ 
+ void
++variable_editor_model::update_data_cache (void)
++{
++  octave_link::post_event
++    (this, &variable_editor_model::init_from_oct, name ());
++}
++
++void
+ variable_editor_model::update_data (const octave_value& val)
+ {
+   if (val.is_undefined ())
+     {
+       QString msg = (QString ("variable '%1' is invalid or undefined")
+-                     .arg (QString::fromStdString (m_d->m_name)));
++                     .arg (QString::fromStdString (name ())));
+ 
+       emit data_error_signal (msg);
+ 
+       return;
+     }
+ 
+-  if (! type_is_editable (val))
+-    return;
+-
+   // Add or remove rows and columns when the size changes.
+ 
+-  int old_display_rows = m_d->display_rows ();
+-  int old_display_cols = m_d->display_columns ();
++  int old_display_rows = display_rows ();
++  int old_display_cols = display_columns ();
+ 
+-  m_d->reset (val);
++  reset (val);
+ 
+-  int new_display_rows = m_d->display_rows ();
+-  int new_display_cols = m_d->display_columns ();
++  int new_display_rows = display_rows ();
++  int new_display_cols = display_columns ();
+ 
+   if (new_display_rows < old_display_rows)
+     {
+       beginRemoveRows (QModelIndex (), new_display_rows, old_display_rows-1);
+       endRemoveRows ();
+     }
+   else if (new_display_rows > old_display_rows)
+     {
+@@ -925,224 +1201,57 @@ variable_editor_model::update_data (cons
+   else if (new_display_cols > old_display_cols)
+     {
+       beginInsertColumns (QModelIndex (), old_display_cols, new_display_cols-1);
+       endInsertColumns ();
+     }
+ 
+   clear_update_pending ();
+ 
+-  display_valid ();
+-
+   emit dataChanged (QAbstractTableModel::index (0, 0),
+                     QAbstractTableModel::index (new_display_rows-1, new_display_cols-1));
+ 
+   emit maybe_resize_columns_signal ();
+ }
+ 
+-// Private.
+-
+-// val has to be copied!
+-
+ void
+-variable_editor_model::set_data_oct (const int& row, const int& col,
+-                                     const std::string& rhs)
++variable_editor_model::data_error (const QString& msg)
+ {
+-  // INTERPRETER THREAD
+-
+-  std::string expr;
+-
+-  try
+-    {
+-      int parse_status = 0;
+-
+-      std::ostringstream os;
+-
+-      std::string name = m_d->m_name;
+-      os << name;
+-
+-      QString tmp = subscript_expression (row, col);
+-      os << tmp.toStdString () << " = ";
++  invalidate ();
+ 
+-      char qc = quote_char (row, col);
+-      if (qc)
+-        os << qc;
+-
+-      os << rhs;
+-
+-      if (qc)
+-        os << qc;
+-
+-      expr = os.str ();
+-
+-      octave::eval_string (expr, true, parse_status);
+-
+-      octave_value val = retrieve_variable (name);
++  m_label->setTextFormat (Qt::PlainText);
+ 
+-      emit update_data_signal (val);
+-    }
+-  catch (octave::execution_exception&)
+-    {
+-      clear_update_pending ();
++  m_label->setText (msg);
+ 
+-      evaluation_error (expr);
+-
+-      // This will cause the data in the cell to be reset
+-      // from the cached octave_value object.
+-
+-      emit dataChanged (QAbstractTableModel::index (row, col),
+-                        QAbstractTableModel::index (row, col));
+-    }
++  dynamic_cast<QWidget *> (parent ())->setVisible (false);
+ }
+ 
+ void
+-variable_editor_model::init_from_oct (const std::string& name)
++variable_editor_model::reset (const octave_value& val)
+ {
+-  // INTERPRETER THREAD
+-
+-  try
+-    {
+-      octave_value val = retrieve_variable (name);
+-
+-      m_d->m_validity = true;
++  base_ve_model *old_rep = rep;
+ 
+-      emit update_data_signal (val);
+-    }
+-  catch (octave::execution_exception&)
+-    {
+-      QString msg = (QString ("variable '%1' is invalid or undefined")
+-                     .arg (QString::fromStdString (name)));
+-
+-      emit data_error_signal (msg);
+-    }
+-}
+-
+-void
+-variable_editor_model::eval_oct (const std::string& name, const std::string& x)
+-{
+-  // INTERPRETER THREAD
+-
+-  try
+-    {
+-      int parse_status = 0;
+-
+-      octave::eval_string (x, true, parse_status);
++  rep = create (QString::fromStdString (name ()), val);
+ 
+-      init_from_oct (name);
+-    }
+-  catch  (octave::execution_exception&)
+-    {
+-      evaluation_error (x);
+-    }
+-}
+-
+-// If the variable exists, load it into the data model.  If it doesn't
+-// exist, flag the data model as referring to a nonexistent variable.
+-// This allows the variable to be opened before it is created.
+-
+-// This function should only be called within other functions that
+-// execute in the interpreter thread.  It should also be called in a
+-// try-catch block that catches execution exceptions.
++  delete old_rep;
+ 
+-octave_value
+-variable_editor_model::retrieve_variable (const std::string& x)
+-{
+-  // INTERPRETER THREAD
+-
+-  std::string name = x;
++  update_label ();
+ 
+-  if (x.back () == ')' || x.back () == '}')
+-    name = x.substr (0, x.find (x.back () == ')' ? "(" : "{"));
+-
+-  if (symbol_exist (name, "var") > 0)
+-    {
+-      int parse_status = 0;
+-
+-      return octave::eval_string (x, true, parse_status);
+-    }
+-
+-  return octave_value ();
++  emit set_editable_signal (is_editable ());
+ }
+ 
+ void
+ variable_editor_model::invalidate (void)
+ {
+   beginResetModel ();
+ 
+-  m_d->invalidate ();
++  reset (octave_value ());
+ 
+   endResetModel ();
+ }
+ 
+ void
+-variable_editor_model::data_error (const QString& msg)
+-{
+-  invalidate ();
+-
+-  m_d->m_label->setTextFormat (Qt::PlainText);
+-
+-  m_d->m_label->setText (msg);
+-
+-  dynamic_cast<QWidget *> (m_parent)->setVisible (false);
+-}
+-
+-void
+-variable_editor_model::display_valid (void)
++variable_editor_model::update_label (void)
+ {
+-  m_d->m_label->setTextFormat (Qt::PlainText);
+-
+-  m_d->m_label->setText (m_d->m_validtext);
+-
+-  dynamic_cast<QWidget *> (m_parent)->setVisible (true);
+-}
+-
+-bool
+-variable_editor_model::type_is_editable (const octave_value& val,
+-                                         bool display_error) const
+-{
+-  if ((val.isnumeric () || val.islogical () || val.iscell ()
+-       || val.isstruct ()) && val.ndims () == 2)
+-    return true;
+-
+-  if (val.is_string () && (val.rows () == 1 || val.is_zero_by_zero ()))
+-    return true;
+-
+-  if (display_error)
+-    {
+-      QString tname = QString::fromStdString (val.type_name ());
++  m_label->setTextFormat (Qt::PlainText);
+ 
+-      dim_vector dv = val.dims ();
+-      QString dimstr = QString::fromStdString (dv.str ());
+-
+-      // FIXME: we will probably want to impose a limit on the size of
+-      // the output here...
+-
+-      // FIXME: shouldn't octave_value::print be a constant method?
+-      QString sep;
+-      QString output;
+-
+-      if (val.is_defined ())
+-        {
+-          std::ostringstream buf;
+-          octave_value tval = val;
+-          tval.print (buf);
+-          output = QString::fromStdString (buf.str ());
+-          if (! output.isEmpty ())
+-            sep = "\n\n";
+-        }
+-
+-      emit data_error_signal (QString ("unable to edit [%1] '%2' objects%3%4")
+-                              .arg (dimstr)
+-                              .arg (tname)
+-                              .arg (sep)
+-                              .arg (output));
+-    }
+-
+-  return false;
++  m_label->setText (make_label_text ());
+ }
+-
+-void
+-variable_editor_model::evaluation_error (const std::string& expr) const
+-{
+-  emit user_error_signal ("Evaluation failed",
+-                          QString ("failed to evaluate expression: '%1'")
+-                          .arg (QString::fromStdString (expr)));
+-}
+diff --git a/libgui/src/variable-editor-model.h b/libgui/src/variable-editor-model.h
+--- a/libgui/src/variable-editor-model.h
++++ b/libgui/src/variable-editor-model.h
+@@ -21,49 +21,174 @@ along with Octave; see the file COPYING.
+ <https://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if ! defined (variable_editor_model_h)
+ #define variable_editor_model_h 1
+ 
+ #include <QAbstractTableModel>
++#include <QMap>
++#include <QString>
+ 
+ #include "ov.h"
++#include "pr-flt-fmt.h"
+ 
+ class QLabel;
+ 
+ class
++base_ve_model
++{
++public:
++
++  base_ve_model (const QString &expr, const octave_value& val);
++
++  virtual ~base_ve_model (void) = default;
++
++  // No copying!
++
++  base_ve_model (const base_ve_model&) = delete;
++
++  base_ve_model& operator = (const base_ve_model&) = delete;
++
++  std::string name (void) const;
++
++  bool index_ok (const QModelIndex& idx, int& row, int& col) const;
++
++  virtual bool is_editable (void) const { return true; }
++
++  virtual octave_value value_at (const QModelIndex& idx) const;
++
++  int column_width (void) const;
++
++  int rowCount (const QModelIndex& = QModelIndex ()) const;
++
++  int columnCount (const QModelIndex& = QModelIndex ()) const;
++
++  QString edit_display_sub (const octave_value& elt) const;
++
++  virtual QVariant edit_display (const QModelIndex& idx) const;
++
++  QVariant data (const QModelIndex& idx, int role = Qt::DisplayRole) const;
++
++  virtual bool requires_sub_editor (const QModelIndex& idx) const;
++
++  void set_update_pending (const QModelIndex& idx, const QString& str);
++
++  bool update_pending (const QModelIndex& idx) const;
++
++  QString update_pending_data (const QModelIndex& idx) const;
++
++  void clear_update_pending (void);
++
++  virtual char quote_char (const QModelIndex& idx) const;
++
++  virtual QVariant
++  header_data (int section, Qt::Orientation orientation, int role) const;
++
++  // Return a subscript expression as a string that can be used to
++  // access a sub-element of a data structure.  For example "{1,3}"
++  // for cell array element {1,3} or "(2,4)" for array element (2,4).
++
++  virtual QString subscript_expression (const QModelIndex& idx) const;
++
++  bool is_valid (void) const { return m_valid; }
++
++  octave_idx_type data_rows (void) const { return m_data_rows; }
++
++  octave_idx_type data_columns (void) const { return m_data_cols; }
++
++  int display_rows (void) const { return m_display_rows; }
++
++  int display_columns (void) const { return m_display_cols; }
++
++  virtual QString make_label_text (void) const;
++
++  void reset (const octave_value& val);
++
++protected:
++
++  std::string m_name;
++
++  octave_value m_value;
++
++  octave_idx_type m_data_rows;
++  octave_idx_type m_data_cols;
++
++  // Qt table widget limits the size to int.
++  int m_display_rows;
++  int m_display_cols;
++
++  QMap<QModelIndex, QString> m_update_pending;
++
++  bool m_valid;
++
++  float_display_format m_display_fmt;
++};
++
++class
+ variable_editor_model : public QAbstractTableModel
+ {
+   Q_OBJECT
+ 
++private:
++
++  static base_ve_model * create (const QString &expr, const octave_value& val);
++
+ public:
+ 
+   variable_editor_model (const QString &expr, const octave_value& val,
+-                         QLabel *label, QObject *p = nullptr);
++                         QLabel *label, QObject *parent = nullptr);
+ 
+-  ~variable_editor_model (void);
++  ~variable_editor_model (void)
++  {
++    delete rep;
++  }
+ 
+   // No copying!
+ 
+   variable_editor_model (const variable_editor_model&) = delete;
+ 
+   variable_editor_model& operator = (const variable_editor_model&) = delete;
+ 
+-  octave_value value_at (const QModelIndex& idx) const;
++  std::string name (void) const
++  {
++    return rep->name ();
++  }
+ 
+-  int column_width (void) const;
++  bool is_editable (void) const
++  {
++    return rep->is_editable ();
++  }
++
++  octave_value value_at (const QModelIndex& idx) const
++  {
++    return rep->value_at (idx);
++  }
+ 
+-  // Display rows and columns, different from data rows and columns.
+-  int rowCount (const QModelIndex& = QModelIndex ()) const;
++  int column_width (void) const
++  {
++    return rep->column_width ();
++  }
++
++  int rowCount (const QModelIndex& idx = QModelIndex ()) const
++  {
++    return rep->rowCount (idx);
++  }
+ 
+-  int columnCount (const QModelIndex& = QModelIndex ()) const;
++  int columnCount (const QModelIndex& idx = QModelIndex ()) const
++  {
++    return rep->columnCount (idx);
++  }
+ 
+-  QVariant data (const QModelIndex& idx, int role = Qt::DisplayRole) const;
++  QVariant data (const QModelIndex& idx = QModelIndex (),
++                 int role = Qt::DisplayRole) const
++  {
++    return rep->data (idx, role);
++  }
+ 
+   bool setData (const QModelIndex& idx, const QVariant& v,
+                 int role = Qt::EditRole);
+ 
+   bool clear_content (const QModelIndex& idx);
+ 
+   Qt::ItemFlags flags (const QModelIndex& idx) const;
+ 
+@@ -74,86 +199,137 @@ public:
+                    const QModelIndex& parent = QModelIndex());
+ 
+   bool insertColumns (int column, int count,
+                       const QModelIndex& parent = QModelIndex());
+ 
+   bool removeColumns (int column, int count,
+                       const QModelIndex& parent = QModelIndex());
+ 
+-  void update_data_cache (void);
+-
+   // Is cell at idx complex enough to require a sub editor?
+-  bool requires_sub_editor (const QModelIndex& idx) const;
+ 
+-  // If a sub editor is required, is it a standard type?
+-  bool editor_type_matrix (const QModelIndex& idx) const;
++  bool requires_sub_editor (const QModelIndex& idx) const
++  {
++    return rep->requires_sub_editor (idx);
++  }
+ 
+-  bool editor_type_string (const QModelIndex& idx) const;
++  void set_update_pending (const QModelIndex& idx, const QString& str)
++  {
++    rep->set_update_pending (idx, str);
++  }
+ 
+-  void set_update_pending (const QModelIndex& idx, const QString& str);
++  bool update_pending (const QModelIndex& idx) const
++  {
++    return rep->update_pending (idx);
++  }
+ 
+-  bool update_pending (const QModelIndex& idx) const;
++  QString update_pending_data (const QModelIndex& idx) const
++  {
++    return rep->update_pending_data (idx);
++  }
+ 
+-  QString update_pending_data (const QModelIndex& idx) const;
++  void clear_update_pending (void)
++  {
++    rep->clear_update_pending ();
++  }
+ 
+-  void clear_update_pending (void);
+-
+-  char quote_char (int r, int c) const;
++  char quote_char (const QModelIndex& idx) const
++  {
++    return rep->quote_char (idx);
++  }
+ 
+   QVariant
+-  headerData (int section, Qt::Orientation orientation, int role) const;
++  headerData (int section, Qt::Orientation orientation, int role) const
++  {
++    if ((orientation == Qt::Vertical && section < data_rows ())
++        || (orientation == Qt::Horizontal && section < data_columns ()))
++      return rep->header_data (section, orientation, role);
++
++    return QVariant ();
++  }
+ 
+   // Return a subscript expression as a string that can be used to
+   // access a sub-element of a data structure.  For example "{1,3}"
+   // for cell array element {1,3} or "(2,4)" for array element (2,4).
+ 
+-  QString subscript_expression (int r, int c) const;
+-
+-  QString subscript_expression (const QModelIndex& idx) const;
++  QString subscript_expression (const QModelIndex& idx) const
++  {
++    return rep->subscript_expression (idx);
++  }
+ 
+ signals: // private
+ 
+   void update_data_signal (const octave_value& val);
+ 
+   void data_error_signal (const QString& name) const;
+ 
+   void user_error_signal (const QString& title, const QString& msg) const;
+ 
+   void maybe_resize_columns_signal (void);
+ 
++  void set_editable_signal (bool);
++
+ private slots:
+ 
+-  void update_data (const octave_value& val);
+-
+-  // Change the display if the variable does not exist.
+   void data_error (const QString& msg);
+ 
+   void user_error (const QString& title, const QString& msg);
+ 
++  void update_data_cache (void);
++
++  void update_data (const octave_value& val);
++
+ private:
+ 
+-  void set_data_oct (const int& row, const int& col, const std::string& val);
++  // Owned by parent, stored here for convenience.
++  QLabel *m_label;
++
++  base_ve_model *rep;
+ 
+-  void init_from_oct (const std::string& x);
++  void set_data_oct (const std::string& name, const std::string& expr,
++                     const QModelIndex&);
++
++  void init_from_oct (const std::string& str);
+ 
+   void eval_oct (const std::string& name, const std::string& expr);
+ 
+-  octave_value retrieve_variable (const std::string& x);
++  octave_value retrieve_variable (const std::string& name);
++
++  bool is_valid (void) const
++  {
++    return rep->is_valid ();
++  }
++
++  octave_idx_type data_rows (void) const
++  {
++    return rep->data_rows ();
++  }
++
++  octave_idx_type data_columns (void) const
++  {
++    return rep->data_columns ();
++  }
++
++  int display_rows (void) const
++  {
++    return rep->display_rows ();
++  }
++
++  int display_columns (void) const
++  {
++    return rep->display_columns ();
++  }
++
++  QString make_label_text (void) const
++  {
++    return rep->make_label_text ();
++  }
++
++  void reset (const octave_value& val);
+ 
+   void invalidate (void);
+ 
+-  // Change the display now that the variable exists
+-  void display_valid (void);
+-
+-  bool type_is_editable (const octave_value& val,
+-                         bool display_error = true) const;
++  void update_label (void);
+ 
+   void evaluation_error (const std::string& expr) const;
+-
+-  QObject *m_parent;
+-
+-  struct impl;
+-
+-  impl *m_d;
+ };
+ 
+ #endif
+diff --git a/libgui/src/variable-editor.cc b/libgui/src/variable-editor.cc
+--- a/libgui/src/variable-editor.cc
++++ b/libgui/src/variable-editor.cc
+@@ -32,86 +32,142 @@ along with Octave; see the file COPYING.
+ #include <QClipboard>
+ #include <QFileDialog>
+ #include <QHeaderView>
+ #include <QLabel>
+ #include <QMainWindow>
+ #include <QMenu>
+ #include <QPalette>
+ #include <QSignalMapper>
++#include <QStackedWidget>
+ #include <QTableView>
++#include <QTextEdit>
+ #include <QTabWidget>
+ #include <QToolBar>
+ #include <QToolButton>
+ #include <QVBoxLayout>
+ 
+ #include "resource-manager.h"
+ #include "shortcut-manager.h"
+ #include "variable-editor.h"
+ #include "variable-editor-model.h"
+ 
+-namespace
+-{
+-  // Helper struct to store widget pointers in "data" Tab property.
+-
+-  struct table_data
+-  {
+-    table_data (QTableView *t = nullptr)
+-      : m_table (t)
+-    { }
+-
+-    QTableView *m_table;
+-  };
+-
+-  table_data get_table_data (QTabWidget *w, int tidx)
+-  {
+-    return w->widget (tidx)->property ("data").value<table_data> ();
+-  }
+-
+-  table_data get_table_data (QTabWidget *w)
+-  {
+-    return get_table_data (w, w->currentIndex ());
+-  }
+-}
+-
+-Q_DECLARE_METATYPE (table_data)
+-
+ static QString
+ idx_to_expr (int32_t from, int32_t to)
+ {
+   return (from == to
+           ? QString ("%1").arg (from + 1)
+           : QString ("%1:%2").arg (from + 1).arg (to + 1));
+ }
+ 
++QTableView *
++var_editor_tab::get_edit_view (void) const
++{
++  return (m_edit_view_idx == m_widget_stack->currentIndex ()
++          ? qobject_cast<QTableView *> (m_widget_stack->widget (m_edit_view_idx))
++          : nullptr);
++}
+ 
++QTextEdit *
++var_editor_tab::get_disp_view (void) const
++{
++  return (m_disp_view_idx == m_widget_stack->currentIndex ()
++          ? qobject_cast<QTextEdit *> (m_widget_stack->widget (m_disp_view_idx))
++          : nullptr);
++}
++
++void
++var_editor_tab::set_edit_view (QTableView *edit_view)
++{
++  m_edit_view_idx = m_widget_stack->addWidget (edit_view);
++}
++
++void
++var_editor_tab::set_disp_view (QTextEdit *disp_view)
++{
++  m_disp_view_idx = m_widget_stack->addWidget (disp_view);
++}
++
++
++bool
++var_editor_tab::has_focus (void) const
++{
++  QTableView *edit_view = get_edit_view ();
++  QTextEdit *disp_view = get_disp_view ();
++
++  return ((disp_view && disp_view->hasFocus ())
++          || (edit_view && edit_view->hasFocus ()));
++}
++
++void
++var_editor_tab::set_editable (bool editable)
++{
++  int idx = (editable ? m_edit_view_idx : m_disp_view_idx);
++
++  m_widget_stack->setCurrentIndex (idx);
++
++  if (! editable)
++    {
++      QTextEdit *viewer = get_disp_view ();
++
++      QVariant v_data = m_model->data ();
++
++      QString str = v_data.toString ();
++
++      viewer->setPlainText (str);
++    }
++}
+ 
+ //
+ // Functions for reimplemented tab widget
+ //
+ 
+ var_editor_tab_widget::var_editor_tab_widget (QWidget *p)
+   : QTabWidget (p)
+ {
+-  tab_bar *bar;
+-  bar = new tab_bar (this);
++  tab_bar *bar = new tab_bar (this);
+ 
+   connect (bar, SIGNAL (close_current_tab_signal (bool)),
+            p->parent (), SLOT (request_close_tab (bool)));
+ 
+   this->setTabBar (bar);
+ }
+ 
+ QTabBar*
+ var_editor_tab_widget::tabBar (void) const
+ {
+   return (QTabWidget::tabBar ());
+ }
+ 
++bool
++var_editor_tab_widget::current_tab_has_focus (void) const
++{
++  var_editor_tab *tab
++    = qobject_cast<var_editor_tab *> (widget (currentIndex ()));
+ 
++  return tab->has_focus ();
++}
++
++QTableView *
++var_editor_tab_widget::get_edit_view (void) const
++{
++  var_editor_tab *tab
++    = qobject_cast<var_editor_tab *> (widget (currentIndex ()));
++
++  return tab->get_edit_view ();
++}
++
++QTextEdit *
++var_editor_tab_widget::get_disp_view (void) const
++{
++  var_editor_tab *tab
++    = qobject_cast<var_editor_tab *> (widget (currentIndex ()));
++
++  return tab->get_disp_view ();
++}
+ 
+ //
+ // Variable editor
+ //
+ 
+ variable_editor::variable_editor (QWidget *p)
+   : octave_dock_widget (p),
+     m_default_width (30), m_default_height (100), m_add_font_height (0),
+@@ -261,29 +317,65 @@ variable_editor::edit_variable (const QS
+ 
+           m_tab_widget->setCurrentIndex (i);
+           return;
+         }
+     }
+ 
+   // Do not set parent.
+ 
+-  QWidget *page = new QWidget;
++  QStackedWidget *widget_stack = new QStackedWidget ();
++
++  var_editor_tab *page = new var_editor_tab (widget_stack);
+ 
+   QVBoxLayout *vbox = new QVBoxLayout (page);
+   page->setLayout (vbox);
+ 
+   QLabel *label = new QLabel (page);
+   label->setTextFormat (Qt::PlainText);
+   label->setText (name);
+   vbox->addWidget (label, 0, Qt::AlignTop);
+ 
++  variable_editor_model *model
++    = new variable_editor_model (name, val, label);
++
++  QTableView *edit_view = make_edit_view (page, model);
++
++  QTextEdit *disp_view = make_disp_view (page, model);
++
++  page->set_model (model);
++
++  page->set_edit_view (edit_view);
++  page->set_disp_view (disp_view);
++
++  vbox->addWidget (widget_stack);
++
++  int tab_idx = m_tab_widget->addTab (page, name);
++
++  m_tab_widget->setCurrentIndex (tab_idx);
++
++  connect (model, SIGNAL (dataChanged (const QModelIndex&, const QModelIndex&)),
++           this, SLOT (callUpdate (const QModelIndex&, const QModelIndex&)));
++
++  connect (this, SIGNAL (refresh_signal (void)),
++           model, SLOT (update_data_cache (void)));
++
++  connect (model, SIGNAL (set_editable_signal (bool)),
++           page, SLOT (set_editable (bool)));
++
++  enable_actions ();
++}
++
++QTableView *
++variable_editor::make_edit_view (var_editor_tab *page,
++                                  variable_editor_model *model)
++{
+   QTableView *table = new QTableView (page);
+-  variable_editor_model *model =
+-    new variable_editor_model (name, val, label, table);
++
++  model->setParent (table);
+ 
+   table->setModel (model);
+   table->setWordWrap (false);
+   table->setContextMenuPolicy (Qt::CustomContextMenu);
+   table->setSelectionMode (QAbstractItemView::ContiguousSelection);
+ 
+ 
+   table->horizontalHeader ()->setContextMenuPolicy (Qt::CustomContextMenu);
+@@ -298,27 +390,16 @@ variable_editor::edit_variable (const QS
+            this, SLOT (rowmenu_requested (const QPoint&)));
+ 
+   connect (table, SIGNAL (customContextMenuRequested (const QPoint&)),
+            this, SLOT (contextmenu_requested (const QPoint&)));
+ 
+   connect (table, SIGNAL (doubleClicked (const QModelIndex&)),
+            this, SLOT (double_click (const QModelIndex&)));
+ 
+-  connect (model, SIGNAL (dataChanged (const QModelIndex&, const QModelIndex&)),
+-           this, SLOT (callUpdate (const QModelIndex&, const QModelIndex&)));
+-
+-  vbox->addWidget (table);
+-
+-  page->setProperty ("data", QVariant::fromValue (table_data (table)));
+-  int tab_idx = m_tab_widget->addTab (page, name);
+-  m_tab_widget->setCurrentIndex (tab_idx);
+-
+-  enable_actions ();
+-
+   table->setFont (m_font);
+   table->setStyleSheet (m_stylesheet);
+   table->setAlternatingRowColors (m_alternate_rows);
+ #if defined (HAVE_QT4)
+   table->verticalHeader ()->setResizeMode (QHeaderView::Interactive);
+ #else
+   table->verticalHeader ()->setSectionResizeMode (QHeaderView::Interactive);
+ #endif
+@@ -337,46 +418,55 @@ variable_editor::edit_variable (const QS
+ 
+       // col_width is in characters.  The font should be a fixed-width
+       // font, so any character will do.  If not, you lose!
+ 
+       QFontMetrics fm (m_font);
+       int w = col_width * fm.width ('0');
+       table->horizontalHeader ()->setDefaultSectionSize (w);
+     }
++
++  return table;
++}
++
++QTextEdit *
++variable_editor::make_disp_view (var_editor_tab *page,
++                                 variable_editor_model *model)
++{
++  QTextEdit *viewer = new QTextEdit (page);
++
++  model->setParent (viewer);
++
++  QVariant v_data = model->data ();
++
++  QString str = v_data.toString ();
++
++  viewer->setPlainText (str);
++
++  return viewer;
+ }
+ 
+ void
+ variable_editor::refresh (void)
+ {
+-  // FIXME: it would be nice to only refresh the variable tabs that are
+-  // displayed, and then only if something has actually changed.
+-
+-  for (int i = 0; i < m_tab_widget->count (); ++i)
+-    {
+-      QTableView *const table = get_table_data (m_tab_widget, i).m_table;
+-      QAbstractItemModel *const model = table->model ();
+-      qobject_cast<variable_editor_model *> (model)->update_data_cache ();
+-    }
++  emit refresh_signal ();
+ }
+ 
+ bool
+ variable_editor::has_focus (void)
+ {
+   // FIXME: This only generates exceptions in certain circumstances.
+   // Get a definitive list and eliminate the need to handle exceptions?
+ 
+   if (m_tab_widget->currentIndex () == -1)
+     return false;  // No tabs.
+ 
+   try
+     {
+-      QTableView *view = get_table_data (m_tab_widget).m_table;
+-
+-      return view ? view->hasFocus () : false;
++      return m_tab_widget->current_tab_has_focus ();
+     }
+   catch (...)
+     {
+       return false;
+     }
+ 
+   return false;
+ }
+@@ -502,27 +592,33 @@ variable_editor::closeEvent (QCloseEvent
+ }
+ 
+ void
+ variable_editor::closeTab (int idx)
+ {
+   if (idx < 0 || idx > m_tab_widget->count ())
+     return;
+ 
+-  QWidget *const wdgt = m_tab_widget->widget (idx);
++  QWidget *wdgt = m_tab_widget->widget (idx);
++
+   m_tab_widget->removeTab (idx);
++
+   delete wdgt;
+ 
+   enable_actions ();
+ }
+ 
+ void
+ variable_editor::contextmenu_requested (const QPoint& qpos)
+ {
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QModelIndex index = view->indexAt (qpos);
+ 
+   if (index.isValid ())
+     {
+       QMenu *menu = new QMenu (this);
+ 
+       menu->addAction (resource_manager::icon ("edit-cut"),
+                        tr ("Cut"), this, SLOT (cutClipboard ()));
+@@ -597,17 +693,20 @@ variable_editor::contextmenu_requested (
+ 
+       menu->exec (view->mapToGlobal (qpos));
+     }
+ }
+ 
+ void
+ variable_editor::columnmenu_requested (const QPoint& pt)
+ {
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
+ 
+   int index = view->horizontalHeader ()->logicalIndexAt (pt);
+ 
+   if (index < 0 || index > view->model ()->columnCount ())
+     return;
+ 
+   QString selection = selected_to_octave ();
+ 
+@@ -710,17 +809,20 @@ variable_editor::columnmenu_requested (c
+   menupos.setY (view->horizontalHeader ()->height ());
+ 
+   menu->exec (view->mapToGlobal (menupos));
+ }
+ 
+ void
+ variable_editor::rowmenu_requested (const QPoint& pt)
+ {
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
+ 
+   int index = view->verticalHeader ()->logicalIndexAt (pt);
+ 
+   if (index < 0 || index > view->model ()->columnCount ())
+     return;
+ 
+   QString selection = selected_to_octave ();
+ 
+@@ -827,19 +929,22 @@ variable_editor::rowmenu_requested (cons
+   menu->exec (view->mapToGlobal (menupos));
+ }
+ 
+ void
+ variable_editor::double_click (const QModelIndex& idx)
+ {
+   QString name = real_var_name (m_tab_widget->currentIndex ());
+ 
+-  QTableView *const table = get_table_data (m_tab_widget).m_table;
++  QTableView *table = m_tab_widget->get_edit_view ();
+ 
+-  variable_editor_model *const model
++  if (! table)
++    return;
++
++  variable_editor_model *model
+     = qobject_cast<variable_editor_model *> (table->model ());
+ 
+   if (model->requires_sub_editor (idx))
+     edit_variable (name + model->subscript_expression (idx),
+                    model->value_at (idx));
+ }
+ 
+ void
+@@ -861,17 +966,21 @@ variable_editor::save (void)
+                             .arg (name));
+ }
+ 
+ void
+ variable_editor::clearContent (void)
+ {
+   // FIXME: Shift?
+ 
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QAbstractItemModel *model = view->model ();
+   QItemSelectionModel *sel = view->selectionModel ();
+   QList<QModelIndex> indices = sel->selectedIndexes ();
+ 
+   // FIXME: Use [] for empty cells?
+ 
+   for (const auto& idx : indices)
+     qobject_cast<variable_editor_model *> (model)->clear_content (idx);
+@@ -889,17 +998,21 @@ variable_editor::cutClipboard (void)
+ }
+ 
+ void
+ variable_editor::copyClipboard (void)
+ {
+   if (! has_focus ())
+     return;
+ 
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QAbstractItemModel *model = view->model ();
+   QItemSelectionModel *sel = view->selectionModel ();
+   QList<QModelIndex> indices = sel->selectedIndexes ();
+   qSort (indices);
+   if (indices.isEmpty ())
+     return;
+ 
+   // Convert selected items into TSV format and copy that.
+@@ -924,17 +1037,21 @@ void
+ variable_editor::pasteClipboard (void)
+ {
+   if (! has_focus ())
+     return;
+ 
+   QClipboard *clipboard = QApplication::clipboard ();
+   QString text = clipboard->text ();
+ 
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QItemSelectionModel *sel = view->selectionModel ();
+   QList<QModelIndex> indices = sel->selectedIndexes ();
+ 
+   variable_editor_model *model
+     = static_cast<variable_editor_model *> (view->model ());
+ 
+   if (indices.isEmpty ())
+     {
+@@ -959,17 +1076,21 @@ variable_editor::pasteClipboard (void)
+ void variable_editor::pasteTableClipboard (void)
+ {
+   if (! has_focus ())
+     return;
+ 
+   QClipboard *clipboard = QApplication::clipboard ();
+   QString text = clipboard->text ();
+ 
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QItemSelectionModel *sel = view->selectionModel ();
+   QList<QModelIndex> indices = sel->selectedIndexes ();
+ 
+   variable_editor_model *model
+     = static_cast<variable_editor_model *> (view->model ());
+ 
+   QPoint start, end;
+ 
+@@ -1070,17 +1191,21 @@ variable_editor::up (void)
+       name.remove (QRegExp ("(\\(|\\{)[^({]*(\\)|\\})$"));
+       edit_variable (name, octave_value ());
+     }
+ }
+ 
+ void
+ variable_editor::delete_selected (void)
+ {
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return;
++
+   QString selection = selected_to_octave ();
+   QList<int> coords = octave_to_coords (selection);
+ 
+   if (coords.isEmpty ())
+     return;
+ 
+   bool whole_columns_selected
+     = coords[0] == 1 && coords[1] == view->model ()->rowCount ();
+@@ -1179,17 +1304,22 @@ variable_editor::real_var_name (int inde
+   var_name.remove (QChar ('&'));
+   return var_name;
+ }
+ 
+ QString
+ variable_editor::selected_to_octave (void)
+ {
+   QString name = real_var_name (m_tab_widget->currentIndex ());
+-  QTableView *view = get_table_data (m_tab_widget).m_table;
++
++  QTableView *view = m_tab_widget->get_edit_view ();
++
++  if (! view)
++    return name;
++
+   QItemSelectionModel *sel = view->selectionModel ();
+ 
+   // Return early if nothing selected.
+ 
+   if (! sel->hasSelection ())
+     return name;
+ 
+   QList<QModelIndex> indices = sel->selectedIndexes ();
+@@ -1246,17 +1376,21 @@ void variable_editor::update_colors (voi
+         + m_table_colors[3].name () +" }";
+     }
+ 
+   if (m_tab_widget->count () < 1)
+     return;
+ 
+   for (int i = 0; i < m_tab_widget->count (); i++)
+     {
+-      QTableView *view = get_table_data (m_tab_widget).m_table;
++      QTableView *view = m_tab_widget->get_edit_view ();
++
++      if (! view)
++        continue;
++
+       view->setAlternatingRowColors (m_alternate_rows);
+       view->setStyleSheet (m_stylesheet);
+       view->setFont (m_font);
+     }
+ 
+ }
+ 
+ void
+diff --git a/libgui/src/variable-editor.h b/libgui/src/variable-editor.h
+--- a/libgui/src/variable-editor.h
++++ b/libgui/src/variable-editor.h
+@@ -28,36 +28,82 @@ along with Octave; see the file COPYING.
+ #include <QHeaderView>
+ #include <QSettings>
+ 
+ #include "octave-dock-widget.h"
+ #include "tab-bar.h"
+ 
+ class octave_value;
+ 
++class QModelIndex;
++class QStackedWidget;
+ class QTabWidget;
++class QTableView;
++class QTextEdit;
+ class QToolBar;
+-class QMainWindow;
+-class QTableView;
+-class QModelIndex;
++
++class variable_editor_model;
++
++class var_editor_tab : public QWidget
++{
++  Q_OBJECT
++
++public:
++
++  var_editor_tab (QStackedWidget *widget_stack, QWidget *p = nullptr)
++    : QWidget (p), m_widget_stack (widget_stack)
++  { }
++
++  ~var_editor_tab (void) = default;
++
++  QTableView * get_edit_view (void) const;
++  QTextEdit * get_disp_view (void) const;
++
++  void set_edit_view (QTableView *);
++  void set_disp_view (QTextEdit *);
+ 
++  void set_model (variable_editor_model *model)
++  {
++    m_model = model;
++  }
++
++  bool has_focus (void) const;
++
++public slots:
++
++  void set_editable (bool);
++
++private:
++
++  variable_editor_model *m_model;
++
++  QStackedWidget *m_widget_stack;
++
++  int m_edit_view_idx;
++  int m_disp_view_idx;
++};
+ 
+ // Subclassed QTabWidget for using custom tabbar
+ 
+ class var_editor_tab_widget : public QTabWidget
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   var_editor_tab_widget (QWidget *p);
+ 
+   ~var_editor_tab_widget (void) = default;
+ 
+   QTabBar * tabBar (void) const;
++
++  bool current_tab_has_focus (void) const;
++
++  QTextEdit *get_disp_view (void) const;
++  QTableView *get_edit_view (void) const;
+ };
+ 
+ 
+ // The variable editor class
+ 
+ class variable_editor : public octave_dock_widget
+ {
+   Q_OBJECT
+@@ -71,16 +117,22 @@ public:
+   // No copying!
+ 
+   variable_editor (const variable_editor&) = delete;
+ 
+   variable_editor& operator = (const variable_editor&) = delete;
+ 
+   void edit_variable (const QString& name, const octave_value& val);
+ 
++  QTableView *make_edit_view (var_editor_tab *page,
++                              variable_editor_model *model);
++
++  QTextEdit *make_disp_view (var_editor_tab *page,
++                             variable_editor_model *model);
++
+   void refresh (void);
+ 
+   bool has_focus (void);
+ 
+   static QList<QColor> default_colors (void);
+ 
+   static QStringList color_names (void);
+ 
+@@ -135,28 +187,30 @@ protected slots:
+ signals:
+ 
+   void updated (void);
+ 
+   void finished (void);
+ 
+   void command_requested (const QString& cmd);
+ 
++  void refresh_signal (void);
++
+ private:
+ 
+   QAction * add_action (QMenu *menu, const QIcon& icon, const QString& text,
+                         const char *member);
+ 
+   void enable_actions (void);
+ 
+   tab_bar *m_tab_bar;
+ 
+   QToolBar *m_tool_bar;
+ 
+-  QTabWidget *m_tab_widget;
++  var_editor_tab_widget *m_tab_widget;
+ 
+   int m_default_width;
+ 
+   int m_default_height;
+ 
+   int m_add_font_height;
+ 
+   bool m_use_terminal_font;

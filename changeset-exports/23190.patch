@@ -1,0 +1,1097 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1487314471 -3600
+#      Fri Feb 17 07:54:31 2017 +0100
+# Node ID 4a2c42792d6c47da56232bf558da8698d5f0ba13
+# Parent  e2e182a8e6996bfaf63aa8a3bca617a23c5d651b
+highlight all occurrences of a selected word in the editor (bug #41470)
+
+* file-editor-tab.cc (file_editor_tab): connect scintillas double click
+  signal the new slot handle_double_click, define indicator used for
+  highlighting the words;
+  (update_lexer): calculate a suitable color of the indicator;
+  (notice_settings): determine from settings whether to highlight all
+  occurrences or not;
+  (handle_double_click): new slot where all occurrences are searched and
+  highlighted with the indicator if it is desired and if it was a double
+  click without modifiers
+
+* file-editor-tab.h: new slot handle_double_click, new class variables for
+  the setting whether to highlight all or not and for the related indicator
+
+* octave-qscintilla.h, octave-qscintilla.cc (clear_indicator): new function
+  for clearing all occurrences of a given indicator
+
+* settings-dialog.ui: new checkbox for highlighting all occurrences of a
+  selected word in the editor
+
+* settings-dialog.cc (settings_dialog): initialize new checkbox without
+  value from settings file;
+  (write_changed_settings): save checkbox state into settings file
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -110,16 +110,19 @@ file_editor_tab::file_editor_tab (const 
+   _bp_conditions.clear ();
+ 
+   connect (_edit_area, SIGNAL (cursorPositionChanged (int, int)),
+            this, SLOT (handle_cursor_moved (int,int)));
+ 
+   connect (_edit_area, SIGNAL (SCN_CHARADDED (int)),
+            this, SLOT (handle_char_added (int)));
+ 
++  connect (_edit_area, SIGNAL (SCN_DOUBLECLICK (int, int, int)),
++           this, SLOT (handle_double_click (int, int, int)));
++
+   connect (_edit_area, SIGNAL (linesChanged ()),
+            this, SLOT (handle_lines_changed ()));
+ 
+   connect (_edit_area, SIGNAL (context_menu_edit_signal (const QString&)),
+            this, SLOT (handle_context_menu_edit (const QString&)));
+ 
+   // create statusbar for row/col indicator and eol mode
+   _status_bar = new QStatusBar (this);
+@@ -224,16 +227,24 @@ file_editor_tab::file_editor_tab (const 
+                                .toString ();
+ #else
+   _encoding = settings->value ("editor/default_encoding","UTF-8")
+                                .toString ();
+ #endif
+   _enc_indicator->setText (_encoding);
+   // no changes in encoding yet
+   _new_encoding = _encoding;
++
++  // indicators
++  _indicator_highlight_all
++        = _edit_area->indicatorDefine (QsciScintilla::StraightBoxIndicator);
++  if (_indicator_highlight_all == -1)
++    _indicator_highlight_all = 1;
++
++  _edit_area->setIndicatorDrawUnder (true, _indicator_highlight_all);
+ }
+ 
+ file_editor_tab::~file_editor_tab (void)
+ {
+   // Tell all connected markers to self-destruct.
+   emit remove_all_breakpoints ();
+   emit remove_all_positions ();
+ 
+@@ -749,16 +760,23 @@ file_editor_tab::update_lexer ()
+   v = bv + (fv - bv)/4;
+   fg.setHsv (h,s,v);
+ 
+   _edit_area->setMarkerForegroundColor (lexer->color (0));
+   _edit_area->setMarginsForegroundColor (lexer->color (0));
+   _edit_area->setMarginsBackgroundColor (bg);
+   _edit_area->setFoldMarginColors (bg,fg);
+ 
++  // color indicator for highlighting all occurrences:
++  // applications highlight color with more transparency
++  QColor hg = QApplication::palette ().color (QPalette::Highlight);
++  hg.setAlphaF (0.25);
++  _edit_area->setIndicatorForegroundColor (hg, _indicator_highlight_all);
++  _edit_area->setIndicatorOutlineColor (hg, _indicator_highlight_all);
++
+   // fix line number width with respect to the font size of the lexer
+   if (settings->value ("editor/showLineNumbers", true).toBool ())
+     auto_margin_width ();
+   else
+     _edit_area->setMarginWidth (2,0);
+ 
+ }
+ 
+@@ -2377,16 +2395,20 @@ file_editor_tab::notice_settings (const 
+   else
+     _edit_area->setWrapMode (QsciScintilla::WrapNone);
+ 
+   if (settings->value ("editor/break_lines",false).toBool ())
+     _line_break = line_length;
+   else
+     _line_break = 0;
+ 
++  // highlight all occurrences of a word selected by a double click
++  _highlight_all_occurrences = settings->value (
++                    "editor/highlight_all_occurrences", true).toBool ();
++
+   // reload changed files
+   _always_reload_changed_files =
+         settings->value ("editor/always_reload_changed_files",false).toBool ();
+ }
+ 
+ void
+ file_editor_tab::auto_margin_width ()
+ {
+@@ -2711,16 +2733,87 @@ file_editor_tab::handle_char_added (int 
+         _edit_area->insertAt (QString ("\n"), line, col_newline);
+       }
+ 
+     // automatically indent new line to the indentation of previous line
+     _edit_area->setIndentation (line + 1, _edit_area->indentation (line));
+   }
+ }
+ 
++// Slot handling a double click into the text area
++void
++file_editor_tab::handle_double_click (int, int, int modifier)
++{
++  if (! modifier)
++    {
++      // double clicks without modifier
++      // clear any existing indicators of this type
++      _edit_area->clear_indicator (_indicator_highlight_all);
++
++      if (_highlight_all_occurrences)
++        {
++          // highlighting of all occurrences of the clicked word is enabled
++
++          // get the resulting cursor position
++          // (required if click was beyond a line ending)
++          int line, col;
++          _edit_area->getCursorPosition (&line, &col);
++
++          // get the word at the cursor (if any)
++          QString word = _edit_area->wordAtLineIndex (line, col);
++          word = word.trimmed ();
++
++          if (! word.isEmpty ())
++            {
++              // word is not empty, so find all occurrences of the word
++
++              // remember first visible line for restoring the view afterwards
++              int first_line = _edit_area->firstVisibleLine ();
++
++              // search for first occurrence of the detected word
++              bool find_result_available
++                      = _edit_area->findFirst (word,
++                                               false,   // no regexp
++                                               true,    // case sensitive
++                                               true,    // whole words only
++                                               false,   // do not wrap
++                                               true,    // forward
++                                               0,0,     // from the beginning
++                                               false
++#if defined (HAVE_QSCI_VERSION_2_6_0)
++                                             , true
++#endif
++                                            );
++
++              // loop over all occurrences and set the related indicator
++              int oline, ocol;
++              int wlen = word.length ();
++
++              while (find_result_available)
++                {
++                  // get cursor position after having found an occurrence
++                  _edit_area->getCursorPosition (&oline, &ocol);
++                  // set the indicator
++                  _edit_area->fillIndicatorRange (oline, ocol - wlen,
++                                                  oline, ocol,
++                                                  _indicator_highlight_all);
++                  // find next occurrence
++                  find_result_available = _edit_area->findNext ();
++                }
++
++              // restore the visible area of the file, the cursor position,
++              // and the selection
++              _edit_area->setFirstVisibleLine (first_line);
++              _edit_area->setCursorPosition (line, col);
++              _edit_area->setSelection (line, col - wlen, line, col);
++            }
++        }
++    }
++}
++
+ void
+ file_editor_tab::do_smart_indent ()
+ {
+   QString prev_line = _edit_area->text (_line);
+ 
+   QRegExp bkey = QRegExp ("^[\t ]*(if|for|while|switch|case|do|function"
+                           "|unwind_protect|unwind_protect_cleanup|try)"
+                           "[\n\t #%]");
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -211,16 +211,17 @@ private slots:
+   // When apis preparation has finished and is ready to save
+   void save_apis_info ();
+ 
+   // When the numer of lines changes -> adapt width of margin
+   void auto_margin_width ();
+ 
+   void handle_cursor_moved (int line, int col);
+   void handle_char_added (int character);
++  void handle_double_click (int p, int l, int modifier);
+   void handle_lines_changed (void);
+ 
+ private:
+ 
+   struct bp_info
+   {
+     bp_info (const QString& fname, int l = 0, const QString& cond = "");
+ 
+@@ -299,12 +300,14 @@ private:
+   QString _prep_apis_file;
+ 
+   static bool _cancelled;
+ 
+   int _line_break;
+   int _line;
+   int _col;
+   bool _lines_changed;
++  bool _highlight_all_occurrences;
++  int _indicator_highlight_all;
+ 
+ };
+ 
+ #endif
+diff --git a/libgui/src/m-editor/octave-qscintilla.cc b/libgui/src/m-editor/octave-qscintilla.cc
+--- a/libgui/src/m-editor/octave-qscintilla.cc
++++ b/libgui/src/m-editor/octave-qscintilla.cc
+@@ -337,9 +337,19 @@ octave_qscintilla::text_changed ()
+ // when edit area gets focus update information on undo/redo actions
+ void octave_qscintilla::focusInEvent (QFocusEvent *focusEvent)
+ {
+   emit status_update (isUndoAvailable (), isRedoAvailable ());
+ 
+   QsciScintilla::focusInEvent (focusEvent);
+ }
+ 
++// helper function for clearing all indicators of a specific style
++void
++octave_qscintilla::clear_indicator (int indicator_style)
++{
++  int end_pos = text ().length ();
++  int end_line, end_col;
++  lineIndexFromPosition (end_pos, &end_line, &end_col);
++  clearIndicatorRange (0, 0, end_line, end_col, indicator_style);
++}
++
+ #endif
+diff --git a/libgui/src/m-editor/octave-qscintilla.h b/libgui/src/m-editor/octave-qscintilla.h
+--- a/libgui/src/m-editor/octave-qscintilla.h
++++ b/libgui/src/m-editor/octave-qscintilla.h
+@@ -40,16 +40,17 @@ public:
+ 
+   virtual void contextMenuEvent (QContextMenuEvent *e);
+ 
+   void context_help_doc (bool);
+   void context_edit ();
+   void context_run ();
+   void get_global_textcursor_pos (QPoint *global_pos, QPoint *local_pos);
+   bool get_actual_word ();
++  void clear_indicator (int indicator_style);
+ 
+ signals:
+ 
+   void execute_command_in_terminal_signal (const QString&);
+   void create_context_menu_signal (QMenu*);
+   void context_menu_edit_signal (const QString&);
+   void qsci_has_focus_signal (bool);
+   void status_update (bool,bool);
+diff --git a/libgui/src/settings-dialog.cc b/libgui/src/settings-dialog.cc
+--- a/libgui/src/settings-dialog.cc
++++ b/libgui/src/settings-dialog.cc
+@@ -412,16 +412,18 @@ settings_dialog::settings_dialog (QWidge
+   ui->editor_wrap_checkbox->setChecked (
+     settings->value ("editor/wrap_lines",false).toBool ());
+   ui->cb_edit_status_bar->setChecked (
+     settings->value ("editor/show_edit_status_bar",true).toBool ());
+   ui->cb_edit_tool_bar->setChecked (
+     settings->value ("editor/show_toolbar",true).toBool ());
+   ui->cb_code_folding->setChecked (
+     settings->value ("editor/code_folding",true).toBool ());
++  ui->editor_highlight_all_occurrences->setChecked (
++    settings->value ("editor/highlight_all_occurrences",true).toBool ());
+ 
+   ui->editor_codeCompletion->setChecked (
+     settings->value ("editor/codeCompletion", true).toBool ());
+   ui->editor_spinbox_ac_threshold->setValue (
+     settings->value ("editor/codeCompletion_threshold",2).toInt ());
+   ui->editor_checkbox_ac_keywords->setChecked (
+     settings->value ("editor/codeCompletion_keywords",true).toBool ());
+   ui->editor_checkbox_ac_builtins->setEnabled (
+@@ -803,16 +805,18 @@ settings_dialog::write_changed_settings 
+   settings->setValue ("editor/wrap_lines",
+                       ui->editor_wrap_checkbox->isChecked ());
+   settings->setValue ("editor/code_folding",
+                       ui->cb_code_folding->isChecked ());
+   settings->setValue ("editor/show_edit_status_bar",
+                       ui->cb_edit_status_bar->isChecked ());
+   settings->setValue ("editor/show_toolbar",
+                       ui->cb_edit_tool_bar->isChecked ());
++  settings->setValue ("editor/highlight_all_occurrences",
++                      ui->editor_highlight_all_occurrences->isChecked ());
+   settings->setValue ("editor/codeCompletion",
+                       ui->editor_codeCompletion->isChecked ());
+   settings->setValue ("editor/codeCompletion_threshold",
+                       ui->editor_spinbox_ac_threshold->value ());
+   settings->setValue ("editor/codeCompletion_keywords",
+                       ui->editor_checkbox_ac_keywords->isChecked ());
+   settings->setValue ("editor/codeCompletion_octave_builtins",
+                       ui->editor_checkbox_ac_builtins->isChecked ());
+diff --git a/libgui/src/settings-dialog.ui b/libgui/src/settings-dialog.ui
+--- a/libgui/src/settings-dialog.ui
++++ b/libgui/src/settings-dialog.ui
+@@ -495,28 +495,170 @@
+           <bool>true</bool>
+          </property>
+          <widget class="QWidget" name="scrollAreaWidgetContents">
+           <property name="geometry">
+            <rect>
+             <x>0</x>
+             <y>0</y>
+             <width>642</width>
+-            <height>904</height>
++            <height>900</height>
+            </rect>
+           </property>
+           <layout class="QVBoxLayout" name="verticalLayout_16">
+            <item>
+             <widget class="QGroupBox" name="groupBox_5">
+              <property name="title">
+               <string>General</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_13">
+               <item>
+                <layout class="QGridLayout" name="editor_common_settings_grid">
++                <property name="topMargin">
++                 <number>0</number>
++                </property>
++                <item row="3" column="2">
++                 <widget class="QCheckBox" name="editor_ws_indent_checkbox">
++                  <property name="enabled">
++                   <bool>false</bool>
++                  </property>
++                  <property name="text">
++                   <string>Do not show whitespace used for indentation</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="10" column="0">
++                 <widget class="QCheckBox" name="cb_show_hscrollbar">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show horizontal scroll bar</string>
++                  </property>
++                  <property name="checked">
++                   <bool>true</bool>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="0">
++                 <widget class="QCheckBox" name="editor_longWindowTitle">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show complete path in window title</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="1" column="1">
++                 <spacer name="horizontalSpacer_24">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeType">
++                   <enum>QSizePolicy::Fixed</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>10</width>
++                    <height>0</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
++                <item row="2" column="0">
++                 <widget class="QCheckBox" name="editor_showLineNumbers">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show line numbers</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="5" column="2">
++                 <layout class="QGridLayout" name="editor_grid_current_line" rowstretch="0" columnstretch="0,0,0,0,0">
++                  <property name="horizontalSpacing">
++                   <number>12</number>
++                  </property>
++                  <property name="verticalSpacing">
++                   <number>0</number>
++                  </property>
++                  <item row="0" column="1">
++                   <widget class="QLabel" name="editor_label_cl_color">
++                    <property name="enabled">
++                     <bool>false</bool>
++                    </property>
++                    <property name="text">
++                     <string>Color</string>
++                    </property>
++                   </widget>
++                  </item>
++                  <item row="0" column="3">
++                   <spacer name="horizontalSpacer_11">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeType">
++                     <enum>QSizePolicy::Fixed</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>80</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                  <item row="0" column="4">
++                   <spacer name="horizontalSpacer_9">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
++                <item row="5" column="0">
++                 <widget class="QCheckBox" name="editor_highlightCurrentLine">
++                  <property name="enabled">
++                   <bool>true</bool>
++                  </property>
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Highlight current line</string>
++                  </property>
++                 </widget>
++                </item>
+                 <item row="1" column="2">
+                  <layout class="QGridLayout" name="gridLayout_6">
+                   <item row="0" column="0">
+                    <widget class="QLabel" name="editor_lbl_min_tab_width">
+                     <property name="text">
+                      <string>Tab width min.</string>
+                     </property>
+                    </widget>
+@@ -582,228 +724,103 @@
+                    <widget class="QLabel" name="editor_lbl_max_tab_width">
+                     <property name="text">
+                      <string>max.</string>
+                     </property>
+                    </widget>
+                   </item>
+                  </layout>
+                 </item>
+-                <item row="5" column="2">
+-                 <layout class="QGridLayout" name="editor_grid_current_line" rowstretch="0" columnstretch="0,0,0,0,0">
+-                  <property name="horizontalSpacing">
+-                   <number>12</number>
+-                  </property>
+-                  <property name="verticalSpacing">
+-                   <number>0</number>
+-                  </property>
+-                  <item row="0" column="1">
+-                   <widget class="QLabel" name="editor_label_cl_color">
+-                    <property name="enabled">
+-                     <bool>false</bool>
+-                    </property>
+-                    <property name="text">
+-                     <string>Color</string>
+-                    </property>
+-                   </widget>
+-                  </item>
+-                  <item row="0" column="3">
+-                   <spacer name="horizontalSpacer_11">
+-                    <property name="orientation">
+-                     <enum>Qt::Horizontal</enum>
+-                    </property>
+-                    <property name="sizeType">
+-                     <enum>QSizePolicy::Fixed</enum>
+-                    </property>
+-                    <property name="sizeHint" stdset="0">
+-                     <size>
+-                      <width>80</width>
+-                      <height>20</height>
+-                     </size>
+-                    </property>
+-                   </spacer>
+-                  </item>
+-                  <item row="0" column="4">
+-                   <spacer name="horizontalSpacer_9">
+-                    <property name="orientation">
+-                     <enum>Qt::Horizontal</enum>
+-                    </property>
+-                    <property name="sizeHint" stdset="0">
+-                     <size>
+-                      <width>40</width>
+-                      <height>20</height>
+-                     </size>
+-                    </property>
+-                   </spacer>
+-                  </item>
+-                 </layout>
+-                </item>
+-                <item row="5" column="0">
+-                 <widget class="QCheckBox" name="editor_highlightCurrentLine">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Highlight current line</string>
+-                  </property>
+-                 </widget>
+-                </item>
+                 <item row="3" column="0">
+                  <widget class="QCheckBox" name="editor_ws_checkbox">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="text">
+                    <string>Show whitespace</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="7" column="0">
++                <item row="9" column="0">
++                 <widget class="QCheckBox" name="cb_edit_status_bar">
++                  <property name="sizePolicy">
++                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                    <horstretch>0</horstretch>
++                    <verstretch>0</verstretch>
++                   </sizepolicy>
++                  </property>
++                  <property name="text">
++                   <string>Show status bar</string>
++                  </property>
++                  <property name="checked">
++                   <bool>true</bool>
++                  </property>
++                 </widget>
++                </item>
++                <item row="8" column="0">
+                  <widget class="QCheckBox" name="cb_code_folding">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="text">
+                    <string>Enable Code Folding</string>
+                   </property>
+                   <property name="checked">
+                    <bool>true</bool>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="3" column="2">
+-                 <widget class="QCheckBox" name="editor_ws_indent_checkbox">
+-                  <property name="enabled">
+-                   <bool>false</bool>
+-                  </property>
+-                  <property name="text">
+-                   <string>Do not show whitespace used for indentation</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="9" column="0">
+-                 <widget class="QCheckBox" name="cb_show_hscrollbar">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show horizontal scroll bar</string>
+-                  </property>
+-                  <property name="checked">
+-                   <bool>true</bool>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="8" column="0">
+-                 <widget class="QCheckBox" name="cb_edit_status_bar">
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show status bar</string>
+-                  </property>
+-                  <property name="checked">
+-                   <bool>true</bool>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="1" column="0">
+-                 <widget class="QCheckBox" name="editor_longWindowTitle">
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show complete path in window title</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="4" column="0">
+-                 <widget class="QCheckBox" name="cb_show_eol">
+-                  <property name="sizePolicy">
+-                   <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                    <horstretch>0</horstretch>
+-                    <verstretch>0</verstretch>
+-                   </sizepolicy>
+-                  </property>
+-                  <property name="text">
+-                   <string>Show EOL characters</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="8" column="2">
++                <item row="9" column="2">
+                  <widget class="QCheckBox" name="cb_edit_tool_bar">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="text">
+                    <string>Show tool bar</string>
+                   </property>
+                   <property name="checked">
+                    <bool>true</bool>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="2" column="0">
+-                 <widget class="QCheckBox" name="editor_showLineNumbers">
+-                  <property name="enabled">
+-                   <bool>true</bool>
+-                  </property>
++                <item row="2" column="2">
++                 <widget class="QCheckBox" name="cb_show_eol">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="text">
+-                   <string>Show line numbers</string>
++                   <string>Show EOL characters</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="1" column="1">
+-                 <spacer name="horizontalSpacer_24">
+-                  <property name="orientation">
+-                   <enum>Qt::Horizontal</enum>
+-                  </property>
+-                  <property name="sizeType">
+-                   <enum>QSizePolicy::Fixed</enum>
++               </layout>
++              </item>
++              <item>
++               <layout class="QHBoxLayout" name="horizontalLayout_22">
++                <property name="topMargin">
++                 <number>0</number>
++                </property>
++                <item>
++                 <widget class="QCheckBox" name="editor_highlight_all_occurrences">
++                  <property name="text">
++                   <string>Highlight all occurrences of a word selected by a double click</string>
+                   </property>
+-                  <property name="sizeHint" stdset="0">
+-                   <size>
+-                    <width>10</width>
+-                    <height>0</height>
+-                   </size>
+-                  </property>
+-                 </spacer>
++                 </widget>
+                 </item>
+                </layout>
+               </item>
+               <item>
+                <layout class="QHBoxLayout" name="horizontalLayout">
+                 <item>
+                  <widget class="QCheckBox" name="useCustomFileEditor">
+                   <property name="enabled">
+@@ -922,48 +939,93 @@
+               <string>Long lines</string>
+              </property>
+              <layout class="QVBoxLayout" name="verticalLayout_23">
+               <item>
+                <layout class="QGridLayout" name="gridLayout_21">
+                 <property name="topMargin">
+                  <number>0</number>
+                 </property>
++                <item row="2" column="5">
++                 <layout class="QHBoxLayout" name="horizontalLayout_18">
++                  <item>
++                   <widget class="QCheckBox" name="editor_break_checkbox">
++                    <property name="enabled">
++                     <bool>true</bool>
++                    </property>
++                    <property name="sizePolicy">
++                     <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                      <horstretch>0</horstretch>
++                      <verstretch>0</verstretch>
++                     </sizepolicy>
++                    </property>
++                    <property name="toolTip">
++                     <string>This works well for monospaced fonts. The line is drawn at a position based on the width of a space character in the default font. It may not work very well if styles use proportional fonts or if varied font sizes or bold, italic and normal texts are used.</string>
++                    </property>
++                    <property name="text">
++                     <string>Break long lines at line length</string>
++                    </property>
++                    <property name="checked">
++                     <bool>false</bool>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <widget class="QCheckBox" name="editor_wrap_checkbox">
++                    <property name="enabled">
++                     <bool>true</bool>
++                    </property>
++                    <property name="sizePolicy">
++                     <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
++                      <horstretch>0</horstretch>
++                      <verstretch>0</verstretch>
++                     </sizepolicy>
++                    </property>
++                    <property name="toolTip">
++                     <string>This works well for monospaced fonts. The line is drawn at a position based on the width of a space character in the default font. It may not work very well if styles use proportional fonts or if varied font sizes or bold, italic and normal texts are used.</string>
++                    </property>
++                    <property name="text">
++                     <string>Wrap lines at window border</string>
++                    </property>
++                    <property name="checked">
++                     <bool>false</bool>
++                    </property>
++                   </widget>
++                  </item>
++                  <item>
++                   <spacer name="horizontalSpacer_17">
++                    <property name="orientation">
++                     <enum>Qt::Horizontal</enum>
++                    </property>
++                    <property name="sizeHint" stdset="0">
++                     <size>
++                      <width>40</width>
++                      <height>20</height>
++                     </size>
++                    </property>
++                   </spacer>
++                  </item>
++                 </layout>
++                </item>
+                 <item row="0" column="3">
+                  <spacer name="horizontalSpacer_37">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeType">
+                    <enum>QSizePolicy::Fixed</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>10</width>
+                     <height>0</height>
+                    </size>
+                   </property>
+                  </spacer>
+                 </item>
+-                <item row="5" column="5">
+-                 <spacer name="horizontalSpacer_14">
+-                  <property name="orientation">
+-                   <enum>Qt::Horizontal</enum>
+-                  </property>
+-                  <property name="sizeType">
+-                   <enum>QSizePolicy::Fixed</enum>
+-                  </property>
+-                  <property name="sizeHint" stdset="0">
+-                   <size>
+-                    <width>10</width>
+-                    <height>0</height>
+-                   </size>
+-                  </property>
+-                 </spacer>
+-                </item>
+                 <item row="0" column="2">
+                  <widget class="QSpinBox" name="editor_long_line_column">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+@@ -1028,77 +1090,16 @@
+                       <width>40</width>
+                       <height>20</height>
+                      </size>
+                     </property>
+                    </spacer>
+                   </item>
+                  </layout>
+                 </item>
+-                <item row="2" column="5">
+-                 <layout class="QHBoxLayout" name="horizontalLayout_18">
+-                  <item>
+-                   <widget class="QCheckBox" name="editor_break_checkbox">
+-                    <property name="enabled">
+-                     <bool>true</bool>
+-                    </property>
+-                    <property name="sizePolicy">
+-                     <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                      <horstretch>0</horstretch>
+-                      <verstretch>0</verstretch>
+-                     </sizepolicy>
+-                    </property>
+-                    <property name="toolTip">
+-                     <string>This works well for monospaced fonts. The line is drawn at a position based on the width of a space character in the default font. It may not work very well if styles use proportional fonts or if varied font sizes or bold, italic and normal texts are used.</string>
+-                    </property>
+-                    <property name="text">
+-                     <string>Break long lines at line length</string>
+-                    </property>
+-                    <property name="checked">
+-                     <bool>false</bool>
+-                    </property>
+-                   </widget>
+-                  </item>
+-                  <item>
+-                   <widget class="QCheckBox" name="editor_wrap_checkbox">
+-                    <property name="enabled">
+-                     <bool>true</bool>
+-                    </property>
+-                    <property name="sizePolicy">
+-                     <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
+-                      <horstretch>0</horstretch>
+-                      <verstretch>0</verstretch>
+-                     </sizepolicy>
+-                    </property>
+-                    <property name="toolTip">
+-                     <string>This works well for monospaced fonts. The line is drawn at a position based on the width of a space character in the default font. It may not work very well if styles use proportional fonts or if varied font sizes or bold, italic and normal texts are used.</string>
+-                    </property>
+-                    <property name="text">
+-                     <string>Wrap lines at window border</string>
+-                    </property>
+-                    <property name="checked">
+-                     <bool>false</bool>
+-                    </property>
+-                   </widget>
+-                  </item>
+-                  <item>
+-                   <spacer name="horizontalSpacer_17">
+-                    <property name="orientation">
+-                     <enum>Qt::Horizontal</enum>
+-                    </property>
+-                    <property name="sizeHint" stdset="0">
+-                     <size>
+-                      <width>40</width>
+-                      <height>20</height>
+-                     </size>
+-                    </property>
+-                   </spacer>
+-                  </item>
+-                 </layout>
+-                </item>
+                </layout>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QGroupBox" name="groupBox_6">
+              <property name="title">
+@@ -1121,32 +1122,45 @@
+                   <property name="maximum">
+                    <number>32</number>
+                   </property>
+                   <property name="value">
+                    <number>2</number>
+                   </property>
+                  </widget>
+                 </item>
++                <item row="2" column="10">
++                 <spacer name="horizontalSpacer_20">
++                  <property name="orientation">
++                   <enum>Qt::Horizontal</enum>
++                  </property>
++                  <property name="sizeHint" stdset="0">
++                   <size>
++                    <width>40</width>
++                    <height>20</height>
++                   </size>
++                  </property>
++                 </spacer>
++                </item>
+                 <item row="0" column="0">
+                  <widget class="QLabel" name="label_13">
+                   <property name="text">
+                    <string>Indent width</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item row="2" column="4">
+                  <widget class="QCheckBox" name="editor_tab_ind_checkbox">
+                   <property name="text">
+                    <string>Tab indents line</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="2" column="10">
+-                 <spacer name="horizontalSpacer_20">
++                <item row="0" column="10">
++                 <spacer name="horizontalSpacer_13">
+                   <property name="orientation">
+                    <enum>Qt::Horizontal</enum>
+                   </property>
+                   <property name="sizeHint" stdset="0">
+                    <size>
+                     <width>40</width>
+                     <height>20</height>
+                    </size>
+@@ -1155,46 +1169,46 @@
+                 </item>
+                 <item row="0" column="4">
+                  <widget class="QCheckBox" name="editor_auto_ind_checkbox">
+                   <property name="text">
+                    <string>Auto indentation</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="2" column="0">
+-                 <widget class="QLabel" name="label_14">
+-                  <property name="text">
+-                   <string>Tab width</string>
+-                  </property>
+-                 </widget>
+-                </item>
+-                <item row="0" column="6">
+-                 <widget class="QCheckBox" name="editor_ind_guides_checkbox">
+-                  <property name="text">
+-                   <string>Show indentation guides</string>
+-                  </property>
+-                 </widget>
+-                </item>
+                 <item row="2" column="2">
+                  <widget class="QSpinBox" name="editor_tab_width_spinbox">
+                   <property name="sizePolicy">
+                    <sizepolicy hsizetype="Preferred" vsizetype="Preferred">
+                     <horstretch>0</horstretch>
+                     <verstretch>0</verstretch>
+                    </sizepolicy>
+                   </property>
+                   <property name="minimum">
+                    <number>1</number>
+                   </property>
+                   <property name="maximum">
+                    <number>32</number>
+                   </property>
+                  </widget>
+                 </item>
++                <item row="2" column="0">
++                 <widget class="QLabel" name="label_14">
++                  <property name="text">
++                   <string>Tab width</string>
++                  </property>
++                 </widget>
++                </item>
++                <item row="0" column="6">
++                 <widget class="QCheckBox" name="editor_ind_guides_checkbox">
++                  <property name="text">
++                   <string>Show indentation guides</string>
++                  </property>
++                 </widget>
++                </item>
+                 <item row="2" column="6">
+                  <widget class="QCheckBox" name="editor_bs_unind_checkbox">
+                   <property name="text">
+                    <string>Backspace unindents line</string>
+                   </property>
+                  </widget>
+                 </item>
+                 <item row="0" column="3">
+@@ -1215,29 +1229,16 @@
+                 </item>
+                 <item row="3" column="4">
+                  <widget class="QCheckBox" name="editor_ind_uses_tabs_checkbox">
+                   <property name="text">
+                    <string>Indentation uses tabs</string>
+                   </property>
+                  </widget>
+                 </item>
+-                <item row="0" column="10">
+-                 <spacer name="horizontalSpacer_13">
+-                  <property name="orientation">
+-                   <enum>Qt::Horizontal</enum>
+-                  </property>
+-                  <property name="sizeHint" stdset="0">
+-                   <size>
+-                    <width>40</width>
+-                    <height>20</height>
+-                   </size>
+-                  </property>
+-                 </spacer>
+-                </item>
+                </layout>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item>
+             <widget class="QGroupBox" name="groupBox_7">
+              <property name="title">

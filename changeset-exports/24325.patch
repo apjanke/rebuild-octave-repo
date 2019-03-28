@@ -1,0 +1,451 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1511844774 18000
+#      Mon Nov 27 23:52:54 2017 -0500
+# Node ID bc65aa8a5ff15141a63287854931253fbe79fe55
+# Parent  06c804ae3815adab1c2c76bc0854a2358a0dc6c3
+don't store persistent variables separately in scope object
+
+* symrec.cc, symrec.h (symbol_record::xpersistent_varref,
+symbol_record::xpersistent_varval): Delete unused functions.
+(symbol_record::symbol_record_rep::clear): If persistent, don't call
+symbol_scope::persistent_assign.  Clear value before clearing status
+as a persistent variable.
+(symbol_record::symbol_record_rep::init_persistent): Only
+mark_persistent, don't set value here.
+(symbol_record::symbol_record_rep::varref): Don't call
+symbol_scope::persistent_varref.  Simply store value in element zero
+of value stack.
+(symbol_record::symbol_record_rep::varval): Don't call
+symbol_scope::persistent_varref.  Simply access value from element
+zero of value stack.
+
+* symscope.cc, symscope.h (symbol_scope::refresh): New function.
+(symbol_scope::m_persistent_symbols): Delete member variable and all
+uses.
+(symbol_scope::m_persistent_symbols_const_iterator,
+symbol_scope::m_persistent_symbols_iterator): Delete typedefs.
+(symbol_scope::persistent_assign, symbol_scope::persistent_varref,
+symbol_scope::persistent_varval): Delete unused functions.
+
+* ov-usr-fcn.cc (octave_user_function::call): To clear local variables
+on function return, add symbol_scope::refresh to the unwind_protect
+frame instead of symbol_scope::clear_variables.
+
+* recursion.tst: New tests.
+
+diff --git a/libinterp/corefcn/symrec.cc b/libinterp/corefcn/symrec.cc
+--- a/libinterp/corefcn/symrec.cc
++++ b/libinterp/corefcn/symrec.cc
+@@ -57,48 +57,33 @@ namespace octave
+       }
+ 
+     if (! (is_hidden () || is_inherited ())
+         && sid == decl_scope ())
+       {
+         if (is_global ())
+           unmark_global ();
+ 
+-        if (is_persistent ())
+-          {
+-            sid->persistent_assign (m_name, varval ());
++        assign (octave_value ());
+ 
+-            unmark_persistent ();
+-          }
+-
+-        assign (octave_value ());
++        if (is_persistent ())
++          unmark_persistent ();
+       }
+   }
+ 
+   void
+   symbol_record::symbol_record_rep::init_persistent (void)
+   {
+     if (auto t_fwd_rep = m_fwd_rep.lock ())
+       {
+         t_fwd_rep->init_persistent ();
+         return;
+       }
+ 
+-    symbol_scope *curr_scope
+-      = __require_current_scope__ ("symbol_record::symbol_record_rep::init_persistent");
+-
+-    if (! is_defined ())
+-      {
+-        mark_persistent ();
+-
+-        assign (curr_scope->persistent_varval (m_name));
+-      }
+-    // FIXME: this causes trouble with recursive calls.
+-    // else
+-    //   error ("unable to declare existing variable persistent");
++    mark_persistent ();
+   }
+ 
+   symbol_record::symbol_record_rep *
+   symbol_record::symbol_record_rep::dup (symbol_scope *new_scope) const
+   {
+     // FIXME: is this the right thing do to?
+     if (auto t_fwd_rep = m_fwd_rep.lock ())
+       return t_fwd_rep->dup (new_scope);
+@@ -138,54 +123,28 @@ namespace octave
+       return t_fwd_rep->xglobal_varref ();
+ 
+     symbol_table& symtab
+       = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varref");
+ 
+     return symtab.global_varref (m_name);
+   }
+ 
+-  octave_value&
+-  symbol_record::symbol_record_rep::xpersistent_varref (void)
+-  {
+-    if (auto t_fwd_rep = m_fwd_rep.lock ())
+-      return t_fwd_rep->xpersistent_varref ();
+-
+-    symbol_scope *curr_scope
+-      = __get_current_scope__ ("symbol_record::symbol_record_rep::xpersistent_varref");
+-
+-    return (curr_scope
+-            ? curr_scope->persistent_varref (m_name) : dummy_octave_value);
+-  }
+-
+   octave_value
+   symbol_record::symbol_record_rep::xglobal_varval (void) const
+   {
+     if (auto t_fwd_rep = m_fwd_rep.lock ())
+       return t_fwd_rep->xglobal_varval ();
+ 
+     symbol_table& symtab
+       = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varval");
+ 
+     return symtab.global_varval (m_name);
+   }
+ 
+-  octave_value
+-  symbol_record::symbol_record_rep::xpersistent_varval (void) const
+-  {
+-    if (auto t_fwd_rep = m_fwd_rep.lock ())
+-      return t_fwd_rep->xpersistent_varval ();
+-
+-    symbol_scope *curr_scope
+-      = __get_current_scope__ ("symbol_record::symbol_record_rep::xpersistent_varval");
+-
+-    return (curr_scope
+-            ? curr_scope->persistent_varval (m_name) : octave_value ());
+-  }
+-
+   symbol_record::symbol_record (void)
+     : m_rep (new symbol_record_rep (__get_current_scope__ ("symbol_record"),
+                                     "", octave_value (), local))
+ 
+   { }
+ 
+   octave_value
+   symbol_record::find (const octave_value_list& args) const
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+--- a/libinterp/corefcn/symrec.h
++++ b/libinterp/corefcn/symrec.h
+@@ -157,50 +157,48 @@ namespace octave
+ 
+       context_id get_decl_scope_context (void) const;
+ 
+       octave_value& varref (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->varref ();
+ 
+-        context_id context = m_decl_scope ? get_decl_scope_context () : 0;
+-
+         if (is_global ())
+           return xglobal_varref ();
+-        else if (is_persistent ())
+-          return xpersistent_varref ();
+-        else
+-          {
+-            context_id n = m_value_stack.size ();
+-            while (n++ <= context)
+-              m_value_stack.push_back (octave_value ());
++
++        context_id context = 0;
++
++        if (m_decl_scope && ! is_persistent ())
++          context = get_decl_scope_context ();
+ 
+-            return m_value_stack[context];
+-          }
++        context_id n = m_value_stack.size ();
++        while (n++ <= context)
++          m_value_stack.push_back (octave_value ());
++
++        return m_value_stack[context];
+       }
+ 
+       octave_value varval (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->varval ();
+ 
+-        context_id context = m_decl_scope ? get_decl_scope_context () : 0;
+-
+         if (is_global ())
+           return xglobal_varval ();
+-        else if (is_persistent ())
+-          return xpersistent_varval ();
++
++        context_id context = 0;
++
++        if (m_decl_scope && ! is_persistent ())
++          context = get_decl_scope_context ();
++
++        if (context < m_value_stack.size ())
++          return m_value_stack[context];
+         else
+-          {
+-            if (context < m_value_stack.size ())
+-              return m_value_stack[context];
+-            else
+-              return octave_value ();
+-          }
++          return octave_value ();
+       }
+ 
+       void push_context (symbol_scope *sid)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           {
+             t_fwd_rep->push_context (sid);
+             return;
+@@ -592,21 +590,17 @@ namespace octave
+       unsigned int m_storage_class;
+ 
+       bool m_valid;
+ 
+     private:
+ 
+       octave_value& xglobal_varref (void);
+ 
+-      octave_value& xpersistent_varref (void);
+-
+       octave_value xglobal_varval (void) const;
+-
+-      octave_value xpersistent_varval (void) const;
+     };
+ 
+   public:
+ 
+     symbol_record (void);
+ 
+     symbol_record (symbol_scope *s, const std::string& nm = "",
+                    const octave_value& v = octave_value (),
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -199,17 +199,16 @@ namespace octave
+   }
+ 
+   octave_value
+   symbol_scope::dump (void) const
+   {
+     std::map<std::string, octave_value> m
+       = {{ "name", m_name },
+          { "symbols", dump_symbols_map () },
+-         { "persistent_variables", m_persistent_symbols },
+          { "subfunctions", dump_function_map (m_subfunctions) }};
+ 
+     return octave_value (m);
+   }
+ 
+   octave_value
+   symbol_scope::dump_symbols_map (void) const
+   {
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -54,28 +54,24 @@ namespace octave
+     typedef symbol_record::context_id context_id;
+ 
+     typedef std::map<std::string, symbol_record>::const_iterator
+     table_const_iterator;
+     typedef std::map<std::string, symbol_record>::iterator
+     table_iterator;
+ 
+     typedef std::map<std::string, octave_value>::const_iterator
+-    m_persistent_symbols_const_iterator;
+-    typedef std::map<std::string, octave_value>::iterator
+-    m_persistent_symbols_iterator;
+-
+-    typedef std::map<std::string, octave_value>::const_iterator
+     subfunctions_const_iterator;
+     typedef std::map<std::string, octave_value>::iterator
+     subfunctions_iterator;
+ 
+     symbol_scope (const std::string& name = "")
+-      : m_name (name), m_symbols (), m_persistent_symbols (), m_subfunctions (),
+-        m_fcn (nullptr), m_parent (nullptr), m_parent_fcn (), m_children (), m_is_nested (false),
++      : m_name (name), m_symbols (), m_subfunctions (),
++        m_fcn (nullptr), m_parent (nullptr), m_parent_fcn (),
++        m_children (), m_is_nested (false),
+         m_is_static (false), m_context (0)
+     { }
+ 
+     // No copying!
+ 
+     symbol_scope (const symbol_scope&) = delete;
+ 
+     symbol_scope& operator = (const symbol_scope&) = delete;
+@@ -241,43 +237,16 @@ namespace octave
+     octave_value varval (const std::string& name) const
+     {
+       table_const_iterator p = m_symbols.find (name);
+ 
+       return (p != m_symbols.end ()
+               ? p->second.varval () : octave_value ());
+     }
+ 
+-    void persistent_assign (const std::string& name, const octave_value& value)
+-    {
+-      m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+-
+-      if (p == m_persistent_symbols.end ())
+-        m_persistent_symbols[name] = value;
+-      else
+-        p->second = value;
+-    }
+-
+-    // Use persistent_assign (name, value) instead.
+-    // Delete when deprecated varref functions are removed.
+-    octave_value& persistent_varref (const std::string& name)
+-    {
+-      m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+-
+-      return (p == m_persistent_symbols.end ()
+-              ? m_persistent_symbols[name] : p->second);
+-    }
+-
+-    octave_value persistent_varval (const std::string& name) const
+-    {
+-      m_persistent_symbols_const_iterator p = m_persistent_symbols.find (name);
+-
+-      return (p != m_persistent_symbols.end ()) ? p->second : octave_value ();
+-    }
+-
+     bool is_variable (const std::string& name) const
+     {
+       bool retval = false;
+ 
+       table_const_iterator p = m_symbols.find (name);
+ 
+       if (p != m_symbols.end ())
+         {
+@@ -303,16 +272,27 @@ namespace octave
+         {
+           if (tbl_it->second.pop_context (this) == 0)
+             m_symbols.erase (tbl_it++);
+           else
+             tbl_it++;
+         }
+     }
+ 
++    void refresh (void)
++    {
++      for (auto& nm_sr : m_symbols)
++        {
++          symbol_record& sr = nm_sr.second;
++
++          if (! sr.is_persistent ())
++            sr.clear (this);
++        }
++    }
++
+     void clear_variables (void)
+     {
+       for (auto& nm_sr : m_symbols)
+         nm_sr.second.clear (this);
+     }
+ 
+     void clear_objects (void)
+     {
+@@ -558,19 +538,16 @@ namespace octave
+ 
+     // Name for this scope (usually the corresponding filename of the
+     // function corresponding to the scope).
+     std::string m_name;
+ 
+     // Map from symbol names to symbol info.
+     std::map<std::string, symbol_record> m_symbols;
+ 
+-    // Map from names of persistent variables to values.
+-    std::map<std::string, octave_value> m_persistent_symbols;
+-
+     // Map from symbol names to subfunctions.
+     std::map<std::string, octave_value> m_subfunctions;
+ 
+     // The list of subfunctions (if any) in the order they appear in
+     // the function file.
+     std::list<std::string> m_subfunction_names;
+ 
+     // The associated user code (may be null).
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -606,17 +606,17 @@ octave_user_function::call (octave::tree
+       //
+       // This cleanup function is added to the unwind_protect stack
+       // after the calls to clear the parameter lists so that local
+       // variables will be cleared before the parameter lists are
+       // cleared.  That way, any function parameters that have been
+       // declared global will be unmarked as global before they are
+       // undefined by the clear_param_list cleanup function.
+ 
+-      frame.add_method (m_scope, &octave::symbol_scope::clear_variables);
++      frame.add_method (m_scope, &octave::symbol_scope::refresh);
+     }
+ 
+   bind_automatic_vars (tw, arg_names, args.length (), nargout,
+                        all_va_args (args));
+ 
+   frame.add_method (this, &octave_user_function::restore_warning_states);
+ 
+   // Evaluate the commands that make up the function.
+diff --git a/test/recursion.tst b/test/recursion.tst
+--- a/test/recursion.tst
++++ b/test/recursion.tst
+@@ -33,9 +33,35 @@
+ %!    return;
+ %!  else
+ %!    y = f (x-1) * x;
+ %!  endif
+ %!endfunction
+ %!
+ %!assert (f (5), 120)
+ 
++%!function r = f (x)
++%!  persistent p = 1;
++%!  if (x == 1)
++%!    f (x + 1);
++%!    r = p;
++%!  else
++%!    clear p
++%!    p = 13;
++%!  endif
++%!endfunction
++%!
++%!error <'p' undefined> f (1)
++
++%!function r = f (x)
++%!  persistent p = 1;
++%!  if (x == 1)
++%!    f (x + 1);
++%!    r = p;
++%!  else
++%!    p = 13;
++%!  endif
++%!endfunction
++%!
++%!assert (f (1), 13)
++
++
+ %%FIXME: Need test for maximum recursion depth

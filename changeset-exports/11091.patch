@@ -1,0 +1,358 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1286565767 14400
+#      Fri Oct 08 15:22:47 2010 -0400
+# Node ID 5677f3f7b5fac3042528bea7d13fd97922d14ff7
+# Parent  2adf4736dafa570d675c93dfbf6d5bfb0be312bb
+Matlab compatible short-circuit behavior for & and | operators
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,29 @@
++2010-10-08  John W. Eaton  <jwe@octave.org>
++
++	* octave.cc (maximum_braindamage):
++	Set do_braindead_shortcircuit_evaluation to true.
++	Disable Octave:possible-matlab-short-circuit-operator warning.
++	* oct-parse.yy (if_cmd_list1, elseif_clause, loop_command):
++	Mark conditions in IF and WHILE statements for braindead
++	short-circuit behavior.
++	* pt-binop.cc (Vdo_braindead_shortcircuit_evaluation): New
++	static variable.
++	(Fdo_braindead_shortcircuit_evaluation): New function.
++	(tree_binary_expression::rvalue1): Perform short-circuit
++	evaluation of | and & expressions that are conditions of WHILE
++	and IF statements if Vdo_braindead_shortcircuit_evaluation is true.
++	* pt-binop.h
++	(tree_binary_expression::eligible_for_braindead_shortcircuit):
++	New data member.  Initialize it in class constructors.
++	(tree_binary_expression::mark_braindead_shortcircuit): New function.
++	* pt-exp.h (tree_expression::mark_braindead_shortcircuit):
++	New virtual function.
++
+ 2010-10-08  Ben Abbott <bpabbott@mac.com>
+ 
+ 	* graphics.h.in: Properly set image pixel size when unique(x/ydata)
+ 	is scalar.
+ 
+ 2010-10-07  Rik  <octave@nomad.inbox5.com>
+ 
+ 	* DLD-FUNCTIONS/conv2.cc (convn): Update docstring.  Add 1 new test.
+diff --git a/src/oct-parse.yy b/src/oct-parse.yy
+--- a/src/oct-parse.yy
++++ b/src/oct-parse.yy
+@@ -1061,26 +1061,34 @@ if_cmd_list     : if_cmd_list1
+                 | if_cmd_list1 else_clause
+                   {
+                     $1->append ($2);
+                     $$ = $1;
+                   }
+                 ;
+ 
+ if_cmd_list1    : expression opt_sep opt_list
+-                  { $$ = start_if_command ($1, $3); }
++                  {
++                    $1->mark_braindead_shortcircuit (curr_fcn_file_full_name);
++
++                    $$ = start_if_command ($1, $3);
++                  }
+                 | if_cmd_list1 elseif_clause
+                   {
+                     $1->append ($2);
+                     $$ = $1;
+                   }
+                 ;
+ 
+ elseif_clause   : ELSEIF stash_comment opt_sep expression opt_sep opt_list
+-                  { $$ = make_elseif_clause ($1, $4, $6, $2); }
++                  {
++                    $4->mark_braindead_shortcircuit (curr_fcn_file_full_name);
++
++                    $$ = make_elseif_clause ($1, $4, $6, $2);
++                  }
+                 ;
+ 
+ else_clause     : ELSE stash_comment opt_sep opt_list
+                   { $$ = new tree_if_clause ($4, $2); }
+                 ;
+ 
+ // ================
+ // Switch statement
+@@ -1124,16 +1132,18 @@ default_case    : OTHERWISE stash_commen
+                 ;
+ 
+ // =======
+ // Looping
+ // =======
+ 
+ loop_command    : WHILE stash_comment expression opt_sep opt_list END
+                   {
++                    $3->mark_braindead_shortcircuit (curr_fcn_file_full_name);
++
+                     if (! ($$ = make_while_command ($1, $3, $5, $6, $2)))
+                       ABORT_PARSE;
+                   }
+                 | DO stash_comment opt_sep opt_list UNTIL expression
+                   {
+                     if (! ($$ = make_do_until_command ($5, $4, $6, $2)))
+                       ABORT_PARSE;
+                   }
+diff --git a/src/octave.cc b/src/octave.cc
+--- a/src/octave.cc
++++ b/src/octave.cc
+@@ -564,26 +564,28 @@ maximum_braindamage (void)
+ 
+   bind_internal_variable ("PS1", ">> ");
+   bind_internal_variable ("PS2", "");
+   bind_internal_variable ("allow_noninteger_range_as_index", true);
+   bind_internal_variable ("beep_on_error", true);
+   bind_internal_variable ("confirm_recursive_rmdir", false);
+   bind_internal_variable ("crash_dumps_octave_core", false);
+   bind_internal_variable ("default_save_options", "-mat-binary");
++  bind_internal_variable ("do_braindead_shortcircuit_evaluation", true);
+   bind_internal_variable ("fixed_point_format", true);
+   bind_internal_variable ("history_timestamp_format_string",
+                          "%%-- %D %I:%M %p --%%");
+   bind_internal_variable ("page_screen_output", false);
+   bind_internal_variable ("print_empty_dimensions", false);
+ 
+   disable_warning ("Octave:abbreviated-property-match");
+   disable_warning ("Octave:fopen-file-in-path");
+   disable_warning ("Octave:function-name-clash");
+   disable_warning ("Octave:load-file-in-path");
++  disable_warning ("Octave:possible-matlab-short-circuit-operator");
+ }
+ 
+ // You guessed it.
+ 
+ int
+ octave_main (int argc, char **argv, int embedded)
+ {
+   octave_env::set_program_name (argv[0]);
+diff --git a/src/pt-binop.cc b/src/pt-binop.cc
+--- a/src/pt-binop.cc
++++ b/src/pt-binop.cc
+@@ -21,21 +21,27 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
++#include "defun.h"
+ #include "oct-obj.h"
+ #include "ov.h"
+ #include "pt-binop.h"
+ #include "pt-bp.h"
+ #include "pt-walk.h"
++#include "variables.h"
++
++// TRUE means we mark | and & expressions for braindead short-circuit
++// behavior.
++static bool Vdo_braindead_shortcircuit_evaluation;
+ 
+ // Binary expressions.
+  
+ octave_value_list
+ tree_binary_expression::rvalue (int nargout)
+ {
+   octave_value_list retval;
+ 
+@@ -51,16 +57,65 @@ tree_binary_expression::rvalue (int narg
+ octave_value
+ tree_binary_expression::rvalue1 (int)
+ {
+   octave_value retval;
+ 
+   if (error_state)
+     return retval;
+ 
++  if (Vdo_braindead_shortcircuit_evaluation
++      && eligible_for_braindead_shortcircuit)
++    {
++      if (op_lhs)
++        {
++          octave_value a = op_lhs->rvalue1 ();
++
++          if (! error_state)
++            {
++              if (a.ndims () == 2 && a.rows () == 1 && a.columns () == 1)
++                {
++                  bool result = false;
++
++                  bool a_true = a.is_true ();
++
++                  if (! error_state)
++                    {
++                      if (a_true)
++                        {
++                          if (etype == octave_value::op_el_or)
++                            {
++                              result = true;
++                              goto done;
++                            }
++                        }
++                      else
++                        {
++                          if (etype == octave_value::op_el_and)
++                            goto done;
++                        }
++
++                      if (op_rhs)
++                        {
++                          octave_value b = op_rhs->rvalue1 ();
++
++                          if (! error_state)
++                            result = b.is_true ();
++                        }
++
++                    done:
++
++                      if (! error_state)
++                        return octave_value (result);
++                    }
++                }
++            }
++        }
++    }
++
+   if (op_lhs)
+     {
+       octave_value a = op_lhs->rvalue1 ();
+ 
+       if (! error_state && a.is_defined () && op_rhs)
+         {
+           octave_value b = op_rhs->rvalue1 ();
+ 
+@@ -202,8 +257,26 @@ tree_boolean_expression::dup (symbol_tab
+     = new tree_boolean_expression (op_lhs ? op_lhs->dup (scope, context) : 0,
+                                    op_rhs ? op_rhs->dup (scope, context) : 0,
+                                    line (), column (), etype);
+ 
+   new_be->copy_base (*this);
+ 
+   return new_be;
+ }
++
++DEFUN (do_braindead_shortcircuit_evaluation, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn  {Built-in Function} {@var{val} =} do_braindead_shortcircuit_evaluation ()\n\
++@deftypefnx  {Built-in Function} {@var{old_val} =} do_braindead_shortcircuit_evaluation (@var{new_val})\n\
++Query or set the internal variable that controls whether Octave will\n\
++do short-circuit evaluation of @samp{|} and @samp{&} operators inside the\n\
++conditions of if or while statements.\n\
++\n\
++This feature is only provided for compatibility with Matlab and should\n\
++not be used unless you are porting old code that relies on this feature.\n\
++\n\
++To obtain short-circuit behavior for logical expressions in new programs,\n\
++you should always use the @samp{&&} and @samp{||} operators.\n\
++@end deftypefn")
++{
++  return SET_INTERNAL_VARIABLE (do_braindead_shortcircuit_evaluation);
++}
+diff --git a/src/pt-binop.h b/src/pt-binop.h
+--- a/src/pt-binop.h
++++ b/src/pt-binop.h
+@@ -41,30 +41,53 @@ class octave_lvalue;
+ class
+ tree_binary_expression : public tree_expression
+ {
+ public:
+ 
+   tree_binary_expression (int l = -1, int c = -1,
+                           octave_value::binary_op t
+                             = octave_value::unknown_binary_op)
+-    : tree_expression (l, c), op_lhs (0), op_rhs (0), etype (t) { }
++    : tree_expression (l, c), op_lhs (0), op_rhs (0), etype (t),
++      eligible_for_braindead_shortcircuit (false) { }
+ 
+   tree_binary_expression (tree_expression *a, tree_expression *b,
+                           int l = -1, int c = -1,
+                           octave_value::binary_op t
+                             = octave_value::unknown_binary_op)
+-    : tree_expression (l, c), op_lhs (a), op_rhs (b), etype (t) { }
++    : tree_expression (l, c), op_lhs (a), op_rhs (b), etype (t),
++      eligible_for_braindead_shortcircuit (false) { }
+ 
+   ~tree_binary_expression (void)
+     {
+       delete op_lhs;
+       delete op_rhs;
+     }
+ 
++  void mark_braindead_shortcircuit (const std::string& file)
++    {
++      if (etype == octave_value::op_el_and
++          || etype == octave_value::op_el_or)
++        {
++          if (file.empty ())
++            warning_with_id ("Octave:possible-matlab-short-circuit-operator",
++                             "possible Matlab-style short-circuit operator at line %d, column %d",
++                             line (), column ());
++          else
++            warning_with_id ("Octave:possible-matlab-short-circuit-operator",
++                             "%s: possible Matlab-style short-circuit operator at line %d, column %d",
++                             file.c_str (), line (), column ());
++
++          eligible_for_braindead_shortcircuit = true;
++
++          op_lhs->mark_braindead_shortcircuit (file);
++          op_rhs->mark_braindead_shortcircuit (file);
++        }
++    }
++
+   bool has_magic_end (void) const
+     {
+       return ((op_lhs && op_lhs->has_magic_end ())
+               || (op_rhs && op_rhs->has_magic_end ()));
+     }
+ 
+   bool is_binary_expression (void) const { return true; }
+ 
+@@ -92,16 +115,20 @@ protected:
+   tree_expression *op_lhs;
+   tree_expression *op_rhs;
+ 
+ private:
+ 
+   // The type of the expression.
+   octave_value::binary_op etype;
+ 
++  // TRUE if this is an | or & expression in the condition of an IF
++  // or WHILE statement.
++  bool eligible_for_braindead_shortcircuit;
++
+   // No copying!
+ 
+   tree_binary_expression (const tree_binary_expression&);
+ 
+   tree_binary_expression& operator = (const tree_binary_expression&);
+ };
+ 
+ // Boolean expressions.
+diff --git a/src/pt-exp.h b/src/pt-exp.h
+--- a/src/pt-exp.h
++++ b/src/pt-exp.h
+@@ -91,16 +91,18 @@ public:
+   bool print_result (void) const { return print_flag; }
+ 
+   virtual std::string oper (void) const { return "<unknown>"; }
+ 
+   virtual std::string name (void) const { return "<unknown>"; }
+ 
+   virtual std::string original_text (void) const;
+ 
++  virtual void mark_braindead_shortcircuit (const std::string&) { }
++
+   tree_expression *mark_in_parens (void)
+     {
+       num_parens++;
+       return this;
+     }
+ 
+   tree_expression *mark_postfix_indexed (void)
+     {

@@ -1,0 +1,3377 @@
+# HG changeset patch
+# User Julien Bect <jbect@users.sourceforge.net>
+# Date 1500791732 -7200
+#      Sun Jul 23 08:35:32 2017 +0200
+# Node ID 790b4389cfb4297ee71d17f57d5671599ed7f226
+# Parent  af23baa0a9da061562af82b11f8e9c106759d1dc
+jit: Use MJCIT instead of the old JIT
+
+diff --git a/libinterp/parse-tree/jit-typeinfo.cc b/libinterp/parse-tree/jit-typeinfo.cc
+--- a/libinterp/parse-tree/jit-typeinfo.cc
++++ b/libinterp/parse-tree/jit-typeinfo.cc
+@@ -27,18 +27,16 @@ along with Octave; see the file COPYING.
+ #define __STDC_CONSTANT_MACROS
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #if defined (HAVE_LLVM)
+ 
+-#include "jit-typeinfo.h"
+-
+ #if defined (HAVE_LLVM_IR_VERIFIER_H)
+ #  include <llvm/IR/Verifier.h>
+ #else
+ #  include <llvm/Analysis/Verifier.h>
+ #endif
+ 
+ #include <llvm/ExecutionEngine/ExecutionEngine.h>
+ 
+@@ -61,31 +59,30 @@ along with Octave; see the file COPYING.
+ #  elif defined(HAVE_LLVM_IR_IRBUILDER_H)
+ #  include <llvm/IR/IRBuilder.h>
+ #else
+ #  include <llvm/IRBuilder.h>
+ #endif
+ 
+ #include <llvm/Support/raw_os_ostream.h>
+ 
++#include "jit-typeinfo.h"
++#include "pt-jit.h"
+ #include "jit-ir.h"
+ #include "ov.h"
+ #include "ov-builtin.h"
+ #include "ov-complex.h"
+ #include "ov-scalar.h"
+ #include "pager.h"
+ #include "interpreter-private.h"
+ 
+ namespace octave
+ {
+-
+   static llvm::LLVMContext& context = llvm::getGlobalContext ();
+ 
+-  jit_typeinfo *jit_typeinfo::instance = nullptr;
+-
+   std::ostream& jit_print (std::ostream& os, jit_type *atype)
+   {
+     if (! atype)
+       return os << "null";
+     return os << atype->name ();
+   }
+ 
+   // function that jit code calls
+@@ -475,42 +472,46 @@ namespace octave
+ 
+     if (! (ovl.empty ()
+            || (ovl.length () == 1 && ovl.xelem (0).is_undefined ())))
+       err_bad_result ();
+ 
+     return 0;
+   }
+ 
++
+   // -------------------- jit_range --------------------
+   bool
+   jit_range::all_elements_are_ints () const
+   {
+     Range r (*this);
+     return r.all_elements_are_ints ();
+   }
+ 
+   std::ostream&
+   operator<< (std::ostream& os, const jit_range& rng)
+   {
+     return os << "Range[" << rng.base << ", " << rng.limit << ", " << rng.inc
+               << ", " << rng.nelem << ']';
+   }
+ 
++
+   // -------------------- jit_matrix --------------------
+ 
+   std::ostream&
+   operator<< (std::ostream& os, const jit_matrix& mat)
+   {
+     return os << "Matrix[" << mat.ref_count << ", " << mat.slice_data << ", "
+               << mat.slice_len << ", " << mat.dimensions << ", "
+               << mat.array << ']';
+   }
+ 
++
+   // -------------------- jit_type --------------------
++
+   jit_type::jit_type (const std::string& aname, jit_type *aparent,
+                       llvm::Type *allvm_type, bool askip_paren, int aid) :
+     mname (aname), mparent (aparent), llvm_type (allvm_type), mid (aid),
+     mdepth (aparent ? aparent->mdepth + 1 : 0), mskip_paren (askip_paren)
+   {
+     std::memset (msret, 0, sizeof (msret));
+     std::memset (mpointer_arg, 0, sizeof (mpointer_arg));
+     std::memset (mpack, 0, sizeof (mpack));
+@@ -521,54 +522,55 @@ namespace octave
+   }
+ 
+   llvm::Type *
+   jit_type::to_llvm_arg (void) const
+   {
+     return llvm_type ? llvm_type->getPointerTo () : nullptr;
+   }
+ 
+-jit_type*
+-jit_type_join (jit_type *lhs, jit_type *rhs)
+-{
+-  // empty case
+-  if (! lhs)
+-    return rhs;
++  jit_type*
++  jit_type_join (jit_type *lhs, jit_type *rhs)
++  {
++    // empty case
++    if (! lhs)
++      return rhs;
+ 
+-  if (! rhs)
+-    return lhs;
++    if (! rhs)
++      return lhs;
+ 
+-  // check for a shared parent
+-  while (lhs != rhs)
+-    {
+-      if (lhs->depth () > rhs->depth ())
+-        lhs = lhs->parent ();
+-      else if (lhs->depth () < rhs->depth ())
+-        rhs = rhs->parent ();
+-      else
+-        {
+-          // we MUST have depth > 0 as any is the base type of everything
+-          do
+-            {
+-              lhs = lhs->parent ();
+-              rhs = rhs->parent ();
+-            }
+-          while (lhs != rhs);
+-        }
+-    }
+-  return lhs;
+-}
++    // check for a shared parent
++    while (lhs != rhs)
++      {
++        if (lhs->depth () > rhs->depth ())
++          lhs = lhs->parent ();
++        else if (lhs->depth () < rhs->depth ())
++          rhs = rhs->parent ();
++        else
++          {
++            // we MUST have depth > 0 as any is the base type of everything
++            do
++              {
++                lhs = lhs->parent ();
++                rhs = rhs->parent ();
++              }
++            while (lhs != rhs);
++          }
++      }
++    return lhs;
++  }
++
+ 
+   // -------------------- jit_function --------------------
+-  jit_function::jit_function () : module (0), llvm_function (0), mresult (0),
+-                                  call_conv (jit_convention::length),
+-                                  mcan_error (false)
++  jit_function::jit_function ()
++    : module (nullptr), llvm_function (nullptr), mresult (nullptr),
++      call_conv (jit_convention::length), mcan_error (false)
+   { }
+ 
+-  jit_function::jit_function (llvm::Module *amodule,
++  jit_function::jit_function (const jit_module *amodule,
+                               jit_convention::type acall_conv,
+                               const llvm::Twine& aname, jit_type *aresult,
+                               const std::vector<jit_type *>& aargs)
+     : module (amodule), mresult (aresult), args (aargs), call_conv (acall_conv),
+       mcan_error (false)
+   {
+     llvm::SmallVector<llvm::Type *, 15> llvm_args;
+ 
+@@ -590,21 +592,18 @@ jit_type_join (jit_type *lhs, jit_type *
+         assert (ty);
+         llvm::Type *argty = ty->packed_type (call_conv);
+         if (ty->pointer_arg (call_conv))
+           argty = argty->getPointerTo ();
+ 
+         llvm_args.push_back (argty);
+       }
+ 
+-    // we mark all functinos as external linkage because this prevents llvm
+-    // from getting rid of always inline functions
+     llvm::FunctionType *ft = llvm::FunctionType::get (rtype, llvm_args, false);
+-    llvm_function = llvm::Function::Create (ft, llvm::Function::ExternalLinkage,
+-                                            aname, module);
++    llvm_function = module->create_llvm_function (ft, aname);
+ 
+     if (sret ())
+       {
+ #if defined (FUNCTION_ADDATTRIBUTE_ARG_IS_ATTRIBUTES)
+         llvm::AttrBuilder attr_builder;
+         attr_builder.addAttribute (llvm::Attributes::StructRet);
+         llvm::Attributes attrs = llvm::Attributes::get(context, attr_builder);
+         llvm_function->addAttribute (1, attrs);
+@@ -783,23 +782,16 @@ jit_type_join (jit_type *lhs, jit_type *
+       }
+     else
+       builder.CreateRetVoid ();
+ 
+     if (verify)
+       llvm::verifyFunction (*llvm_function);
+   }
+ 
+-  void
+-  jit_function::do_add_mapping (llvm::ExecutionEngine *engine, void *fn)
+-  {
+-    assert (valid ());
+-    engine->addGlobalMapping (llvm_function, fn);
+-  }
+-
+   std::ostream&
+   operator<< (std::ostream& os, const jit_function& fn)
+   {
+     llvm::Function *lfn = fn.to_llvm ();
+     os << "jit_function: cc=" << fn.call_conv;
+     llvm::raw_os_ostream llvm_out (os);
+     lfn->print (llvm_out);
+     llvm_out.flush ();
+@@ -849,18 +841,18 @@ jit_type_join (jit_type *lhs, jit_type *
+       over.resize (dv);
+ 
+     over(idx) = func;
+   }
+ 
+   const jit_function&
+   jit_operation::overload (const std::vector<jit_type*>& types) const
+   {
+-  // Number of input arguments of the overload that is being looked for
+-  size_t nargs = types.size ();
++    // Number of input arguments of the overload that is being looked for
++    size_t nargs = types.size ();
+ 
+     static jit_function null_overload;
+     for (size_t i = 0; i < nargs; ++i)
+       if (! types[i])
+         return null_overload;
+ 
+     if (nargs >= overloads.size ())
+       return do_generate (types);
+@@ -982,245 +974,327 @@ jit_type_join (jit_type *lhs, jit_type *
+       }
+ 
+     llvm::Value *array_mem = builder.CreateAlloca (array_t);
+     builder.CreateStore (array, array_mem);
+     return builder.CreateBitCast (array_mem, scalar_t->getPointerTo ());
+   }
+ 
+   // -------------------- jit_paren_subsref --------------------
++
++  jit_paren_subsref::jit_paren_subsref (const jit_typeinfo& ti)
++    : jit_index_operation (ti, "()subsref"),
++      paren_scalar (nullptr)
++  {
++  }
++
++  jit_paren_subsref::~jit_paren_subsref ()
++  {
++    delete paren_scalar;
++  }
++
+   jit_function *
+   jit_paren_subsref::generate_matrix (const signature_vec& types) const
+   {
++    if (paren_scalar == nullptr)
++      panic_impossible ();
++
+     std::stringstream ss;
+     ss << "jit_paren_subsref_matrix_scalar" << (types.size () - 1);
+ 
+-    jit_type *scalar = jit_typeinfo::get_scalar ();
+-    jit_function *fn = new jit_function (module, jit_convention::internal,
+-                                         ss.str (), scalar, types);
++    // FIXME: Where will this be deleted?
++    jit_function *fn = new jit_function
++      (typeinfo.create_internal (ss.str (), typeinfo.scalar, types));
++
+     fn->mark_can_error ();
+     llvm::BasicBlock *body = fn->new_block ();
+     llvm::IRBuilder<> builder (body);
+ 
+     llvm::Value *array = create_arg_array (builder, *fn, 1, types.size ());
+-    jit_type *index = jit_typeinfo::get_index ();
+-    llvm::Value *nelem = llvm::ConstantInt::get (index->to_llvm (),
++    llvm::Value *nelem = llvm::ConstantInt::get (typeinfo.index_t,
+                                                  types.size () - 1);
+     llvm::Value *mat = fn->argument (builder, 0);
+-    llvm::Value *ret = paren_scalar.call (builder, mat, array, nelem);
+-    fn->do_return (builder, ret);
+-    return fn;
+-  }
+-
+-  void
+-  jit_paren_subsref::do_initialize (void)
+-  {
+-    std::vector<jit_type *> types (3);
+-    types[0] = jit_typeinfo::get_matrix ();
+-    types[1] = jit_typeinfo::get_scalar_ptr ();
+-    types[2] = jit_typeinfo::get_index ();
+-
+-    jit_type *scalar = jit_typeinfo::get_scalar ();
+-    paren_scalar = jit_function (module, jit_convention::external,
+-                                 "octave_jit_paren_scalar", scalar, types);
+-    paren_scalar.add_mapping (engine, &octave_jit_paren_scalar);
+-    paren_scalar.mark_can_error ();
+-  }
+-
+-  // -------------------- jit_paren_subsasgn --------------------
+-  jit_function *
+-  jit_paren_subsasgn::generate_matrix (const signature_vec& types) const
+-  {
+-    std::stringstream ss;
+-    ss << "jit_paren_subsasgn_matrix_scalar" << (types.size () - 2);
+-
+-    jit_type *matrix = jit_typeinfo::get_matrix ();
+-    jit_function *fn = new jit_function (module, jit_convention::internal,
+-                                         ss.str (), matrix, types);
+-    fn->mark_can_error ();
+-    llvm::BasicBlock *body = fn->new_block ();
+-    llvm::IRBuilder<> builder (body);
+-
+-    llvm::Value *array = create_arg_array (builder, *fn, 1, types.size () - 1);
+-    jit_type *index = jit_typeinfo::get_index ();
+-    llvm::Value *nelem = llvm::ConstantInt::get (index->to_llvm (),
+-                                                 types.size () - 2);
+-
+-    llvm::Value *mat = fn->argument (builder, 0);
+-    llvm::Value *value = fn->argument (builder, types.size () - 1);
+-    llvm::Value *ret = paren_scalar.call (builder, mat, array, nelem, value);
++    llvm::Value *ret = paren_scalar->call (builder, mat, array, nelem);
+     fn->do_return (builder, ret);
+     return fn;
+   }
+ 
+   void
+-  jit_paren_subsasgn::do_initialize (void)
++  jit_paren_subsref::init_paren_scalar ()
+   {
+-    if (paren_scalar.valid ())
+-      return;
++    std::vector<jit_type *> types (3);
++    types[0] = typeinfo.matrix;
++    types[1] = typeinfo.scalar_ptr;
++    types[2] = typeinfo.index;
++
++    paren_scalar = new jit_function
++      (typeinfo.create_external (&octave_jit_paren_scalar,
++                                 "octave_jit_paren_scalar",
++                                 typeinfo.scalar, types));
+ 
+-    jit_type *matrix = jit_typeinfo::get_matrix ();
+-    std::vector<jit_type *> types (4);
+-    types[0] = matrix;
+-    types[1] = jit_typeinfo::get_scalar_ptr ();
+-    types[2] = jit_typeinfo::get_index ();
+-    types[3] = jit_typeinfo::get_scalar ();
++    paren_scalar->mark_can_error ();
++  }
++
++  // -------------------- jit_paren_subsasgn --------------------
+ 
+-    paren_scalar = jit_function (module, jit_convention::external,
+-                                 "octave_jit_paren_scalar", matrix, types);
+-    paren_scalar.add_mapping (engine, &octave_jit_paren_scalar_subsasgn);
+-    paren_scalar.mark_can_error ();
++  jit_paren_subsasgn::jit_paren_subsasgn (const jit_typeinfo& ti)
++    : jit_index_operation (ti, "()subsasgn"),
++      paren_scalar (nullptr)
++  {
++  }
++
++  jit_paren_subsasgn::~jit_paren_subsasgn ()
++  {
++    delete paren_scalar;
+   }
+ 
+-  // -------------------- jit_typeinfo --------------------
++  jit_function *
++  jit_paren_subsasgn::generate_matrix (const signature_vec& types) const
++  {
++    if (paren_scalar == nullptr)
++      panic_impossible ();
++
++    std::stringstream ss;
++    ss << "jit_paren_subsasgn_matrix_scalar" << (types.size () - 2);
++
++    // FIXME: Where will this be deleted?
++    jit_function *fn = new jit_function
++      (typeinfo.create_internal (ss.str (), typeinfo.matrix, types));
++
++    fn->mark_can_error ();
++    llvm::BasicBlock *body = fn->new_block ();
++    llvm::IRBuilder<> builder (body);
++
++    llvm::Value *array = create_arg_array (builder, *fn, 1, types.size () - 1);
++    llvm::Value *nelem = llvm::ConstantInt::get (typeinfo.index_t,
++                                                 types.size () - 2);
++
++    llvm::Value *mat = fn->argument (builder, 0);
++    llvm::Value *value = fn->argument (builder, types.size () - 1);
++    llvm::Value *ret = paren_scalar->call (builder, mat, array, nelem, value);
++    fn->do_return (builder, ret);
++
++    return fn;
++  }
++
+   void
+-  jit_typeinfo::initialize (llvm::Module *m, llvm::ExecutionEngine *e)
++  jit_paren_subsasgn::init_paren_scalar ()
+   {
+-    new jit_typeinfo (m, e);
++    std::vector<jit_type *> types (4);
++    types[0] = typeinfo.matrix;
++    types[1] = typeinfo.scalar_ptr;
++    types[2] = typeinfo.index;
++    types[3] = typeinfo.scalar;
++
++    paren_scalar = new jit_function
++      (typeinfo.create_external (&octave_jit_paren_scalar_subsasgn,
++                                 "octave_jit_paren_scalar",
++                                 typeinfo.matrix, types));
++
++    paren_scalar->mark_can_error ();
++  }
++
++
++  // -------------------- jit_typeinfo --------------------
++
++  bool jit_typeinfo::in_construction = false;
++
++  // Static method that holds the singleton instance
++  jit_typeinfo&
++  jit_typeinfo::instance (void)
++  {
++    if (in_construction)
++      // This state is typically reached when the constructor calls one
++      // of the static methods of the singleton class...
++      panic_impossible ();
++
++    static jit_typeinfo typeinfo;
++    return typeinfo;
++  }
++
++  jit_typeinfo::~jit_typeinfo ()
++  {
++    while (! id_to_type.empty ())
++      {
++        delete id_to_type.back ();
++        id_to_type.pop_back ();
++      }
++
++    delete builder_ptr;
++    delete base_jit_module;
+   }
+ 
+   // wrap function names to simplify jit_typeinfo::create_external
+-#define JIT_FN(fn) engine, &fn, #fn
+-
+-  jit_typeinfo::jit_typeinfo (llvm::Module *m, llvm::ExecutionEngine *e)
+-    : module (m), engine (e), next_id (0),
+-      builder (*new llvm::IRBuilderD (context))
+-  {
+-    instance = this;
++#define JIT_FN(fn) &fn, #fn
+ 
+-    // FIXME: We should be registering types like in octave_value_typeinfo
+-    llvm::Type *any_t = llvm::StructType::create (context, "octave_base_value");
+-    any_t = any_t->getPointerTo ();
++  jit_typeinfo::jit_typeinfo ()
++    : paren_subsref_fn (*this),
++      paren_subsasgn_fn (*this),
++      next_id (0),
++      grab_fn ("grab"),
++      release_fn ("release"),
++      destroy_fn ("destroy"),
++      print_fn ("print"),
++      for_init_fn ("for_init"),
++      for_check_fn ("for_check"),
++      for_index_fn ("for_index"),
++      logically_true_fn ("logically_true"),
++      make_range_fn ("make_range"),
++      end1_fn ("end1"),
++      end_fn ("end"),
++      create_undef_fn ("create_undef"),
++      base_jit_module (new jit_module ("octaveJITBaseModule")),
++      builder_ptr (new llvm::IRBuilderD (context)),
++      builder (*builder_ptr)  // FIXME: Use a pointer directly in the constructor, and get rid of this
++  {
++    in_construction = true;
+ 
+-    llvm::Type *scalar_t = llvm::Type::getDoubleTy (context);
+-    llvm::Type *bool_t = llvm::Type::getInt1Ty (context);
+-    llvm::Type *string_t = llvm::Type::getInt8Ty (context);
+-    string_t = string_t->getPointerTo ();
+-    llvm::Type *index_t = llvm::Type::getIntNTy (context,
+-                                                 sizeof(octave_idx_type) * 8);
++    // ----- Register basic JIT types -----
++
++    // FIXME: It seems that our type lattice is not really a lattice
++    //        since any and any_ptr have no common upper_bound (?!?)
++
++    // jit_types: "any"     < (nullptr)
++    //            "any_ptr" < (nullptr)
++    any_t = llvm::StructType::create (context, "octave_base_value");
++    any_t = any_t->getPointerTo ();
++    any = do_register_new_type ("any", nullptr, any_t);
++    any_ptr = do_register_new_type ("any_ptr", nullptr, any_t->getPointerTo ());
++
++    // jit_types: "scalar"     < "complex" < "any"
++    //       and: "scalar_ptr" < (nullptr)
++    // FIXME: what about sing-precision floats ???
++    // FIXME: shouldn't we make scalar_ptr a sub_type of any_ptr ?
++    scalar_t = llvm::Type::getDoubleTy (context);
++    complex_t = llvm::ArrayType::get (scalar_t, 2);
++    complex = do_register_new_type ("complex", any, complex_t);
++    scalar = do_register_new_type ("scalar", complex, scalar_t);
++    scalar_ptr = do_register_new_type ("scalar_ptr", nullptr, scalar_t->getPointerTo ());
+ 
+-    llvm::StructType *range_t = llvm::StructType::create (context, "range");
+-    std::vector<llvm::Type *> range_contents (4, scalar_t);
+-    range_contents[3] = index_t;
+-    range_t->setBody (range_contents);
++    // jit_type: "bool" < "any"
++    bool_t = llvm::Type::getInt1Ty (context);
++    boolean = do_register_new_type ("bool", any, bool_t);
+ 
+-    llvm::Type *refcount_t = llvm::Type::getIntNTy (context, sizeof(int) * 8);
++    // jit_types: "int8", "int16", "int32", "int64" < "any"
++    ints[ 8] = do_register_new_type ("int8",  any, llvm::Type::getIntNTy (context,  8));
++    ints[16] = do_register_new_type ("int16", any, llvm::Type::getIntNTy (context, 16));
++    ints[32] = do_register_new_type ("int32", any, llvm::Type::getIntNTy (context, 32));
++    ints[64] = do_register_new_type ("int64", any, llvm::Type::getIntNTy (context, 64));
++
++    // jit_type: "string" < "any"
++    string_t = llvm::Type::getInt8Ty (context);
++    string_t = string_t->getPointerTo ();
++    string = do_register_new_type ("string", any, string_t);
++
++    // jit_type: "index" < "any"
++    index_t = llvm::Type::getIntNTy (context, sizeof (octave_idx_type) * 8);
++    index = do_register_new_type ("index", any, index_t);
+ 
+-    llvm::StructType *matrix_t = llvm::StructType::create (context, "matrix");
+-    llvm::Type *matrix_contents[5];
+-    matrix_contents[0] = refcount_t->getPointerTo ();
+-    matrix_contents[1] = scalar_t->getPointerTo ();
+-    matrix_contents[2] = index_t;
+-    matrix_contents[3] = index_t->getPointerTo ();
+-    matrix_contents[4] = string_t;
+-    matrix_t->setBody (llvm::makeArrayRef (matrix_contents, 5));
++    // jit_type: "range" < "any"
++    range_t = llvm::StructType::create (context, "range");
++    {
++      std::vector<llvm::Type *> range_contents (4, scalar_t);
++      range_contents[3] = index_t;
++      range_t->setBody (range_contents);
++    }
++    range = do_register_new_type ("range", any, range_t);
+ 
+-    llvm::Type *complex_t = llvm::ArrayType::get (scalar_t, 2);
++    // jit_type: "matrix" < "any"
++    matrix_t = llvm::StructType::create (context, "matrix");
++    {
++      llvm::Type *refcount_t = llvm::Type::getIntNTy (context, sizeof(int) * 8);    
++      llvm::Type *matrix_contents[5];
++      matrix_contents[0] = refcount_t->getPointerTo ();
++      matrix_contents[1] = scalar_t->getPointerTo ();
++      matrix_contents[2] = index_t;
++      matrix_contents[3] = index_t->getPointerTo ();
++      matrix_contents[4] = string_t;
++      matrix_t->setBody (llvm::makeArrayRef (matrix_contents, 5));
++    }
++    matrix = do_register_new_type ("matrix", any, matrix_t);
+ 
+-    // complex_ret is what is passed to C functions in order to get calling
+-    // convention right
+-    llvm::Type *cmplx_inner_cont[] = {scalar_t, scalar_t};
+-    llvm::StructType *cmplx_inner = llvm::StructType::create (cmplx_inner_cont);
++    // ----- Specify calling conventions -----
+ 
++    // complex_ret is what is passed to C functions
++    // in order to get calling convention right
+     complex_ret = llvm::StructType::create (context, "complex_ret");
+     {
++      llvm::Type *cmplx_inner_cont[] = {scalar_t, scalar_t};
++      llvm::StructType *cmplx_inner = llvm::StructType::create (cmplx_inner_cont);
+       llvm::Type *contents[] = {cmplx_inner};
+       complex_ret->setBody (contents);
+     }
+ 
+-    // create types
+-    any = new_type ("any", 0, any_t);
+-    matrix = new_type ("matrix", any, matrix_t);
+-    complex = new_type ("complex", any, complex_t);
+-    scalar = new_type ("scalar", complex, scalar_t);
+-    scalar_ptr = new_type ("scalar_ptr", 0, scalar_t->getPointerTo ());
+-    any_ptr = new_type ("any_ptr", 0, any_t->getPointerTo ());
+-    range = new_type ("range", any, range_t);
+-    string = new_type ("string", any, string_t);
+-    boolean = new_type ("bool", any, bool_t);
+-    index = new_type ("index", any, index_t);
+-
+-    create_int (8);
+-    create_int (16);
+-    create_int (32);
+-    create_int (64);
+-
+-    casts.resize (next_id + 1);
+-    identities.resize (next_id + 1);
+-
+-    // specify calling conventions
+-    // FIXME: We should detect architecture and do something sane based on that
+-    // here we assume x86 or x86_64
++    // FIXME: We should detect architecture and do something sane
++    //        based on that here we assume x86 or x86_64
+     matrix->mark_sret (jit_convention::external);
+     matrix->mark_pointer_arg (jit_convention::external);
+ 
+     range->mark_sret (jit_convention::external);
+     range->mark_pointer_arg (jit_convention::external);
+ 
+     complex->set_pack (jit_convention::external, &jit_typeinfo::pack_complex);
+     complex->set_unpack (jit_convention::external, &jit_typeinfo::unpack_complex);
+     complex->set_packed_type (jit_convention::external, complex_ret);
+ 
+     if (sizeof (void *) == 4)
+       complex->mark_sret (jit_convention::external);
+ 
+-    paren_subsref_fn.initialize (module, engine);
+-    paren_subsasgn_fn.initialize (module, engine);
++    paren_subsref_fn.init_paren_scalar ();
++    paren_subsasgn_fn.init_paren_scalar ();
+ 
+     // bind global variables
+-    lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
+-                                             llvm::GlobalValue::ExternalLinkage,
+-                                             0, "error_state");
+-    engine->addGlobalMapping (lerror_state,
+-                              reinterpret_cast<void *> (&error_state));
++    lerror_state = base_jit_module->create_global_variable (bool_t, false,
++                                                            "error_state");
++
++    base_jit_module->add_global_mapping (lerror_state, &error_state);
+ 
+     // sig_atomic_type is going to be some sort of integer
+     sig_atomic_type = llvm::Type::getIntNTy (context, sizeof(sig_atomic_t) * 8);
+-    loctave_interrupt_state
+-      = new llvm::GlobalVariable (*module, sig_atomic_type, false,
+-                                  llvm::GlobalValue::ExternalLinkage, 0,
+-                                  "octave_interrupt_state");
+-    engine->addGlobalMapping (loctave_interrupt_state,
+-                              reinterpret_cast<void *> (&octave_interrupt_state));
++
++    loctave_interrupt_state = base_jit_module->create_global_variable
++      (sig_atomic_type, false, "octave_interrupt_state");
++
++    base_jit_module->add_global_mapping (loctave_interrupt_state,
++                                         &octave_interrupt_state);
+ 
+     // generic call function
+     {
+-      jit_type *int_t = intN (sizeof (octave_builtin::fcn) * 8);
++      jit_type *int_t = do_get_intN (sizeof (octave_builtin::fcn) * 8);
+       any_call = create_external (JIT_FN (octave_jit_call), any, int_t, int_t,
+                                   any_ptr, int_t);
+     }
+ 
+     // any with anything is an any op
+     jit_function fn;
+-    jit_type *binary_op_type = intN (sizeof (octave_value::binary_op) * 8);
++    jit_type *binary_op_type = do_get_intN (sizeof (octave_value::binary_op) * 8);
+     llvm::Type *llvm_bo_type = binary_op_type->to_llvm ();
+     jit_function any_binary = create_external (JIT_FN (octave_jit_binary_any_any),
+                                                any, binary_op_type, any, any);
+     any_binary.mark_can_error ();
+-    binary_ops.resize (octave_value::num_binary_ops);
++
+     for (size_t i = 0; i < octave_value::num_binary_ops; ++i)
+       {
+         octave_value::binary_op op = static_cast<octave_value::binary_op> (i);
+         std::string op_name = octave_value::binary_op_as_string (op);
+-        binary_ops[i].stash_name ("binary" + op_name);
++        binary_ops.push_back (jit_operation ("binary" + op_name));
+       }
+ 
+-    unary_ops.resize (octave_value::num_unary_ops);
+     for (size_t i = 0; i < octave_value::num_unary_ops; ++i)
+       {
+         octave_value::unary_op op = static_cast<octave_value::unary_op> (i);
+         std::string op_name = octave_value::unary_op_as_string (op);
+-        unary_ops[i].stash_name ("unary" + op_name);
++        unary_ops.push_back (jit_operation ("unary" + op_name));
+       }
+ 
+     for (int op = 0; op < octave_value::num_binary_ops; ++op)
+       {
+         const llvm::Twine &fn_name =
+           "octave_jit_binary_any_any_" + llvm::Twine (op);
+- 
++
+         fn = create_internal (fn_name, any, any, any);
+         fn.mark_can_error ();
+         llvm::BasicBlock *block = fn.new_block ();
+         builder.SetInsertPoint (block);
+         llvm::APInt op_int(sizeof (octave_value::binary_op) * 8, op,
+                            std::numeric_limits<octave_value::binary_op>::is_signed);
+         llvm::Value *op_as_llvm = llvm::ConstantInt::get (llvm_bo_type, op_int);
+         llvm::Value *ret = any_binary.call (builder, op_as_llvm,
+@@ -1228,36 +1302,33 @@ jit_type_join (jit_type *lhs, jit_type *
+                                             fn.argument (builder, 1));
+         fn.do_return (builder, ret);
+         binary_ops[op].add_overload (fn);
+       }
+ 
+     // grab matrix
+     fn = create_external (JIT_FN (octave_jit_grab_matrix), matrix, matrix);
+     grab_fn.add_overload (fn);
+-
+     grab_fn.add_overload (create_identity (scalar));
+     grab_fn.add_overload (create_identity (scalar_ptr));
+     grab_fn.add_overload (create_identity (any_ptr));
+     grab_fn.add_overload (create_identity (boolean));
+     grab_fn.add_overload (create_identity (complex));
+     grab_fn.add_overload (create_identity (index));
+ 
+     // release any
+     fn = create_external (JIT_FN (octave_jit_release_any), nullptr, any);
+     release_fn.add_overload (fn);
+-    release_fn.stash_name ("release");
+ 
+     // release matrix
+     fn = create_external (JIT_FN (octave_jit_release_matrix), nullptr, matrix);
+     release_fn.add_overload (fn);
+ 
+     // destroy
+     destroy_fn = release_fn;
+-    destroy_fn.stash_name ("destroy");
+     destroy_fn.add_overload (create_identity(scalar));
+     destroy_fn.add_overload (create_identity(boolean));
+     destroy_fn.add_overload (create_identity(index));
+     destroy_fn.add_overload (create_identity(complex));
+ 
+     // -------------------- scalar related operations --------------------
+ 
+     // now for binary scalar operations
+@@ -1487,50 +1558,43 @@ jit_type_join (jit_type *lhs, jit_type *
+     // now for binary index operators
+     add_binary_op (index, octave_value::op_add, llvm::Instruction::Add);
+ 
+     // and binary bool operators
+     add_binary_op (boolean, octave_value::op_el_or, llvm::Instruction::Or);
+     add_binary_op (boolean, octave_value::op_el_and, llvm::Instruction::And);
+ 
+     // now for printing functions
+-    print_fn.stash_name ("print");
+     add_print (any, reinterpret_cast<void *> (&octave_jit_print_any));
+     add_print (scalar, reinterpret_cast<void *> (&octave_jit_print_scalar));
+ 
+     // initialize for loop
+-    for_init_fn.stash_name ("for_init");
+-
+     fn = create_internal ("octave_jit_for_range_init", index, range);
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *zero = llvm::ConstantInt::get (index_t, 0);
+       fn.do_return (builder, zero);
+     }
+     for_init_fn.add_overload (fn);
+ 
+     // bounds check for for loop
+-    for_check_fn.stash_name ("for_check");
+-
+     fn = create_internal ("octave_jit_for_range_check", boolean, range, index);
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *nelem
+         = builder.CreateExtractValue (fn.argument (builder, 0), 3);
+       llvm::Value *idx = fn.argument (builder, 1);
+       llvm::Value *ret = builder.CreateICmpULT (idx, nelem);
+       fn.do_return (builder, ret);
+     }
+     for_check_fn.add_overload (fn);
+ 
+     // index variabe for for loop
+-    for_index_fn.stash_name ("for_index");
+-
+     fn = create_internal ("octave_jit_for_range_idx", scalar, range, index);
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *idx = fn.argument (builder, 1);
+       llvm::Value *didx = builder.CreateSIToFP (idx, scalar_t);
+       llvm::Value *rng = fn.argument (builder, 0);
+       llvm::Value *base = builder.CreateExtractValue (rng, 0);
+@@ -1538,25 +1602,21 @@ jit_type_join (jit_type *lhs, jit_type *
+ 
+       llvm::Value *ret = builder.CreateFMul (didx, inc);
+       ret = builder.CreateFAdd (base, ret);
+       fn.do_return (builder, ret);
+     }
+     for_index_fn.add_overload (fn);
+ 
+     // logically true
+-    logically_true_fn.stash_name ("logically_true");
+-
+     jit_function gripe_nantl
+       = create_external (JIT_FN (octave_jit_err_nan_to_logical_conversion), nullptr);
+     gripe_nantl.mark_can_error ();
+-
+     fn = create_internal ("octave_jit_logically_true_scalar", boolean, scalar);
+     fn.mark_can_error ();
+-
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::BasicBlock *error_block = fn.new_block ("error");
+       llvm::BasicBlock *normal_block = fn.new_block ("normal");
+ 
+       llvm::Value *check = builder.CreateFCmpUNE (fn.argument (builder, 0),
+                                                   fn.argument (builder, 0));
+@@ -1574,21 +1634,19 @@ jit_type_join (jit_type *lhs, jit_type *
+     logically_true_fn.add_overload (fn);
+ 
+     // logically_true boolean
+     fn = create_identity (boolean);
+     logically_true_fn.add_overload (fn);
+ 
+     // make_range
+     // FIXME: May be benificial to implement all in LLVM
+-    make_range_fn.stash_name ("make_range");
+     jit_function compute_nelem
+       = create_external (JIT_FN (octave_jit_compute_nelem),
+                          index, scalar, scalar, scalar);
+-
+     fn = create_internal ("octave_jit_make_range", range, scalar, scalar, scalar);
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *base = fn.argument (builder, 0);
+       llvm::Value *limit = fn.argument (builder, 1);
+       llvm::Value *inc = fn.argument (builder, 2);
+       llvm::Value *nelem = compute_nelem.call (builder, base, limit, inc);
+@@ -1601,17 +1659,17 @@ jit_type_join (jit_type *lhs, jit_type *
+       rng = builder.CreateInsertValue (rng, limit, 1);
+       rng = builder.CreateInsertValue (rng, inc, 2);
+       rng = builder.CreateInsertValue (rng, nelem, 3);
+       fn.do_return (builder, rng);
+     }
+     make_range_fn.add_overload (fn);
+ 
+     // paren_subsref
+-    jit_type *jit_int = intN (sizeof (int) * 8);
++    jit_type *jit_int = do_get_intN (sizeof (int) * 8);
+     llvm::Type *int_t = jit_int->to_llvm ();
+     jit_function ginvalid_index
+       = create_external (JIT_FN (octave_jit_ginvalid_index), nullptr);
+     jit_function gindex_range = create_external (JIT_FN (octave_jit_gindex_range),
+                                                  nullptr, jit_int, jit_int, index,
+                                                  index);
+ 
+     fn = create_internal ("()subsref", scalar, matrix, scalar);
+@@ -1670,22 +1728,19 @@ jit_type_join (jit_type *lhs, jit_type *
+       merge->addIncoming (undef, conv_error);
+       merge->addIncoming (undef, bounds_error);
+       merge->addIncoming (ret, success);
+       fn.do_return (builder, merge);
+     }
+     paren_subsref_fn.add_overload (fn);
+ 
+     // paren subsasgn
+-    paren_subsasgn_fn.stash_name ("()subsasgn");
+-
+     jit_function resize_paren_subsasgn
+       = create_external (JIT_FN (octave_jit_paren_subsasgn_impl), matrix, matrix,
+                          index, scalar);
+-
+     fn = create_internal ("octave_jit_paren_subsasgn", matrix, matrix, scalar,
+                           scalar);
+     fn.mark_can_error ();
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *one_idx = llvm::ConstantInt::get (index_t, 1);
+       llvm::Value *one_int = llvm::ConstantInt::get (int_t, 1);
+@@ -1746,34 +1801,31 @@ jit_type_join (jit_type *lhs, jit_type *
+     }
+     paren_subsasgn_fn.add_overload (fn);
+ 
+     fn = create_external (JIT_FN (octave_jit_paren_subsasgn_matrix_range), matrix,
+                           matrix, range, scalar);
+     fn.mark_can_error ();
+     paren_subsasgn_fn.add_overload (fn);
+ 
+-    end1_fn.stash_name ("end1");
+     fn = create_internal ("octave_jit_end1_matrix", scalar, matrix, index, index);
+     body = fn.new_block ();
+     builder.SetInsertPoint (body);
+     {
+       llvm::Value *mat = fn.argument (builder, 0);
+       llvm::Value *ret = builder.CreateExtractValue (mat, 2);
+       fn.do_return (builder, builder.CreateSIToFP (ret, scalar_t));
+     }
+     end1_fn.add_overload (fn);
+ 
+-    end_fn.stash_name ("end");
+     fn = create_external (JIT_FN (octave_jit_end_matrix),scalar, matrix, index,
+                           index);
+     end_fn.add_overload (fn);
+ 
+     // -------------------- create_undef --------------------
+-    create_undef_fn.stash_name ("create_undef");
+     fn = create_external (JIT_FN (octave_jit_create_undef), any);
+     create_undef_fn.add_overload (fn);
+ 
+     casts[any->type_id ()].stash_name ("(any)");
+     casts[scalar->type_id ()].stash_name ("(scalar)");
+     casts[complex->type_id ()].stash_name ("(complex)");
+     casts[matrix->type_id ()].stash_name ("(matrix)");
+     casts[range->type_id ()].stash_name ("(range)");
+@@ -1877,21 +1929,23 @@ jit_type_join (jit_type *lhs, jit_type *
+ 
+     add_builtin ("eye");
+     register_generic ("eye", matrix, scalar);
+     register_generic ("eye", matrix, std::vector<jit_type *> (2, scalar));
+ 
+     add_builtin ("mod");
+     register_generic ("mod", scalar, std::vector<jit_type *> (2, scalar));
+ 
+-    casts.resize (next_id + 1);
++    // casts.resize (next_id + 1);
+     jit_function any_id = create_identity (any);
+     jit_function grab_any = create_external (JIT_FN (octave_jit_grab_any),
+                                              any, any);
+-    jit_function release_any = get_release (any);
++
++    jit_function release_any = release_fn.overload (any);
++
+     std::vector<jit_type *> args;
+     args.resize (1);
+ 
+     for (std::map<std::string, jit_type *>::iterator iter = builtins.begin ();
+          iter != builtins.end (); ++iter)
+       {
+         jit_type *btype = iter->second;
+         args[0] = btype;
+@@ -1899,44 +1953,86 @@ jit_type_join (jit_type *lhs, jit_type *
+         grab_fn.add_overload (jit_function (grab_any, btype, args));
+         release_fn.add_overload (jit_function (release_any, 0, args));
+         casts[any->type_id ()].add_overload (jit_function (any_id, any, args));
+ 
+         args[0] = any;
+         casts[btype->type_id ()].add_overload (jit_function (any_id, btype,
+                                                              args));
+       }
++
++    base_jit_module->finalizeObject ();
++
++    in_construction = false;
++  }
++
++  // create a function with an external calling convention
++  // forces the function pointer to be specified
++  template <typename fn_ptr_type> jit_function
++  jit_typeinfo::create_external (fn_ptr_type fn,
++                                 const llvm::Twine& name,
++                                 jit_type *ret,
++                                 const std::vector<jit_type *>& args) const
++  {
++    jit_function retval (base_jit_module, jit_convention::external,
++                         name, ret, args);
++
++    base_jit_module->add_global_mapping (retval.to_llvm (), fn);
++
++    return retval;
++  }
++
++  jit_type*
++  jit_typeinfo::do_register_new_type (const std::string& name,
++                                      jit_type *parent,
++                                      llvm::Type *llvm_type,
++                                      bool skip_paren)
++  {
++    // FIXME: Currently our types do *not* form a lattice
++    assert ((name == "any") || (name == "any_ptr") ||
++            (name == "scalar_ptr") || (parent != nullptr));
++
++    jit_type *ret = new jit_type (name, parent, llvm_type, skip_paren, next_id++);
++    id_to_type.push_back (ret);
++
++    casts.push_back (jit_operation ("(" + name + ")"));
++    identities.push_back (jit_function ());
++
++    return ret;
++  }
++
++  jit_type*
++  jit_typeinfo::do_get_intN (size_t nbits) const
++  {
++    std::map<size_t, jit_type *>::const_iterator iter = ints.find (nbits);
++    if (iter != ints.end ())
++      return iter->second;
++
++    throw jit_fail_exception ("No such integer type");
+   }
+ 
+   const jit_function&
+   jit_typeinfo::do_end (jit_value *value, jit_value *idx, jit_value *count)
+   {
+     jit_const_index *ccount = dynamic_cast<jit_const_index *> (count);
+     if (ccount && ccount->value () == 1)
+       return end1_fn.overload (value->type (), idx->type (), count->type ());
+ 
+     return end_fn.overload (value->type (), idx->type (), count->type ());
+   }
+ 
+-  jit_type*
+-  jit_typeinfo::new_type (const std::string& name, jit_type *parent,
+-                          llvm::Type *llvm_type, bool skip_paren)
+-  {
+-    jit_type *ret = new jit_type (name, parent, llvm_type, skip_paren, next_id++);
+-    id_to_type.push_back (ret);
+-    return ret;
+-  }
+-
+   void
+   jit_typeinfo::add_print (jit_type *ty, void *fptr)
+   {
+     std::stringstream name;
+     name << "octave_jit_print_" << ty->name ();
+-    jit_function fn = create_external (engine, fptr, name.str (),
+-                                       nullptr, intN (8), ty);
++
++    jit_function fn = create_external (fptr, name.str (), nullptr,
++                                       do_get_intN (8), ty);
++
+     print_fn.add_overload (fn);
+   }
+ 
+   // FIXME: cp between add_binary_op, add_binary_icmp, and add_binary_fcmp
+   void
+   jit_typeinfo::add_binary_op (jit_type *ty, int op, int llvm_op)
+   {
+     std::stringstream fname;
+@@ -1990,25 +2086,16 @@ jit_type_join (jit_type *lhs, jit_type *
+       = static_cast<llvm::CmpInst::Predicate>(llvm_op);
+     llvm::Value *ret = builder.CreateFCmp (temp, fn.argument (builder, 0),
+                                            fn.argument (builder, 1));
+     fn.do_return (builder, ret);
+     binary_ops[op].add_overload (fn);
+   }
+ 
+   jit_function
+-  jit_typeinfo::create_function (jit_convention::type cc, const llvm::Twine& name,
+-                                 jit_type *ret,
+-                                 const std::vector<jit_type *>& args)
+-  {
+-    jit_function result (module, cc, name, ret, args);
+-    return result;
+-  }
+-
+-  jit_function
+   jit_typeinfo::create_identity (jit_type *type)
+   {
+     size_t id = type->type_id ();
+     if (id >= identities.size ())
+       identities.resize (id + 1);
+ 
+     if (! identities[id].valid ())
+       {
+@@ -2037,38 +2124,38 @@ jit_type_join (jit_type *lhs, jit_type *
+     llvm::LoadInst *val = abuilder.CreateLoad (loctave_interrupt_state);
+     val->setVolatile (true);
+     return abuilder.CreateICmpSGT (val, abuilder.getInt32 (0));
+   }
+ 
+   void
+   jit_typeinfo::add_builtin (const std::string& name)
+   {
+-    jit_type *btype = new_type (name, any, any->to_llvm (), true);
++    jit_type *btype = do_register_new_type (name, any, any_t, true);
+     builtins[name] = btype;
+ 
+     octave_builtin *ov_builtin = find_builtin (name);
+     if (ov_builtin)
+       ov_builtin->stash_jit (*btype);
+   }
+ 
+   void
+   jit_typeinfo::register_intrinsic (const std::string& name, size_t iid,
+                                     jit_type *result,
+                                     const std::vector<jit_type *>& args)
+   {
+     jit_type *builtin_type = builtins[name];
+     size_t nargs = args.size ();
+-    llvm::SmallVector<llvm::Type *, 5> llvm_args (nargs);
++    std::vector<llvm::Type*> llvm_args (nargs);
+     for (size_t i = 0; i < nargs; ++i)
+       llvm_args[i] = args[i]->to_llvm ();
+ 
+-    llvm::Intrinsic::ID id = static_cast<llvm::Intrinsic::ID> (iid);
+-    llvm::Function *ifun = llvm::Intrinsic::getDeclaration (module, id,
+-                                                            llvm_args);
++    llvm::Function *ifun = base_jit_module->
++      get_intrinsic_declaration (iid, llvm_args);
++
+     std::stringstream fn_name;
+     fn_name << "octave_jit_" << name;
+ 
+     std::vector<jit_type *> args1 (nargs + 1);
+     args1[0] = builtin_type;
+     std::copy (args.begin (), args.end (), args1.begin () + 1);
+ 
+     // The first argument will be the Octave function, but we already know that
+@@ -2108,43 +2195,42 @@ jit_type_join (jit_type *lhs, jit_type *
+ 
+     std::vector<jit_type *> fn_args (args.size () + 1);
+     fn_args[0] = builtins[name];
+     std::copy (args.begin (), args.end (), fn_args.begin () + 1);
+     jit_function fn = create_internal (name, result, fn_args);
+     fn.mark_can_error ();
+     llvm::BasicBlock *block = fn.new_block ();
+     builder.SetInsertPoint (block);
+-    llvm::Type *any_t = any->to_llvm ();
+     llvm::ArrayType *array_t = llvm::ArrayType::get (any_t, args.size ());
+     llvm::Value *array = llvm::UndefValue::get (array_t);
+     for (size_t i = 0; i < args.size (); ++i)
+       {
+         llvm::Value *arg = fn.argument (builder, i + 1);
+-        jit_function agrab = get_grab (args[i]);
++        jit_function agrab = grab_fn.overload (args[i]);
+         if (agrab.valid ())
+           arg = agrab.call (builder, arg);
+-        jit_function acast = cast (any, args[i]);
++        jit_function acast = do_cast (any, args[i]);
+         array = builder.CreateInsertValue (array, acast.call (builder, arg), i);
+       }
+ 
+     llvm::Value *array_mem = builder.CreateAlloca (array_t);
+     builder.CreateStore (array, array_mem);
+     array = builder.CreateBitCast (array_mem, any_t->getPointerTo ());
+ 
+-    jit_type *jintTy = intN (sizeof (octave_builtin::fcn) * 8);
++    jit_type *jintTy = do_get_intN (sizeof (octave_builtin::fcn) * 8);
+     llvm::Type *intTy = jintTy->to_llvm ();
+     size_t fcn_int = reinterpret_cast<size_t> (builtin->function ());
+     llvm::Value *fcn = llvm::ConstantInt::get (intTy, fcn_int);
+     llvm::Value *nargin = llvm::ConstantInt::get (intTy, args.size ());
+     size_t result_int = reinterpret_cast<size_t> (result);
+     llvm::Value *res_llvm = llvm::ConstantInt::get (intTy, result_int);
+     llvm::Value *ret = any_call.call (builder, fcn, nargin, array, res_llvm);
+ 
+-    jit_function cast_result = cast (result, any);
++    jit_function cast_result = do_cast (result, any);
+     fn.do_return (builder, cast_result.call (builder, ret));
+     paren_subsref_fn.add_overload (fn);
+   }
+ 
+   jit_function
+   jit_typeinfo::mirror_binary (const jit_function& fn)
+   {
+     jit_function ret = create_internal (fn.name () + "_reverse",
+@@ -2161,19 +2247,18 @@ jit_type_join (jit_type *lhs, jit_type *
+       ret.do_return (builder, result);
+     else
+       ret.do_return (builder);
+ 
+     return ret;
+   }
+ 
+   llvm::Value *
+-  jit_typeinfo::pack_complex (llvm::IRBuilderD& bld, llvm::Value *cplx)
++  jit_typeinfo::do_pack_complex (llvm::IRBuilderD& bld, llvm::Value *cplx) const
+   {
+-    llvm::Type *complex_ret = instance->complex_ret;
+     llvm::Value *real = bld.CreateExtractValue (cplx, 0);
+     llvm::Value *imag = bld.CreateExtractValue (cplx, 1);
+     llvm::Value *ret = llvm::UndefValue::get (complex_ret);
+ 
+     unsigned int re_idx[] = {0, 0};
+     unsigned int im_idx[] = {0, 1};
+     ret = bld.CreateInsertValue (ret, real, re_idx);
+     return bld.CreateInsertValue (ret, imag, im_idx);
+@@ -2221,68 +2306,49 @@ jit_type_join (jit_type *lhs, jit_type *
+   llvm::Value *
+   jit_typeinfo::complex_new (llvm::Value *real, llvm::Value *imag)
+   {
+     llvm::Value *ret = llvm::UndefValue::get (complex->to_llvm ());
+     ret = complex_real (ret, real);
+     return complex_imag (ret, imag);
+   }
+ 
+-  void
+-  jit_typeinfo::create_int (size_t nbits)
+-  {
+-    std::stringstream tname;
+-    tname << "int" << nbits;
+-    ints[nbits] = new_type (tname.str (), any, llvm::Type::getIntNTy (context,
+-                                                                      nbits));
+-  }
+-
+-  jit_type *
+-  jit_typeinfo::intN (size_t nbits) const
+-  {
+-    std::map<size_t, jit_type *>::const_iterator iter = ints.find (nbits);
+-    if (iter != ints.end ())
+-      return iter->second;
+-
+-    throw jit_fail_exception ("No such integer type");
+-  }
+-
+   jit_type *
+   jit_typeinfo::do_type_of (const octave_value& ov) const
+   {
+     if (ov.is_function ())
+       {
+         // FIXME: This is ugly, we need to finalize how we want to do this, then
+         // have octave_value fully support the needed functionality
+         octave_builtin *builtin
+           = dynamic_cast<octave_builtin *> (ov.internal_rep ());
+         return builtin && builtin->to_jit () ? builtin->to_jit ()
+           : unknown_function;
+       }
+ 
+     if (ov.is_range ())
+-      return get_range ();
++      return range;
+ 
+     if (ov.is_double_type () && ! ov.iscomplex ())
+       {
+         if (ov.is_real_scalar ())
+-          return get_scalar ();
++          return scalar;
+ 
+         if (ov.is_matrix_type ())
+-          return get_matrix ();
++          return matrix;
+       }
+ 
+     if (ov.is_complex_scalar ())
+       {
+         Complex cv = ov.complex_value ();
+ 
+         // We don't really represent complex values, instead we represent
+         // complex_or_scalar.  If the imag value is zero, we assume a scalar.
+         if (cv.imag () != 0)
+-          return get_complex ();
++          return complex;
+       }
+ 
+-    return get_any ();
++    return any;
+   }
+ 
+ }
+ 
+ #endif
+diff --git a/libinterp/parse-tree/jit-typeinfo.h b/libinterp/parse-tree/jit-typeinfo.h
+--- a/libinterp/parse-tree/jit-typeinfo.h
++++ b/libinterp/parse-tree/jit-typeinfo.h
+@@ -33,16 +33,19 @@ along with Octave; see the file COPYING.
+ #include <vector>
+ 
+ #include "Range.h"
+ #include "jit-util.h"
+ 
+ namespace octave
+ {
+ 
++  class jit_typeinfo;
++  class jit_module;
++
+   // Defines the type system used by jit and a singleton class, jit_typeinfo, to
+   // manage the types.
+   //
+   // FIXME:
+   // Operations are defined and implemented in jit_typeinfo.  Eventually they
+   // should be moved elsewhere. (just like with octave_typeinfo)
+ 
+   // jit_range is compatible with the llvm range structure
+@@ -214,52 +217,47 @@ namespace octave
+     convert_fn munpack[jit_convention::length];
+ 
+     llvm::Type *mpacked_type[jit_convention::length];
+   };
+ 
+   // seperate print function to allow easy printing if type is null
+   std::ostream& jit_print (std::ostream& os, jit_type *atype);
+ 
+-// Find common type
+-jit_type* jit_type_join (jit_type *lhs, jit_type *rhs);
++  // Find common type
++  jit_type* jit_type_join (jit_type *lhs, jit_type *rhs);
++
+ 
+ 
+   class jit_value;
+ 
+   // An abstraction for calling llvm functions with jit_values.  Deals with
+   // calling convention details.
+   class
+   jit_function
+   {
+     friend std::ostream& operator << (std::ostream& os, const jit_function& fn);
+   public:
+     // create a function in an invalid state
+     jit_function ();
+ 
+-    jit_function (llvm::Module *amodule, jit_convention::type acall_conv,
++    jit_function (const jit_module *amodule, jit_convention::type acall_conv,
+                   const llvm::Twine& aname, jit_type *aresult,
+                   const std::vector<jit_type *>& aargs);
+ 
+     // Use an existing function, but change the argument types.  The new argument
+     // types must behave the same for the current calling convention.
+     jit_function (const jit_function& fn, jit_type *aresult,
+                   const std::vector<jit_type *>& aargs);
+ 
+     jit_function (const jit_function& fn);
+ 
+     // erase the interal LLVM function (if it exists).  Will become invalid.
+     void erase (void);
+ 
+-    template <typename T>
+-    void add_mapping (llvm::ExecutionEngine *engine, T fn)
+-    {
+-      do_add_mapping (engine, reinterpret_cast<void *> (fn));
+-    }
+-
+     bool valid (void) const { return llvm_function; }
+ 
+     std::string name (void) const;
+ 
+     llvm::BasicBlock * new_block (const std::string& aname = "body",
+                                   llvm::BasicBlock *insert_before = nullptr);
+ 
+     typedef std::vector<llvm::Value *> arg_vec;
+@@ -324,35 +322,37 @@ jit_type* jit_type_join (jit_type *lhs, 
+ 
+     jit_type * argument_type (size_t idx) const
+     {
+       assert (idx < args.size ());
+       return args[idx];
+     }
+ 
+     const std::vector<jit_type *>& arguments (void) const { return args; }
++
+   private:
+-    void do_add_mapping (llvm::ExecutionEngine *engine, void *fn);
+ 
+-    llvm::Module *module;
++    const jit_module *module;
+     llvm::Function *llvm_function;
+     jit_type *mresult;
+     std::vector<jit_type *> args;
+     jit_convention::type call_conv;
+     bool mcan_error;
+   };
+ 
+   std::ostream& operator << (std::ostream& os, const jit_function& fn);
+ 
+   // Keeps track of information about how to implement operations (+, -, *, ect)
+   // and their resulting types.
+   class
+   jit_operation
+   {
+   public:
++    jit_operation (const std::string& aname)  { mname = aname; }
++
+     // type signature vector
+     typedef std::vector<jit_type *> signature_vec;
+ 
+     virtual ~jit_operation (void);
+ 
+     void add_overload (const jit_function& func)
+     {
+       add_overload (func, func.arguments ());
+@@ -423,246 +423,230 @@ jit_type* jit_type_join (jit_type *lhs, 
+ 
+     mutable generated_map generated;
+ 
+     std::vector<Array<jit_function>> overloads;
+ 
+     std::string mname;
+   };
+ 
++
+   class
+   jit_index_operation : public jit_operation
+   {
+   public:
+-    jit_index_operation (void) : module (0), engine (0) { }
++    jit_index_operation (const jit_typeinfo& ti, const std::string& name)
++      : jit_operation (name), typeinfo (ti) { }
+ 
+-    void initialize (llvm::Module *amodule, llvm::ExecutionEngine *aengine)
+-    {
+-      module = amodule;
+-      engine = aengine;
+-      do_initialize ();
+-    }
+   protected:
+     virtual jit_function * generate (const signature_vec& types) const;
+ 
+     virtual jit_function * generate_matrix (const signature_vec& types) const = 0;
+ 
+-    virtual void do_initialize (void) = 0;
+-
+     // helper functions
+     // [start_idx, end_idx).
+     llvm::Value * create_arg_array (llvm::IRBuilderD& builder,
+                                     const jit_function& fn, size_t start_idx,
+                                     size_t end_idx) const;
+ 
+-    llvm::Module *module;
+-    llvm::ExecutionEngine *engine;
++    const jit_typeinfo& typeinfo;
+   };
+ 
+   class
+   jit_paren_subsref : public jit_index_operation
+   {
++  public:
++    // FIXME: Avoid creating object in an invalid state?
++    jit_paren_subsref (const jit_typeinfo& ti);
++    ~jit_paren_subsref ();
++    void init_paren_scalar ();
++
+   protected:
+     virtual jit_function * generate_matrix (const signature_vec& types) const;
+ 
+-    virtual void do_initialize (void);
+   private:
+-    jit_function paren_scalar;
++    jit_function *paren_scalar;
+   };
+ 
+   class
+   jit_paren_subsasgn : public jit_index_operation
+   {
++  public:
++    // FIXME: Avoid creating object in an invalid state?
++    jit_paren_subsasgn (const jit_typeinfo& ti);
++    ~jit_paren_subsasgn ();
++    void init_paren_scalar ();
++
+   protected:
+     jit_function * generate_matrix (const signature_vec& types) const;
+ 
+-    virtual void do_initialize (void);
+   private:
+-    jit_function paren_scalar;
++    jit_function *paren_scalar;
+   };
+ 
+-  // A singleton class which handles the construction of jit_types and
+-  // jit_operations.
++
++  // A singleton class which handles the construction of jit_types
+   class
+   jit_typeinfo
+   {
+-  public:
+-    static void initialize (llvm::Module *m, llvm::ExecutionEngine *e);
+-
+-
+-    static jit_type * get_any (void) { return instance->any; }
+-
+-    static jit_type * get_matrix (void) { return instance->matrix; }
++    // ----- Constructor/destructor (singleton pattern) -----
+ 
+-    static jit_type * get_scalar (void) { return instance->scalar; }
+-
+-    static llvm::Type * get_scalar_llvm (void)
+-    { return instance->scalar->to_llvm (); }
+-
+-    static jit_type * get_scalar_ptr (void) { return instance->scalar_ptr; }
+-
+-    static jit_type * get_any_ptr (void) { return instance->any_ptr; }
+-
+-    static jit_type * get_range (void) { return instance->range; }
++  public:
++    ~jit_typeinfo ();
+ 
+-    static jit_type * get_string (void) { return instance->string; }
+-
+-    static jit_type * get_bool (void) { return instance->boolean; }
+-
+-    static jit_type * get_index (void) { return instance->index; }
+-
+-    static llvm::Type * get_index_llvm (void)
+-    { return instance->index->to_llvm (); }
++  private:
++    static jit_typeinfo& instance (void);
++    jit_typeinfo ();
++    static bool in_construction;
+ 
+-    static jit_type * get_complex (void) { return instance->complex; }
++    // ----- Registering types -----
+ 
+-    // Get the jit_type of an octave_value
+-    static jit_type * type_of (const octave_value& ov)
+-    {
+-      return instance->do_type_of (ov);
+-    }
+-
+-    static const jit_operation& binary_op (int op)
++  public:
++    static jit_type *register_new_type (const std::string& name, jit_type *parent,
++                                        llvm::Type *llvm_type, bool skip_paren = false)
+     {
+-      return instance->do_binary_op (op);
+-    }
+-
+-    static const jit_operation& unary_op (int op)
+-    {
+-      return instance->do_unary_op (op);
+-    }
+-
+-    static const jit_operation& grab (void) { return instance->grab_fn; }
+-
+-    static const jit_function& get_grab (jit_type *type)
+-    {
+-      return instance->grab_fn.overload (type);
+-    }
+-
+-    static const jit_operation& release (void)
+-    {
+-      return instance->release_fn;
+-    }
+-
+-    static const jit_function& get_release (jit_type *type)
+-    {
+-      return instance->release_fn.overload (type);
+-    }
+-
+-    static const jit_operation& destroy (void)
+-    {
+-      return instance->destroy_fn;
+-    }
+-
+-    static const jit_operation& print_value (void)
+-    {
+-      return instance->print_fn;
+-    }
+-
+-    static const jit_operation& for_init (void)
+-    {
+-      return instance->for_init_fn;
++      return instance ().do_register_new_type (name, parent, llvm_type, skip_paren);
+     }
+ 
+-    static const jit_operation& for_check (void)
+-    {
+-      return instance->for_check_fn;
+-    }
++  private:
++    // List of all registered types
++    std::vector<jit_type*> id_to_type;
++
++    // Register a new type
++    jit_type *do_register_new_type (const std::string& name, jit_type *parent,
++                                    llvm::Type *llvm_type, bool skip_paren = false);
++
++    // ----- Base types -----
+ 
+-    static const jit_operation& for_index (void)
+-    {
+-      return instance->for_index_fn;
+-    }
++  public:
++    static jit_type *get_any (void)           { return instance ().any; }
++    static jit_type *get_matrix (void)        { return instance ().matrix; }
++    static jit_type *get_scalar (void)        { return instance ().scalar; }
++    static jit_type *get_scalar_ptr (void)    { return instance ().scalar_ptr; }
++    static jit_type *get_any_ptr (void)       { return instance ().any_ptr; }
++    static jit_type *get_range (void)         { return instance ().range; }
++    static jit_type *get_string (void)        { return instance ().string; }
++    static jit_type *get_bool (void)          { return instance ().boolean; }
++    static jit_type *get_index (void)         { return instance ().index; }
++    static jit_type *get_complex (void)       { return instance ().complex; }
++    static jit_type *intN (size_t nbits)  { return instance ().do_get_intN (nbits); }
+ 
+-    static const jit_operation& make_range (void)
+-    {
+-      return instance->make_range_fn;
+-    }
++    // FIXME: do we really need these two ?
++    static llvm::Type *get_scalar_llvm (void) { return instance ().scalar->to_llvm (); }  // this one is weird
++    static llvm::Type *get_index_llvm (void)  { return instance ().index->to_llvm (); }  // this one is weird too
++
++  private:
+ 
+-    static const jit_operation& paren_subsref (void)
+-    {
+-      return instance->paren_subsref_fn;
+-    }
++    // Base types as LLVM types
+ 
+-    static const jit_operation& paren_subsasgn (void)
+-    {
+-      return instance->paren_subsasgn_fn;
+-    }
++    llvm::Type *any_t;
++    llvm::Type *bool_t;  // FIXME: should be "boolean_t", for consistency
++    llvm::Type *complex_t;
++    llvm::Type *index_t;
++    llvm::Type *scalar_t;
++    llvm::Type *string_t;
++
++    llvm::StructType *range_t;
++    llvm::StructType *matrix_t;
++
++    // Base types as jit_type objects)
+ 
+-    static const jit_operation& logically_true (void)
+-    {
+-      return instance->logically_true_fn;
+-    }
++    jit_type *any;
++    jit_type *boolean;
++    jit_type *complex;
++    jit_type *index;
++    jit_type *scalar;
++    jit_type *string;
+ 
+-    static const jit_operation& cast (jit_type *result)
+-    {
+-      return instance->do_cast (result);
+-    }
++    jit_type *range;
++    jit_type *matrix;
++
++    jit_type *scalar_ptr;  // a fake type for interfacing with C++
++    jit_type *any_ptr;     // a fake type for interfacing with C++ (bis)
++    jit_type *unknown_function;
++
++    // complex_ret is what is passed to C functions
++    // in order to get calling convention right
++    llvm::StructType *complex_ret;
+ 
+-    static const jit_function& cast (jit_type *to, jit_type *from)
+-    {
+-      return instance->do_cast (to, from);
+-    }
++    // Get integer type from number of bits
++    jit_type *do_get_intN (size_t nbits) const;
+ 
+-    static llvm::Value * insert_error_check (llvm::IRBuilderD& bld)
+-    {
+-      return instance->do_insert_error_check (bld);
+-    }
++    // map container for integer types: int8, int16, etc.
++    // (note that they are also stored in id_to_types)
++    std::map<size_t, jit_type *> ints;
++
++
++    // ----- parenthesis subsref/subsasgn -----
++
++    friend jit_paren_subsref;
++    friend jit_paren_subsasgn;
+ 
+-    static llvm::Value * insert_interrupt_check (llvm::IRBuilderD& bld)
+-    {
+-      return instance->do_insert_interrupt_check (bld);
+-    }
++  public:
++    static const jit_operation& paren_subsref (void)   { return instance ().paren_subsref_fn; }
++    static const jit_operation& paren_subsasgn (void)  { return instance ().paren_subsasgn_fn; }
++
++  private:
++    jit_paren_subsref paren_subsref_fn;
++    jit_paren_subsasgn paren_subsasgn_fn;
+ 
+-    static const jit_operation& end (void)
+-    {
+-      return instance->end_fn;
+-    }
++    // ----- Miscellaneous (FIXME: needs to be organized) -----
++
++  public:
++    // Get the jit_type of an octave_value
++    static jit_type *type_of (const octave_value &ov) { return instance ().do_type_of (ov); };
++
++    // Get a unary or binary operation from its integer id
++    static const jit_operation& binary_op (int op) { return instance ().do_binary_op (op); }
++    static const jit_operation& unary_op (int op) { return instance ().do_unary_op (op); }
+ 
+-    static const jit_function& end (jit_value *value, jit_value *index,
+-                                    jit_value *count)
+-    {
+-      return instance->do_end (value, index, count);
+-    }
++    static const jit_operation& grab (void)               { return instance ().grab_fn; }
++    static const jit_function& get_grab (jit_type *type)  { return instance ().grab_fn.overload (type); }
++
++    static const jit_operation& release (void)               { return instance ().release_fn; }
++    static const jit_function& get_release (jit_type *type)  { return instance ().release_fn.overload (type); }
+ 
+-    static const jit_operation& create_undef (void)
+-    {
+-      return instance->create_undef_fn;
+-    }
++    static const jit_operation& destroy (void)         { return instance ().destroy_fn; }
++    static const jit_operation& print_value (void)     { return instance ().print_fn; }
++    static const jit_operation& for_init (void)        { return instance ().for_init_fn; }
++    static const jit_operation& for_check (void)       { return instance ().for_check_fn; }
++    static const jit_operation& for_index (void)       { return instance ().for_index_fn; }
++    static const jit_operation& make_range (void)      { return instance ().make_range_fn; }
++    static const jit_operation& logically_true (void)  { return instance ().logically_true_fn; }
+ 
+-    static llvm::Value * create_complex (llvm::Value *real, llvm::Value *imag)
+-    {
+-      return instance->complex_new (real, imag);
+-    }
++    static const jit_operation& cast (jit_type *result)             { return instance ().do_cast (result); }
++    static const jit_function& cast (jit_type *to, jit_type *from)  { return instance ().do_cast (to, from); }
++
++    static llvm::Value *insert_error_check (llvm::IRBuilderD& bld)      { return instance ().do_insert_error_check (bld); }
++    static llvm::Value *insert_interrupt_check (llvm::IRBuilderD& bld)  { return instance ().do_insert_interrupt_check (bld); }
++
++    static const jit_operation& end (void)                                               { return instance ().end_fn; }
++    static const jit_function&  end (jit_value *value, jit_value *idx, jit_value *count) { return instance ().do_end (value, idx, count); }
++
++    static const jit_operation& create_undef (void)  { return instance ().create_undef_fn; }
++
++    static llvm::Value *create_complex (llvm::Value *real, llvm::Value *imag)    { return instance ().complex_new (real, imag); }
++    static llvm::Value *pack_complex (llvm::IRBuilderD& bld, llvm::Value *cplx)  { return instance ().do_pack_complex (bld, cplx); }
++    static llvm::Value *unpack_complex (llvm::IRBuilderD& bld, llvm::Value *result);
++
+   private:
+-    jit_typeinfo (llvm::Module *m, llvm::ExecutionEngine *e);
+-
+-    jit_type * do_difference (jit_type *lhs, jit_type *)
+-    {
+-      // FIXME: Maybe we can do something smarter?
+-      return lhs;
+-    }
+ 
+     jit_type * do_type_of (const octave_value& ov) const;
+ 
+     const jit_operation& do_binary_op (int op) const
+-    {
+-      assert (static_cast<size_t>(op) < binary_ops.size ());
+-      return binary_ops[op];
+-    }
++    { assert (static_cast<size_t>(op) < binary_ops.size ());
++      return binary_ops[op]; }
+ 
+     const jit_operation& do_unary_op (int op) const
+-    {
+-      assert (static_cast<size_t> (op) < unary_ops.size ());
+-      return unary_ops[op];
+-    }
++    { assert (static_cast<size_t> (op) < unary_ops.size ());
++      return unary_ops[op]; }
+ 
+     const jit_operation& do_cast (jit_type *to)
+     {
+-      static jit_operation null_function;
++      static jit_operation null_function ("null_function");
+       if (! to)
+         return null_function;
+ 
+       size_t id = to->type_id ();
+       if (id >= casts.size ())
+         return null_function;
+       return casts[id];
+     }
+@@ -670,91 +654,74 @@ jit_type* jit_type_join (jit_type *lhs, 
+     const jit_function& do_cast (jit_type *to, jit_type *from)
+     {
+       return do_cast (to).overload (from);
+     }
+ 
+     const jit_function& do_end (jit_value *value, jit_value *index,
+                                 jit_value *count);
+ 
+-    jit_type * new_type (const std::string& name, jit_type *parent,
+-                         llvm::Type *llvm_type, bool skip_paren = false);
+-
+     void add_print (jit_type *ty, void *fptr);
+ 
+     void add_binary_op (jit_type *ty, int op, int llvm_op);
+ 
+     void add_binary_icmp (jit_type *ty, int op, int llvm_op);
+ 
+     void add_binary_fcmp (jit_type *ty, int op, int llvm_op);
+ 
+     // type signature vector
+     typedef std::vector<jit_type *> signature_vec;
+ 
+     // create a function with an external calling convention
+     // forces the function pointer to be specified
+     template <typename T>
+-    jit_function create_external (llvm::ExecutionEngine *ee, T fn,
+-                                  const llvm::Twine& name, jit_type *ret,
+-                                  const signature_vec& args
+-                                  = signature_vec ())
++    jit_function create_external (T fn, const llvm::Twine& name,
++                                  jit_type * ret, const signature_vec& args
++                                  = signature_vec ()) const;
++
++    template <typename T, typename ...Args>
++    jit_function create_external (T fn, const llvm::Twine& name,
++                                  jit_type * ret, signature_vec& args,
++                                  jit_type * arg1, Args... other_args) const
+     {
+-      jit_function retval = create_function (jit_convention::external, name, ret,
+-                                             args);
+-      retval.add_mapping (ee, fn);
+-      return retval;
++      args.push_back (arg1);
++      return create_external (fn, name, ret, args, other_args...);
+     }
+ 
+     template <typename T, typename ...Args>
+-    jit_function create_external (llvm::ExecutionEngine *ee, T fn,
+-                                  const llvm::Twine& name, jit_type *ret,
+-                                  signature_vec& args, jit_type * arg1,
+-                                  Args... other_args)
+-    {
+-      args.push_back (arg1);
+-      return create_external (ee, fn, name, ret, args, other_args...);
+-    }
+-
+-    template <typename T, typename ...Args>
+-    jit_function create_external (llvm::ExecutionEngine *ee, T fn,
+-                                  const llvm::Twine& name, jit_type *ret,
+-                                  jit_type * arg1, Args... other_args)
++    jit_function create_external (T fn, const llvm::Twine& name, jit_type *ret,
++                                  jit_type * arg1, Args... other_args) const
+     {
+       signature_vec args;
+       args.reserve (1 + sizeof... (other_args));
+       args.push_back (arg1);
+-      return create_external (ee, fn, name, ret, args, other_args...);
++      return create_external (fn, name, ret, args, other_args...);
+     }
+ 
+-    // use create_external or create_internal directly
+-    jit_function create_function (jit_convention::type cc,
+-                                  const llvm::Twine& name, jit_type *ret,
+-                                  const std::vector<jit_type *>& args
+-                                  = std::vector<jit_type *> ());
+-
+     // create an internal calling convention (a function defined in llvm)
+     jit_function create_internal (const llvm::Twine& name, jit_type *ret,
+                                   const signature_vec& args
+-                                  = signature_vec ())
++                                  = signature_vec ()) const
+     {
+-      return create_function (jit_convention::internal, name, ret, args);
++      return jit_function (base_jit_module, jit_convention::internal,
++                           name, ret, args);
+     }
+ 
+     template <typename ...Args>
+     jit_function create_internal (const llvm::Twine& name, jit_type *ret,
+                                   signature_vec& args,
+-                                  jit_type * arg1, Args... other_args)
++                                  jit_type * arg1, Args... other_args) const
+     {
+       args.push_back (arg1);
+       return create_internal (name, ret, args, other_args...);
+     }
+ 
+     template <typename ...Args>
+     jit_function create_internal (const llvm::Twine& name, jit_type *ret,
+-                                  jit_type * arg1, Args... other_args)
++                                  jit_type * arg1, Args... other_args) const
+     {
+       signature_vec args;
+       args.reserve (1 + sizeof... (other_args));
+       args.push_back (arg1);
+       return create_internal (name, ret, args, other_args...);
+     }
+ 
+     jit_function create_identity (jit_type *type);
+@@ -786,88 +753,62 @@ jit_type* jit_type_join (jit_type *lhs, 
+                            const std::vector<jit_type *>& args);
+ 
+     octave_builtin * find_builtin (const std::string& name);
+ 
+     jit_function mirror_binary (const jit_function& fn);
+ 
+     llvm::Function * wrap_complex (llvm::Function *wrap);
+ 
+-    static llvm::Value * pack_complex (llvm::IRBuilderD& bld,
+-                                       llvm::Value *cplx);
+-
+-    static llvm::Value * unpack_complex (llvm::IRBuilderD& bld,
+-                                         llvm::Value *result);
+-
+     llvm::Value * complex_real (llvm::Value *cx);
+ 
+     llvm::Value * complex_real (llvm::Value *cx, llvm::Value *real);
+ 
+     llvm::Value * complex_imag (llvm::Value *cx);
+ 
+     llvm::Value * complex_imag (llvm::Value *cx, llvm::Value *imag);
+ 
+     llvm::Value * complex_new (llvm::Value *real, llvm::Value *imag);
+ 
+-    void create_int (size_t nbits);
+-
+-    jit_type * intN (size_t nbits) const;
++    llvm::Value *do_pack_complex (llvm::IRBuilderD& bld, llvm::Value *cplx) const;
+ 
+-    static jit_typeinfo *instance;
+-
+-    llvm::Module *module;
+-    llvm::ExecutionEngine *engine;
+     int next_id;
+ 
+     llvm::GlobalVariable *lerror_state;
+     llvm::GlobalVariable *loctave_interrupt_state;
+ 
+     llvm::Type *sig_atomic_type;
+ 
+-    std::vector<jit_type*> id_to_type;
+-    jit_type *any;
+-    jit_type *matrix;
+-    jit_type *scalar;
+-    jit_type *scalar_ptr; // a fake type for interfacing with C++
+-    jit_type *any_ptr; // a fake type for interfacing with C++
+-    jit_type *range;
+-    jit_type *string;
+-    jit_type *boolean;
+-    jit_type *index;
+-    jit_type *complex;
+-    jit_type *unknown_function;
+-    std::map<size_t, jit_type *> ints;
+     std::map<std::string, jit_type *> builtins;
+ 
+-    llvm::StructType *complex_ret;
+-
+     std::vector<jit_operation> binary_ops;
+     std::vector<jit_operation> unary_ops;
+     jit_operation grab_fn;
+     jit_operation release_fn;
+     jit_operation destroy_fn;
+     jit_operation print_fn;
+     jit_operation for_init_fn;
+     jit_operation for_check_fn;
+     jit_operation for_index_fn;
+     jit_operation logically_true_fn;
+     jit_operation make_range_fn;
+-    jit_paren_subsref paren_subsref_fn;
+-    jit_paren_subsasgn paren_subsasgn_fn;
+     jit_operation end1_fn;
+     jit_operation end_fn;
+     jit_operation create_undef_fn;
+ 
+     jit_function any_call;
+ 
+     // type id -> cast function TO that type
+     std::vector<jit_operation> casts;
+ 
+     // type id -> identity function
+     std::vector<jit_function> identities;
+ 
++    jit_module *base_jit_module;
++
++    llvm::IRBuilderD *builder_ptr;
+     llvm::IRBuilderD& builder;
+   };
+ 
+ }
+ 
+ #endif
+ #endif
+diff --git a/libinterp/parse-tree/jit-util.h b/libinterp/parse-tree/jit-util.h
+--- a/libinterp/parse-tree/jit-util.h
++++ b/libinterp/parse-tree/jit-util.h
+@@ -55,21 +55,24 @@ namespace llvm
+   class PassManager;
+ #endif
+   class ExecutionEngine;
+   class Function;
+   class BasicBlock;
+   class LLVMContext;
+   class Type;
+   class StructType;
++  class FunctionType;  
+   class Twine;
++  class GlobalValue;
+   class GlobalVariable;
+   class TerminatorInst;
+   class PHINode;
+-
++  class TargetMachine;
++  
+   class ConstantFolder;
+ 
+   template <bool preserveNames>
+   class IRBuilderDefaultInserter;
+ 
+   template <bool preserveNames, typename T, typename Inserter>
+   class IRBuilder;
+ 
+diff --git a/libinterp/parse-tree/pt-jit.cc b/libinterp/parse-tree/pt-jit.cc
+--- a/libinterp/parse-tree/pt-jit.cc
++++ b/libinterp/parse-tree/pt-jit.cc
+@@ -59,30 +59,34 @@ along with Octave; see the file COPYING.
+ // In LLVM 3.8.x and later, we use createBasicAAWrapperPass from:
+ #  include <llvm/Analysis/BasicAliasAnalysis.h>
+ #endif
+ // In LLVM 3.7.x and earlier, we use createBasicAliasAnalysisPass
+ // from llvm/Analysis/Passes.h (already included above)
+ 
+ #include <llvm/Bitcode/ReaderWriter.h>
+ #include <llvm/ExecutionEngine/ExecutionEngine.h>
+-#include <llvm/ExecutionEngine/JIT.h>
++// #include <llvm/ExecutionEngine/JIT.h>  // old JIT, LLVM < 3.6.0
++#include <llvm/ExecutionEngine/MCJIT.h>   // MCJIT, LLVM >= 3.0.0
++#include "llvm/ExecutionEngine/SectionMemoryManager.h"
+ 
+ #if defined (LEGACY_PASSMANAGER)
+ #  include <llvm/IR/LegacyPassManager.h>
+ #else
+ #  include <llvm/PassManager.h>
+ #endif
+ 
+ #if defined (HAVE_LLVM_IR_FUNCTION_H)
+ #  include <llvm/IR/LLVMContext.h>
+ #  include <llvm/IR/Module.h>
++#  include <llvm/IR/Intrinsics.h>
+ #else
+ #  include <llvm/LLVMContext.h>
+ #  include <llvm/Module.h>
++#  include <llvm/Intrinsics.h>
+ #endif
+ 
+ #if defined (HAVE_LLVM_SUPPORT_IRBUILDER_H)
+ #  include <llvm/Support/IRBuilder.h>
+ #elif defined(HAVE_LLVM_IR_IRBUILDER_H)
+ #  include <llvm/IR/IRBuilder.h>
+ #else
+ #  include <llvm/IRBuilder.h>
+@@ -1301,19 +1305,20 @@ void
+       {
+         jit_block *b = *iter;
+         b->append (factory.create<jit_branch> (dest));
+       }
+   }
+ 
+   // -------------------- jit_convert_llvm --------------------
+   llvm::Function *
+-  jit_convert_llvm::convert_loop (llvm::Module *module,
++  jit_convert_llvm::convert_loop (const jit_module& module,
+                                   const jit_block_list& blocks,
+-                                  const std::list<jit_value *>& constants)
++                                  const std::list<jit_value *>& constants,
++                                  const std::string& llvm_function_name)
+   {
+     converting_function = false;
+ 
+     // for now just init arguments from entry, later we will have to do something
+     // more interesting
+     jit_block *entry_block = blocks.front ();
+     for (jit_block::iterator iter = entry_block->begin ();
+          iter != entry_block->end (); ++iter)
+@@ -1323,57 +1328,59 @@ void
+ 
+     jit_type *any = jit_typeinfo::get_any ();
+ 
+     // argument is an array of octave_base_value*, or octave_base_value**
+     llvm::Type *arg_type = any->to_llvm (); // this is octave_base_value*
+     llvm::FunctionType *ft;
+     ft = llvm::FunctionType::get (llvm::Type::getVoidTy (context),
+                                   arg_type->getPointerTo (), false);
+-    function = llvm::Function::Create (ft, llvm::Function::ExternalLinkage,
+-                                       "foobar", module);
+-
++
++    function = module.create_llvm_function (ft, llvm_function_name);
+     try
+       {
+         prelude = llvm::BasicBlock::Create (context, "prelude", function);
+         builder.SetInsertPoint (prelude);
+ 
++        // The jitted function will have only one function argument, of octave_base_value** type
+         llvm::Value *arg = &*(function->arg_begin ());
++
+         for (size_t i = 0; i < argument_vec.size (); ++i)
+           {
+             // llvm::Value *loaded_arg = builder.CreateConstInBoundsGEP1_32 (arg, i);         // LLVM <= 3.6
+             llvm::Value *loaded_arg = builder.CreateConstInBoundsGEP1_32 (arg_type, arg, i);  // LLVM >= 3.7
++
+             arguments[argument_vec[i].first] = loaded_arg;
+           }
+ 
+         convert (blocks, constants);
+       }
+     catch (const jit_fail_exception& e)
+       {
+         function->eraseFromParent ();
+         throw;
+       }
+ 
+     return function;
+   }
+ 
+   jit_function
+-  jit_convert_llvm::convert_function (llvm::Module *module,
++  jit_convert_llvm::convert_function (const jit_module& module,
+                                       const jit_block_list& blocks,
+                                       const std::list<jit_value *>& constants,
+                                       octave_user_function& fcn,
+                                       const std::vector<jit_type *>& args)
+   {
+     converting_function = true;
+ 
+     jit_block *final_block = blocks.back ();
+     jit_return *ret = dynamic_cast<jit_return *> (final_block->back ());
+     assert (ret);
+ 
+-    creating = jit_function (module, jit_convention::internal,
++    creating = jit_function (&module, jit_convention::internal,
+                              "foobar", ret->result_type (), args);
+     function = creating.to_llvm ();
+ 
+     try
+       {
+         prelude = creating.new_block ("prelude");
+         builder.SetInsertPoint (prelude);
+ 
+@@ -2016,156 +2023,270 @@ void
+             split->insert_before (term, assign);
+             cast->infer ();
+             assign->infer ();
+             phi.stash_argument (i, assign);
+           }
+       }
+   }
+ 
++
++  // ---------------- jit_memory_manager ------------------
++
++  // A simple memory manager for our LLVM engines,
++  // based on LLVM's Kaleidoscope example
++
++  class jit_memory_manager : public llvm::SectionMemoryManager
++  {
++    jit_memory_manager (const jit_memory_manager&) = delete;
++    void operator= (const jit_memory_manager&) = delete;
++  public:
++    jit_memory_manager () {}
++    virtual ~jit_memory_manager () {}
++
++    // The Kaleidoscope example in LLVM 3.8 indicates that
++    // getPointerToNamedFunction has to be overloaded, but actually it is
++    // getSymbolAddress that must be overloaded.
++    virtual uint64_t getSymbolAddress (const std::string &name);
++
++    // Is it still useful to overload getPointerToNamedFunction to support
++    // some older version of LLVM?  Are there others virtual functions
++    // that must be overloaded?
++    virtual void* getPointerToNamedFunction (const std::string& name, bool abort_on_failure);
++  };
++
++  void*
++  jit_memory_manager::getPointerToNamedFunction (const std::string& name,
++                                                 bool abort_on_failure)
++  {
++    // Try the standard symbol resolution first, but ask it not to abort
++    void *pfn = llvm::RTDyldMemoryManager::getPointerToNamedFunction (name, false);
++    if (pfn)
++      return pfn;
++
++    pfn = tree_jit::getPointerToNamedFunction (name);
++    if ((pfn == nullptr) && abort_on_failure)
++      llvm::report_fatal_error ("Program used external function '" + name +
++                                "' which could not be resolved!");
++    return pfn;
++  }
++
++  uint64_t
++  jit_memory_manager::getSymbolAddress (const std::string &name)
++  {
++    uint64_t addr = llvm::SectionMemoryManager::getSymbolAddress (name);
++    if (addr)
++      return addr;
++
++    addr = tree_jit::getSymbolAddress (name);
++    if (addr == 0)
++      llvm::report_fatal_error ("Program used extern function '" + name +
++                                "' which could not be resolved!");
++
++    return addr;
++  }
++
++
+   // -------------------- tree_jit --------------------
+ 
+-  tree_jit::tree_jit (void) : module (0), engine (0)
+-  { }
++  bool tree_jit::initialized = false;
++
++  int tree_jit::next_forloop_number = 0;
++  int tree_jit::next_function_number = 0;
++  int tree_jit::next_module_number = 0;
++
++  tree_jit::tree_jit (void)
++    : target_machine (nullptr)
++  {
++    // target_machine will be truly initialized by tree_jit::do_initialize ()
++  }
+ 
+   tree_jit::~tree_jit (void)
+-  { }
+-
+-  bool
+-  tree_jit::execute (tree_simple_for_command& cmd, const octave_value& bounds)
+   {
+-    return instance ().do_execute (cmd, bounds);
+-  }
+-
+-  bool
+-  tree_jit::execute (tree_while_command& cmd)
+-  {
+-    return instance ().do_execute (cmd);
+-  }
+-
+-  bool
+-  tree_jit::execute (octave_user_function& fcn, const octave_value_list& args,
+-                     octave_value_list& retval)
+-  {
+-    return instance ().do_execute (fcn, args, retval);
++    delete target_machine;
+   }
+ 
+   tree_jit&
+   tree_jit::instance (void)
+   {
+-    static tree_jit ret;
++    static tree_jit ret;  // singleton instance of tree_jit
++
++    if (! initialized)
++      // Try to initialize the singleton instance
++      ret.do_initialize ();
++
+     return ret;
+   }
+ 
++  jit::EngineOwner
++  tree_jit::create_new_engine (jit::ModuleOwner module_owner)
++  {
++    std::string err;
++
++    llvm::ExecutionEngine *e = llvm::EngineBuilder (std::move (module_owner))
++      .setErrorStr (&err)
++      .setMCJITMemoryManager(llvm::make_unique<jit_memory_manager> ())
++      .create ();
++
++    // Note: in some versions of LLVM, we should call .setUseMCJIT (true) before .create () ?
++    // FIXME: autconf this
++
++    if (e == nullptr)
++      {
++        std::cerr << "Failed to create JIT engine" << std::endl;
++        std::cerr << err << std::endl;
++      }
++
++    return jit::EngineOwner (e);
++  }
++
++  void
++  tree_jit::do_register_jit_module (jit_module* jm)
++  {
++    jm_list.push_back (jm);
++  }
++
++  void
++  tree_jit::do_unregister_jit_module (jit_module* jm)
++  {
++    jm_list.remove (jm);
++  }
++
++  void*
++  tree_jit::do_getPointerToNamedFunction (const std::string &name) const
++  {
++    std::list<jit_module*>::const_iterator it;
++
++    for (it = jm_list.begin (); it != jm_list.end (); it++)
++      {
++        uint64_t addr = (*it)->getFunctionAddress (name);
++
++        if (addr)
++          return reinterpret_cast<void*> (addr);
++      }
++
++    return nullptr;
++  }
++
++  uint64_t
++  tree_jit::do_getSymbolAddress(const std::string &name) const
++  {
++    std::list<jit_module*>::const_iterator it;
++
++    for (it = jm_list.begin (); it != jm_list.end (); it++)
++      {
++        uint64_t addr = (*it)->getFunctionAddress (name);
++
++        if (addr)
++          return addr;
++      }
++
++    return 0;
++  }
++
+   bool
+-  tree_jit::initialize (void)
++  tree_jit::do_initialize (void)
+   {
+-    if (engine)
++    if (initialized)
+       return true;
+ 
+-    if (! module)
++    llvm::InitializeNativeTarget ();
++    llvm::InitializeNativeTargetAsmPrinter ();
++    llvm::InitializeNativeTargetAsmParser ();
++    // FIXME: Check that these three initializations succeed
++
++    if (target_machine == nullptr)
+       {
+-        llvm::InitializeNativeTarget ();
+-        module = new llvm::Module ("octave", context);
++        target_machine = llvm::EngineBuilder ().selectTarget ();
++        if (target_machine == nullptr)
++          return false;
+       }
+ 
+-    // sometimes this fails pre main
+-    engine = llvm::ExecutionEngine::createJIT (module);
+-
+-    if (! engine)
+-      return false;
+-
+-#if defined (LEGACY_PASSMANAGER)
+-    module_pass_manager = new llvm::legacy::PassManager ();
+-    pass_manager = new llvm::legacy::FunctionPassManager (module);
+-#else
+-    module_pass_manager = new llvm::PassManager ();
+-    pass_manager = new llvm::FunctionPassManager (module);
+-#endif
+-    module_pass_manager->add (llvm::createAlwaysInlinerPass ());
+-
+-#if defined (HAVE_LLVM_DATALAYOUT)
+-    pass_manager->add (new llvm::DataLayout (*engine->getDataLayout ()));
+-#else
+-    pass_manager->add (new llvm::TargetData (*engine->getTargetData ()));
+-#endif
+-
+-    pass_manager->add (llvm::createCFGSimplificationPass ());
+-
+-#if defined (HAVE_LLVM_ANALYSIS_BASICALIASANALYSIS_H)
+-    pass_manager->add (llvm::createBasicAAWrapperPass ());
+-#else
+-    pass_manager->add (llvm::createBasicAliasAnalysisPass ());
+-#endif
+-
+-    pass_manager->add (llvm::createPromoteMemoryToRegisterPass ());
+-    pass_manager->add (llvm::createInstructionCombiningPass ());
+-    pass_manager->add (llvm::createReassociatePass ());
+-    pass_manager->add (llvm::createGVNPass ());
+-    pass_manager->add (llvm::createCFGSimplificationPass ());
+-    pass_manager->doInitialization ();
+-
+-    jit_typeinfo::initialize (module, engine);
+-
+-    return true;
++    return (initialized = true);
++  }
++
++  jit::ModuleOwner
++  tree_jit::open_new_module (const std::string& module_name)
++  {
++    return instance ().do_open_new_module (module_name);
++  }
++
++  jit::ModuleOwner
++  tree_jit::do_open_new_module (const std::string& module_name) const
++  {
++    if (! initialized)
++      return nullptr;
++
++    jit::ModuleOwner m (new llvm::Module (module_name, context));
++
++
++    if (m != nullptr)
++      m->setDataLayout (target_machine->createDataLayout ());
++
++    return m;
+   }
+ 
+   bool
+-  tree_jit::do_execute (tree_simple_for_command& cmd, const octave_value& bounds)
++  tree_jit::do_execute (tree_simple_for_command& cmd,
++                        const octave_value& bounds)
+   {
+     size_t tc = trip_count (bounds);
+-    if (! tc || ! initialize () || ! enabled ())
++    if (! tc || ! initialized || ! enabled ())
+       return false;
+ 
+     jit_info::vmap extra_vars;
+     extra_vars["#for_bounds0"] = &bounds;
+ 
+     jit_info *info = cmd.get_info ();
++
+     if (! info || ! info->match (extra_vars))
+       {
+         if (tc < static_cast<size_t> (Vjit_startcnt))
+           return false;
+ 
+         delete info;
+-        info = new jit_info (*this, cmd, bounds);
++
++        info = new jit_info (cmd, bounds);
++
+         cmd.stash_info (info);
+       }
+ 
+     return info->execute (extra_vars);
+   }
+ 
+   bool
+   tree_jit::do_execute (tree_while_command& cmd)
+   {
+-    if (! initialize () || ! enabled ())
++    if (! initialized || ! enabled ())
+       return false;
+ 
+     jit_info *info = cmd.get_info ();
+     if (! info || ! info->match ())
+       {
+         delete info;
+-        info = new jit_info (*this, cmd);
++        info = new jit_info (cmd);
+         cmd.stash_info (info);
+       }
+ 
+     return info->execute ();
+   }
+ 
+   bool
+-  tree_jit::do_execute (octave_user_function& fcn, const octave_value_list& args,
++  tree_jit::do_execute (octave_user_function& fcn,
++                        const octave_value_list& args,
+                         octave_value_list& retval)
+   {
+-    if (! initialize () || ! enabled ())
++    if (! initialized || ! enabled ())
+       return false;
+ 
+     jit_function_info *info = fcn.get_info ();
+     if (! info || ! info->match (args))
+       {
+         delete info;
+-        info = new jit_function_info (*this, fcn, args);
++        info = new jit_function_info (fcn, args);
+         fcn.stash_info (info);
+       }
+ 
+     return info->execute (args, retval);
+   }
+ 
+   bool
+   tree_jit::enabled (void)
+@@ -2185,25 +2306,143 @@ void
+         Range rng = bounds.range_value ();
+         return rng.numel ();
+       }
+ 
+     // unsupported type
+     return 0;
+   }
+ 
++
++  // -------------------- jit_module --------------------
++
++  jit_module::jit_module (const std::string& module_name)
++    : module (nullptr), engine (nullptr)
++  {
++    jit::ModuleOwner module_owner = tree_jit::open_new_module (module_name);
++    // FIXME: what if this fails? exception?
++
++    // Get a pointer to the module before ownership is transfered to engine
++    module = module_owner.get ();
++
++    jit::EngineOwner engine_owner = std::move
++      (tree_jit::create_new_engine (std::move (module_owner)));
++    // FIXME: what if this fails? exception?
++
++    // TODO?: Consider creating the engine just before jitting
++
++    // We take responsibility for deleting the engine
++    engine = engine_owner.get ();
++    engine_owner.release ();
++
++    tree_jit::register_jit_module (this);
++  }
++
++  jit_module::~jit_module ()
++  {
++    tree_jit::unregister_jit_module (this);
++
++    delete engine;
++  }
++
++  // Create an LLVM function in the module, with external linkage
++  llvm::Function*
++  jit_module::create_llvm_function (llvm::FunctionType *ftype,
++                                    const llvm::Twine &name) const
++  {
++    // we mark all functinos as external linkage because this prevents
++    // llvm from getting rid of always inline functions
++
++    return llvm::Function::Create (ftype, llvm::Function::ExternalLinkage,
++                                   name, module);
++  }
++
++  // Create or insert an LLVM Function declaration for an intrinsic and return it
++  llvm::Function*
++  jit_module::get_intrinsic_declaration (size_t id,
++                                         std::vector<llvm::Type*> types) const
++  {
++    return llvm::Intrinsic::getDeclaration
++      (module, static_cast<llvm::Intrinsic::ID> (id), types);
++  }
++
++  // Create a global in the module
++  llvm::GlobalVariable*
++  jit_module::create_global_variable (llvm::Type *type, bool is_constant,
++                                      const llvm::Twine& name) const
++  {
++    return new llvm::GlobalVariable (*module, type, is_constant,
++                                     llvm::GlobalValue::ExternalLinkage,
++                                     nullptr, name);
++  }
++
+   void
+-  tree_jit::optimize (llvm::Function *fn)
++  jit_module::do_add_global_mapping (const llvm::GlobalValue* gv, void* p) const
++  {
++    assert (gv);
++    engine->addGlobalMapping (gv, p);
++  }
++
++  // Return the address of the specified function.
++  uint64_t
++  jit_module::getFunctionAddress (const std::string &name) const
++  {
++    return engine->getFunctionAddress (name);
++  }
++
++  void
++  jit_module::optimize (llvm::Function *fn) const
+   {
+     if (Vdebug_jit)
+       llvm::verifyModule (*module);
+ 
++    // DOCUMENT-ME: Why do we need two separate pass managers?
++
++    jit::PassManager *module_pass_manager = new jit::PassManager ();
++    jit::FunctionPassManager *pass_manager = new jit::FunctionPassManager (module);
++
++    module_pass_manager->add (llvm::createAlwaysInlinerPass ());
++
++    // In 3.6, a pass was inserted in the pipeline to make the DataLayout accessible:
++    //    MyPassManager->add(new DataLayoutPass(MyTargetMachine->getDataLayout()));
++    // In 3.7, you don’t need a pass, you set the DataLayout on the Module:
++    //    MyModule->setDataLayout(MyTargetMachine->createDataLayout());
++    //
++    // FIXME: autoconf to support <= 3.6
++    //
++    // #if defined (HAVE_LLVM_DATALAYOUT)
++    //   pass_manager->add (new llvm::DataLayout (*engine->getDataLayout ()));
++    // #else
++    //   // For very old LLVM releases ???
++    //   pass_manager->add (new llvm::TargetData (*engine->getTargetData ()));
++    // #endif
++
++    // DOCUMENT-ME: What does each of these passes actually do?
++
++    pass_manager->add (llvm::createCFGSimplificationPass ());
++
++#if defined (HAVE_LLVM_ANALYSIS_BASICALIASANALYSIS_H)
++    pass_manager->add (llvm::createBasicAAWrapperPass ());
++#else
++    pass_manager->add (llvm::createBasicAliasAnalysisPass ());
++#endif
++
++    pass_manager->add (llvm::createPromoteMemoryToRegisterPass ());
++    pass_manager->add (llvm::createInstructionCombiningPass ());
++    pass_manager->add (llvm::createReassociatePass ());
++    pass_manager->add (llvm::createGVNPass ());
++    pass_manager->add (llvm::createCFGSimplificationPass ());
++    pass_manager->doInitialization ();
++
+     module_pass_manager->run (*module);
+     pass_manager->run (*fn);
+ 
++    delete module_pass_manager;
++    delete pass_manager;
++
+     if (Vdebug_jit)
+       {
+         // This should be OK in LLVM 3.6 -- 3.8 (and later ?)
+         std::error_code ec;
+         llvm::raw_fd_ostream fout ("test.bc", ec, llvm::sys::fs::F_None);
+ 
+         //      std::string error;
+         //#if defined (RAW_FD_OSTREAM_ARG_IS_LLVM_SYS_FS)
+@@ -2211,21 +2450,29 @@ void
+         //#else
+         //      llvm::raw_fd_ostream fout ("test.bc", error, llvm::raw_fd_ostream::F_Binary);
+         //#endif
+ 
+         llvm::WriteBitcodeToFile (module, fout);
+       }
+   }
+ 
++  void
++  jit_module::finalizeObject (void)
++  {
++    engine->finalizeObject ();
++  }
++
++
+   // -------------------- jit_function_info --------------------
+-  jit_function_info::jit_function_info (tree_jit& tjit,
+-                                        octave_user_function& fcn,
++  jit_function_info::jit_function_info (octave_user_function& fcn,
+                                         const octave_value_list& ov_args)
+-    : argument_types (ov_args.length ()), function (0)
++    : llvm_function_name (""),
++      function (nullptr),
++      argument_types (ov_args.length ())
+   {
+     size_t nargs = ov_args.length ();
+     for (size_t i = 0; i < nargs; ++i)
+       argument_types[i] = jit_typeinfo::type_of (ov_args(i));
+ 
+     jit_function raw_fn;
+     jit_function wrapper;
+ 
+@@ -2246,35 +2493,34 @@ void
+             tree_print_code tpc (std::cout);
+             tpc.visit_octave_user_function_header (fcn);
+             tpc.visit_statement_list (*fcn.body ());
+             tpc.visit_octave_user_function_trailer (fcn);
+             blocks.print (std::cout, "octave jit ir");
+           }
+ 
+         jit_factory& factory = conv.get_factory ();
+-        llvm::Module *module = tjit.get_module ();
+         jit_convert_llvm to_llvm;
+-        raw_fn = to_llvm.convert_function (module, infer.get_blocks (),
++        raw_fn = to_llvm.convert_function (*this, infer.get_blocks (),
+                                            factory.constants (), fcn,
+                                            argument_types);
+ 
+         if (Vdebug_jit)
+           {
+             std::cout << "-------------------- raw function ";
+             std::cout << "--------------------\n";
+             std::cout << *raw_fn.to_llvm () << std::endl;
+             llvm::verifyFunction (*raw_fn.to_llvm ());
+           }
+ 
+-        std::string wrapper_name = fcn.name () + "_wrapper";
++        llvm_function_name = fcn.name () + "_wrapper";
+         jit_type *any_t = jit_typeinfo::get_any ();
+         std::vector<jit_type *> wrapper_args (1, jit_typeinfo::get_any_ptr ());
+-        wrapper = jit_function (module, jit_convention::internal, wrapper_name,
+-                                any_t, wrapper_args);
++        wrapper = jit_function (this, jit_convention::internal,
++                                llvm_function_name, any_t, wrapper_args);
+ 
+         llvm::BasicBlock *wrapper_body = wrapper.new_block ();
+         builder.SetInsertPoint (wrapper_body);
+ 
+         llvm::Value *wrapper_arg = wrapper.argument (builder, 0);
+         std::vector<llvm::Value *> raw_args (nargs);
+         for (size_t i = 0; i < nargs; ++i)
+           {
+@@ -2299,29 +2545,40 @@ void
+           {
+             llvm::Value *zero = builder.getInt32 (0);
+             result = builder.CreateBitCast (zero, any_t->to_llvm ());
+           }
+ 
+         wrapper.do_return (builder, result);
+ 
+         llvm::Function *llvm_function = wrapper.to_llvm ();
+-        tjit.optimize (llvm_function);
++        optimize (llvm_function);
+ 
+         if (Vdebug_jit)
+           {
+             std::cout << "-------------------- optimized and wrapped ";
+             std::cout << "--------------------\n";
+             std::cout << *llvm_function << std::endl;
+             llvm::verifyFunction (*llvm_function);
+           }
+ 
+-        llvm::ExecutionEngine *engine = tjit.get_engine ();
+-        void *void_fn = engine->getPointerToFunction (llvm_function);
+-        function = reinterpret_cast<jited_function> (void_fn);
++        finalizeObject ();
++
++        uint64_t void_fn = getFunctionAddress (llvm_function_name);
++
++        if (void_fn == 0)
++          {
++            llvm_function->eraseFromParent ();
++            llvm_function = nullptr;
++            function = nullptr;
++          }
++        else
++          {
++            function = reinterpret_cast<jited_function> (void_fn);
++          }
+       }
+     catch (const jit_fail_exception& e)
+       {
+         argument_types.clear ();
+ 
+         if (Vdebug_jit)
+           {
+             if (e.known ())
+@@ -2373,49 +2630,55 @@ void
+ 
+     for (size_t i = 0; i < nargs; ++i)
+       if (jit_typeinfo::type_of (ov_args(i)) != argument_types[i])
+         return false;
+ 
+     return true;
+   }
+ 
++
+   // -------------------- jit_info --------------------
+-  jit_info::jit_info (tree_jit& tjit, tree& tee)
+-    : engine (tjit.get_engine ()), function (0), llvm_function (0)
++  jit_info::jit_info (tree& tee)
++    : llvm_function_name (tree_jit::generate_unique_function_name ()),
++      function (nullptr)
+   {
+-    compile (tjit, tee);
++    compile (tee);
+   }
+ 
+-  jit_info::jit_info (tree_jit& tjit, tree& tee, const octave_value& for_bounds)
+-    : engine (tjit.get_engine ()), function (0), llvm_function (0)
++  jit_info::jit_info (tree& tee, const octave_value& for_bounds)
++    : llvm_function_name (tree_jit::generate_unique_function_name ()),
++      function (nullptr)
+   {
+-    compile (tjit, tee, jit_typeinfo::type_of (for_bounds));
++    compile (tee, jit_typeinfo::type_of (for_bounds));
+   }
+ 
+-  jit_info::~jit_info (void)
++  jit_info::jit_info (tree_simple_for_command& tee, const octave_value& for_bounds)
++    : llvm_function_name (tree_jit::generate_unique_forloop_name ()),
++      function (nullptr)
+   {
+-    if (llvm_function)
+-      llvm_function->eraseFromParent ();
++    compile (tee, jit_typeinfo::type_of (for_bounds));
+   }
+ 
+   bool
+   jit_info::execute (const vmap& extra_vars) const
+   {
+     if (! function)
+       return false;
+ 
+     std::vector<octave_base_value *> real_arguments (arguments.size ());
+     for (size_t i = 0; i < arguments.size (); ++i)
+       {
+         if (arguments[i].second)
+           {
+             octave_value current = find (extra_vars, arguments[i].first);
+             octave_base_value *obv = current.internal_rep ();
++
+             obv->grab ();
++
+             real_arguments[i] = obv;
+           }
+       }
+ 
+     function (&real_arguments[0]);
+ 
+     symbol_table& symtab = __get_symbol_table__ ("jit_info::execute");
+ 
+@@ -2449,18 +2712,20 @@ void
+         if (type != bounds[i].first)
+           return false;
+       }
+ 
+     return true;
+   }
+ 
+   void
+-  jit_info::compile (tree_jit& tjit, tree& tee, jit_type *for_bounds)
++  jit_info::compile (tree& tee, jit_type *for_bounds)
+   {
++    llvm::Function * llvm_function = nullptr;
++
+     try
+       {
+         jit_convert conv (tee, for_bounds);
+         jit_infer infer (conv.get_factory (), conv.get_blocks (),
+                          conv.get_variable_map ());
+ 
+         infer.infer ();
+ 
+@@ -2470,20 +2735,23 @@ void
+             blocks.label ();
+             std::cout << "-------------------- Compiling tree --------------------\n";
+             std::cout << tee.str_print_code () << std::endl;
+             blocks.print (std::cout, "octave jit ir");
+           }
+ 
+         jit_factory& factory = conv.get_factory ();
+         jit_convert_llvm to_llvm;
+-        llvm_function = to_llvm.convert_loop (tjit.get_module (),
+-                                              infer.get_blocks (),
+-                                              factory.constants ());
++
++        llvm_function = to_llvm.convert_loop (*this, infer.get_blocks (),
++                                              factory.constants (),
++                                              llvm_function_name);
++
+         arguments = to_llvm.get_arguments ();
++
+         bounds = conv.get_bounds ();
+       }
+     catch (const jit_fail_exception& e)
+       {
+         if (Vdebug_jit)
+           {
+             if (e.known ())
+               std::cout << "jit fail: " << e.what () << std::endl;
+@@ -2497,27 +2765,39 @@ void
+       {
+         if (Vdebug_jit)
+           {
+             std::cout << "-------------------- llvm ir --------------------";
+             std::cout << *llvm_function << std::endl;
+             llvm::verifyFunction (*llvm_function);
+           }
+ 
+-        tjit.optimize (llvm_function);
++        optimize (llvm_function);
+ 
+         if (Vdebug_jit)
+           {
+             std::cout << "-------------------- optimized llvm ir "
+                       << "--------------------\n";
+             std::cout << *llvm_function << std::endl;
+           }
+ 
+-        void *void_fn = engine->getPointerToFunction (llvm_function);
+-        function = reinterpret_cast<jited_function> (void_fn);
++        finalizeObject ();
++
++        uint64_t void_fn = getFunctionAddress (llvm_function_name);
++
++        if (void_fn == 0)
++          {
++            llvm_function->eraseFromParent ();
++            llvm_function = nullptr;
++            function = nullptr;
++          }
++        else
++          {
++            function = reinterpret_cast<jited_function> (void_fn);
++          }
+       }
+   }
+ 
+   octave_value
+   jit_info::find (const vmap& extra_vars, const std::string& vname) const
+   {
+     vmap::const_iterator iter = extra_vars.find (vname);
+ 
+@@ -2525,17 +2805,16 @@ void
+       {
+         symbol_table::scope *scope = __require_current_scope__ ("jit_convert::find");
+ 
+         return scope->varval (vname);
+       }
+     else
+       return *iter->second;
+   }
+-
+ }
+ 
+ #endif
+ 
+ DEFUN (jit_failcnt, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} jit_failcnt ()
+ @deftypefnx {} {@var{old_val} =} jit_failcnt (@var{new_val})
+diff --git a/libinterp/parse-tree/pt-jit.h b/libinterp/parse-tree/pt-jit.h
+--- a/libinterp/parse-tree/pt-jit.h
++++ b/libinterp/parse-tree/pt-jit.h
+@@ -24,25 +24,42 @@ along with Octave; see the file COPYING.
+ 
+ #if ! defined (octave_pt_jit_h)
+ #define octave_pt_jit_h 1
+ 
+ #include "octave-config.h"
+ 
+ #if defined (HAVE_LLVM)
+ 
++#include "jit-typeinfo.h"
+ #include "jit-ir.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
+ 
+ // octave_value_list is not (yet) in the octave namespace
+ class octave_value_list;
+ 
+ namespace octave
+ {
++  namespace jit
++  {
++
++#if defined (LEGACY_PASSMANAGER)
++    typedef llvm::legacy::PassManager PassManager;
++    typedef llvm::legacy::FunctionPassManager FunctionPassManager;
++#else
++    typedef llvm::PassManager PassManager;
++    typedef llvm::FunctionPassManager FunctionPassManager;
++#endif
++
++    typedef std::unique_ptr<llvm::Module> ModuleOwner;
++    typedef std::unique_ptr<llvm::ExecutionEngine> EngineOwner;
++
++  }
++
+   // Convert from the parse tree (AST) to the low level Octave IR.
+   class
+   jit_convert : public tree_walker
+   {
+   public:
+     typedef std::pair<jit_type *, std::string> type_bound;
+     typedef std::vector<type_bound> type_bound_vector;
+     typedef std::map<std::string, jit_variable *> variable_map;
+@@ -237,21 +254,22 @@ namespace octave
+     void finish_breaks (jit_block *dest, const block_list& lst);
+   };
+ 
+   // Convert from the low level Octave IR to LLVM
+   class
+   jit_convert_llvm : public jit_ir_walker
+   {
+   public:
+-    llvm::Function * convert_loop (llvm::Module *module,
++    llvm::Function * convert_loop (const jit_module& module,
+                                    const jit_block_list& blocks,
+-                                   const std::list<jit_value *>& constants);
++                                   const std::list<jit_value *>& constants,
++                                   const std::string& llvm_function_name);
+ 
+-    jit_function convert_function (llvm::Module *module,
++    jit_function convert_function (const jit_module& module,
+                                    const jit_block_list& blocks,
+                                    const std::list<jit_value *>& constants,
+                                    octave_user_function& fcn,
+                                    const std::vector<jit_type *>& args);
+ 
+     // arguments to the llvm::Function for loops
+     const std::vector<std::pair<std::string, bool>>& get_arguments(void) const
+     { return argument_vec; }
+@@ -338,111 +356,257 @@ namespace octave
+ 
+     void release_temp (jit_block& ablock, std::set<jit_value *>& temp);
+ 
+     void simplify_phi (void);
+ 
+     void simplify_phi (jit_phi& phi);
+   };
+ 
++
++  class jit_module;
++
+   class
+   tree_jit
+   {
++    // ----- Constructor/destructor (singleton pattern) -----
++
+   public:
+     ~tree_jit (void);
+ 
+-    static bool execute (tree_simple_for_command& cmd,
+-                         const octave_value& bounds);
+-
+-    static bool execute (tree_while_command& cmd);
+-
+-    static bool execute (octave_user_function& fcn, const octave_value_list& args,
+-                         octave_value_list& retval);
+-
+-    llvm::ExecutionEngine * get_engine (void) const { return engine; }
+-
+-    llvm::Module * get_module (void) const { return module; }
+-
+-    void optimize (llvm::Function *fn);
+   private:
+     tree_jit (void);
+-
+     static tree_jit& instance (void);
+ 
+-    bool initialize (void);
++    // ----- Initialization -----
++
++  private:
++    static bool initialized;
++    bool do_initialize (void);
++
++    // ----- Target machine ----
++
++  public:
++    static const llvm::TargetMachine* get_target_machine (void)
++    { return instance ().target_machine; }
++
++  private:
++    llvm::TargetMachine *target_machine;
++
++    // ----- Create LLVM modules and engines -----
++
++  public:
++    static jit::ModuleOwner
++    open_new_module (const std::string& module_name = generate_unique_module_name ());
++
++    static jit::EngineOwner
++    create_new_engine (jit::ModuleOwner module_owner);
++
++  private:
++    jit::ModuleOwner
++    do_open_new_module (const std::string& module_name) const;
++
++    // ----- Registering JIT modules (module+engine pairs) -----
++
++  public:
++    static void register_jit_module (jit_module* jm)
++    { instance ().do_register_jit_module (jm); }
++    static void unregister_jit_module (jit_module* jm)
++    { instance ().do_unregister_jit_module (jm); }
++  private:
++    // List of all currently registered jit modules
++    std::list<jit_module*> jm_list;
++    void do_register_jit_module (jit_module* jm);
++    void do_unregister_jit_module (jit_module* jm);
++    void do_dump_all_modules (void) const;
++
++    // ----- Symbol resolution -----
+ 
+-    bool do_execute (tree_simple_for_command& cmd, const octave_value& bounds);
++  public:
++    static void* getPointerToNamedFunction (const std::string &name)
++    { return instance ().do_getPointerToNamedFunction (name); }
++    static uint64_t getSymbolAddress (const std::string &name)
++    { return instance ().do_getSymbolAddress (name); }
++
++  private:
++    void* do_getPointerToNamedFunction (const std::string &Name) const;
++    uint64_t do_getSymbolAddress (const std::string &name) const;
++
++    // ----- Generate unique identifiers -----
++
++  public:
++    static std::string generate_unique_forloop_name (void)
++    { return std::string ("jittedForLoop")
++        + std::to_string (next_forloop_number ++); }
++    // FIXME: Check that the identifier does not exist
++
++    static std::string generate_unique_function_name (void)
++    { return std::string ("jittedFunction")
++        + std::to_string (next_function_number ++); }
++    // FIXME: Check that the identifier does not exist
++
++    static std::string generate_unique_module_name (void)
++    { return std::string ("octaveJITModule")
++        + std::to_string (next_module_number ++); }
++    // FIXME: Check that the identifier does not exist
++
++  private:
++    static int next_forloop_number;
++    static int next_function_number;
++    static int next_module_number;
++
++    // ----- JIT and execute ASTs -----
++
++  public:
++    static bool execute (tree_simple_for_command& cmd,
++                         const octave_value& bounds)
++    { return instance ().do_execute (cmd, bounds); }
++
++    static bool execute (tree_while_command& cmd)
++    { return instance ().do_execute (cmd); }
++
++    static bool execute (octave_user_function& fcn,
++                         const octave_value_list& args,
++                         octave_value_list& retval)
++    { return instance ().do_execute (fcn, args, retval); }
++
++  private:
++    bool do_execute (tree_simple_for_command& cmd,
++                     const octave_value& bounds);
+ 
+     bool do_execute (tree_while_command& cmd);
+ 
+-    bool do_execute (octave_user_function& fcn, const octave_value_list& args,
++    bool do_execute (octave_user_function& fcn,
++                     const octave_value_list& args,
+                      octave_value_list& retval);
+ 
++    // ----- Miscellaneous -----
++
+     bool enabled (void);
+ 
+     size_t trip_count (const octave_value& bounds) const;
+ 
++  };
++
++
++  class
++  jit_module
++  {
++    // TODO: Encapsulate all operations that can modify the module,
++    //       and prevent them if the module has been finalized
++
++    // TODO: Consider creating the engine at the end only?
++    //       I have read somewhere that this is more efficient (nor sure)
++
++  public:
++
++    // Create an open module and associated JIT engine
++    jit_module (const std::string& module_name
++                = tree_jit::generate_unique_module_name ());
++
++    // Delete the underlying JIT engine
++    ~jit_module ();
++
++    // Create an LLVM function in the module, with external linkage
++    llvm::Function*
++    create_llvm_function (llvm::FunctionType *ftype,
++                          const llvm::Twine &name) const;
++
++    // Create a global in the module, with external linkage
++    llvm::GlobalVariable*
++    create_global_variable (llvm::Type *type, bool is_constant,
++                            const llvm::Twine& name) const;
++
++    // Create or insert an LLVM Function declaration for an intrinsic,
++    // and return it
++    llvm::Function*
++    get_intrinsic_declaration (size_t id,
++                               std::vector<llvm::Type*> types) const;
++
++    // Underlying type of enums defined in yet-inconplete types
++    typedef unsigned llvm_gv_linkage;  // FIXME: autoconf this
++
++    // add_global_mapping tells the execution engine where a specified
++    // global value (variable or function) is
++    template <typename ptr_type>
++    void add_global_mapping (const llvm::GlobalValue* gv, ptr_type p) const
++    {
++      do_add_global_mapping (gv, reinterpret_cast<void *> (p));
++    }
++
++    // Return the address of the specified function.
++    uint64_t getFunctionAddress (const std::string &name) const;
++
++    // Optimize a function in the LLVM module
++    void optimize (llvm::Function *fn) const;
++
++    // FIXME: Once this has been called, we should not be able
++    // to change anything in the module...
++    void finalizeObject (void);
++
++  private:  
++    void do_add_global_mapping (const llvm::GlobalValue* gv, void* p) const;
++
+     llvm::Module *module;
+-#if defined (LEGACY_PASSMANAGER)
+-    llvm::legacy::PassManager *module_pass_manager;
+-    llvm::legacy::FunctionPassManager *pass_manager;
+-#else
+-    llvm::PassManager *module_pass_manager;
+-    llvm::FunctionPassManager *pass_manager;
+-#endif
+     llvm::ExecutionEngine *engine;
+   };
+ 
++
+   class
+-  jit_function_info
++  jit_info : public jit_module
+   {
+   public:
+-    jit_function_info (tree_jit& tjit, octave_user_function& fcn,
++    // we use a pointer here so we don't have to include ov.h
++    typedef std::map<std::string, const octave_value *> vmap;
++
++    jit_info (tree& tee);
++
++    jit_info (tree& tee, const octave_value& for_bounds);
++
++    jit_info (tree_simple_for_command& tee, const octave_value& for_bounds);
++
++    bool execute (const vmap& extra_vars = vmap ()) const;
++
++    bool match (const vmap& extra_vars = vmap ()) const;
++
++  private:
++    typedef jit_convert::type_bound type_bound;
++    typedef jit_convert::type_bound_vector type_bound_vector;
++    typedef void (*jited_function)(octave_base_value**);
++
++    void compile (tree& tee, jit_type *for_bounds = 0);
++
++    octave_value find (const vmap& extra_vars, const std::string& vname) const;
++
++    // LLVM function associated to this jit_info object
++    std::string llvm_function_name;
++    jited_function function;
++
++    std::vector<std::pair<std::string, bool>> arguments;
++    type_bound_vector bounds;
++  };
++
++
++  class
++  jit_function_info : public jit_module
++  {
++  public:
++    jit_function_info (octave_user_function& fcn,
+                        const octave_value_list& ov_args);
+ 
+     bool execute (const octave_value_list& ov_args,
+                   octave_value_list& retval) const;
+ 
+     bool match (const octave_value_list& ov_args) const;
+   private:
+     typedef octave_base_value *(*jited_function)(octave_base_value**);
+ 
+-    std::vector<jit_type *> argument_types;
++    // LLVM function associated to this jit_info object
++    std::string llvm_function_name;
+     jited_function function;
+-  };
+-
+-  class
+-  jit_info
+-  {
+-  public:
+-    // we use a pointer here so we don't have to include ov.h
+-    typedef std::map<std::string, const octave_value *> vmap;
+-
+-    jit_info (tree_jit& tjit, tree& tee);
+-
+-    jit_info (tree_jit& tjit, tree& tee, const octave_value& for_bounds);
+-
+-    ~jit_info (void);
+ 
+-    bool execute (const vmap& extra_vars = vmap ()) const;
+-
+-    bool match (const vmap& extra_vars = vmap ()) const;
+-  private:
+-    typedef jit_convert::type_bound type_bound;
+-    typedef jit_convert::type_bound_vector type_bound_vector;
+-    typedef void (*jited_function)(octave_base_value**);
+-
+-    void compile (tree_jit& tjit, tree& tee, jit_type *for_bounds = nullptr);
+-
+-    octave_value find (const vmap& extra_vars, const std::string& vname) const;
+-
+-    llvm::ExecutionEngine *engine;
+-    jited_function function;
+-    llvm::Function *llvm_function;
+-
+-    std::vector<std::pair<std::string, bool>> arguments;
+-    type_bound_vector bounds;
++    std::vector<jit_type *> argument_types;
+   };
+ 
+ }
+ 
+ #endif
+ #endif
+diff --git a/libinterp/parse-tree/pt-loop.h b/libinterp/parse-tree/pt-loop.h
+--- a/libinterp/parse-tree/pt-loop.h
++++ b/libinterp/parse-tree/pt-loop.h
+@@ -27,20 +27,19 @@ along with Octave; see the file COPYING.
+ 
+ class octave_value;
+ 
+ #include "pt-cmd.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
+ #include "pt-jit.h"
+ 
+-class jit_info;
+-
+ namespace octave
+ {
++  class jit_info;
+   class tree_argument_list;
+   class tree_expression;
+   class tree_statement_list;
+ 
+   // While.
+ 
+   class tree_while_command : public tree_command
+   {
+@@ -94,22 +93,22 @@ namespace octave
+ 
+     void accept (tree_walker& tw)
+     {
+       tw.visit_while_command (*this);
+     }
+ 
+ #if defined (HAVE_LLVM)
+     // some functions use by tree_jit
+-    octave::jit_info * get_info (void) const
++    jit_info * get_info (void) const
+     {
+       return compiled;
+     }
+ 
+-    void stash_info (octave::jit_info *jinfo)
++    void stash_info (jit_info *jinfo)
+     {
+       compiled = jinfo;
+     }
+ #endif
+ 
+   protected:
+ 
+     // Expression to test.

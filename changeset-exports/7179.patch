@@ -1,0 +1,214 @@
+# HG changeset patch
+# User jwe
+# Date 1195094646 0
+#      Thu Nov 15 02:44:06 2007 +0000
+# Node ID 32abf21b21e9367c53004780d0d26228671eb7ac
+# Parent  8cfdb0f24f41c4b3397be0873d68eb5f2947b58c
+[project @ 2007-11-15 02:44:05 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,18 @@
++2007-11-14  John W. Eaton  <jwe@octave.org>
++
++	* mex.cc (mex::foreign_memlist): New data member.
++	(mex::mark_foreign, mex::unmark_foreign): New functions.
++	(mex::free): Don't warn about pointers found in foreign_memlist.
++	(maybe_mark_foreign): New function.
++	(mxArray_octave_value::get_data, mxArray_octave_value::get_ir,
++	mxArray_octave_value::get_jc):
++	Call maybe_mark_foreign on returned pointer.
++
+ 2007-11-14  David Bateman  <dbateman@free.fr>
+ 
+ 	* mex.cc (mxArray_sparse::mxArray_sparse (const mxArray_sparse&)):
+ 	Also ensure that pr and pi are correctly copied.
+ 
+ 2007-11-14  John W. Eaton  <jwe@octave.org>
+ 
+ 	* Makefile.in (@bsd_gcc_kluge_targets_frag@): Delete line for
+diff --git a/src/mex.cc b/src/mex.cc
+--- a/src/mex.cc
++++ b/src/mex.cc
+@@ -277,16 +277,18 @@ protected:
+ // then invoke the method on that object instead (for example, getting
+ // a pointer to real or imaginary data from a complex object requires
+ // a mutation but getting a pointer to real data from a real object
+ // does not).  Changing the representation causes a copy so we try to
+ // avoid it unless it is really necessary.  Once the conversion
+ // happens, we delete this representation, so the conversion can only
+ // happen once per call to a MEX file.
+ 
++static inline void *maybe_mark_foreign (void *ptr);
++
+ class mxArray_octave_value : public mxArray_base
+ {
+ public:
+ 
+   mxArray_octave_value (const octave_value& ov)
+     : mxArray_base (), val (ov), mutate_flag (false),
+       id (mxUNKNOWN_CLASS), class_name (0), ndims (-1), dims (0) { }
+ 
+@@ -462,17 +464,17 @@ public:
+   double get_scalar (void) const { return val.scalar_value (true); }
+ 
+   void *get_data (void) const
+   {
+     void *retval = 0;
+ 
+     if (is_char ()
+ 	|| (is_numeric () && is_real_type () && ! is_range ()))
+-      retval = val.mex_get_data ();
++      retval = maybe_mark_foreign (val.mex_get_data ());
+     else
+       request_mutation ();
+ 
+     return retval;
+   }
+ 
+   void *get_imag_data (void) const
+   {
+@@ -489,22 +491,22 @@ public:
+   // Not allowed.
+   void set_data (void */*pr*/) { request_mutation (); }
+ 
+   // Not allowed.
+   void set_imag_data (void */*pi*/) { request_mutation (); }
+ 
+   mwIndex *get_ir (void) const
+   {
+-    return val.mex_get_ir ();
++    return static_cast<mwIndex *> (maybe_mark_foreign (val.mex_get_ir ()));
+   }
+ 
+   mwIndex *get_jc (void) const
+   {
+-    return val.mex_get_jc ();
++    return static_cast<mwIndex *> (maybe_mark_foreign (val.mex_get_jc ()));
+   }
+ 
+   mwSize get_nzmax (void) const { return val.nzmax (); }
+ 
+   // Not allowed.
+   void set_ir (mwIndex */*ir*/) { request_mutation (); }
+ 
+   // Not allowed.
+@@ -2170,17 +2172,24 @@ public:
+ 
+ 	if (p != global_memlist.end ())
+ 	  {
+ 	    global_memlist.erase (p);
+ 
+ 	    xfree (ptr);
+ 	  }
+ 	else
+-	  warning ("mxFree: skipping memory not allocated by mxMalloc, mxCalloc, or mxRealloc");
++	  {
++	    p = foreign_memlist.find (ptr);
++
++	    if (p != foreign_memlist.end ())
++	      foreign_memlist.erase (p);
++	    else
++	      warning ("mxFree: skipping memory not allocated by mxMalloc, mxCalloc, or mxRealloc");
++	  }
+       }
+   }
+ 
+   // Mark a pointer to be freed on exit.
+   void mark (void *ptr)
+   {
+ #ifdef DEBUG
+     if (memlist.find (ptr) != memlist.end ())
+@@ -2213,16 +2222,41 @@ public:
+   void unmark_array (mxArray *ptr)
+   {
+     std::set<mxArray *>::iterator p = arraylist.find (ptr);
+ 
+     if (p != arraylist.end ())
+       arraylist.erase (p);
+   }
+ 
++  // Mark a pointer as one we allocated.
++  void mark_foreign (void *ptr)
++  {
++#ifdef DEBUG
++    if (foreign_memlist.find (ptr) != foreign_memlist.end ())
++      warning ("%s: double registration ignored", function_name ());
++#endif
++
++    foreign_memlist.insert (ptr);
++  }
++
++  // Unmark a pointer as one we allocated.
++  void unmark_foreign (void *ptr)
++  {
++    std::set<void *>::iterator p = foreign_memlist.find (ptr);
++
++    if (p != foreign_memlist.end ())
++      foreign_memlist.erase (p);
++#ifdef DEBUG
++    else
++      warning ("%s: value not marked", function_name ());
++#endif
++
++  }
++
+   // Make a new array value and initialize from an octave value; it will be
+   // freed on exit unless marked as persistent.
+   mxArray *make_value (const octave_value& ov)
+   {
+     return mark_array (new mxArray (ov));
+   }
+ 
+   // Free an array and its contents.
+@@ -2263,18 +2297,23 @@ public:
+ private:
+ 
+   // Pointer to the mex function that corresponds to this mex context.
+   octave_mex_function *curr_mex_fcn;
+ 
+   // List of memory resources that need to be freed upon exit.
+   std::set<void *> memlist;
+ 
++  // List of mxArray objects that need to be freed upon exit.
+   std::set<mxArray *> arraylist;
+ 
++  // List of memory resources we know about, but that were allocated
++  // elsewhere.
++  std::set<void *> foreign_memlist;
++
+   // The name of the currently executing function.
+   mutable char *fname;
+ 
+   // List of memory resources we allocated.
+   static std::set<void *> global_memlist;
+ 
+   // Mark a pointer as one we allocated.
+   void global_mark (void *ptr)
+@@ -2315,16 +2354,25 @@ mxArray::malloc (size_t n)
+ }
+ 
+ void *
+ mxArray::calloc (size_t n, size_t t)
+ {
+   return mex_context ? mex_context->calloc_unmarked (n, t) : ::calloc (n, t);
+ }
+ 
++static inline void *
++maybe_mark_foreign (void *ptr)
++{
++  if (mex_context)
++    mex_context->mark_foreign (ptr);
++
++  return ptr;
++}
++
+ static inline mxArray *
+ maybe_unmark_array (mxArray *ptr)
+ {
+   if (mex_context)
+     mex_context->unmark_array (ptr);
+ 
+   return ptr;
+ }

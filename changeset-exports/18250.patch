@@ -1,0 +1,253 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1389214245 -3600
+#      Wed Jan 08 21:50:45 2014 +0100
+# Branch stable
+# Node ID 0da2e7051778b3d5072169a03822701ccea8743b
+# Parent  8193ef6d07fc66b6dc70bec79b7aa8d827b8ad77
+synchronize gui's debug actions with the octave core thread (bug #41139)
+
+* main-window.cc (constructor): initialize new queue with debug commands
+  (debug_continue, debug_step_into, debug_step_over, debug_step_out,
+  debug_quit): call queue_debug instead post octave_link-event and remove
+  the related callback functions
+  (queue_debug): new functin handling the queue of debug actions and posting
+  octave_link events;
+  (execute_debug_callback): common new callback function for debug actions
+
+* main-window.h: removed functions: debug_continue_callback,
+  debug_step_into_callback, debug_step_over_callback,
+  debug_step_out_callback, debug_quit_callback;
+  new functions: queue_debug, execute_debug_callback;
+  new variables for handling the debug queue
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -83,17 +83,20 @@ main_window::main_window (QWidget *p)
+     workspace_window (new workspace_view (this)),
+     find_files_dlg (0),
+     release_notes_window (0),
+     community_news_window (0),
+     _octave_qt_link (0),
+     _clipboard (QApplication::clipboard ()),
+     _cmd_queue (new QStringList ()),  // no command pending
+     _cmd_processing (1),
+-    _cmd_queue_mutex ()
++    _cmd_queue_mutex (),
++    _dbg_queue (new QStringList ()),  // no debug pending
++    _dbg_processing (1),
++    _dbg_queue_mutex ()
+ {
+   QSettings *settings = resource_manager::get_settings ();
+ 
+   bool connect_to_web = true;
+   QDateTime last_checked;
+   int serial = 0;
+ 
+   if (settings)
+@@ -765,41 +768,41 @@ main_window::handle_exit_debugger (void)
+ #ifdef HAVE_QSCINTILLA
+   editor_window->handle_exit_debug_mode ();
+ #endif
+ }
+ 
+ void
+ main_window::debug_continue (void)
+ {
+-  octave_link::post_event (this, &main_window::debug_continue_callback);
++  queue_debug ("cont");
+ }
+ 
+ void
+ main_window::debug_step_into (void)
+ {
+-  octave_link::post_event (this, &main_window::debug_step_into_callback);
++  queue_debug ("in");
+ }
+ 
+ void
+ main_window::debug_step_over (void)
+ {
+-  octave_link::post_event (this, &main_window::debug_step_over_callback);
++  queue_debug ("step");
+ }
+ 
+ void
+ main_window::debug_step_out (void)
+ {
+-  octave_link::post_event (this, &main_window::debug_step_out_callback);
++  queue_debug ("out");
+ }
+ 
+ void
+ main_window::debug_quit (void)
+ {
+-  octave_link::post_event (this, &main_window::debug_quit_callback);
++  queue_debug ("quit");
+ }
+ 
+ void
+ main_window::handle_insert_debugger_pointer_request (const QString& file,
+                                                      int line)
+ {
+   bool cmd_focus = command_window_has_focus ();
+ 
+@@ -2086,61 +2089,64 @@ main_window::new_figure_callback (void)
+ }
+ 
+ void
+ main_window::change_directory_callback (const std::string& directory)
+ {
+   Fcd (ovl (directory));
+ }
+ 
+-void
+-main_window::debug_continue_callback (void)
+-{
+-  Fdbcont ();
+-
+-  command_editor::interrupt (true);
+-}
+-
+-// The next three callbacks are invoked by GUI buttons.  Those buttons
++// The next callbacks are invoked by GUI buttons.  Those buttons
+ // should only be active when we are doing debugging, which means that
+ // Octave is waiting for input in get_debug_input.  Calling
+ // command_editor::interrupt will force readline to return even if it
+ // has not read any input, and then get_debug_input will return,
+ // allowing the evaluator to continue and execute the next statement.
+ 
+ void
+-main_window::debug_step_into_callback (void)
++main_window::queue_debug (QString debug_cmd)
+ {
+-  Fdbstep (ovl ("in"));
+-
+-  command_editor::interrupt (true);
++  _dbg_queue_mutex.lock ();
++  _dbg_queue->append (debug_cmd);   // queue command
++  _dbg_queue_mutex.unlock ();
++
++  if (_dbg_processing.tryAcquire ())  // if callback not processing, post event
++    octave_link::post_event (this, &main_window::execute_debug_callback);
+ }
+ 
+ void
+-main_window::debug_step_over_callback (void)
+-{
+-  Fdbstep ();
+-
+-  command_editor::interrupt (true);
+-}
+-
+-void
+-main_window::debug_step_out_callback (void)
++main_window::execute_debug_callback ()
+ {
+-  Fdbstep (ovl ("out"));
+-
+-  command_editor::interrupt (true);
+-}
+-
+-void
+-main_window::debug_quit_callback (void)
+-{
+-  Fdbquit ();
+-
+-  command_editor::interrupt (true);
++  bool repost = false;          // flag for reposting event for this callback
++
++  if (!_dbg_queue->isEmpty ())  // list can not be empty here, just to make sure
++    {
++      _dbg_queue_mutex.lock (); // critical path
++      QString debug = _dbg_queue->takeFirst ();
++      if (_dbg_queue->isEmpty ())
++        _dbg_processing.release ();  // cmd queue empty, processing will stop
++      else
++        repost = true;          // not empty, repost at end
++      _dbg_queue_mutex.unlock ();
++
++      if (debug == "step")
++        Fdbstep ();
++      else if (debug == "cont")
++        Fdbcont ();
++      else if (debug == "quit")
++        Fdbquit ();
++      else
++        Fdbstep (ovl (debug.toStdString ()));
++
++      command_editor::interrupt (true);
++    }
++
++  if (repost)  // queue not empty, so repost event for further processing
++    octave_link::post_event (this, &main_window::execute_debug_callback);
++
+ }
+ 
+ void
+ main_window::exit_callback (void)
+ {
+   Fquit ();
+ }
+ 
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -250,29 +250,23 @@ private:
+ 
+   void execute_command_callback ();
+   void run_file_callback (const QFileInfo& info);
+ 
+   void new_figure_callback (void);
+ 
+   void change_directory_callback (const std::string& directory);
+ 
+-  void debug_continue_callback (void);
+-
+-  void debug_step_into_callback (void);
+-
+-  void debug_step_over_callback (void);
+-
+-  void debug_step_out_callback (void);
+-
+-  void debug_quit_callback (void);
+-
+   void exit_callback (void);
+ 
+-  void queue_command (QString command);  // Data models.
++  void queue_command (QString command);
++
++  void queue_debug (QString command);
++
++  void execute_debug_callback ();
+ 
+   workspace_model *_workspace_model;
+ 
+   // Toolbars.
+   QStatusBar *status_bar;
+ 
+   // Subwindows.
+   terminal_dock_widget *command_window;
+@@ -343,16 +337,21 @@ private:
+ 
+   // Flag for closing whole application.
+   bool _closing;
+ 
+   // semaphore to synchronize execution signals and related callback
+   QStringList *_cmd_queue;
+   QSemaphore   _cmd_processing;
+   QMutex       _cmd_queue_mutex;
++
++  // semaphore to synchronize debug signals and related callbacks
++  QStringList *_dbg_queue;
++  QSemaphore   _dbg_processing;
++  QMutex       _dbg_queue_mutex;
+ };
+ 
+ class news_reader : public QObject
+ {
+   Q_OBJECT
+ 
+ public:
+ 

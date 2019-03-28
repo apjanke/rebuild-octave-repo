@@ -1,0 +1,674 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1541747742 18000
+#      Fri Nov 09 02:15:42 2018 -0500
+# Node ID edcb09d4b1f55ea96ca19de1725e0199e15b0ca7
+# Parent  da2bbcf1fbcd7723f29d8d633eef2e92444efa97
+store nesting depth and primary parent info in nested function scopes
+
+* symscope.h, symscope.cc (symbol_scope_rep::m_nesting_depth,
+symbol_scope_rep::m_primary_parent): New data members.
+(symbol_scope_rep::m_is_nested, symbol_scope_rep::mark_nested,
+(symbol_scope::mark_nested): Delete.
+
+(symbol_scope_rep::set_primary_parent,
+symbol_scope_rep::primary_parent_scope_rep,
+symbol_scope_rep::is_relative,
+symbol_scope_rep::nesting_depth,
+symbol_scope_rep::set_nesting_depth): New functions.
+
+(symbol_scope::set_primary_parent,
+symbol_scope::primary_parent_scope_rep,
+symbol_scope::is_relative,
+symbol_scope::nesting_depth,
+symbol_scope::set_nesting_depth): New functions.
+
+(symbol_scope::set_primary_parent,
+symbol_scope_rep::primary_parent_scope_rep,
+symbol_scope_rep::is_relative, symbol_scope_rep::nesting_depth,
+symbol_scope_rep::set_nesting_depth): New functions.
+
+(symbol_scope_rep::is_nested): Use nesting depth to determine whether
+a function is nested.
+(symbol_scope_rep::dump): Also include nesting_depth and is_static.
+
+* oct-parse.yy (base_parser::m_curr_fcn_depth,
+base_parser::m_max_fcn_depth): Initialize to -1.  Primary scope now
+has nesting level of 0.  Adjust all uses.
+
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -106,17 +106,17 @@ namespace octave
+     table_iterator p = m_symbols.find (name);
+ 
+     if (p == m_symbols.end ())
+       {
+         symbol_record ret (name);
+ 
+         auto t_parent = m_parent.lock ();
+ 
+-        if (m_is_nested && t_parent && t_parent->look_nonlocal (name, ret))
++        if (is_nested () && t_parent && t_parent->look_nonlocal (name, ret))
+           return m_symbols[name] = ret;
+         else
+           {
+             if (m_is_static && ! force_add)
+               ret.mark_added_static ();
+ 
+             return m_symbols[name] = ret;
+           }
+@@ -125,17 +125,20 @@ namespace octave
+       return p->second;
+   }
+ 
+   octave_value
+   symbol_scope_rep::dump (void) const
+   {
+     std::map<std::string, octave_value> m
+       = {{ "name", m_name },
++         { "nesting_depth", m_nesting_depth },
++         { "is_static", m_is_static },
+          { "symbols", dump_symbols_map () },
++         { "subfunction_names", string_vector (m_subfunction_names) },
+          { "subfunctions", dump_function_map (m_subfunctions) }};
+ 
+     return octave_value (m);
+   }
+ 
+   octave_value
+   symbol_scope_rep::dump_symbols_map (void) const
+   {
+@@ -181,37 +184,70 @@ namespace octave
+ 
+   void
+   symbol_scope_rep::set_parent (const std::shared_ptr<symbol_scope_rep>& parent)
+   {
+     m_parent = std::weak_ptr<symbol_scope_rep> (parent);
+   }
+ 
+   void
++  symbol_scope_rep::set_primary_parent (const std::shared_ptr<symbol_scope_rep>& parent)
++  {
++    m_primary_parent = std::weak_ptr<symbol_scope_rep> (parent);
++  }
++
++  bool
++  symbol_scope_rep::is_relative (const std::shared_ptr<symbol_scope_rep>& scope) const
++  {
++    if (is_nested ())
++      {
++        // Since is_nested is true, the following should always return a
++        // valid scope.
++
++        auto t_primary_parent = m_primary_parent.lock ();
++
++        if (t_primary_parent)
++          {
++            // SCOPE is the primary parent of this scope: this scope is a
++            // child of SCOPE.
++            if (t_primary_parent == scope)
++              return true;
++
++            // SCOPE and this scope share the same primary parent: they are
++            // siblings.
++            if (t_primary_parent == scope->primary_parent_scope_rep ())
++              return true;
++          }
++      }
++
++    return false;
++  }
++
++  void
+   symbol_scope_rep::update_nest (void)
+   {
+     auto t_parent = m_parent.lock ();
+ 
+     if (t_parent)
+       {
+         // fix bad symbol_records
+         for (auto& nm_sr : m_symbols)
+           {
+             symbol_record& ours = nm_sr.second;
+ 
+             if (! ours.is_formal ()
+-                && m_is_nested && t_parent->look_nonlocal (nm_sr.first, ours))
++                && is_nested () && t_parent->look_nonlocal (nm_sr.first, ours))
+               {
+                 if (ours.is_global () || ours.is_persistent ())
+                   error ("global and persistent may only be used in the topmost level in which a nested variable is used");
+               }
+           }
+ 
+         // The scopes of nested functions are static.
+-        if (m_is_nested)
++        if (is_nested ())
+           m_is_static = true;
+       }
+     else if (m_children.size ())
+       {
+         // Parents of nested functions have static scopes.
+         m_is_static = true;
+       }
+ 
+@@ -223,17 +259,17 @@ namespace octave
+   symbol_scope_rep::look_nonlocal (const std::string& name,
+                                    symbol_record& result)
+   {
+     table_iterator p = m_symbols.find (name);
+     if (p == m_symbols.end ())
+       {
+         auto t_parent = m_parent.lock ();
+ 
+-        if (m_is_nested && t_parent)
++        if (is_nested () && t_parent)
+           return t_parent->look_nonlocal (name, result);
+       }
+     else if (! p->second.is_automatic ())
+       {
+         result.bind_fwd_rep (shared_from_this (), p->second);
+         return true;
+       }
+ 
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -60,18 +60,18 @@ namespace octave
+ 
+     typedef std::map<std::string, octave_value>::const_iterator
+     subfunctions_const_iterator;
+     typedef std::map<std::string, octave_value>::iterator
+     subfunctions_iterator;
+ 
+     symbol_scope_rep (const std::string& name = "")
+       : m_name (name), m_symbols (), m_subfunctions (), m_fcn (nullptr),
+-        m_parent (), m_children (), m_is_nested (false),
+-        m_is_static (false), m_context (0)
++        m_parent (), m_primary_parent (), m_children (),
++        m_nesting_depth (0), m_is_static (false), m_context (0)
+     { }
+ 
+     // No copying!
+ 
+     symbol_scope_rep (const symbol_scope&) = delete;
+ 
+     symbol_scope_rep& operator = (const symbol_scope&) = delete;
+ 
+@@ -81,38 +81,46 @@ namespace octave
+     {
+       m_symbols[sr.name ()] = sr;
+     }
+ 
+     void install_auto_fcn_vars (void);
+ 
+     void install_auto_fcn_var (const std::string& name);
+ 
+-    bool is_nested (void) const { return m_is_nested; }
++    bool is_nested (void) const { return m_nesting_depth > 0; }
+ 
+-    void mark_nested (void) { m_is_nested = true; }
++    size_t nesting_depth (void) const { return m_nesting_depth; }
++
++    void set_nesting_depth (size_t depth) { m_nesting_depth = depth; }
+ 
+     bool is_static (void) const { return m_is_static; }
+ 
+     void mark_static (void) { m_is_static = true; }
+ 
+     std::shared_ptr<symbol_scope_rep> parent_scope_rep (void) const
+     {
+       return m_parent.lock ();
+     }
+ 
++    std::shared_ptr<symbol_scope_rep> primary_parent_scope_rep (void) const
++    {
++      return m_primary_parent.lock ();
++    }
++
+     std::shared_ptr<symbol_scope_rep> dup (void) const
+     {
+       std::shared_ptr<symbol_scope_rep> new_sid
+         = std::shared_ptr<symbol_scope_rep> (new symbol_scope_rep (m_name));
+ 
+       for (const auto& nm_sr : m_symbols)
+         new_sid->insert_symbol_record (nm_sr.second.dup (new_sid));
+ 
+       new_sid->m_parent = m_parent;
++      new_sid->m_primary_parent = m_primary_parent;
+ 
+       return new_sid;
+     }
+ 
+     void set_context (symbol_record::context_id context)
+     {
+       m_context = context;
+     }
+@@ -305,17 +313,17 @@ namespace octave
+     }
+ 
+     void clear_variable (const std::string& name)
+     {
+       auto p = m_symbols.find (name);
+ 
+       if (p != m_symbols.end ())
+         p->second.clear (m_context);
+-      else if (m_is_nested)
++      else if (is_nested ())
+         {
+           std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
+ 
+           if (psr)
+             psr->clear_variable (name);
+         }
+     }
+ 
+@@ -329,17 +337,17 @@ namespace octave
+ 
+           if (sr.is_defined (m_context) || sr.is_global ())
+             {
+               if (pattern.match (sr.name ()))
+                 sr.clear (m_context);
+             }
+         }
+ 
+-      if (m_is_nested)
++      if (is_nested ())
+         {
+           std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
+ 
+           if (psr)
+             psr->clear_variable_pattern (pat);
+         }
+     }
+ 
+@@ -353,17 +361,17 @@ namespace octave
+ 
+           if (sr.is_defined (m_context) || sr.is_global ())
+             {
+               if (pattern.is_match (sr.name ()))
+                 sr.clear (m_context);
+             }
+         }
+ 
+-      if (m_is_nested)
++      if (is_nested ())
+         {
+           std::shared_ptr<symbol_scope_rep> psr = parent_scope_rep ();
+ 
+           if (psr)
+             psr->clear_variable_regexp (pat);
+         }
+     }
+ 
+@@ -542,16 +550,20 @@ namespace octave
+     void cache_name (const std::string& name) { m_name = name; }
+ 
+     octave_user_function *function (void) { return m_fcn; }
+ 
+     void set_function (octave_user_function *fcn) { m_fcn = fcn; }
+ 
+     void set_parent (const std::shared_ptr<symbol_scope_rep>& parent);
+ 
++    void set_primary_parent (const std::shared_ptr<symbol_scope_rep>& parent);
++
++    bool is_relative (const std::shared_ptr<symbol_scope_rep>& scope) const;
++
+     void update_nest (void);
+ 
+     bool look_nonlocal (const std::string& name, symbol_record& result);
+ 
+     void bind_script_symbols (const std::shared_ptr<symbol_scope_rep>& curr_scope);
+ 
+     void unbind_script_symbols (void);
+ 
+@@ -580,23 +592,28 @@ namespace octave
+     //! The associated user code (may be null).
+ 
+     octave_user_function *m_fcn;
+ 
+     //! Parent of nested function (may be null).
+ 
+     std::weak_ptr<symbol_scope_rep> m_parent;
+ 
++    //! Primary (top) parent of nested function (may be null).  Used
++    //! to determine whether two nested functions are related.
++
++    std::weak_ptr<symbol_scope_rep> m_primary_parent;
++
+     //! Child nested functions.
+ 
+     std::vector<symbol_scope> m_children;
+ 
+     //! If true, then this scope belongs to a nested function.
+ 
+-    bool m_is_nested;
++    size_t m_nesting_depth;
+ 
+     //! If true then no variables can be added.
+ 
+     bool m_is_static;
+ 
+     symbol_record::context_id m_context;
+   };
+ 
+@@ -637,20 +654,25 @@ namespace octave
+         m_rep->install_auto_fcn_vars ();
+     }
+ 
+     bool is_nested (void) const
+     {
+       return m_rep ? m_rep->is_nested () : false;
+     }
+ 
+-    void mark_nested (void)
++    void set_nesting_depth (size_t depth)
+     {
+       if (m_rep)
+-        m_rep->mark_nested ();
++        m_rep->set_nesting_depth (depth);
++    }
++
++    size_t nesting_depth (void) const
++    {
++      return m_rep ? m_rep->nesting_depth () : 0;
+     }
+ 
+     bool is_static (void) const
+     {
+       return m_rep ? m_rep->is_static () : false;
+     }
+ 
+     void mark_static (void)
+@@ -659,16 +681,21 @@ namespace octave
+         m_rep->mark_static ();
+     }
+ 
+     std::shared_ptr<symbol_scope_rep> parent_scope (void) const
+     {
+       return m_rep ? m_rep->parent_scope_rep () : nullptr;
+     }
+ 
++    std::shared_ptr<symbol_scope_rep> primary_parent_scope (void) const
++    {
++      return m_rep ? m_rep->primary_parent_scope_rep () : nullptr;
++    }
++
+     symbol_scope dup (void) const
+     {
+       return symbol_scope (m_rep ? m_rep->dup () : nullptr);
+     }
+ 
+     void set_context (symbol_record::context_id context)
+     {
+       if (m_rep)
+@@ -948,16 +975,27 @@ namespace octave
+     }
+ 
+     void set_parent (const symbol_scope& p)
+     {
+       if (m_rep)
+         m_rep->set_parent (p.get_rep ());
+     }
+ 
++    void set_primary_parent (const symbol_scope& p)
++    {
++      if (m_rep)
++        m_rep->set_primary_parent (p.get_rep ());
++    }
++
++    bool is_relative (const symbol_scope& scope) const
++    {
++      return m_rep ? m_rep->is_relative (scope.get_rep ()) : false;
++    }
++
+     void update_nest (void)
+     {
+       if (m_rep)
+         m_rep->update_nest ();
+     }
+ 
+     bool look_nonlocal (const std::string& name, symbol_record& result)
+     {
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -1285,23 +1285,23 @@ push_fcn_symtab : // empty
+                     if (parser.m_max_fcn_depth < parser.m_curr_fcn_depth)
+                       parser.m_max_fcn_depth = parser.m_curr_fcn_depth;
+ 
+                     // Will get a real name later.
+                     lexer.m_symtab_context.push (octave::symbol_scope ("parser:push_fcn_symtab"));
+                     parser.m_function_scopes.push (lexer.m_symtab_context.curr_scope ());
+ 
+                     if (! lexer.m_reading_script_file
+-                        && parser.m_curr_fcn_depth == 1
++                        && parser.m_curr_fcn_depth == 0
+                         && ! parser.m_parsing_subfunctions)
+                       parser.m_primary_fcn_scope
+                         = lexer.m_symtab_context.curr_scope ();
+ 
+                     if (lexer.m_reading_script_file
+-                        && parser.m_curr_fcn_depth > 1)
++                        && parser.m_curr_fcn_depth > 0)
+                       {
+                         parser.bison_error ("nested functions not implemented in this context");
+                         YYABORT;
+                       }
+                   }
+                 ;
+ 
+ // ===========================
+@@ -1522,17 +1522,17 @@ function_beg    : push_fcn_symtab FCN
+ fcn_name        : identifier
+                   {
+                     std::string id = $1->name ();
+ 
+                     // Make classdef local functions unique from
+                     // classdef methods.
+ 
+                     if (parser.m_parsing_local_functions
+-                        && parser.m_curr_fcn_depth == 1)
++                        && parser.m_curr_fcn_depth == 0)
+                       id = lexer.m_fcn_file_name + ">" + id;
+ 
+                     if (! parser.m_function_scopes.name_current_scope (id))
+                       {
+                         parser.bison_error ("duplicate subfunction or nested function name",
+                                             $1->line (), $1->column ());
+ 
+                         delete $1;
+@@ -2172,17 +2172,17 @@ namespace octave
+     m_info.clear ();
+     m_all_names.clear ();
+   }
+ 
+   base_parser::base_parser (base_lexer& lxr)
+     : m_endfunction_found (false), m_autoloading (false),
+       m_fcn_file_from_relative_lookup (false),
+       m_parsing_subfunctions (false), m_parsing_local_functions (false),
+-      m_max_fcn_depth (0), m_curr_fcn_depth (0), m_primary_fcn_scope (),
++      m_max_fcn_depth (-1), m_curr_fcn_depth (-1), m_primary_fcn_scope (),
+       m_curr_class_name (), m_curr_package_name (), m_function_scopes (),
+       m_primary_fcn_ptr (nullptr), m_subfunction_names (),
+       m_classdef_object (nullptr), m_stmt_list (nullptr), m_lexer (lxr),
+       m_parser_state (yypstate_new ())
+   { }
+ 
+   base_parser::~base_parser (void)
+   {
+@@ -2204,18 +2204,18 @@ namespace octave
+   void
+   base_parser::reset (void)
+   {
+     m_endfunction_found = false;
+     m_autoloading = false;
+     m_fcn_file_from_relative_lookup = false;
+     m_parsing_subfunctions = false;
+     m_parsing_local_functions = false;
+-    m_max_fcn_depth = 0;
+-    m_curr_fcn_depth = 0;
++    m_max_fcn_depth = -1;
++    m_curr_fcn_depth = -1;
+     m_primary_fcn_scope = symbol_scope ();
+     m_curr_class_name = "";
+     m_curr_package_name = "";
+     m_function_scopes.clear ();
+     m_primary_fcn_ptr  = nullptr;
+     m_subfunction_names.clear ();
+     m_classdef_object = nullptr;
+ 
+@@ -3354,17 +3354,17 @@ namespace octave
+                                      end_fcn_stmt->column ());
+       }
+ 
+     // If input is coming from a file, issue a warning if the name of
+     // the file does not match the name of the function stated in the
+     // file.  Matlab doesn't provide a diagnostic (it ignores the stated
+     // name).
+     if (! m_autoloading && m_lexer.m_reading_fcn_file
+-        && m_curr_fcn_depth == 1 && ! m_parsing_subfunctions)
++        && m_curr_fcn_depth == 0 && ! m_parsing_subfunctions)
+       {
+         // FIXME: should m_lexer.m_fcn_file_name already be
+         // preprocessed when we get here?  It seems to only be a
+         // problem with relative filenames.
+ 
+         std::string nm = m_lexer.m_fcn_file_name;
+ 
+         size_t pos = nm.find_last_of (sys::file_ops::dir_sep_chars ());
+@@ -3425,24 +3425,24 @@ namespace octave
+ 
+     fcn->stash_function_name (id_name);
+ 
+     // Record help text for functions other than nested functions.
+     // We cannot currently record help for nested functions (bug #46008)
+     // because the doc_string of the outermost function is read first,
+     // whereas this function is called for the innermost function first.
+     // We could have a stack of help_text in lexer.
+-    if (! m_lexer.m_help_text.empty () && m_curr_fcn_depth == 1)
++    if (! m_lexer.m_help_text.empty () && m_curr_fcn_depth == 0)
+       {
+         fcn->document (m_lexer.m_help_text);
+ 
+         m_lexer.m_help_text = "";
+       }
+ 
+-    if (m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 1
++    if (m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 0
+         && ! m_parsing_subfunctions)
+       m_primary_fcn_ptr = fcn;
+ 
+     return fcn;
+   }
+ 
+   tree_statement *
+   base_parser::make_end (const std::string& type, bool eof, int l, int c)
+@@ -3474,45 +3474,46 @@ namespace octave
+         fcn_scope.cache_name (tmp);
+         fcn_scope.install_auto_fcn_vars ();
+ 
+         if (lc)
+           fcn->stash_leading_comment (lc);
+ 
+         fcn->define_ret_list (ret_list);
+ 
+-        if (m_curr_fcn_depth > 1 || m_parsing_subfunctions)
++        if (m_curr_fcn_depth > 0 || m_parsing_subfunctions)
+           {
+             fcn->stash_fcn_location (l, c);
+             fcn->stash_parent_fcn_name (m_lexer.m_fcn_file_name);
+ 
+             octave_value ov_fcn (fcn);
+ 
+             if (m_endfunction_found && m_function_scopes.size () > 1)
+               {
+                 fcn->mark_as_nested_function ();
+-                fcn_scope.mark_nested ();
++                fcn_scope.set_nesting_depth (m_curr_fcn_depth);
+ 
+                 symbol_scope pscope = m_function_scopes.parent_scope ();
+                 fcn_scope.set_parent (pscope);
++                fcn_scope.set_primary_parent (m_primary_fcn_scope);
+                 pscope.install_nestfunction (nm, ov_fcn, fcn_scope);
+               }
+             else
+               {
+                 fcn->mark_as_subfunction ();
+                 m_subfunction_names.push_back (nm);
+                 fcn_scope.set_parent (m_primary_fcn_scope);
+                 m_primary_fcn_scope.install_subfunction (nm, ov_fcn);
+               }
+           }
+ 
+-        if (m_curr_fcn_depth == 1)
++        if (m_curr_fcn_depth == 0)
+           fcn_scope.update_nest ();
+ 
+-        if (! m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 1)
++        if (! m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 0)
+           {
+             // We are either reading a script file or defining a function
+             // at the command line, so this definition creates a
+             // tree_function object that is placed in the parse tree.
+             // Otherwise, it is just inserted in the symbol table,
+             // either as a subfunction or nested function (see above),
+             // or as the primary function for the file, via
+             // m_primary_fcn_ptr (see also load_fcn_from_file,,
+@@ -3533,17 +3534,17 @@ namespace octave
+     return retval;
+   }
+ 
+   void
+   base_parser::recover_from_parsing_function (void)
+   {
+     m_lexer.m_symtab_context.pop ();
+ 
+-    if (m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 1
++    if (m_lexer.m_reading_fcn_file && m_curr_fcn_depth == 0
+         && ! m_parsing_subfunctions)
+       m_parsing_subfunctions = true;
+ 
+     m_curr_fcn_depth--;
+     m_function_scopes.pop ();
+ 
+     m_lexer.m_defining_func--;
+     m_lexer.m_parsed_function_name.pop ();
+@@ -3995,17 +3996,17 @@ namespace octave
+       case GLOBAL:
+         {
+           retval = new tree_decl_command ("global", lst, l, c);
+           retval->mark_global ();
+         }
+         break;
+ 
+       case PERSISTENT:
+-        if (m_curr_fcn_depth > 0)
++        if (m_curr_fcn_depth >= 0)
+           {
+             retval = new tree_decl_command ("persistent", lst, l, c);
+             retval->mark_persistent ();
+           }
+         else
+           {
+             if (m_lexer.m_reading_script_file)
+               warning ("ignoring persistent declaration near line %d of file '%s'",
+@@ -4235,17 +4236,17 @@ namespace octave
+     return (c
+             ? finish_array_list (c)
+             : new tree_constant (octave_value (Cell ())));
+   }
+ 
+   void
+   base_parser::maybe_warn_missing_semi (tree_statement_list *t)
+   {
+-    if (m_curr_fcn_depth > 0)
++    if (m_curr_fcn_depth >= 0)
+       {
+         tree_statement *tmp = t->back ();
+ 
+         if (tmp->is_expression ())
+           warning_with_id
+             ("Octave:missing-semicolon",
+              "missing semicolon near line %d, column %d in file '%s'",
+              tmp->line (), tmp->column (), m_lexer.m_fcn_file_full_name.c_str ());

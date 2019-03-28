@@ -1,0 +1,357 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1339102123 18000
+#      Thu Jun 07 15:48:43 2012 -0500
+# Node ID 4488022820c972c7a5400958fdaa2356776e397c
+# Parent  bab44e3ee2912d9d083f69c8832f5ceb1184b57f
+No longer segfault when compiling nested for loops
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -726,16 +726,65 @@ std::ostream&
+ jit_instruction::short_print (std::ostream& os) const
+ {
+   if (type ())
+     jit_print (os, type ()) << ": ";
+   return os << "#" << mid;
+ }
+ 
+ // -------------------- jit_block --------------------
++jit_block *
++jit_block::maybe_merge ()
++{
++  if (succ_count () == 1 && succ (0) != this
++      && (succ (0)->pred_count () == 1 || instructions.size () == 1))
++    {
++      jit_block *to_merge = succ (0);
++      merge (*to_merge);
++      return to_merge;
++    }
++
++  return 0;
++}
++
++void
++jit_block::merge (jit_block& block)
++{
++  // the merge block will contain a new terminator
++  jit_terminator *old_term = terminator ();
++  if (old_term)
++    {
++      old_term->remove ();
++      for (size_t i = 0; i < old_term->argument_count (); ++i)
++        old_term->stash_argument (i, 0);
++    }
++
++  bool was_empty = end () == begin ();
++  iterator merge_begin = end ();
++  if (! was_empty)
++    --merge_begin;
++
++  instructions.splice (end (), block.instructions);
++  if (was_empty)
++    merge_begin = begin ();
++  else
++    ++merge_begin;
++
++  // now merge_begin points to the start of the new instructions, we must
++  // update their parent information
++  for (iterator iter = merge_begin; iter != end (); ++iter)
++    {
++      jit_instruction *instr = *iter;
++      instr->stash_parent (this, iter);
++    }
++
++  block.replace_with (this);
++  block.mark_dead ();
++}
++
+ jit_instruction *
+ jit_block::prepend (jit_instruction *instr)
+ {
+   instructions.push_front (instr);
+   instr->stash_parent (this, instructions.begin ());
+   return instr;
+ }
+ 
+@@ -822,36 +871,36 @@ jit_block::pred_index (jit_block *apred)
+ void
+ jit_block::create_merge (llvm::Function *inside, size_t pred_idx)
+ {
+   mpred_llvm.resize (pred_count ());
+ 
+   jit_block *ipred = pred (pred_idx);
+   if (! mpred_llvm[pred_idx] && ipred->pred_count () > 1)
+     {
+-      llvm::BasicBlock *merge;
+-      merge = llvm::BasicBlock::Create (context, "phi_merge", inside,
+-                                        to_llvm ());
++      llvm::BasicBlock *amerge;
++      amerge = llvm::BasicBlock::Create (context, "phi_merge", inside,
++                                         to_llvm ());
+           
+       // fix the predecessor jump if it has been created
+       jit_terminator *jterm = pred_terminator (pred_idx);
+       if (jterm->has_llvm ())
+         {
+           llvm::Value *term = jterm->to_llvm ();
+           llvm::TerminatorInst *branch = llvm::cast<llvm::TerminatorInst> (term);
+           for (size_t i = 0; i < branch->getNumSuccessors (); ++i)
+             {
+               if (branch->getSuccessor (i) == to_llvm ())
+-                branch->setSuccessor (i, merge);
++                branch->setSuccessor (i, amerge);
+             }
+         }
+ 
+-      llvm::IRBuilder<> temp (merge);
++      llvm::IRBuilder<> temp (amerge);
+       temp.CreateBr (to_llvm ());
+-      mpred_llvm[pred_idx] = merge;
++      mpred_llvm[pred_idx] = amerge;
+     }
+ }
+ 
+ jit_block *
+ jit_block::succ (size_t i) const
+ {
+   jit_terminator *term = terminator ();
+   return term->sucessor (i);
+@@ -937,30 +986,16 @@ jit_block::update_idom (size_t visit_cou
+ 
+   if (! pred_count ())
+     return false;
+ 
+   bool changed = false;
+   for (size_t i = 0; i < pred_count (); ++i)
+     changed = pred (i)->update_idom (visit_count) || changed;
+ 
+-  if (! idom)
+-    {
+-      // one of our predecessors may have an idom of us, so if idom_intersect
+-      // is called we need to have an idom. Assign idom to the pred with the
+-      // lowest rpo id, as this prevents an infinite loop in idom_intersect
+-      // FIXME: Textbook algorithm doesn't do this, ensure this is correct
+-      size_t lowest_rpo = 0;
+-      for (size_t i = 1; i < pred_count (); ++i)
+-        if (pred (i)->id () < pred (lowest_rpo)->id ())
+-          lowest_rpo = i;
+-      idom = pred (lowest_rpo);
+-      changed = true;
+-    }
+-
+   jit_block *new_idom = pred (0);
+   for (size_t i = 1; i < pred_count (); ++i)
+     {
+       jit_block *pidom = pred (i)->idom;
+       if (pidom)
+         new_idom = pidom->idom_intersect (new_idom);
+     }
+ 
+@@ -1694,20 +1729,47 @@ jit_convert::visit (tree& tee)
+   tee.accept (*this);
+ 
+   jit_instruction *ret = result;
+   result = 0;
+   return ret;
+ }
+ 
+ void
++jit_convert::merge_blocks (void)
++{
++  for (block_list::iterator iter = blocks.begin (); iter != blocks.end ();
++       ++iter)
++    {
++      jit_block *b = *iter;
++      jit_block *merged = b->maybe_merge ();
++
++      if (merged == final_block)
++        final_block = b;
++
++      if (merged == entry_block)
++        entry_block = b;
++    }
++
++  for (block_list::iterator iter = blocks.begin (); iter != blocks.end ();)
++    {
++      jit_block *b = *iter;
++      if (b->dead ())
++        iter = blocks.erase (iter);
++      else
++        ++iter;
++    }
++}
++
++void
+ jit_convert::construct_ssa (void)
+ {
++  merge_blocks ();
+   final_block->label ();
+-  entry_block->compute_idom (final_block);
++  final_block->compute_idom (entry_block);
+   entry_block->compute_df ();
+   entry_block->create_dom_tree ();
+ 
+   // insert phi nodes where needed, this is done on a per variable basis
+   for (vmap_t::iterator iter = vmap.begin (); iter != vmap.end (); ++iter)
+     {
+       jit_block::df_set visited, added_phi;
+       std::list<jit_block *> ssa_worklist;
+@@ -1736,17 +1798,16 @@ jit_convert::construct_ssa (void)
+                   ssa_worklist.push_back (dblock);
+                   visited.insert (dblock);
+                 }
+             }
+         }
+     }
+ 
+   entry_block->visit_dom (&jit_convert::do_construct_ssa, &jit_block::pop_all);
+-  print_dom ();
+ }
+ 
+ void
+ jit_convert::do_construct_ssa (jit_block& block)
+ {
+   // replace variables with their current SSA value
+   for (jit_block::iterator iter = block.begin (); iter != block.end (); ++iter)
+     {
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -956,19 +956,29 @@ public:
+   typedef std::list<jit_instruction *> instruction_list;
+   typedef instruction_list::iterator iterator;
+   typedef instruction_list::const_iterator const_iterator;
+ 
+   typedef std::set<jit_block *> df_set;
+   typedef df_set::const_iterator df_iterator;
+ 
+   jit_block (const std::string& aname) : mvisit_count (0), mid (NO_ID), idom (0),
+-                                         mname (aname)
++                                         mname (aname), mdead (false)
+   {}
+ 
++  virtual bool dead (void) const { return mdead; }
++
++  void mark_dead (void) { mdead = true; }
++
++  // If we can merge with a sucessor, do so and return the now empty block
++  jit_block *maybe_merge ();
++
++  // merge another block into this block, leaving the merge block empty
++  void merge (jit_block& merge);
++
+   const std::string& name (void) const { return mname; }
+ 
+   jit_instruction *prepend (jit_instruction *instr);
+ 
+   jit_instruction *prepend_after_phi (jit_instruction *instr);
+ 
+   jit_instruction *append (jit_instruction *instr);
+ 
+@@ -1064,22 +1074,22 @@ public:
+       pred (i)->label (visit_count, number);
+ 
+     mid = number++;
+   }
+ 
+   // See for idom computation algorithm
+   // Cooper, Keith D.; Harvey, Timothy J; and Kennedy, Ken (2001).
+   // "A Simple, Fast Dominance Algorithm"
+-  void compute_idom (jit_block *final)
++  void compute_idom (jit_block *entry_block)
+   {
+     bool changed;
+-    idom = this;
++    entry_block->idom = entry_block;
+     do
+-      changed = final->update_idom (mvisit_count);
++      changed = update_idom (mvisit_count);
+     while (changed);
+   }
+ 
+   // compute dominance frontier
+   void compute_df (void)
+   {
+     compute_df (mvisit_count);
+   }
+@@ -1098,17 +1108,18 @@ public:
+     do_visit_dom (mvisit_count, inorder, postorder);
+   }
+ 
+   // call pop_varaible on all instructions
+   void pop_all (void);
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent) const
+   {
+-    print_indent (os, indent) << mname << ":        %pred = ";
++    print_indent (os, indent);
++    short_print (os) << ":        %pred = ";
+     for (size_t i = 0; i < pred_count (); ++i)
+       {
+         print_pred (os, i);
+         if (i + 1 < pred_count ())
+           os << ", ";
+       }
+     os << std::endl;
+ 
+@@ -1120,17 +1131,20 @@ public:
+     return os;
+   }
+ 
+   // print dominator infomration
+   std::ostream& print_dom (std::ostream& os) const;
+ 
+   virtual std::ostream& short_print (std::ostream& os) const
+   {
+-    return os << mname;
++    os << mname;
++    if (mid != NO_ID)
++      os << mid;
++    return os;
+   }
+ 
+   llvm::BasicBlock *to_llvm (void) const;
+ 
+   JIT_VALUE_ACCEPT (block)
+ private:
+   void compute_df (size_t visit_count);
+ 
+@@ -1147,16 +1161,17 @@ private:
+   size_t mvisit_count;
+   size_t mid;
+   jit_block *idom;
+   df_set mdf;
+   std::vector<jit_block *> dom_succ;
+   std::string mname;
+   instruction_list instructions;
+   mutable std::vector<llvm::BasicBlock *> mpred_llvm;
++  bool mdead;
+ };
+ 
+ // allow regular function pointers as well as pointers to members
+ template <typename func_type>
+ class jit_block_callback
+ {
+ public:
+   jit_block_callback (func_type afunction) : function (afunction) {}
+@@ -1883,16 +1898,18 @@ private:
+ 
+   void track_value (jit_value *value)
+   {
+     if (value->type ())
+       constants.push_back (value);
+     all_values.push_back (value);
+   }
+ 
++  void merge_blocks (void);
++
+   void construct_ssa (void);
+ 
+   static void do_construct_ssa (jit_block& block);
+ 
+   void place_releases (void);
+ 
+   void print_blocks (const std::string& header)
+   {

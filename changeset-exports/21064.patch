@@ -1,0 +1,455 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1452767307 18000
+#      Thu Jan 14 05:28:27 2016 -0500
+# Node ID a9f2c2d72892ba63df9918ab8770e4e3397aa0eb
+# Parent  202cfd2b45149719f1a87c209a4cb73498c1b6c2
+handle lexical errors as parser errors (bug #46877)
+
+* lex.ll: Store error message info in LEXICAL_ERROR tokens and return
+token instead of immediately throwing errors in the lexer.
+* oct-parse.in.yy (LEXICAL_ERROR): Declare type as tok_val instead of
+dummy_type.
+(parse_error): Call parser.bison_error to report error.
+
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -875,17 +875,27 @@ ANY_INCLUDING_NL (.|{NL})
+     curr_lexer->lexer_debug ("<DQ_STRING_START>\\\\[0-7]{1,3}");
+ 
+     curr_lexer->current_input_column += yyleng;
+ 
+     int result;
+     sscanf (yytext+1, "%o", &result);
+ 
+     if (result > 0xff)
+-      error ("invalid octal escape sequence in character string");
++      {
++        token *tok
++          = new token (LEXICAL_ERROR,
++                       "invalid octal escape sequence in character string",
++                       curr_lexer->input_line_number,
++                       curr_lexer->current_input_column);
++
++        curr_lexer->push_token (tok);
++
++        return curr_lexer->count_token_internal (LEXICAL_ERROR);
++      }
+     else
+       curr_lexer->string_text += static_cast<unsigned char> (result);
+   }
+ 
+ <DQ_STRING_START>\\x[0-9a-fA-F]+ {
+     curr_lexer->lexer_debug ("<DQ_STRING_START>\\\\x[0-9a-fA-F]+");
+ 
+     curr_lexer->current_input_column += yyleng;
+@@ -1008,23 +1018,27 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+     curr_lexer->current_input_column += yyleng;
+     curr_lexer->string_text += yytext;
+   }
+ 
+ <DQ_STRING_START>{NL} {
+     curr_lexer->lexer_debug ("<DQ_STRING_START>{NL}");
+ 
++    token *tok = new token (LEXICAL_ERROR,
++                            "unterminated character string constant",
++                            curr_lexer->input_line_number,
++                            curr_lexer->current_input_column);
++
++    curr_lexer->push_token (tok);
++
+     curr_lexer->input_line_number++;
+     curr_lexer->current_input_column = 1;
+ 
+-    error ("unterminated character string constant");
+-
+-    // FIXME: This is no longer reachable now that error is exception based.
+-    return LEXICAL_ERROR;
++    return curr_lexer->count_token_internal (LEXICAL_ERROR);
+   }
+ 
+ %{
+ // Single-quoted character strings.
+ %}
+ 
+ <SQ_STRING_START>\'\' {
+     curr_lexer->lexer_debug ("<SQ_STRING_START>\\'\\'");
+@@ -1061,23 +1075,27 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+     curr_lexer->current_input_column += yyleng;
+     curr_lexer->string_text += yytext;
+   }
+ 
+ <SQ_STRING_START>{NL} {
+     curr_lexer->lexer_debug ("<SQ_STRING_START>{NL}");
+ 
++    token *tok = new token (LEXICAL_ERROR,
++                            "unterminated character string constant",
++                            curr_lexer->input_line_number,
++                            curr_lexer->current_input_column);
++
++    curr_lexer->push_token (tok);
++
+     curr_lexer->input_line_number++;
+     curr_lexer->current_input_column = 1;
+ 
+-    error ("unterminated character string constant");
+-
+-    // FIXME: This is no longer reachable now that error is exception based.
+-    return LEXICAL_ERROR;
++    return curr_lexer->count_token_internal (LEXICAL_ERROR);
+   }
+ 
+ %{
+ // Fully-qualified identifiers (used for classdef).
+ %}
+ 
+ <FQ_IDENT_START>{FQIDENT} {
+     curr_lexer->lexer_debug ("<FQ_IDENT_START>{FQIDENT}");
+@@ -1327,33 +1345,49 @@ ANY_INCLUDING_NL (.|{NL})
+ // A new line character.  New line characters inside matrix constants
+ // are handled by the <MATRIX_START> start state code above.  If closest
+ // nesting is inside parentheses, don't return a row separator.
+ %}
+ 
+ {NL} {
+     curr_lexer->lexer_debug ("{NL}");
+ 
+-    curr_lexer->input_line_number++;
+-    curr_lexer->current_input_column = 1;
+-
+     if (curr_lexer->nesting_level.is_paren ())
+       {
++        curr_lexer->input_line_number++;
++        curr_lexer->current_input_column = 1;
++
+         curr_lexer->at_beginning_of_statement = false;
+         curr_lexer->gripe_language_extension
+           ("bare newline inside parentheses");
+       }
+     else if (curr_lexer->nesting_level.none ()
+         || curr_lexer->nesting_level.is_anon_fcn_body ())
+       {
++        curr_lexer->input_line_number++;
++        curr_lexer->current_input_column = 1;
++
+         curr_lexer->at_beginning_of_statement = true;
++
+         return curr_lexer->count_token ('\n');
+       }
+     else if (curr_lexer->nesting_level.is_bracket_or_brace ())
+-      return LEXICAL_ERROR;
++      {
++        token *tok = new token (LEXICAL_ERROR,
++                                "unexpected internal lexer error",
++                                curr_lexer->input_line_number,
++                                curr_lexer->current_input_column);
++
++        curr_lexer->push_token (tok);
++
++        curr_lexer->input_line_number++;
++        curr_lexer->current_input_column = 1;
++
++        return curr_lexer->count_token_internal (LEXICAL_ERROR);
++      }
+   }
+ 
+ %{
+ // Single quote can either be the beginning of a string or a transpose
+ // operator.
+ %}
+ 
+ "'" {
+@@ -1719,24 +1753,31 @@ ANY_INCLUDING_NL (.|{NL})
+     int c = curr_lexer->text_yyinput ();
+ 
+     if (c == 1)
+       return -1;
+     else if (c == EOF)
+       return curr_lexer->handle_end_of_input ();
+     else
+       {
++        std::ostringstream buf;
++
++        buf << "invalid character '"
++            << undo_string_escape (static_cast<char> (c))
++            << "' (ASCII " << c << ")";
++
++        token *tok = new token (LEXICAL_ERROR, buf.str (),
++                                curr_lexer->input_line_number,
++                                curr_lexer->current_input_column);
++
++        curr_lexer->push_token (tok);
++
+         curr_lexer->current_input_column++;
+ 
+-        error ("invalid character '%s' (ASCII %d) near line %d, column %d",
+-               undo_string_escape (static_cast<char> (c)), c,
+-               curr_lexer->input_line_number, curr_lexer->current_input_column);
+-
+-        // FIXME: This is no longer reachable now that error is exception based.
+-        return LEXICAL_ERROR;
++        return curr_lexer->count_token_internal (LEXICAL_ERROR);
+       }
+   }
+ 
+ %{
+ #if defined (HAVE_PRAGMA_GCC_DIAGNOSTIC)
+ // Disable this warning for code that is generated by flex.
+ #pragma GCC diagnostic push
+ #pragma GCC diagnostic ignored "-Wold-style-cast"
+@@ -2899,19 +2940,24 @@ octave_base_lexer::handle_superclass_ide
+   std::string cls = meth.substr (pos + 1);
+   meth = meth.substr (0, pos);
+ 
+   bool kw_token = (is_keyword_token (meth)
+                    || fq_identifier_contains_keyword (cls));
+ 
+   if (kw_token)
+     {
+-      error ("method, class, and package names may not be keywords");
+-      // FIXME: This is no longer reachable now that error is exception based.
+-      return LEXICAL_ERROR;
++      token *tok
++        = new token (LEXICAL_ERROR,
++                     "method, class, and package names may not be keywords",
++                     input_line_number, current_input_column);
++
++      push_token (tok);
++
++      return count_token_internal (LEXICAL_ERROR);
+     }
+ 
+   push_token (new token (SUPERCLASSREF, meth, cls,
+                          input_line_number, current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+ 
+   return SUPERCLASSREF;
+@@ -2919,93 +2965,104 @@ octave_base_lexer::handle_superclass_ide
+ 
+ int
+ octave_base_lexer::handle_meta_identifier (void)
+ {
+   std::string cls = std::string(flex_yytext ()).substr (1);
+ 
+   if (fq_identifier_contains_keyword (cls))
+     {
+-      error ("class and package names may not be keywords");
+-      // FIXME: This is no longer reachable now that error is exception based.
+-      return LEXICAL_ERROR;
++      token *tok = new token (LEXICAL_ERROR,
++                              "class and package names may not be keywords",
++                              input_line_number, current_input_column);
++      push_token (tok);
++
++      return count_token_internal (LEXICAL_ERROR);
+     }
+ 
+   push_token (new token (METAQUERY, cls, input_line_number,
+                          current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+ 
+   return METAQUERY;
+ }
+ 
+ int
+ octave_base_lexer::handle_fq_identifier (void)
+ {
+-  std::string tok = flex_yytext ();
+-
+-  if (fq_identifier_contains_keyword (tok))
++  std::string fq_id = flex_yytext ();
++
++  if (fq_identifier_contains_keyword (fq_id))
+     {
+-      error ("function, method, class, and package names may not be keywords");
+-      // FIXME: This is no longer reachable now that error is exception based.
+-      return LEXICAL_ERROR;
++      token *tok
++        = new token (LEXICAL_ERROR,
++                     "function, method, class, and package names may not be keywords",
++                     input_line_number, current_input_column);
++
++      push_token (tok);
++
++      return count_token_internal (LEXICAL_ERROR);
+     }
+ 
+-  push_token (new token (FQ_IDENT, tok, input_line_number,
++  push_token (new token (FQ_IDENT, fq_id, input_line_number,
+                          current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+ 
+   return FQ_IDENT;
+ }
+ 
+ // Figure out exactly what kind of token to return when we have seen
+ // an identifier.  Handles keywords.  Return -1 if the identifier
+ // should be ignored.
+ 
+ int
+ octave_base_lexer::handle_identifier (void)
+ {
+-  char *yytxt = flex_yytext ();
+-
+-  std::string tok = yytxt;
++  std::string ident = flex_yytext ();
+ 
+   // If we are expecting a structure element, avoid recognizing
+   // keywords and other special names and return STRUCT_ELT, which is
+   // a string that is also a valid identifier.
+ 
+   if (looking_at_indirect_ref)
+     {
+-      push_token (new token (STRUCT_ELT, tok, input_line_number,
++      push_token (new token (STRUCT_ELT, ident, input_line_number,
+                              current_input_column));
+ 
+       looking_for_object_index = true;
+ 
+       current_input_column += flex_yyleng ();
+ 
+       return STRUCT_ELT;
+     }
+ 
+-  // If tok is a keyword token, then is_keyword_token will set
++  // If ident is a keyword token, then is_keyword_token will set
+   // at_beginning_of_statement.  For example, if tok is an IF
+   // token, then at_beginning_of_statement will be false.
+ 
+-  int kw_token = is_keyword_token (tok);
++  int kw_token = is_keyword_token (ident);
+ 
+   if (looking_at_function_handle)
+     {
+       if (kw_token)
+         {
+-          error ("function handles may not refer to keywords");
+-          // FIXME: This is no longer reachable now that error is exception based.
+-          return LEXICAL_ERROR;
++          token *tok
++            = new token (LEXICAL_ERROR,
++                         "function handles may not refer to keywords",
++                         input_line_number, current_input_column);
++
++          push_token (tok);
++
++          return count_token_internal (LEXICAL_ERROR);
+         }
+       else
+         {
+-          push_token (new token (FCN_HANDLE, tok, input_line_number,
++          push_token (new token (FCN_HANDLE, ident, input_line_number,
+                                  current_input_column));
+ 
+           current_input_column += flex_yyleng ();
+           looking_for_object_index = true;
+ 
+           at_beginning_of_statement = false;
+ 
+           return FCN_HANDLE;
+@@ -3027,42 +3084,42 @@ octave_base_lexer::handle_identifier (vo
+ 
+       return kw_token;
+     }
+ 
+   // Find the token in the symbol table.
+ 
+   symbol_table::scope_id sid = symtab_context.curr_scope ();
+ 
+-  token *tok_val = new token (NAME, &(symbol_table::insert (tok, sid)),
+-                              input_line_number, current_input_column);
++  token *tok = new token (NAME, &(symbol_table::insert (ident, sid)),
++                          input_line_number, current_input_column);
+ 
+   // The following symbols are handled specially so that things like
+   //
+   //   pi +1
+   //
+   // are parsed as an addition expression instead of as a command-style
+   // function call with the argument "+1".
+ 
+   if (at_beginning_of_statement
+-      && (! (is_variable (tok)
+-             || tok == "e" || tok == "pi"
+-             || tok == "I" || tok == "i"
+-             || tok == "J" || tok == "j"
+-             || tok == "Inf" || tok == "inf"
+-             || tok == "NaN" || tok == "nan")))
+-    tok_val->mark_may_be_command ();
+-
+-  push_token (tok_val);
++      && (! (is_variable (ident)
++             || ident == "e" || ident == "pi"
++             || ident == "I" || ident == "i"
++             || ident == "J" || ident == "j"
++             || ident == "Inf" || ident == "inf"
++             || ident == "NaN" || ident == "nan")))
++    tok->mark_may_be_command ();
++
++  push_token (tok);
+ 
+   current_input_column += flex_yyleng ();
+ 
+   // The magic end index can't be indexed.
+ 
+-  if (tok != "end")
++  if (ident != "end")
+     looking_for_object_index = true;
+ 
+   at_beginning_of_statement = false;
+ 
+   return NAME;
+ }
+ 
+ void
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -240,19 +240,20 @@ static void yyerror (octave_base_parser&
+ %token <tok_val> FCN_HANDLE
+ %token <tok_val> CLASSDEF
+ %token <tok_val> PROPERTIES METHODS EVENTS ENUMERATION
+ %token <tok_val> METAQUERY
+ %token <tok_val> SUPERCLASSREF
+ %token <tok_val> FQ_IDENT
+ %token <tok_val> GET SET
+ %token <tok_val> FCN
++%token <tok_val> LEXICAL_ERROR
+ 
+ // Other tokens.
+-%token<dummy_type> END_OF_INPUT LEXICAL_ERROR
++%token<dummy_type> END_OF_INPUT
+ %token<dummy_type> INPUT_FILE
+ // %token VARARGIN VARARGOUT
+ 
+ %token<dummy_type> '(' ')' '[' ']' '{' '}' '.' ',' ';' '@' '\n'
+ 
+ // Nonterminals we construct.
+ %type <dummy_type> indirect_ref_op decl_param_init push_fcn_symtab
+ %type <dummy_type> param_list_beg param_list_end stmt_begin parse_error
+@@ -1953,17 +1954,18 @@ stmt_begin      : // empty
+ 
+ stash_comment   : // empty
+                   { $$ = lexer.get_comment (); }
+                 ;
+ 
+ parse_error     : LEXICAL_ERROR
+                   {
+                     $$ = 0;
+-                    parser.bison_error ("parse error");
++                    std::string msg = $1->text ();
++                    parser.bison_error (msg.c_str ());
+                   }
+                 | error
+                   { $$ = 0; }
+                 ;
+ 
+ sep_no_nl       : ','
+                   { $$ = ','; }
+                 | ';'

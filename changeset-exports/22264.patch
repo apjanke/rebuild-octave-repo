@@ -1,0 +1,331 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1470933206 14400
+#      Thu Aug 11 12:33:26 2016 -0400
+# Node ID 9b78fda7830046fd3ad12ba54d23ae31c9376daa
+# Parent  05a8be08368e7bfec8436a6b46271164cff4805d
+fix build failure for --without-z (bug #48757)
+
+* liboctave/wrappers/async-system-wrapper.h,
+liboctave/wrappers/async-system-wrapper.c: New files for function
+extracted from Fsystem.
+* liboctave/wrappers/module.mk: Update.
+
+* toplev.cc: Include async-system-wrapper.h.
+(Fsystem): Use new octave_async_system_wrapper for async case.
+
+* oct-procbuf.cc: Include unistd.h, reluctantly.  Use HAVE_UNISTD_H
+instead of HAVE_SYS_WAIT_H for conditional code.
+
+diff --git a/libinterp/corefcn/oct-procbuf.cc b/libinterp/corefcn/oct-procbuf.cc
+--- a/libinterp/corefcn/oct-procbuf.cc
++++ b/libinterp/corefcn/oct-procbuf.cc
+@@ -23,16 +23,28 @@ along with Octave; see the file COPYING.
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <cerrno>
+ 
+ #include <iostream>
+ 
++// FIXME: we would prefer to avoid including these directly in Octave
++// sources, but eliminating them is complicated by the mingling of
++// octave_procbuf_list and the calls to system library functions like
++// execl.
++
++#if defined (HAVE_UNISTD_H)
++#  if defined (HAVE_SYS_TYPES_H)
++#    include <sys/types.h>
++#  endif
++#  include <unistd.h>
++#endif
++
+ #include "lo-mappers.h"
+ #include "lo-utils.h"
+ #include "oct-procbuf.h"
+ #include "oct-syscalls.h"
+ #include "sysdep.h"
+ #include "unistd-wrappers.h"
+ #include "variables.h"
+ 
+@@ -72,17 +84,17 @@ octave_procbuf::open (const char *comman
+ 
+   open_p = true;
+ 
+   if (mode & std::ios::out)
+     ::setvbuf (f, 0, _IOLBF, BUFSIZ);
+ 
+   return this;
+ 
+-#elif defined (HAVE_SYS_WAIT_H)
++#elif defined (HAVE_UNISTD_H)
+ 
+   int pipe_fds[2];
+ 
+   volatile int child_std_end = (mode & std::ios::in) ? 1 : 0;
+ 
+   volatile int parent_end, child_end;
+ 
+   if (is_open ())
+@@ -169,17 +181,17 @@ octave_procbuf::close (void)
+       wstatus = octave_pclose (f);
+       f = 0;
+     }
+ 
+   open_p = false;
+ 
+   return this;
+ 
+-#elif defined (HAVE_SYS_WAIT_H)
++#elif defined (HAVE_UNISTD_H)
+ 
+   if (f)
+     {
+       pid_t wait_pid;
+ 
+       int status = -1;
+ 
+       for (octave_procbuf **ptr = &octave_procbuf_list;
+diff --git a/libinterp/corefcn/toplev.cc b/libinterp/corefcn/toplev.cc
+--- a/libinterp/corefcn/toplev.cc
++++ b/libinterp/corefcn/toplev.cc
+@@ -31,16 +31,17 @@ along with Octave; see the file COPYING.
+ #include <sstream>
+ #include <string>
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+ #  define WIN32_LEAN_AND_MEAN 1
+ #  include <windows.h>
+ #endif
+ 
++#include "async-system-wrapper.h"
+ #include "child-list.h"
+ #include "lo-error.h"
+ #include "oct-fftw.h"
+ #include "oct-locbuf.h"
+ #include "oct-syscalls.h"
+ #include "str-vec.h"
+ #include "wait-for-input.h"
+ 
+@@ -241,51 +242,17 @@ command shell that is started to run the
+ 
+ #if defined (OCTAVE_USE_WINDOWS_API)
+   // Work around weird double-quote handling on Windows systems.
+   if (type == et_sync)
+     cmd_str = "\"" + cmd_str + "\"";
+ #endif
+ 
+   if (type == et_async)
+-    {
+-      // FIXME: maybe this should go in sysdep.cc?
+-#if defined (HAVE_FORK)
+-      pid_t pid = fork ();
+-
+-      if (pid < 0)
+-        error ("system: fork failed -- can't create child process");
+-      else if (pid == 0)
+-        {
+-          // FIXME: should probably replace this call with something portable.
+-          execl (SHELL_PATH, "sh", "-c", cmd_str.c_str (),
+-                 static_cast<char *> (0));
+-
+-          panic_impossible ();
+-        }
+-      else
+-        retval(0) = pid;
+-#elif defined (OCTAVE_USE_WINDOWS_API)
+-      STARTUPINFO si;
+-      PROCESS_INFORMATION pi;
+-      ZeroMemory (&si, sizeof (si));
+-      ZeroMemory (&pi, sizeof (pi));
+-      OCTAVE_LOCAL_BUFFER (char, xcmd_str, cmd_str.length ()+1);
+-      strcpy (xcmd_str, cmd_str.c_str ());
+-
+-      if (! CreateProcess (0, xcmd_str, 0, 0, FALSE, 0, 0, 0, &si, &pi))
+-        error ("system: CreateProcess failed -- can't create child process");
+-
+-      retval(0) = pi.dwProcessId;
+-      CloseHandle (pi.hProcess);
+-      CloseHandle (pi.hThread);
+-#else
+-      err_disabled_feature ("system", "asynchronous system calls");
+-#endif
+-    }
++    retval(0) = octave_async_system_wrapper (cmd_str.c_str ());
+   else if (return_output)
+     retval = run_command_and_return_output (cmd_str);
+   else
+     {
+       int status = system (cmd_str.c_str ());
+ 
+       // The value in status is as returned by waitpid.  If
+       // the process exited normally, extract the actual exit
+diff --git a/liboctave/wrappers/async-system-wrapper.c b/liboctave/wrappers/async-system-wrapper.c
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/async-system-wrapper.c
+@@ -0,0 +1,87 @@
++/*
++
++Copyright (C) 2016 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++// areadlink is provided by gnulib.  We don't include gnulib headers
++// directly in Octave's C++ source files to avoid problems that may be
++// caused by the way that gnulib overrides standard library functions.
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#if defined (__WIN32__) && ! defined (__CYGWIN__)
++#  include <stdlib.h>
++#  include <string.h>
++#  define WIN32_LEAN_AND_MEAN 1
++#  include <windows.h>
++#else
++#  include <sys/types.h>
++#  include <unistd.h>
++#endif
++
++#include "async-system-wrapper.h"
++
++pid_t
++octave_async_system_wrapper (const char *cmd)
++{
++  int retval = -1;
++
++  if (! cmd)
++    return retval;
++
++#if defined (OCTAVE_USE_WINDOWS_API)
++
++  STARTUPINFO si;
++  PROCESS_INFORMATION pi;
++
++  ZeroMemory (&si, sizeof (si));
++  ZeroMemory (&pi, sizeof (pi));
++
++  char *xcmd = (char *) malloc (strlen (cmd) + 1);
++
++  strcpy (xcmd, cmd);
++
++  if (! CreateProcess (0, xcmd, 0, 0, FALSE, 0, 0, 0, &si, &pi))
++    retval = -1;
++  else
++    {
++      retval = pi.dwProcessId;
++
++      CloseHandle (pi.hProcess);
++      CloseHandle (pi.hThread);
++    }
++
++  free (xcmd);
++
++#else
++
++  pid_t pid = fork ();
++
++  if (pid == 0)
++    execl (SHELL_PATH, "sh", "-c", cmd, (char *) (0));
++  else
++    retval = pid;
++
++#endif
++
++  return retval;
++}
+diff --git a/liboctave/wrappers/async-system-wrapper.h b/liboctave/wrappers/async-system-wrapper.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/wrappers/async-system-wrapper.h
+@@ -0,0 +1,38 @@
++/*
++
++Copyright (C) 2016 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_async_system_wrapper_h)
++#define octave_async_system_wrapper_h 1
++
++#include <sys/types.h>
++
++#if defined __cplusplus
++extern "C" {
++#endif
++
++extern pid_t octave_async_system_wrapper (const char *cmd);
++
++#if defined __cplusplus
++}
++#endif
++
++#endif
+diff --git a/liboctave/wrappers/module.mk b/liboctave/wrappers/module.mk
+--- a/liboctave/wrappers/module.mk
++++ b/liboctave/wrappers/module.mk
+@@ -1,10 +1,11 @@
+ NOINSTALL_WRAPPERS_INC = \
+   liboctave/wrappers/areadlink-wrapper.h \
++  liboctave/wrappers/async-system-wrapper.h \
+   liboctave/wrappers/base64-wrappers.h \
+   liboctave/wrappers/canonicalize-file-name-wrapper.h \
+   liboctave/wrappers/dirent-wrappers.h \
+   liboctave/wrappers/fcntl-wrappers.h \
+   liboctave/wrappers/filepos-wrappers.h \
+   liboctave/wrappers/fpucw-wrappers.h \
+   liboctave/wrappers/gen-tempname-wrapper.h \
+   liboctave/wrappers/getopt-wrapper.h \
+@@ -29,16 +30,17 @@ NOINSTALL_WRAPPERS_INC = \
+   liboctave/wrappers/unistd-wrappers.h \
+   liboctave/wrappers/unsetenv-wrapper.h \
+   liboctave/wrappers/vasprintf-wrapper.h \
+   liboctave/wrappers/wait-for-input.h \
+   liboctave/wrappers/wait-wrappers.h
+ 
+ WRAPPERS_SRC = \
+   liboctave/wrappers/areadlink-wrapper.c \
++  liboctave/wrappers/async-system-wrapper.c \
+   liboctave/wrappers/base64-wrappers.c \
+   liboctave/wrappers/canonicalize-file-name-wrapper.c \
+   liboctave/wrappers/dirent-wrappers.c \
+   liboctave/wrappers/fcntl-wrappers.c \
+   liboctave/wrappers/filepos-wrappers.c \
+   liboctave/wrappers/fpucw-wrappers.c \
+   liboctave/wrappers/gen-tempname-wrapper.c \
+   liboctave/wrappers/getopt-wrapper.c \

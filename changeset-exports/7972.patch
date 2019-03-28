@@ -1,0 +1,385 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1217010335 14400
+#      Fri Jul 25 14:25:35 2008 -0400
+# Node ID 5bf4e2c13ed8560de014765efd8c699eea90fbf5
+# Parent  dd5cc5016487f81a49b0f17a8127cdabc61a4c6c
+make superiorto and inferiorto work
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,21 @@
++2008-07-25  John W. Eaton  <jwe@octave.org>
++
++	* symtab.cc (get_dispatch_type): New function.
++	(symbol_table::fcn_info::fcn_info_rep::find): Use it.
++
++	* ov-class.cc (set_class_relationship): Delete static function.
++	(Fsuperiorto, Finferiorto): Warn about precedence conflicts.
++	Call symbol_table::set_class_relationship instead of local static
++	function.
++	* symtab.h (symbol_table::class_precedence_table): New data member.
++	(symbol_table::set_class_relationship, symbol_table::is_superiorto):
++	New static functions.
++
+ 2008-07-24  John W. Eaton  <jwe@octave.org>
+ 
+ 	* load-path.h (load_path::dir_info::class_info): New struct.
+ 	(load_path::dir_info::method_file_map_type): Now a map from
+ 	class name to a to a class_info object.  Change all uses.
+ 	* load-path.cc (load_path::dir_info::get_method_file_map):
+ 	Also look for private functions in the class directory.
+ 	(load_path::add_to_method_map): Also add private functions from
+diff --git a/src/ov-class.cc b/src/ov-class.cc
+--- a/src/ov-class.cc
++++ b/src/ov-class.cc
+@@ -1092,25 +1092,16 @@ is_built_in_class (const std::string& cn
+       built_in_class_names.insert ("uint32");
+       built_in_class_names.insert ("int64");
+       built_in_class_names.insert ("uint64");
+     }
+ 
+   return built_in_class_names.find (cn) != built_in_class_names.end ();
+ }
+ 
+-static void
+-set_class_relationship (const std::string& sup_class,
+-			const std::string& inf_class)
+-{
+-  // FIXME
+-
+-  warning ("class precedence not implemented");
+-}
+-
+ DEFUN (superiorto, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} superiorto (@var{class_name})\n\
+ When called from a class constructor, mark the object currently\n\
+ constructed as having a higher precedence than @var{class_name}.\n\
+ This function may only be called from a class constructor.\n\
+ @end deftypefn")
+ {
+@@ -1125,17 +1116,20 @@ This function may only be called from a 
+ 	  std::string class_name = args(0).string_value ();
+ 
+ 	  if (! error_state)
+ 	    {
+ 	      if (! is_built_in_class (class_name))
+ 		{
+ 		  std::string this_class_name = fcn->name ();
+ 
+-		  set_class_relationship (this_class_name, class_name);
++		  if (! symbol_table::set_class_relationship (this_class_name,
++							      class_name))
++		    error ("superiorto: precedence already set for %s and %s",
++			   this_class_name.c_str (), class_name.c_str ());
+ 		}
+ 	      else
+ 		{
+ 		  // User defined classes always have higher precedence
+ 		  // than built-in classes.
+ 		}
+ 	    }
+ 	  else
+@@ -1169,17 +1163,23 @@ This function may only be called from a 
+ 	  std::string class_name = args(0).string_value ();
+ 
+ 	  if (! error_state)
+ 	    {
+ 	      if (! is_built_in_class (class_name))
+ 		{
+ 		  std::string this_class_name = fcn->name ();
+ 
+-		  set_class_relationship (class_name, this_class_name);
++		  symbol_table::set_class_relationship (class_name,
++							this_class_name);
++
++		  if (! symbol_table::set_class_relationship (this_class_name,
++							      class_name))
++		    error ("inferiorto: precedence already set for %s and %s",
++			   this_class_name.c_str (), class_name.c_str ());
+ 		}
+ 	      else
+ 		error ("inferiorto: cannot give user-defined class lower precedence than built-in class");
+ 	    }
+ 	  else
+ 	    error ("inferiorto: expecting argument to be class name");
+ 	}
+       else
+diff --git a/src/symtab.cc b/src/symtab.cc
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -48,16 +48,18 @@ symbol_table *symbol_table::instance = 0
+ symbol_table::scope_id_cache *symbol_table::scope_id_cache::instance = 0;
+ 
+ std::map<symbol_table::scope_id, symbol_table*> symbol_table::all_instances;
+ 
+ std::map<std::string, octave_value> symbol_table::global_table;
+ 
+ std::map<std::string, symbol_table::fcn_info> symbol_table::fcn_table;
+ 
++std::map<std::string, std::set<std::string> > symbol_table::class_precedence_table;
++
+ const symbol_table::scope_id symbol_table::xglobal_scope = 0;
+ const symbol_table::scope_id symbol_table::xtop_scope = 1;
+ 
+ symbol_table::scope_id symbol_table::xcurrent_scope = 1;
+ 
+ symbol_table::scope_id symbol_table::xparent_scope = -1;
+ 
+ std::deque<symbol_table::scope_id> symbol_table::scope_stack;
+@@ -354,16 +356,67 @@ symbol_table::fcn_info::fcn_info_rep::he
+       for (dispatch_map_const_iterator p = dispatch_map.begin ();
+ 	   p != dispatch_map.end (); p++)
+ 	retval += "  " + p->second + " (" + p->first + ", ...)\n\n";
+     }
+ 
+   return retval;
+ }
+ 
++static std::string
++get_dispatch_type (const octave_value_list& evaluated_args)
++{
++  std::string dispatch_type;
++
++  int n = evaluated_args.length ();
++
++  if (n > 0)
++    {
++      // Find first object, if any.
++
++      int i;
++
++      for (i = 0; i < n; i++)
++	{
++	  octave_value arg = evaluated_args(i);
++
++	  if (arg.is_object ())
++	    {
++	      dispatch_type = arg.class_name ();
++	      break;
++	    }
++	}
++
++      for (int j = i+1; j < n; j++)
++	{
++	  octave_value arg = evaluated_args(j);
++
++	  if (arg.is_object ())
++	    {
++	      std::string cname = arg.class_name ();
++
++	      // Only switch to type of ARG if it is marked superior
++	      // to the current DISPATCH_TYPE.
++	      if (! symbol_table::is_superiorto (dispatch_type, cname)
++		  && symbol_table::is_superiorto (cname, dispatch_type))
++		dispatch_type = cname;
++	    }
++	}
++
++      if (dispatch_type.empty ())
++	{
++	  // No object found, so use class of first argument.
++
++	  dispatch_type = evaluated_args(0).class_name ();
++	}
++    }
++
++  return dispatch_type;
++}
++
+ // Find the definition of NAME according to the following precedence
+ // list:
+ //
+ //   variable
+ //   subfunction
+ //   private function
+ //   class constructor
+ //   class method
+@@ -514,35 +567,25 @@ symbol_table::fcn_info::fcn_info_rep::fi
+ 	{
+ 	  int n = evaluated_args.length ();
+ 
+ 	  if (n > 0 && ! args_evaluated)
+ 	    evaluated_args.stash_name_tags (arg_names);
+ 
+ 	  args_evaluated = true;
+ 
+-	  // FIXME -- need to handle precedence.
+-
+-	  std::string dispatch_type = evaluated_args(0).class_name ();
+-
+-	  for (int i = 1; i < n; i++)
++	  if (n > 0)
+ 	    {
+-	      octave_value arg = evaluated_args(i);
++	      std::string dispatch_type = get_dispatch_type (evaluated_args);
+ 
+-	      if (arg.is_object ())
+-		{
+-		  dispatch_type = arg.class_name ();
+-		  break;
+-		}
++	      octave_value fcn = find_method (dispatch_type);
++
++	      if (fcn.is_defined ())
++		return fcn;
+ 	    }
+-
+-	  octave_value fcn = find_method (dispatch_type);
+-
+-	  if (fcn.is_defined ())
+-	    return fcn;
+ 	}
+       else
+ 	return octave_value ();
+     }
+ 
+   // Legacy dispatch.  We just check args_evaluated here because the
+   // actual evaluation will have happened already when searching for
+   // class methods.
+@@ -701,16 +744,75 @@ symbol_table::fcn_info::fcn_info_rep::fi
+ 	  if (fcn)
+ 	    function_on_path = octave_value (fcn);
+ 	}
+     }
+ 
+   return function_on_path;
+ }
+ 
++// Insert INF_CLASS in the set of class names that are considered
++// inferior to SUP_CLASS.  Return FALSE if INF_CLASS is currently
++// marked as superior to  SUP_CLASS.
++
++bool
++symbol_table::set_class_relationship (const std::string& sup_class,
++				      const std::string& inf_class)
++{
++  class_precedence_table_const_iterator p
++    = class_precedence_table.find (inf_class);
++
++  if (p != class_precedence_table.end ())
++    {
++      const std::set<std::string>& inferior_classes = p->second;
++
++      std::set<std::string>::const_iterator q
++	= inferior_classes.find (sup_class);
++
++      if (q != inferior_classes.end ())
++	return false;
++    }
++
++  class_precedence_table[sup_class].insert (inf_class);
++
++  return true;
++}
++
++// Has class A been marked as superior to class B?  Also returns
++// TRUE if B has been marked as inferior to A, since we only keep
++// one table, and convert inferiort information to a superiorto
++// relationship.  Two calls are required to determine whether there
++// is no relationship between two classes:
++//
++//  if (symbol_table::is_superiorto (a, b))
++//    // A is superior to B, or B has been marked inferior to A.
++//  else if (symbol_table::is_superiorto (b, a))
++//    // B is superior to A, or A has been marked inferior to B.
++//  else
++//    // No relation.
++
++bool
++symbol_table::is_superiorto (const std::string& a, const std::string& b)
++{
++  bool retval = false;
++
++  class_precedence_table_const_iterator p = class_precedence_table.find (a);
++
++  if (p != class_precedence_table.end ())
++    {
++      const std::set<std::string>& inferior_classes = p->second;
++      std::set<std::string>::const_iterator q = inferior_classes.find (b);
++
++      if (q != inferior_classes.end ())
++	retval = true;
++    }
++
++  return retval;
++}
++
+ static std::string
+ fcn_file_name (const octave_value& fcn)
+ {
+   const octave_function *f = fcn.function_value ();
+ 
+   return f ? f->fcn_file_name () : std::string ();
+ }
+ 
+diff --git a/src/symtab.h b/src/symtab.h
+--- a/src/symtab.h
++++ b/src/symtab.h
+@@ -816,17 +816,17 @@ public:
+       rep->install_built_in_function (f);
+     }
+ 
+     void clear (void) { rep->clear (); }
+     
+     void clear_user_function (void) { rep->clear_user_function (); }
+     
+     void clear_mex_function (void) { rep->clear_mex_function (); }
+-    
++
+     void add_dispatch (const std::string& type, const std::string& fname)
+     {
+       rep->add_dispatch (type, fname);
+     }
+ 
+     void clear_dispatch (const std::string& type)
+     {
+       rep->clear_dispatch (type);
+@@ -1391,16 +1391,21 @@ public:
+     for (fcn_table_iterator p = fcn_table.begin (); p != fcn_table.end (); p++)
+       {
+ 	fcn_info& finfo = p->second;
+ 
+ 	finfo.clear_mex_function ();
+       }
+   }
+ 
++  static bool set_class_relationship (const std::string& sup_class,
++				      const std::string& inf_class);
++
++  static bool is_superiorto (const std::string& a, const std::string& b);
++    
+   static void alias_built_in_function (const std::string& alias,
+ 				       const std::string& name)
+   {
+     octave_value fcn = find_built_in_function (name);
+ 
+     if (fcn.is_defined ())
+       {
+ 	fcn_info finfo (alias);
+@@ -1809,16 +1814,23 @@ private:
+ 
+   // Map from scope id to symbol table instances.
+   static std::map<scope_id, symbol_table*> all_instances;
+ 
+   // Map from function names to function info (subfunctions, private
+   // functions, class constructors, class methods, etc.)
+   static std::map<std::string, fcn_info> fcn_table;
+ 
++  // Mape from class names to set of classes that have lower
++  // precedence.
++  static std::map<std::string, std::set<std::string> > class_precedence_table;
++
++  typedef std::map<std::string, std::set<std::string> >::const_iterator class_precedence_table_const_iterator;
++  typedef std::map<std::string, std::set<std::string> >::iterator class_precedence_table_iterator;
++
+   static const scope_id xglobal_scope;
+   static const scope_id xtop_scope;
+ 
+   static scope_id xcurrent_scope;
+ 
+   // We use parent_scope to handle parsing subfunctions.
+   static scope_id xparent_scope;
+ 

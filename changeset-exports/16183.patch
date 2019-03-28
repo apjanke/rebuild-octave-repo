@@ -1,0 +1,241 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1362337361 18000
+#      Sun Mar 03 14:02:41 2013 -0500
+# Node ID 359d56094efa92663fea91fec4a3938dc5a6ca79
+# Parent  d200b2b184c125b6120dbbfe388cf4dfa2cb7730
+handle lexer input buffering with class
+
+* lex.h, lex.ll (octave_lexer::input_buffer): New class.
+(octave_lexer::input_buf): New data member.
+(octave_lexer::octave_lexer): Initialize it.
+(octave_lexer::octave_read): Use input_buf to simplify function and
+replace static data.
+
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -148,33 +148,61 @@ public:
+         context.pop ();
+     }
+ 
+   private:
+ 
+     std::stack<int> context;
+   };
+ 
++  // Handle buffering of input for lexer.
++
++  class input_buffer
++  {
++  public:
++
++    input_buffer (void)
++      : buffer (), pos (0), chars_left (0), eof (false)
++    { }
++
++    // Grab more input from the current input source.
++    void read (void);
++
++    // Copy at most max_size characters to buf.
++    int copy_chunk (char *buf, size_t max_size);
++
++    bool empty (void) const { return chars_left == 0; }
++
++    bool at_eof (void) const { return eof; }
++
++  private:
++
++    std::string buffer;
++    const char *pos;
++    size_t chars_left;
++    bool eof;
++  };
++
+   octave_lexer (void)
+     : scanner (0), end_of_input (false), convert_spaces_to_comma (true),
+       do_comma_insert (false), at_beginning_of_statement (true),
+       looking_at_anon_fcn_args (false), looking_at_return_list (false),
+       looking_at_parameter_list (false), looking_at_decl_list (false),
+       looking_at_initializer_expression (false),
+       looking_at_matrix_or_assign_lhs (false),
+       looking_for_object_index (false), 
+       looking_at_indirect_ref (false), parsing_class_method (false),
+       maybe_classdef_get_set_method (false), parsing_classdef (false),
+       quote_is_transpose (false),
+       input_line_number (1), current_input_column (1),
+       bracketflag (0), braceflag (0),
+       looping (0), defining_func (0), looking_at_function_handle (0),
+       block_comment_nesting_level (0),
+       looking_at_object_index (), parsed_function_name (),
+-      pending_local_variables (), nesting_level ()
++      pending_local_variables (), nesting_level (), input_buf ()
+   {
+     init ();
+   }
+ 
+   ~octave_lexer (void);
+ 
+   void init (void);
+ 
+@@ -369,16 +397,19 @@ public:
+ 
+   // Set of identifiers that might be local variable names.
+   std::set<std::string> pending_local_variables;
+ 
+   // Is the closest nesting level a square bracket, squiggly brace or
+   // a paren?
+   bbp_nesting_level nesting_level;
+ 
++  // Object that reads and buffers input.
++  input_buffer input_buf;
++
+   // For unwind protect.
+   static void cleanup (octave_lexer *lexer) { delete lexer; }
+ 
+ private:
+ 
+   // Stack to hold tokens so that we can delete them when the parser is
+   // reset and avoid growing forever just because we are stashing some
+   // information.
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -1287,16 +1287,59 @@ private:
+ 
+   flex_stream_reader& operator = (const flex_stream_reader&);
+ 
+   octave_lexer *lexer;
+ 
+   char *buf;
+ };
+ 
++void
++octave_lexer::input_buffer::read (void)
++{
++  buffer = get_user_input (eof);
++  chars_left = buffer.length ();
++  pos = buffer.c_str ();
++}
++
++int
++octave_lexer::input_buffer::copy_chunk (char *buf, size_t max_size)
++{
++  static const char * const eol = "\n";
++
++  size_t len = max_size > chars_left ? chars_left : max_size;
++  assert (len > 0);
++
++  memcpy (buf, pos, len);
++
++  chars_left -= len;
++  pos += len;
++
++  // Make sure input ends with a new line character.
++  if (chars_left == 0 && buf[len-1] != '\n')
++    {
++      if (len < max_size)
++        {
++          // There is enough room to plug the newline character in
++          // the buffer.
++          buf[len++] = '\n';
++        }
++      else
++        {
++          // There isn't enough room to plug the newline character
++          // in the buffer so arrange to have it returned on the next
++          // call to octave_read.
++          pos = eol;
++          chars_left = 1;
++        }
++    }
++
++  return len;
++}
++
+ octave_lexer::~octave_lexer (void)
+ {
+   // Clear out the stack of token info used to track line and
+   // column numbers.
+ 
+   while (! token_stack.empty ())
+     {
+       delete token_stack.top ();
+@@ -1373,71 +1416,28 @@ octave_lexer::prep_for_function_file (vo
+   OCTAVE_YYG;
+ 
+   BEGIN (FUNCTION_FILE_BEGIN);
+ }
+ 
+ int
+ octave_lexer::octave_read (char *buf, unsigned max_size)
+ {
+-  static const char * const eol = "\n";
+-  static std::string input_buf;
+-  static const char *pos = 0;
+-  static size_t chars_left = 0;
+-  static bool eof = false;
+-
+   int status = 0;
+ 
+-  if (chars_left == 0)
+-    {
+-      pos = 0;
+-
+-      input_buf = get_user_input (eof);
+-
+-      chars_left = input_buf.length ();
+-
+-      pos = input_buf.c_str ();
+-    }
+-
+-  if (chars_left > 0)
+-    {
+-      size_t len = max_size > chars_left ? chars_left : max_size;
+-      assert (len > 0);
+-
+-      memcpy (buf, pos, len);
+-
+-      chars_left -= len;
+-      pos += len;
+-
+-      // Make sure input ends with a new line character.
+-      if (chars_left == 0 && buf[len-1] != '\n')
+-        {
+-          if (len < max_size)
+-            {
+-              // There is enough room to plug the newline character in
+-              // the buffer.
+-              buf[len++] = '\n';
+-            }
+-          else
+-            {
+-              // There isn't enough room to plug the newline character
+-              // in the buffer so make sure it is returned on the next
+-              // octave_read call.
+-              pos = eol;
+-              chars_left = 1;
+-            }
+-        }
+-
+-      status = len;
+-    }
++  if (input_buf.empty ())
++    input_buf.read ();
++
++  if (! input_buf.empty ())
++    status = input_buf.copy_chunk (buf, max_size);
+   else
+     {
+       status = YY_NULL;
+ 
+-      if (! eof)
++      if (! input_buf.at_eof ())
+         fatal_error ("octave_read () in flex scanner failed");
+     }
+ 
+   return status;
+ }
+ 
+ int
+ octave_lexer::handle_end_of_input (void)

@@ -1,0 +1,1602 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1454109214 -39600
+#      Sat Jan 30 10:13:34 2016 +1100
+# Node ID 65827e9cccb87e602491d97bfa425214edc93285
+# Parent  94fc5f13d51bf05bc4b361d41f9ce7d600523d5a
+Gui support for enhancement of dbstop.
+
+* octave-qscintilla.cc (contextMenuEvent): Capture right-click in the
+  left margins to show a context menu for "dbstop if...".
+
+* octave-qscintilla.{cc,h} (contextmenu_break_condition): new function
+
+* file-editor-interface.h: pass condition to
+                           handle_update_breakpoint_marker_request
+
+* file-editor-tab.{cc,h}: (file_editor_tab, bp_info,
+                           handle_request_add_breakpoint, next_breakpoint,
+                           previous_breakpoint, do_breakpoint_marker,
+                           add_breakpoint_callback):
+  Allow conditional breakpoint markers
+
+* file-editor-tab.cc (handle_context_menu_break_condition): new function
+
+* file-editor.{cc,h} (request_open_file, add_file_editor_tab,
+                    handle_delete_debugger_pointer_request): pass bp conditions.
+
+* marker.{cc,h} (marker, construct, handle_report_editor_linenr):
+                pass breakpoint conditions
+
+* main-window.{cc,h} (handle_update_breakpoint_marker_request):
+                      pass breakpoint condition.
+
+* octave-link.h (update_breakpoint): pass breakpoint condition.
+
+* octave-qt-link.{cc,h} (do_update_breakpoint): pass breakpoint condition.
+
+diff --git a/libgui/src/m-editor/file-editor-interface.h b/libgui/src/m-editor/file-editor-interface.h
+--- a/libgui/src/m-editor/file-editor-interface.h
++++ b/libgui/src/m-editor/file-editor-interface.h
+@@ -51,17 +51,17 @@ public:
+   virtual void
+   handle_insert_debugger_pointer_request (const QString& file, int line) = 0;
+ 
+   virtual void
+   handle_delete_debugger_pointer_request (const QString& file, int line) = 0;
+ 
+   virtual void
+   handle_update_breakpoint_marker_request (bool insert, const QString& file,
+-                                           int line) = 0;
++                                           int line, const QString& cond) = 0;
+ 
+   virtual void handle_edit_file_request (const QString& file) = 0;
+ 
+   virtual bool check_closing (void) = 0;
+ 
+   virtual void empty_script (bool, bool) = 0;
+ 
+   virtual void enable_menu_shortcuts (bool enable) = 0;
+@@ -71,17 +71,18 @@ public slots:
+   virtual void request_new_script (const QString& command = QString ()) = 0;
+   virtual void request_new_function (bool) = 0;
+   virtual void request_open_file () = 0;
+   virtual void request_open_file (const QString& openFileName,
+                                   const QString& encoding = QString (),
+                                   int line = -1,
+                                   bool debug_pointer = false,
+                                   bool breakpoint_marker = false,
+-                                  bool insert = true) = 0;
++                                  bool insert = true,
++                                  const QString& cond = "") = 0;
+ //signals:
+ 
+ //protected:
+ 
+ //protected slots:
+ 
+ };
+ 
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -69,16 +69,17 @@ along with Octave; see the file COPYING.
+ #include "octave-txt-lexer.h"
+ #include "marker.h"
+ 
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ #include "version.h"
+ #include "utils.h"
+ #include "defaults.h"
++#include "unwind-prot.h"
+ #include <oct-map.h>
+ 
+ bool file_editor_tab::_cancelled = false;
+ 
+ /**
+  A file_editor_tab object consists of a text area and three left margins.
+  The first holds breakpoints, bookmarks, and the debug program counter.
+  The second holds line numbers.
+@@ -98,17 +99,18 @@ file_editor_tab::file_editor_tab (octave
+ 
+   _file_name = "";
+   _file_system_watcher.setObjectName ("_qt_autotest_force_engine_poller");
+ 
+   _edit_area = new octave_qscintilla (this);
+   _line = 0;
+   _col  = 0;
+ 
+-  _bp_list.clear ();  // start with an empty list of breakpoints
++  _bp_lines.clear ();      // start with empty lists of breakpoints
++  _bp_conditions.clear ();
+ 
+   connect (_edit_area, SIGNAL (cursorPositionChanged (int, int)),
+            this, SLOT (handle_cursor_moved (int,int)));
+ 
+   connect (_edit_area, SIGNAL (linesChanged ()),
+            this, SLOT (handle_lines_changed ()));
+ 
+   connect (_edit_area, SIGNAL (context_menu_edit_signal (const QString&)),
+@@ -150,27 +152,32 @@ file_editor_tab::file_editor_tab (octave
+ 
+   // symbols
+   _edit_area->setMarginType (1, QsciScintilla::SymbolMargin);
+   _edit_area->setMarginSensitivity (1, true);
+   _edit_area->markerDefine (QsciScintilla::RightTriangle, marker::bookmark);
+   _edit_area->setMarkerBackgroundColor (QColor (0,0,232), marker::bookmark);
+   _edit_area->markerDefine (QsciScintilla::Circle, marker::breakpoint);
+   _edit_area->setMarkerBackgroundColor (QColor (192,0,0), marker::breakpoint);
++  _edit_area->markerDefine (QsciScintilla::Circle, marker::cond_break);
++  _edit_area->setMarkerBackgroundColor (QColor (255,127,0), marker::cond_break);
+   _edit_area->markerDefine (QsciScintilla::RightTriangle, marker::debugger_position);
+   _edit_area->setMarkerBackgroundColor (QColor (255,255,0), marker::debugger_position);
+   _edit_area->markerDefine (QsciScintilla::RightTriangle,
+                             marker::unsure_debugger_position);
+   _edit_area->setMarkerBackgroundColor (QColor (192,192,192), marker::unsure_debugger_position);
+ 
+   connect (_edit_area, SIGNAL (marginClicked (int, int,
+                                               Qt::KeyboardModifiers)),
+            this, SLOT (handle_margin_clicked (int, int,
+                                               Qt::KeyboardModifiers)));
+ 
++  connect (_edit_area, SIGNAL (context_menu_break_condition_signal (int)),
++           this, SLOT (handle_context_menu_break_condition (int)));
++
+   // line numbers
+   _edit_area->setMarginsForegroundColor (QColor (96, 96, 96));
+   _edit_area->setMarginsBackgroundColor (QColor (232, 232, 220));
+   _edit_area->setMarginType (2, QsciScintilla::TextMargin);
+ 
+   // other features
+   _edit_area->setBraceMatching (QsciScintilla::StrictBraceMatch);
+   _edit_area->setAutoIndent (true);
+@@ -311,16 +318,93 @@ file_editor_tab::handle_context_menu_edi
+       _edit_area->setCursorPosition (line, pos_fct);
+       _edit_area->SendScintilla (2613, line); // SCI_SETFIRSTVISIBLELINE
+       return;
+     }
+ 
+   emit edit_mfile_request (word_at_cursor, _file_name, _ced, -1);
+ }
+ 
++// If "dbstop if ..." selected from context menu, create a conditional
++// breakpoint.  The default condition is (a) the existing condition if there
++// is already a breakpoint (b) any selected text, or (c) empty
++void
++file_editor_tab::handle_context_menu_break_condition (int linenr)
++{
++  QString cond;
++  bp_info info (_file_name, linenr);  // Get function name & dir from filename.
++
++  // Ensure editor line numbers match Octave core's line numbers.
++  // Give users the option to save modifications if necessary.
++  if (! unchanged_or_saved ()
++     || !(_main_win->get_octave_qt_link ()->file_in_path (info.file, info.dir)))
++    return;
++
++  // Search for previous condition.  FIXME -- is there a more direct way?
++  if (_edit_area->markersAtLine (linenr) & (1 << marker::cond_break))
++    {
++      emit report_marker_linenr (_bp_lines, _bp_conditions);
++      for (int i = 0; i < _bp_lines.length (); i++)
++        if (_bp_lines.value (i) == linenr)
++          {
++            cond = _bp_conditions.value (i);
++            break;
++          }
++      _bp_lines.clear ();
++    }
++
++  // If text selected by the mouse, default to that instead
++  // If both present, use the OR of them, to avoid accidental overwriting
++  // FIXME If both are present, show old condition unselected and
++  //       the selection (in edit area) selected (in the dialog).
++  if (_edit_area->hasSelectedText ())
++    {
++      if (cond == "")
++        cond = _edit_area->selectedText ();
++      else
++        cond = "(" + cond + ") || (" + _edit_area->selectedText () + ")";
++    }
++
++  bool valid = false;
++  std::string prompt = "dbstop if";
++  while (!valid)
++    {
++      bool ok;
++      QString new_condition
++        = QInputDialog::getText (this, tr ("Breakpoint condition"),
++                                 tr (prompt.c_str ()), QLineEdit::Normal, cond,
++                                 &ok);
++      if (ok)     // If cancel, don't change breakpoint condition.
++        {
++          bp_table::intmap line;
++          line[0] = linenr + 1;
++
++          try
++            {
++              // Suppress error messages on the console.
++              unwind_protect frame;
++              frame.protect_var (buffer_error_messages);
++              buffer_error_messages++;
++
++              bp_table::add_breakpoint (info.function_name, line,
++                                        new_condition.toStdString ());
++              valid = true;
++            }
++          catch (const octave_interrupt_exception&) { valid = true; }
++          catch (const index_exception& e) { }
++          catch (const octave_execution_exception& e) { }
++
++          // In case we repeat, set new prompt.
++          prompt = "ERROR: " + last_error_message () + "\n\ndbstop if";
++          cond = new_condition;
++        }
++      else
++        valid = true;
++    }
++}
+ 
+ void
+ file_editor_tab::set_file_name (const QString& fileName)
+ {
+   // update tracked file if we really have a file on disk
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (! trackedFiles.isEmpty ())
+     _file_system_watcher.removePath (_file_name);
+@@ -393,22 +477,23 @@ file_editor_tab::handle_margin_clicked (
+         {
+           if (markers_mask & (1 << marker::bookmark))
+             _edit_area->markerDelete (editor_linenr, marker::bookmark);
+           else
+             _edit_area->markerAdd (editor_linenr, marker::bookmark);
+         }
+       else
+         {
+-          if (markers_mask & (1 << marker::breakpoint))
++          if (markers_mask & ((1 << marker::breakpoint)
++                              | (1 << marker::cond_break)))
+             handle_request_remove_breakpoint (editor_linenr + 1);
+           else
+             {
+               if (unchanged_or_saved ())
+-                handle_request_add_breakpoint (editor_linenr + 1);
++                handle_request_add_breakpoint (editor_linenr + 1, "");
+             }
+         }
+     }
+ }
+ 
+ void
+ file_editor_tab::update_lexer ()
+ {
+@@ -840,17 +925,17 @@ file_editor_tab::remove_bookmark (const 
+ 
+ void
+ file_editor_tab::add_breakpoint_callback (const bp_info& info)
+ {
+   bp_table::intmap line_info;
+   line_info[0] = info.line;
+ 
+   if (_main_win->get_octave_qt_link ()->file_in_path (info.file, info.dir))
+-    bp_table::add_breakpoint (info.function_name, line_info);
++    bp_table::add_breakpoint (info.function_name, line_info, info.condition);
+ }
+ 
+ void
+ file_editor_tab::remove_breakpoint_callback (const bp_info& info)
+ {
+   bp_table::intmap line_info;
+   line_info[0] = info.line;
+ 
+@@ -860,18 +945,19 @@ file_editor_tab::remove_breakpoint_callb
+ 
+ void
+ file_editor_tab::remove_all_breakpoints_callback (const bp_info& info)
+ {
+   if (_main_win->get_octave_qt_link ()->file_in_path (info.file, info.dir))
+     bp_table::remove_all_breakpoints_in_file (info.function_name, true);
+ }
+ 
+-file_editor_tab::bp_info::bp_info (const QString& fname, int l)
+-  : line (l), file (fname.toStdString ())
++file_editor_tab::bp_info::bp_info (const QString& fname, int l,
++                                   const QString& cond)
++  : line (l), file (fname.toStdString ()), condition (cond.toStdString ())
+ {
+   QFileInfo file_info (fname);
+ 
+   QString q_dir = file_info.absolutePath ();
+   QString q_function_name = file_info.fileName ();
+ 
+   // We have to cut off the suffix, because octave appends it.
+   q_function_name.chop (file_info.suffix ().length () + 1);
+@@ -891,19 +977,20 @@ file_editor_tab::bp_info::bp_info (const
+           function_name = file_ops::concat (dir.substr (pos+1), function_name);
+ 
+           dir = dir.substr (0, pos);
+         }
+     }
+ }
+ 
+ void
+-file_editor_tab::handle_request_add_breakpoint (int line)
++file_editor_tab::handle_request_add_breakpoint (int line,
++                                                const QString& condition)
+ {
+-  bp_info info (_file_name, line);
++  bp_info info (_file_name, line, condition);
+ 
+   octave_link::post_event
+     (this, &file_editor_tab::add_breakpoint_callback, info);
+ }
+ 
+ void
+ file_editor_tab::handle_request_remove_breakpoint (int line)
+ {
+@@ -922,52 +1009,62 @@ file_editor_tab::toggle_breakpoint (cons
+   int editor_linenr, cur;
+   _edit_area->getCursorPosition (&editor_linenr, &cur);
+ 
+   if (_edit_area->markersAtLine (editor_linenr) & (1 << marker::breakpoint))
+     request_remove_breakpoint_via_editor_linenr (editor_linenr);
+   else
+     {
+       if (unchanged_or_saved ())
+-        handle_request_add_breakpoint (editor_linenr + 1);
++        handle_request_add_breakpoint (editor_linenr + 1, "");
+     }
+ }
+ 
+-// Move the text cursor to the closest breakpoint
++// Move the text cursor to the closest breakpoint (conditional or unconditional)
+ // after the current line.
+ void
+ file_editor_tab::next_breakpoint (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   int line, cur;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+   line++; // Find breakpoint strictly after the current line.
+ 
+   int nextline = _edit_area->markerFindNext (line, (1 << marker::breakpoint));
++  int nextcond = _edit_area->markerFindNext (line, (1 << marker::cond_break));
++
++  // Check if the next conditional breakpoint is before next unconditional one.
++  if (nextcond != -1 && (nextcond < nextline || nextline == -1))
++    nextline = nextcond;
+ 
+   _edit_area->setCursorPosition (nextline, 0);
+ }
+ 
+-// Move the text cursor to the closest breakpoint
++// Move the text cursor to the closest breakpoint (conditional or unconditional)
+ // before the current line.
+ void
+ file_editor_tab::previous_breakpoint (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+-  int line, cur, prevline;
++  int line, cur, prevline, prevcond;
+   _edit_area->getCursorPosition (&line, &cur);
+ 
+   line--; // Find breakpoint strictly before the current line.
+ 
+   prevline = _edit_area->markerFindPrevious (line, (1 << marker::breakpoint));
++  prevcond = _edit_area->markerFindPrevious (line, (1 << marker::cond_break));
++
++  // Check if the prev conditional breakpoint is closer than the unconditional.
++  if (prevcond != -1 && prevcond > prevline)
++    prevline = prevcond;
+ 
+   _edit_area->setCursorPosition (prevline, 0);
+ }
+ 
+ void
+ file_editor_tab::remove_all_breakpoints (const QWidget *ID)
+ {
+   if (ID != this)
+@@ -1400,28 +1497,29 @@ file_editor_tab::recover_from_exit ()
+   // restoring the breakpoints and not emptying the list) and the user
+   // canceled this closing late on.
+   check_restore_breakpoints ();
+ }
+ 
+ void
+ file_editor_tab::check_restore_breakpoints ()
+ {
+-  if (! _bp_list.isEmpty ())
++  if (! _bp_lines.isEmpty ())
+     {
+       // At least one breakpoint is present.
+       // Get rid of breakpoints at old (now possibly invalid) linenumbers
+       remove_all_breakpoints (this);
+ 
+       // and set breakpoints at the new linenumbers
+-      for (int i = 0; i < _bp_list.length (); i++)
+-        handle_request_add_breakpoint (_bp_list.value (i) + 1);
++      for (int i = 0; i < _bp_lines.length (); i++)
++        handle_request_add_breakpoint (_bp_lines.value (i) + 1,
++                                       _bp_conditions.value (i));
+ 
+      // reset the list of breakpoints
+-      _bp_list.clear ();
++      _bp_lines.clear ();
+     }
+ }
+ 
+ QString
+ file_editor_tab::load_file (const QString& fileName)
+ {
+   // get the absolute path
+   QFileInfo file_info = QFileInfo (fileName);
+@@ -1608,17 +1706,17 @@ file_editor_tab::save_file (const QStrin
+   QString file_to_save;
+   if (file_info.exists ())
+     file_to_save = file_info.canonicalFilePath ();
+   else
+     file_to_save = saveFileName;
+   QFile file (file_to_save);
+ 
+   // Get a list of all the breakpoint line numbers.
+-  emit report_editor_linenr (_bp_list);
++  emit report_marker_linenr (_bp_lines, _bp_conditions);
+ 
+   // stop watching file
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (trackedFiles.contains (file_to_save))
+     _file_system_watcher.removePath (file_to_save);
+ 
+   // open the file for writing
+   if (! file.open (QIODevice::WriteOnly))
+@@ -2220,17 +2318,18 @@ file_editor_tab::insert_debugger_pointer
+         {
+           // The best that can be done if the editor contents has been
+           // modified is to see if there is a match with the original
+           // line number of any existing breakpoints.  We can put a normal
+           // debugger pointer at that breakpoint position.  Otherwise, it
+           // isn't certain whether the original line number and current line
+           // number match.
+           int editor_linenr = -1;
+-          emit find_translated_line_number (line, editor_linenr);
++          marker *dummy;
++          emit find_translated_line_number (line, editor_linenr, dummy);
+           if (editor_linenr != -1)
+             {
+               // Match with an existing breakpoint.
+               dp = new marker (_edit_area, line,
+                                marker::debugger_position, editor_linenr);
+             }
+           else
+             {
+@@ -2272,50 +2371,69 @@ file_editor_tab::delete_debugger_pointer
+   if (ID != this || ID == 0)
+     return;
+ 
+   if (line > 0)
+     _edit_area->markerDelete (line-1, marker::debugger_position);
+ }
+ 
+ void
+-file_editor_tab::do_breakpoint_marker (bool insert, const QWidget *ID, int line)
++file_editor_tab::do_breakpoint_marker (bool insert, const QWidget *ID, int line,
++                                       const QString& cond)
+ {
+   if (ID != this || ID == 0)
+     return;
+ 
+   if (line > 0)
+     {
+       if (insert)
+         {
+           int editor_linenr = -1;
+-
+-          // If comes back indicating a modified editor line number
+-          // then there is already a breakpoint marker associated
+-          // with this debugger line.
+-          emit find_translated_line_number (line, editor_linenr);
+-
+-          if (editor_linenr == -1)
++          marker *bp = 0;
++
++          // If comes back indicating a non-zero breakpoint marker,
++          // reuse it if possible
++          emit find_translated_line_number (line, editor_linenr, bp);
++          if (bp != 0)
+             {
+-              marker *bp = new marker (_edit_area, line, marker::breakpoint);
+-              connect (this, SIGNAL (remove_breakpoint_via_debugger_linenr (int)),
+-                       bp,   SLOT (handle_remove_via_original_linenr (int)));
+-              connect (this, SIGNAL (request_remove_breakpoint_via_editor_linenr (int)),
+-                       bp,   SLOT (handle_request_remove_via_editor_linenr (int)));
+-              connect (this, SIGNAL (remove_all_breakpoints (void)),
+-                       bp,   SLOT (handle_remove (void)));
+-              connect (this, SIGNAL (find_translated_line_number (int, int&)),
+-                       bp,   SLOT (handle_find_translation (int, int&)));
+-              connect (this, SIGNAL (find_linenr_just_before (int, int&, int&)),
+-                       bp,   SLOT (handle_find_just_before (int, int&, int&)));
+-              connect (this, SIGNAL (report_editor_linenr (QIntList&)),
+-                       bp,   SLOT (handle_report_editor_linenr (QIntList&)));
+-              connect (bp,   SIGNAL (request_remove (int)),
+-                       this, SLOT (handle_request_remove_breakpoint (int)));
++              if ((cond == "") != (bp->get_cond () == ""))
++                {       // can only reuse conditional bp as conditional
++                  emit remove_breakpoint_via_debugger_linenr (line);
++                  bp = 0;
++                }
++              else
++                bp->set_cond (cond);
+             }
++
++          if (bp == 0)
++            bp = new marker (_edit_area, line,
++                             cond == "" ? marker::breakpoint
++                                        : marker::cond_break, cond);
++
++          connect (this, SIGNAL (remove_breakpoint_via_debugger_linenr
++                                 (int)),
++                   bp,   SLOT (handle_remove_via_original_linenr (int)));
++          connect (this, SIGNAL (request_remove_breakpoint_via_editor_linenr
++                                 (int)),
++                   bp,   SLOT (handle_request_remove_via_editor_linenr
++                                 (int)));
++          connect (this, SIGNAL (remove_all_breakpoints (void)),
++                   bp,   SLOT (handle_remove (void)));
++          connect (this, SIGNAL (find_translated_line_number (int, int&,
++                                                              marker*&)),
++                   bp,   SLOT (handle_find_translation (int, int&,
++                                                        marker*&)));
++          connect (this, SIGNAL (find_linenr_just_before (int, int&, int&)),
++                   bp,   SLOT (handle_find_just_before (int, int&, int&)));
++          connect (this, SIGNAL (report_marker_linenr (QIntList&,
++                                                       QStringList&)),
++                   bp,   SLOT (handle_report_editor_linenr (QIntList&,
++                                                            QStringList&)));
++          connect (bp,   SIGNAL (request_remove (int)),
++                   this, SLOT (handle_request_remove_breakpoint (int)));
+         }
+       else
+         emit remove_breakpoint_via_debugger_linenr (line);
+     }
+ }
+ 
+ 
+ void
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -123,32 +123,34 @@ public slots:
+   void find (const QWidget *ID);
+   void goto_line (const QWidget *ID, int line = -1);
+   void move_match_brace (const QWidget *ID, bool select);
+   void show_auto_completion (const QWidget *ID);
+ 
+   void insert_debugger_pointer (const QWidget *ID, int line = -1);
+   void delete_debugger_pointer (const QWidget *ID, int line = -1);
+ 
+-  void do_breakpoint_marker (bool insert, const QWidget *ID, int line = -1);
++  void do_breakpoint_marker (bool insert, const QWidget *ID, int line = -1,
++                             const QString& cond = "");
+ 
+   void recover_from_exit (void);
+   void set_modified (bool modified = true);
+ 
+   void set_encoding (const QString& new_encoding);
+ 
+   QString load_file (const QString& fileName);
+ 
+   void new_file (const QString& commands = QString ());
+ 
+   void file_has_changed (const QString& fileName);
+ 
+   void handle_context_menu_edit (const QString&);
++  void handle_context_menu_break_condition (int linenr);
+ 
+-  void handle_request_add_breakpoint (int line);
++  void handle_request_add_breakpoint (int line, const QString& cond);
+   void handle_request_remove_breakpoint (int line);
+ 
+   void handle_octave_result (QObject *requester, QString& command, octave_value_list &result);
+ 
+ signals:
+ 
+   void file_name_changed (const QString& fileName, const QString& toolTip);
+   void editor_state_changed (bool copy_available, bool is_octave_file);
+@@ -160,19 +162,19 @@ signals:
+   void run_file_signal (const QFileInfo& info);
+   void request_open_file (const QString&);
+   void  edit_mfile_request (const QString&, const QString&,
+                             const QString&, int);
+ 
+   void remove_breakpoint_via_debugger_linenr (int debugger_linenr);
+   void request_remove_breakpoint_via_editor_linenr (int editor_linenr);
+   void remove_all_breakpoints (void);
+-  void find_translated_line_number (int original_linenr, int& translated_linenr);
++  void find_translated_line_number (int original_linenr, int& translated_linenr, marker*&);
+   void find_linenr_just_before (int linenr, int& original_linenr, int& editor_linenr);
+-  void report_editor_linenr (QIntList& int_list);
++  void report_marker_linenr (QIntList& lines, QStringList& conditions);
+   void remove_position_via_debugger_linenr (int debugger_linenr);
+   void remove_all_positions (void);
+   // TODO: The following is similar to "process_octave_code" signal.  However,
+   // currently that signal is connected to something that simply focuses a
+   // window and not actually communicate with Octave.
+   // void evaluate_octave_command (const QString& command);
+ 
+ protected:
+@@ -210,22 +212,23 @@ private slots:
+ 
+   void handle_cursor_moved (int line, int col);
+   void handle_lines_changed (void);
+ 
+ private:
+ 
+   struct bp_info
+   {
+-    bp_info (const QString& fname, int l = 0);
++    bp_info (const QString& fname, int l = 0, const QString& cond = "");
+ 
+     int line;
+     std::string file;
+     std::string dir;
+     std::string function_name;
++    std::string condition;
+   };
+ 
+   bool valid_file_name (const QString& file=QString ());
+   void save_file (const QString& saveFileName, bool remove_on_success = false,
+                                                bool restore_breakpoints = true);
+   void save_file_as (bool remove_on_success = false);
+   bool check_valid_identifier (QString file_name);
+   bool check_valid_codec (QTextCodec *codec);
+@@ -274,17 +277,18 @@ private:
+   bool _long_title;
+   bool _copy_available;
+   bool _is_octave_file;
+   bool _always_reload_changed_files;
+   bool _smart_indent;
+ 
+   QFileSystemWatcher _file_system_watcher;
+ 
+-  QIntList _bp_list;
++  QIntList _bp_lines;
++  QStringList _bp_conditions;
+ 
+   find_dialog *_find_dialog;
+   bool _find_dialog_is_visible;
+   QRect _find_dialog_geometry;
+ 
+   QsciAPIs *_lexer_apis;
+   QString _prep_apis_file;
+ 
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -399,21 +399,24 @@ file_editor::is_editor_console_tabbed ()
+ // _file_encoding
+ void
+ file_editor::request_open_files (const QStringList& open_file_names)
+ {
+   for (int i = 0; i < open_file_names.count (); i++)
+     request_open_file (open_file_names.at (i), _file_encoding);
+ }
+ 
++// Open a file, if not already open, and mark the current execution location
++// and/or a breakpoint with condition cond.
+ void
+ file_editor::request_open_file (const QString& openFileName,
+                                 const QString& encoding,
+                                 int line, bool debug_pointer,
+-                                bool breakpoint_marker, bool insert)
++                                bool breakpoint_marker, bool insert,
++                                const QString& cond)
+ {
+   if (call_custom_editor (openFileName, line))
+     return;   // custom editor called
+ 
+   if (openFileName.isEmpty ())
+     {
+       // This happens if edit is calles without an argument
+       // Open eitor with empty edit area instead (as new file would do)
+@@ -435,17 +438,17 @@ file_editor::request_open_file (const QS
+           if (line > 0)
+             {
+               emit fetab_goto_line (tab, line);
+ 
+               if (debug_pointer)
+                 emit fetab_insert_debugger_pointer (tab, line);
+ 
+               if (breakpoint_marker)
+-                emit fetab_do_breakpoint_marker (insert, tab, line);
++                emit fetab_do_breakpoint_marker (insert, tab, line, cond);
+             }
+ 
+           if (! ((breakpoint_marker || debug_pointer) && is_editor_console_tabbed ()))
+             {
+               emit fetab_set_focus (tab);
+               focus ();
+             }
+         }
+@@ -471,17 +474,17 @@ file_editor::request_open_file (const QS
+                     {
+                       emit fetab_goto_line (fileEditorTab, line);
+ 
+                       if (debug_pointer)
+                         emit fetab_insert_debugger_pointer (fileEditorTab,
+                                                             line);
+                       if (breakpoint_marker)
+                         emit fetab_do_breakpoint_marker (insert, fileEditorTab,
+-                                                         line);
++                                                         line, cond);
+                     }
+                 }
+               else
+                 {
+                   delete fileEditorTab;
+ 
+                   if (QFile::exists (openFileName))
+                     {
+@@ -753,19 +756,20 @@ file_editor::handle_delete_debugger_poin
+           emit fetab_set_focus (tab);
+         }
+     }
+ }
+ 
+ void
+ file_editor::handle_update_breakpoint_marker_request (bool insert,
+                                                       const QString& file,
+-                                                      int line)
++                                                      int line,
++                                                      const QString& cond)
+ {
+-  request_open_file (file, QString (), line, false, true, insert);
++  request_open_file (file, QString (), line, false, true, insert, cond);
+ }
+ 
+ void
+ file_editor::handle_edit_file_request (const QString& file)
+ {
+   request_open_file (file);
+ }
+ 
+@@ -882,16 +886,17 @@ file_editor::request_previous_bookmark (
+ }
+ 
+ void
+ file_editor::request_remove_bookmark (bool)
+ {
+   emit fetab_remove_bookmark (_tab_widget->currentWidget ());
+ }
+ 
++// FIXME What should this do with conditional breakpoints?
+ void
+ file_editor::request_toggle_breakpoint (bool)
+ {
+   emit fetab_toggle_breakpoint (_tab_widget->currentWidget ());
+ }
+ 
+ void
+ file_editor::request_next_breakpoint (bool)
+@@ -1853,19 +1858,16 @@ file_editor::construct (void)
+   mru_menu_update ();
+ 
+   connect (_tab_widget, SIGNAL (tabCloseRequested (int)),
+            this, SLOT (handle_tab_close_request (int)));
+ 
+   connect (_tab_widget, SIGNAL (currentChanged (int)),
+            this, SLOT (active_tab_changed (int)));
+ 
+-  connect (this, SIGNAL (execute_command_in_terminal_signal (const QString&)),
+-           main_win (), SLOT (execute_command_in_terminal (const QString&)));
+-
+   resize (500, 400);
+   setWindowIcon (QIcon (":/actions/icons/logo.png"));
+   set_title (tr ("Editor"));
+ 
+   restore_session (settings);
+ 
+   check_actions ();
+ }
+@@ -1976,16 +1978,19 @@ file_editor::add_file_editor_tab (file_e
+ 
+   connect (this, SIGNAL (fetab_save_file (const QWidget*, const QString&,
+                                           bool)),
+            f, SLOT (save_file (const QWidget*, const QString&, bool)));
+ 
+   connect (this, SIGNAL (fetab_check_modified_file (void)),
+            f, SLOT (check_modified_file (void)));
+ 
++  connect (f, SIGNAL (execute_command_in_terminal_signal (const QString&)),
++           main_win (), SLOT (execute_command_in_terminal (const QString&)));
++
+   // Signals from the file_editor trivial operations
+   connect (this, SIGNAL (fetab_recover_from_exit (void)),
+            f, SLOT (recover_from_exit (void)));
+ 
+   connect (this, SIGNAL (fetab_set_directory (const QString&)),
+            f, SLOT (set_current_directory (const QString&)));
+ 
+   connect (this, SIGNAL (fetab_zoom_in (const QWidget*)),
+@@ -2075,18 +2080,19 @@ file_editor::add_file_editor_tab (file_e
+ 
+   connect (this, SIGNAL (fetab_insert_debugger_pointer (const QWidget*, int)),
+            f, SLOT (insert_debugger_pointer (const QWidget*, int)));
+ 
+   connect (this, SIGNAL (fetab_delete_debugger_pointer (const QWidget*, int)),
+            f, SLOT (delete_debugger_pointer (const QWidget*, int)));
+ 
+   connect (this, SIGNAL (fetab_do_breakpoint_marker (bool, const QWidget*,
+-                                                     int)),
+-           f, SLOT (do_breakpoint_marker (bool, const QWidget*, int)));
++                                                     int, const QString&)),
++           f, SLOT (do_breakpoint_marker (bool, const QWidget*, int,
++                                          const QString&)));
+ 
+   _tab_widget->setCurrentWidget (f);
+ 
+   check_actions ();
+ }
+ 
+ bool
+ file_editor::editor_tab_has_focus ()
+diff --git a/libgui/src/m-editor/file-editor.h b/libgui/src/m-editor/file-editor.h
+--- a/libgui/src/m-editor/file-editor.h
++++ b/libgui/src/m-editor/file-editor.h
+@@ -138,17 +138,17 @@ signals:
+   void fetab_convert_eol (const QWidget* ID, QsciScintilla::EolMode eol_mode);
+   void fetab_find (const QWidget* ID);
+   void fetab_goto_line (const QWidget* ID, int line = -1);
+   void fetab_move_match_brace (const QWidget* ID, bool select);
+   void fetab_completion (const QWidget*);
+   void fetab_insert_debugger_pointer (const QWidget* ID, int line = -1);
+   void fetab_delete_debugger_pointer (const QWidget* ID, int line = -1);
+   void fetab_do_breakpoint_marker (bool insert, const QWidget* ID,
+-                                   int line = -1);
++                                   int line = -1, const QString& = "");
+   void fetab_set_focus (const QWidget* ID);
+   void fetab_scintilla_command (const QWidget* ID, unsigned int sci_msg);
+ 
+   void fetab_zoom_in (const QWidget* ID);
+   void fetab_zoom_out (const QWidget* ID);
+   void fetab_zoom_normal (const QWidget* ID);
+ 
+   void fetab_set_directory (const QString& dir);
+@@ -230,17 +230,18 @@ public slots:
+   void active_tab_changed (int index);
+   void handle_editor_state_changed (bool enableCopy, bool is_octave_file);
+   void handle_mru_add_file (const QString& file_name, const QString& encoding);
+   void check_conflict_save (const QString& fileName, bool remove_on_success);
+ 
+   void handle_insert_debugger_pointer_request (const QString& file, int line);
+   void handle_delete_debugger_pointer_request (const QString& file, int line);
+   void handle_update_breakpoint_marker_request (bool insert,
+-                                                const QString& file, int line);
++                                                const QString& file, int line,
++                                                const QString& cond);
+   void handle_edit_mfile_request (const QString& name, const QString& file,
+                                   const QString& curr_dir, int line);
+ 
+   void handle_edit_file_request (const QString& file);
+ 
+   // Tells the editor to react on changed settings.
+   void notice_settings (const QSettings *settings);
+ 
+@@ -257,17 +258,18 @@ protected slots:
+   void do_undo ();
+ 
+ private slots:
+ 
+   void request_open_files (const QStringList&);
+   void request_open_file (const QString& fileName,
+                           const QString& encoding = QString (),
+                           int line = -1, bool debug_pointer = false,
+-                          bool breakpoint_marker = false, bool insert = true);
++                          bool breakpoint_marker = false, bool insert = true,
++                          const QString& cond = "");
+   void request_preferences (bool);
+   void request_styles_preferences (bool);
+   void restore_create_file_setting ();
+ 
+   void handle_combo_enc_current_index (QString new_encoding);
+ 
+   void show_line_numbers (bool);
+   void show_white_space (bool);
+diff --git a/libgui/src/m-editor/marker.cc b/libgui/src/m-editor/marker.cc
+--- a/libgui/src/m-editor/marker.cc
++++ b/libgui/src/m-editor/marker.cc
+@@ -27,42 +27,44 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_QSCINTILLA
+ 
+ #include <stdio.h>
+ 
+ #include "marker.h"
+ 
+ 
+ marker::marker (QsciScintilla *area, int original_linenr, editor_markers type,
+-                int editor_linenr) : QObject ()
++                int editor_linenr, const QString& condition) : QObject ()
+ {
+-  construct (area, original_linenr, type, editor_linenr);
++  construct (area, original_linenr, type, editor_linenr, condition);
+ }
+ 
+ 
+ marker::marker (QsciScintilla *area, int original_linenr,
+-                editor_markers type) : QObject ()
++                editor_markers type, const QString& condition) : QObject ()
+ {
+-  construct (area, original_linenr, type, original_linenr - 1);
++  construct (area, original_linenr, type, original_linenr - 1, condition);
+ }
+ 
+ 
+ marker::~marker (void)
+ {
+ }
+ 
+ 
+ void
+ marker::construct (QsciScintilla *area, int original_linenr,
+-                   editor_markers type, int editor_linenr)
++                   editor_markers type, int editor_linenr,
++                   const QString& condition)
+ {
+   _edit_area = area;
+   _original_linenr = original_linenr;
+   _marker_type = type;
+   _mhandle = _edit_area->markerAdd (editor_linenr, _marker_type);
++  _condition = condition;
+ }
+ 
+ 
+ void
+ marker::handle_remove_via_original_linenr (int linenr)
+ {
+   if (_original_linenr == linenr)
+     {
+@@ -91,20 +93,24 @@ void
+ marker::handle_remove (void)
+ {
+   _edit_area->markerDeleteHandle (_mhandle);
+   delete this;
+ }
+ 
+ 
+ void
+-marker::handle_find_translation (int linenr, int& translation_linenr)
++marker::handle_find_translation (int linenr, int& translation_linenr,
++                                 marker *& bp)
+ {
+   if (_original_linenr == linenr)
+-    translation_linenr = _edit_area->markerLine (_mhandle);
++    {
++      translation_linenr = _edit_area->markerLine (_mhandle);
++      bp = this;
++    }
+ }
+ 
+ 
+ void
+ marker::handle_find_just_before (int linenr, int& original_linenr, int& editor_linenr)
+ {
+   if (_original_linenr < linenr && _original_linenr >= original_linenr)
+     {
+@@ -121,19 +127,20 @@ marker::handle_find_just_after (int line
+     {
+       original_linenr = _original_linenr;
+       editor_linenr = _edit_area->markerLine (_mhandle);
+     }
+ }
+ 
+ 
+ void
+-marker::handle_report_editor_linenr (QIntList& list)
++marker::handle_report_editor_linenr (QIntList& lines, QStringList& conditions)
+ {
+-  list << _edit_area->markerLine (_mhandle);
++  lines << _edit_area->markerLine (_mhandle);
++  conditions << _condition;
+ }
+ 
+ 
+ void
+ marker::handle_marker_line_deleted (int mhandle)
+ {
+   // FUTURE SUPPORT: There really should be a signal in QsciScintilla
+   // called markerLineDeleted (int mhandle) because there is no way
+diff --git a/libgui/src/m-editor/marker.h b/libgui/src/m-editor/marker.h
+--- a/libgui/src/m-editor/marker.h
++++ b/libgui/src/m-editor/marker.h
+@@ -41,45 +41,54 @@ class marker : public QObject
+   Q_OBJECT
+ 
+ public:
+ 
+   enum editor_markers
+     {
+       bookmark,
+       breakpoint,
++      cond_break,
+       unsure_breakpoint,
+       debugger_position,
+       unsure_debugger_position
+     };
+ 
+   marker (QsciScintilla *edit_area, int original_linenr,
+-          editor_markers marker_type);
++          editor_markers marker_type, const QString& condition = "");
+   marker (QsciScintilla *edit_area, int original_linenr,
+-          editor_markers marker_type, int editor_linenr);
++          editor_markers marker_type, int editor_linenr,
++          const QString& condition = "");
+   ~marker (void);
+ 
++  const QString& get_cond (void) const { return _condition; }
++
++  void set_cond (const QString& cond) { _condition = cond; }
++
+ public slots:
+   void handle_remove_via_original_linenr (int original_linenr);
+   void handle_request_remove_via_editor_linenr (int editor_linenr);
+   void handle_remove (void);
+-  void handle_find_translation (int original_linenr, int& editor_linenr);
++  void handle_find_translation (int original_linenr, int& editor_linenr,
++                                marker*& bp);
+   void handle_find_just_before (int linenr, int& original_linenr, int& editor_linenr);
+   void handle_find_just_after (int linenr, int& original_linenr, int& editor_linenr);
+ /*  void handle_lines_changed (void);*/
+   void handle_marker_line_deleted (int mhandle);
+   void handle_marker_line_undeleted (int mhandle);
+-  void handle_report_editor_linenr (QIntList& int_list);
++  void handle_report_editor_linenr (QIntList& lines, QStringList& conditions);
+ 
+ signals:
+   void request_remove (int original_linenr);
+ 
+ private:
+   void construct (QsciScintilla *edit_area, int original_linenr,
+-                  editor_markers marker_type, int editor_linenr);
++                  editor_markers marker_type, int editor_linenr,
++                  const QString& condition);
+ 
+   QsciScintilla *       _edit_area;
+   int                   _original_linenr;
+   editor_markers        _marker_type;
+   int                   _mhandle;
++  QString               _condition;
+ };
+ 
+ #endif // MARKER_H
+diff --git a/libgui/src/m-editor/octave-qscintilla.cc b/libgui/src/m-editor/octave-qscintilla.cc
+--- a/libgui/src/m-editor/octave-qscintilla.cc
++++ b/libgui/src/m-editor/octave-qscintilla.cc
+@@ -189,57 +189,77 @@ octave_qscintilla::context_run ()
+ // context menu requested
+ void
+ octave_qscintilla::contextMenuEvent (QContextMenuEvent *e)
+ {
+ #ifdef HAVE_QSCI_VERSION_2_6_0
+   QPoint global_pos, local_pos;                         // the menu's position
+   QMenu *context_menu = createStandardContextMenu ();  // standard menu
+ 
+-  // fill context menu with editor's standard actions
+-  emit create_context_menu_signal (context_menu);
++  bool in_left_margin = false;
+ 
+   // determine position depending on mouse or keyboard event
+   if (e->reason () == QContextMenuEvent::Mouse)
+     {
+       // context menu by mouse
+       global_pos = e->globalPos ();            // global mouse position
+       local_pos  = e->pos ();                  // local mouse position
++      if (e->x () < marginWidth (1) + marginWidth (2))
++        in_left_margin = true;
+     }
+   else
+     {
+       // context menu by keyboard or other: get point of text cursor
+       get_global_textcursor_pos (&global_pos, &local_pos);
+       QRect editor_rect = geometry ();      // editor rect mapped to global
+       editor_rect.moveTopLeft
+       (parentWidget ()->mapToGlobal (editor_rect.topLeft ()));
+       if (! editor_rect.contains (global_pos))  // is cursor outside editor?
+         global_pos = editor_rect.topLeft ();   // yes, take top left corner
+     }
+ 
+-  // additional custom entries of the context menu
+-  context_menu->addSeparator ();   // separator before custom entries
+-
+-  // help menu: get the position of the mouse or the text cursor
+-  // (only for octave files)
+-  QString lexer_name = lexer ()->lexer ();
+-  if (lexer_name == "octave" || lexer_name == "matlab")
++  if (! in_left_margin)
+     {
+-      _word_at_cursor = wordAtPoint (local_pos);
+-      if (! _word_at_cursor.isEmpty ())
++      // fill context menu with editor's standard actions
++      emit create_context_menu_signal (context_menu);
++
++      // additional custom entries of the context menu
++      context_menu->addSeparator ();   // separator before custom entries
++
++      // help menu: get the position of the mouse or the text cursor
++      // (only for octave files)
++      QString lexer_name = lexer ()->lexer ();
++      if (lexer_name == "octave" || lexer_name == "matlab")
+         {
+-          context_menu->addAction (tr ("Help on") + " " + _word_at_cursor,
+-                                   this, SLOT (contextmenu_help (bool)));
+-          context_menu->addAction (tr ("Documentation on")
+-                                   + " " + _word_at_cursor,
+-                                   this, SLOT (contextmenu_doc (bool)));
+-          context_menu->addAction (tr ("Edit") + " " + _word_at_cursor,
+-                                   this, SLOT (contextmenu_edit (bool)));
++          _word_at_cursor = wordAtPoint (local_pos);
++          if (! _word_at_cursor.isEmpty ())
++            {
++              context_menu->addAction (tr ("Help on") + " " + _word_at_cursor,
++                                       this, SLOT (contextmenu_help (bool)));
++              context_menu->addAction (tr ("Documentation on")
++                                       + " " + _word_at_cursor,
++                                       this, SLOT (contextmenu_doc (bool)));
++              context_menu->addAction (tr ("Edit") + " " + _word_at_cursor,
++                                       this, SLOT (contextmenu_edit (bool)));
++            }
+         }
+-    }
++      }
++    else
++      {
++        // remove all standard actions from scintilla
++        QList<QAction *> all_actions = context_menu->actions ();
++        QAction* a;
++
++        foreach (a, all_actions)
++          context_menu->removeAction (a);
++
++        a = context_menu->addAction (tr ("dbstop if ..."), this,
++                                     SLOT (contextmenu_break_condition (bool)));
++        a->setData (local_pos);
++      }
+ 
+   // finaly show the menu
+   context_menu->exec (global_pos);
+ #endif
+ }
+ 
+ 
+ // handle the menu entry for calling help or doc
+@@ -274,16 +294,48 @@ void
+ octave_qscintilla::contextmenu_run (bool)
+ {
+   QStringList commands = selectedText ().split (QRegExp("[\r\n]"),
+                                                 QString::SkipEmptyParts);
+   for (int i = 0; i < commands.size (); i++)
+     emit execute_command_in_terminal_signal (commands.at (i));
+ }
+ 
++// wrappers for dbstop related context menu items
++
++#ifdef HAVE_QSCI_VERSION_2_6_0
++// FIXME Why can't the data be sent as the argument to the function???
++void
++octave_qscintilla::contextmenu_break_condition (bool)
++{
++  QAction *action = qobject_cast<QAction *>(sender());
++  QPoint local_pos = action->data ().value<QPoint> ();
++
++  // pick point just right of margins, so lineAt doesn't give -1
++  int margins = marginWidth (1) + marginWidth (2) + marginWidth (3);
++  local_pos = QPoint (margins + 1, local_pos.y ());
++
++  emit context_menu_break_condition_signal (lineAt (local_pos));
++}
++
++void
++octave_qscintilla::contextmenu_break_once (const QPoint& local_pos)
++{
++  emit context_menu_break_once (lineAt (local_pos));
++}
++
++/*
++void
++octave_qscintilla::contextmenu_break_if_caught (bool)
++{
++  emit context_menu_break_if_caught
++}
++*/
++#endif // HAVE_QSCI_VERSION_2_6_0
++
+ void
+ octave_qscintilla::text_changed ()
+ {
+   emit status_update (isUndoAvailable (), isRedoAvailable ());
+ }
+ 
+ // when edit area gets focus update information on undo/redo actions
+ void octave_qscintilla::focusInEvent(QFocusEvent *focusEvent)
+diff --git a/libgui/src/m-editor/octave-qscintilla.h b/libgui/src/m-editor/octave-qscintilla.h
+--- a/libgui/src/m-editor/octave-qscintilla.h
++++ b/libgui/src/m-editor/octave-qscintilla.h
+@@ -49,25 +49,30 @@ public:
+ signals:
+ 
+   void execute_command_in_terminal_signal (const QString&);
+   void create_context_menu_signal (QMenu*);
+   void context_menu_edit_signal (const QString&);
+   void qsci_has_focus_signal (bool);
+   void status_update (bool,bool);
+   void show_doc_signal (const QString&);
++  void context_menu_break_condition_signal (int);
++  void context_menu_break_once (int);
+ 
+ private slots:
+ 
+   void contextmenu_help (bool);
+   void contextmenu_doc (bool);
+   void contextmenu_help_doc (bool);
+   void contextmenu_edit (bool);
+   void contextmenu_run (bool);
+ 
++  void contextmenu_break_condition (bool);
++  void contextmenu_break_once (const QPoint&);
++
+   void text_changed (void);
+ 
+ protected:
+ 
+   void focusInEvent(QFocusEvent *focusEvent);
+ 
+ private:
+ 
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -995,21 +995,22 @@ main_window::handle_delete_debugger_poin
+ 
+   if (cmd_focus)
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::handle_update_breakpoint_marker_request (bool insert,
+                                                       const QString& file,
+-                                                      int line)
++                                                      int line,
++						      const QString& cond)
+ {
+   bool cmd_focus = command_window_has_focus ();
+ 
+-  emit update_breakpoint_marker_signal (insert, file, line);
++  emit update_breakpoint_marker_signal (insert, file, line, cond);
+ 
+   if (cmd_focus)
+     focus_command_window ();
+ }
+ 
+ void
+ main_window::show_about_octave (void)
+ {
+@@ -1409,21 +1410,23 @@ main_window::construct (void)
+                SLOT (handle_insert_debugger_pointer_request (const QString&, int)));
+ 
+       connect (this,
+                SIGNAL (delete_debugger_pointer_signal (const QString&, int)),
+                editor_window,
+                SLOT (handle_delete_debugger_pointer_request (const QString&, int)));
+ 
+       connect (this,
+-               SIGNAL (update_breakpoint_marker_signal (bool, const QString&, int)),
++               SIGNAL (update_breakpoint_marker_signal (bool, const QString&,
++	                                                int, const QString&)),
+                editor_window,
+                SLOT (handle_update_breakpoint_marker_request (bool,
+                                                               const QString&,
+-                                                              int)));
++                                                              int,
++							      const QString&)));
+ #endif
+ 
+       octave_link::post_event (this, &main_window::resize_command_window_callback);
+ 
+       configure_shortcuts ();
+     }
+ }
+ 
+@@ -1553,20 +1556,23 @@ main_window::construct_octave_qt_link (v
+                SLOT (handle_insert_debugger_pointer_request (const QString&, int)));
+ 
+       connect (_octave_qt_link,
+                SIGNAL (delete_debugger_pointer_signal (const QString&, int)),
+                this,
+                SLOT (handle_delete_debugger_pointer_request (const QString&, int)));
+ 
+       connect (_octave_qt_link,
+-               SIGNAL (update_breakpoint_marker_signal (bool, const QString&, int)),
++               SIGNAL (update_breakpoint_marker_signal (bool, const QString&,
++	                                                int, const QString&)),
+                this,
+-               SLOT (handle_update_breakpoint_marker_request (bool, const QString&,
+-                                                              int)));
++               SLOT (handle_update_breakpoint_marker_request (bool,
++	                                                      const QString&,
++                                                              int,
++							      const QString&)));
+ 
+       connect (_octave_qt_link,
+                SIGNAL (show_doc_signal (const QString &)),
+                this, SLOT (handle_show_doc (const QString &)));
+ 
+       connect (_workspace_model,
+                SIGNAL (rename_variable (const QString&, const QString&)),
+                this,
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -95,17 +95,17 @@ signals:
+   void open_file_signal (const QString&);
+   void edit_mfile_request (const QString&, const QString&, const QString&, int);
+ 
+   void show_doc_signal (const QString&);
+ 
+   void insert_debugger_pointer_signal (const QString& file, int line);
+   void delete_debugger_pointer_signal (const QString& file, int line);
+   void update_breakpoint_marker_signal (bool insert, const QString& file,
+-                                        int line);
++                                        int line, const QString& cond);
+ 
+   void copyClipboard_signal (void);
+   void pasteClipboard_signal (void);
+   void selectAll_signal (void);
+   void undo_signal (void);
+ 
+   void add_actions_signal (QList <QAction *> action_list);
+ 
+@@ -164,17 +164,18 @@ public slots:
+   void debug_step_into (void);
+   void debug_step_over (void);
+   void debug_step_out (void);
+   void debug_quit (void);
+ 
+   void handle_insert_debugger_pointer_request (const QString& file, int line);
+   void handle_delete_debugger_pointer_request (const QString& file, int line);
+   void handle_update_breakpoint_marker_request (bool insert,
+-                                                const QString& file, int line);
++                                                const QString& file, int line,
++						const QString& cond);
+ 
+   void read_settings (void);
+   void init_terminal_size (void);
+   void set_window_layout (QSettings *settings);
+   void write_settings (void);
+   void connect_visibility_changed (void);
+ 
+   void copyClipboard (void);
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -24,16 +24,17 @@ along with Octave; see the file COPYING.
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <QStringList>
+ #include <QDialog>
+ #include <QDir>
++#include <QPushButton>
+ 
+ #include "str-vec.h"
+ #include "dialog.h"
+ #include "error.h"
+ #include "workspace-element.h"
+ #include "builtin-defun-decls.h"
+ #include "load-path.h"
+ #include "oct-env.h"
+@@ -367,66 +368,55 @@ octave_qt_link::do_file_dialog (const fi
+   retval.push_back ((QString ("%1").arg (
+                        uiwidget_creator.get_dialog_result ())).toStdString ());
+ 
+   uiwidget_creator.mutex.unlock ();
+ 
+   return retval;
+ }
+ 
++// Prompt to allow file to be run by setting cwd (or if addpath_option==true,
++// alternatively setting the path).
++// This uses a QMessageBox unlike other functions in this file,
++// because uiwidget_creator.waitcondition.wait hangs when called from
++// file_editor_tab::handle_context_menu_break_condition().  (FIXME -- why hang?)
+ int
+ octave_qt_link::do_debug_cd_or_addpath_error (const std::string& file,
+                                               const std::string& dir,
+                                               bool addpath_option)
+ {
+   int retval = -1;
+ 
+   QString qdir = QString::fromStdString (dir);
+   QString qfile = QString::fromStdString (file);
+ 
+-  QString msg
+-    = (addpath_option
+-       ? tr ("The file %1 does not exist in the load path.  To run or debug the function you are editing, you must either change to the directory %2 or add that directory to the load path.").arg (qfile).arg (qdir)
+-       : tr ("The file %1 is shadowed by a file with the same name in the load path. To run or debug the function you are editing, change to the directory %2.").arg (qfile).arg (qdir));
+-
+-  QString title = tr ("Change Directory or Add Directory to Load Path");
++  QMessageBox msgBox;
+ 
+-  QString cd_txt = tr ("Change Directory");
+-  QString addpath_txt = tr ("Add Directory to Load Path");
+-  QString cancel_txt = tr ("Cancel");
++  msgBox.setText ("File not in load path");
++  QPushButton *cd_btn = msgBox.addButton (tr ("Change Directory"),
++                                          QMessageBox::YesRole);
+ 
+-  QStringList btn;
+-  QStringList role;
+-  btn << cd_txt;
+-  role << "YesRole";
++  QPushButton *addpath_btn = 0;
+   if (addpath_option)
+     {
+-      btn << addpath_txt;
+-      role << "AcceptRole";
++      msgBox.setInformativeText (tr ("The file %1 does not exist in the load path.  To run or debug the function you are editing, you must either change to the directory %2 or add that directory to the load path.").arg (qfile).arg (qdir));
++      addpath_btn = msgBox.addButton (tr ("Add Directory to Load Path"),
++                                     QMessageBox::AcceptRole);
+     }
+-  btn << cancel_txt;
+-  role << "RejectRole";
+-
+-  // Lock mutex before signaling.
+-  uiwidget_creator.mutex.lock ();
+-
+-  uiwidget_creator.signal_dialog (msg, title, "quest", btn, cancel_txt, role);
++    else
++    {
++      msgBox.setInformativeText (tr ("The file %1 is shadowed by a file with the same name in the load path. To run or debug the function you are editing, change to the directory %2.").arg (qfile).arg (qdir));
++    }
++  msgBox.setStandardButtons (QMessageBox::Cancel);
+ 
+-  // Wait while the user is responding to message box.
+-  uiwidget_creator.waitcondition.wait (&uiwidget_creator.mutex);
+-
+-  // The GUI has sent a signal and the thread has been awakened.
++  msgBox.exec ();
+ 
+-  QString result = uiwidget_creator.get_dialog_button ();
+-
+-  uiwidget_creator.mutex.unlock ();
+-
+-  if (result == cd_txt)
++  if (msgBox.clickedButton () == cd_btn)
+     retval = 1;
+-  else if (result == addpath_txt)
++  else if (msgBox.clickedButton () == addpath_btn)
+     retval = 2;
+ 
+   return retval;
+ }
+ 
+ void
+ octave_qt_link::do_change_directory (const std::string& dir)
+ {
+@@ -533,22 +523,25 @@ octave_qt_link::do_execute_in_debugger_e
+ }
+ 
+ void
+ octave_qt_link::do_exit_debugger_event (void)
+ {
+   emit exit_debugger_signal ();
+ }
+ 
++// Display (if @insert true) or remove the appropriate symbol for a breakpoint
++// in @file at @line with condition @cond.
+ void
+ octave_qt_link::do_update_breakpoint (bool insert,
+-                                      const std::string& file, int line)
++                                      const std::string& file, int line,
++                                      const std::string& cond)
+ {
+   emit update_breakpoint_marker_signal (insert, QString::fromStdString (file),
+-                                        line);
++                                        line, QString::fromStdString (cond));
+ }
+ 
+ void
+ octave_qt_link::do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                         std::string& ps4)
+ {
+   ps1 = ">> ";
+   ps2 = "";
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -119,17 +119,18 @@ public:
+ 
+   void do_pre_input_event (void);
+   void do_post_input_event (void);
+ 
+   void do_enter_debugger_event (const std::string& file, int line);
+   void do_execute_in_debugger_event (const std::string& file, int line);
+   void do_exit_debugger_event (void);
+ 
+-  void do_update_breakpoint (bool insert, const std::string& file, int line);
++  void do_update_breakpoint (bool insert, const std::string& file, int line,
++                             const std::string& cond);
+ 
+   void do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                std::string& ps4);
+ 
+   bool file_in_path (const std::string& file, const std::string& dir);
+ 
+   void do_show_preferences (void);
+ 
+@@ -186,17 +187,17 @@ signals:
+   void set_history_signal (const QStringList& hist);
+   void append_history_signal (const QString& hist_entry);
+   void clear_history_signal (void);
+ 
+   void enter_debugger_signal (void);
+   void exit_debugger_signal (void);
+ 
+   void update_breakpoint_marker_signal (bool insert, const QString& file,
+-                                        int line);
++                                        int line, const QString& cond);
+ 
+   void insert_debugger_pointer_signal (const QString&, int);
+   void delete_debugger_pointer_signal (const QString&, int);
+ 
+   void show_preferences_signal (void);
+ 
+   void show_doc_signal (const QString &file);
+ 
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -302,17 +302,17 @@ public:
+       }
+   }
+ 
+   static void
+   update_breakpoint (bool insert, const std::string& file, int line,
+                      const std::string& cond = "")
+   {
+     if (enabled ())
+-      instance->do_update_breakpoint (insert, file, line);
++      instance->do_update_breakpoint (insert, file, line, cond);
+   }
+ 
+   static void connect_link (octave_link *);
+ 
+   static void set_default_prompts (std::string& ps1, std::string& ps2,
+                                    std::string& ps4)
+   {
+     if (enabled ())
+@@ -462,17 +462,18 @@ protected:
+   do_enter_debugger_event (const std::string& file, int line) = 0;
+ 
+   virtual void
+   do_execute_in_debugger_event (const std::string& file, int line) = 0;
+ 
+   virtual void do_exit_debugger_event (void) = 0;
+ 
+   virtual void do_update_breakpoint (bool insert,
+-                                     const std::string& file, int line) = 0;
++                                     const std::string& file, int line,
++                                     const std::string& cond) = 0;
+ 
+   virtual void do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                        std::string& ps4) = 0;
+ 
+   virtual void do_show_preferences (void) = 0;
+ 
+   virtual void do_show_doc (const std::string &file) = 0;
+ };

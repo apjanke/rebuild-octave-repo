@@ -1,0 +1,611 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1368212462 -7200
+#      Fri May 10 21:01:02 2013 +0200
+# Node ID 25e418d23a4b00750f38e46b7f7d5e4e5352afa0
+# Parent  2510fffc05e1fcd8c8226d7b4da9f020f41b6f2c
+fix running files from file browser's context menu
+
+* main-window.cc(run_file_in_terminal): new slot for run_file_signal
+  (run_file_callback): callback for running files after checking the path
+* main-window.h: new functions run_file_in_terminal und run_file_callback)
+
+* files-dock-widget.cc(constructor): connect signal to slot for running files
+  (contextmenu_run): emit run_file_signal with QFileInfo as parameter
+* files-dock-widget.h: run_file_signal has QFileInfo as parameter
+
+* file-editor-tab.cc: removed function run_file_callback
+  (run_file): get file info of current file and emit run_file_signal
+  (file_in_path): moved to octave_qt_link allowiung access from other widgets,
+  updated calls to this functions
+* file-editor-tab.h: new run_file_signal with QFileInfo, removed functions
+  run_file_callback and file_in_path
+
+* file-editor.cc(add_file_editor_tab): connect signal to slot for running files
+
+* octave-qt-link.cc/h(file_in_path): moved from file-editor-tab and made static
+
+diff --git a/libgui/src/files-dock-widget.cc b/libgui/src/files-dock-widget.cc
+--- a/libgui/src/files-dock-widget.cc
++++ b/libgui/src/files-dock-widget.cc
+@@ -189,18 +189,18 @@ files_dock_widget::files_dock_widget (QW
+   // TODO: Add right-click contextual menus for copying, pasting, deleting files (and others)
+ 
+   connect (_current_directory->lineEdit(), SIGNAL (returnPressed ()),
+             this, SLOT (accept_directory_line_edit ()));
+ 
+   connect (_current_directory, SIGNAL (activated (const QString &)),
+            this, SLOT (set_current_directory (const QString &)));
+ 
+-  connect (this, SIGNAL (run_file_signal (const QString&)),
+-           parent (), SLOT (execute_command_in_terminal (const QString&)));
++  connect (this, SIGNAL (run_file_signal (const QFileInfo&)),
++           parent (), SLOT (run_file_in_terminal (const QFileInfo&)));
+ 
+   QCompleter *completer = new QCompleter (_file_system_model, this);
+   _current_directory->setCompleter (completer);
+ 
+   setFocusProxy (_current_directory);
+   
+   _sync_octave_dir = true;   // default, overwirtten with notice_settings ()
+   _octave_dir = "";
+@@ -447,22 +447,17 @@ files_dock_widget::contextmenu_run (bool
+   QItemSelectionModel *m = _file_tree_view->selectionModel ();
+   QModelIndexList rows = m->selectedRows ();
+ 
+   if (rows.size () > 0)
+     {
+       QModelIndex index = rows[0];
+ 
+       QFileInfo info = _file_system_model->fileInfo(index);
+-
+-      QString function_name = info.fileName ();
+-      // We have to cut off the suffix, because octave appends it.
+-      function_name.chop (info.suffix ().length () + 1);
+-      emit run_file_signal (QString ("cd \'%1\'\n%2\n")
+-                            .arg(info.absolutePath ()).arg (function_name));
++      emit run_file_signal (info);
+     }
+ }
+ 
+ void 
+ files_dock_widget::contextmenu_rename (bool)
+ {
+   QItemSelectionModel *m = _file_tree_view->selectionModel ();
+   QModelIndexList rows = m->selectedRows ();
+@@ -662,9 +657,8 @@ files_dock_widget::process_new_dir (cons
+       _file_system_model->revert();
+     }
+ }
+ 
+ void files_dock_widget::process_set_current_dir(const QString & dir)
+ {
+   emit displayed_directory_changed (dir);
+ }
+-
+diff --git a/libgui/src/files-dock-widget.h b/libgui/src/files-dock-widget.h
+--- a/libgui/src/files-dock-widget.h
++++ b/libgui/src/files-dock-widget.h
+@@ -107,17 +107,17 @@ signals:
+ 
+   /** Emitted, whenever the currently displayed directory changed. */
+   void displayed_directory_changed (const QString& dir);
+ 
+   /** Emitted, whenever the user requested to load a file. */
+   void load_file_signal (const QString& fileName);
+ 
+   /** Emitted, whenever the user requested to run a file. */
+-  void run_file_signal (const QString& fileName);
++  void run_file_signal (const QFileInfo& info);
+ 
+ private:
+   void process_new_file(const QString &parent_name);
+   void process_new_dir(const QString &parent_name);
+   void process_set_current_dir(const QString &parent_name);
+ 
+   /** set a new directory or open a file **/
+   void display_directory (const QString& dir, bool set_octave_dir = true);
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -43,24 +43,18 @@ along with Octave; see the file COPYING.
+ #include <QTextStream>
+ #include <QVBoxLayout>
+ #include <QInputDialog>
+ #include <QPrintDialog>
+ 
+ #include "file-editor-tab.h"
+ #include "file-editor.h"
+ 
+-#include "cmd-edit.h"
+-
+-#include "builtin-defun-decls.h"
+ #include "debug.h"
+-#include "load-path.h"
+-#include "octave-link.h"
+-#include "oct-env.h"
+-#include "utils.h"
++#include "octave-qt-link.h"
+ 
+ // Make parent null for the file editor tab so that warning
+ // WindowModal messages don't affect grandparents.
+ file_editor_tab::file_editor_tab (const QString& directory_arg)
+ {
+   QString directory = directory_arg;
+ 
+   // Make sure there is a slash at the end of the directory name
+@@ -350,52 +344,27 @@ file_editor_tab::print_file (const QWidg
+   QPrintDialog printDlg (printer, this);
+ 
+   if (printDlg.exec () == QDialog::Accepted)
+     printer->printRange (_edit_area);
+ 
+   delete printer;
+ }
+ 
+-
+-void
+-file_editor_tab::run_file_callback (const bp_info& info)
+-{
+-  if (file_in_path (info.file, info.dir))
+-    {
+-      std::string pending_input = command_editor::get_current_line ();
+-
+-      command_editor::set_initial_input (pending_input);
+-
+-      command_editor::replace_line (info.function_name);
+-      command_editor::redisplay ();
+-
+-      // We are executing inside the command editor event loop.  Force
+-      // the current line to be returned for processing.
+-      command_editor::interrupt ();
+-    }
+-}
+-
+ void
+ file_editor_tab::run_file (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   if (_edit_area->isModified ())
+     save_file (_file_name);
+ 
+-  QFileInfo file_info (_file_name);
+-  QString dir = file_info.absolutePath ();
+-  QString function_name = file_info.fileName ();
+-  function_name.chop (file_info.suffix ().length () + 1);
+-
+-  bp_info info (_file_name, dir, function_name, 1);
+-
+-  octave_link::post_event (this, &file_editor_tab::run_file_callback, info);
++  QFileInfo info (_file_name);
++  emit run_file_signal (info);
+ }
+ 
+ void
+ file_editor_tab::toggle_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+@@ -446,104 +415,40 @@ void
+ file_editor_tab::remove_bookmark (const QWidget *ID)
+ {
+   if (ID != this)
+     return;
+ 
+   _edit_area->markerDeleteAll (bookmark);
+ }
+ 
+-bool
+-file_editor_tab::file_in_path (const std::string& file, const std::string& dir)
+-{
+-  bool ok = false;
+-  bool addpath_option = true;
+-
+-  std::string curr_dir = octave_env::get_current_directory ();
+-
+-  if (same_file (curr_dir, dir))
+-    ok = true;
+-  else
+-    {
+-      bool dir_in_load_path = load_path::contains_canonical (dir);
+-
+-      std::string base_file = octave_env::base_pathname (file);
+-      std::string lp_file = load_path::find_file (base_file);
+-
+-      if (dir_in_load_path)
+-        {
+-          if (same_file (lp_file, file))
+-            ok = true;
+-        }
+-      else
+-        {
+-          // File directory is not in path.  Is the file in the path in
+-          // the current directory?  If so, then changing the current
+-          // directory will be needed.  Adding directory to path is
+-          // not enough because the file in the current directory would
+-          // still be found.
+-
+-          if (same_file (lp_file, base_file))
+-            {
+-              if (same_file (curr_dir, dir))
+-                ok = true;
+-              else
+-                addpath_option = false;
+-            }
+-        }
+-    }
+-
+-  if (! ok)
+-    {
+-      int action
+-        = octave_link::debug_cd_or_addpath_error (file, dir, addpath_option);
+-      switch (action)
+-        {
+-        case 1:
+-          Fcd (ovl (dir));
+-          ok = true;
+-          break;
+-
+-        case 2:
+-          load_path::prepend (dir);
+-          ok = true;
+-          break;
+-
+-        default:
+-          break;
+-        }
+-    }
+-
+-  return ok;
+-}
+-
+ void
+ file_editor_tab::add_breakpoint_callback (const bp_info& info)
+ {
+   bp_table::intmap line_info;
+   line_info[0] = info.line;
+ 
+-  if (file_in_path (info.file, info.dir))
++  if (octave_qt_link::file_in_path (info.file, info.dir))
+     bp_table::add_breakpoint (info.function_name, line_info);
+ }
+ 
+ void
+ file_editor_tab::remove_breakpoint_callback (const bp_info& info)
+ {
+   bp_table::intmap line_info;
+   line_info[0] = info.line;
+ 
+-  if (file_in_path (info.file, info.dir))
++  if (octave_qt_link::file_in_path (info.file, info.dir))
+     bp_table::remove_breakpoint (info.function_name, line_info);
+ }
+ 
+ void
+ file_editor_tab::remove_all_breakpoints_callback (const bp_info& info)
+ {
+-  if (file_in_path (info.file, info.dir))
++  if (octave_qt_link::file_in_path (info.file, info.dir))
+     bp_table::remove_all_breakpoints_in_file (info.function_name, true);
+ }
+ 
+ void
+ file_editor_tab::request_add_breakpoint (int line)
+ {
+   QFileInfo file_info (_file_name);
+   QString dir = file_info.absolutePath ();
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -22,17 +22,17 @@ along with Octave; see the file COPYING.
+ 
+ #if !defined (file_editor_tab_h)
+ #define file_editor_tab_h 1
+ 
+ #include <QWidget>
+ #include <QCloseEvent>
+ #include <QFileSystemWatcher>
+ #include <QSettings>
+-
++#include <QFileInfo>
+ #include <Qsci/qsciscintilla.h>
+ 
+ #include "find-dialog.h"
+ 
+ class file_editor;
+ 
+ class file_editor_tab : public QWidget
+ {
+@@ -106,17 +106,17 @@ signals:
+ 
+   void file_name_changed (const QString& fileName, const QString& toolTip);
+   void editor_state_changed (bool copy_available, const QString& fileName);
+   void tab_remove_request ();
+   void add_filename_to_list (const QString&, QWidget *);
+   void mru_add_file (const QString& file_name);
+   void editor_check_conflict_save (const QString& saveFileName,
+                                    bool remove_on_success);
+-  void process_octave_code (const QString& command);
++  void run_file_signal (const QFileInfo& info);
+ 
+ protected:
+ 
+   void closeEvent (QCloseEvent *event);
+   void set_file_name (const QString& fileName);
+ 
+ private slots:
+ 
+@@ -165,20 +165,16 @@ private:
+ 
+   void update_lexer ();
+   void request_add_breakpoint (int line);
+   void request_remove_breakpoint (int line);
+ 
+   int check_file_modified ();
+   void do_comment_selected_text (bool comment);
+ 
+-  void run_file_callback (const bp_info& info);
+-
+-  bool file_in_path (const std::string& file, const std::string& dir);
+-
+   void add_breakpoint_callback (const bp_info& info);
+   void remove_breakpoint_callback (const bp_info& info);
+   void remove_all_breakpoints_callback (const bp_info& info);
+   void center_current_line ();
+ 
+   QsciScintilla *_edit_area;
+ 
+   QString _file_name;
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -1074,18 +1074,18 @@ file_editor::add_file_editor_tab (file_e
+            this, SLOT (handle_add_filename_to_list (const QString&, QWidget*)));
+ 
+   connect (f, SIGNAL (editor_check_conflict_save (const QString&, bool)),
+            this, SLOT (check_conflict_save (const QString&, bool)));
+ 
+   connect (f, SIGNAL (mru_add_file (const QString&)),
+            this, SLOT (handle_mru_add_file (const QString&)));
+ 
+-  connect (f, SIGNAL (process_octave_code (const QString&)),
+-           parent (), SLOT (execute_command_in_terminal (const QString&)));
++  connect (f, SIGNAL (run_file_signal (const QFileInfo&)),
++           parent (), SLOT (run_file_in_terminal (const QFileInfo&)));
+   
+   // Signals from the file_editor non-trivial operations
+   connect (this, SIGNAL (fetab_settings_changed (const QSettings *)),
+            f, SLOT (notice_settings (const QSettings *)));
+ 
+   connect (this, SIGNAL (fetab_close_request (const QWidget*)),
+            f, SLOT (conditional_close (const QWidget*)));
+ 
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -198,16 +198,22 @@ main_window::execute_command_in_terminal
+ {
+   octave_link::post_event (this, &main_window::execute_command_callback,
+                            command.toStdString ());
+ 
+   focus_command_window ();
+ }
+ 
+ void
++main_window::run_file_in_terminal (const QFileInfo& info)
++{
++  octave_link::post_event (this, &main_window::run_file_callback, info);
++}
++
++void
+ main_window::handle_new_figure_request (void)
+ {
+   octave_link::post_event (this, &main_window::new_figure_callback);
+ }
+ 
+ void
+ main_window::handle_new_variable_request (void)
+ {
+@@ -1454,16 +1460,27 @@ main_window::execute_command_callback (c
+   command_editor::redisplay ();
+ 
+   // We are executing inside the command editor event loop.  Force
+   // the current line to be returned for processing.
+   command_editor::interrupt ();
+ }
+ 
+ void
++main_window::run_file_callback (const QFileInfo& info)
++{
++  QString dir = info.absolutePath ();
++  QString function_name = info.fileName ();
++  function_name.chop (info.suffix ().length () + 1);
++  if (octave_qt_link::file_in_path (info.absoluteFilePath ().toStdString (),
++                                    dir.toStdString ()))
++    execute_command_callback (function_name.toStdString ());
++}
++
++void
+ main_window::new_figure_callback (void)
+ {
+   Fbuiltin (ovl ("figure"));
+   Fdrawnow ();
+ }
+ 
+ void
+ main_window::change_directory_callback (const std::string& directory)
+@@ -1556,8 +1573,9 @@ main_window::find_files(const QString &s
+ }
+ 
+ void 
+ main_window::find_files_finished(int)
+ {
+ 
+ }
+ 
++
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -111,16 +111,17 @@ public slots:
+ 
+   void change_directory (const QString& dir);
+   void browse_for_directory (void);
+   void set_current_working_directory (const QString& dir);
+   void change_directory_up (void);
+   void accept_directory_line_edit (void);
+ 
+   void execute_command_in_terminal(const QString& dir);
++  void run_file_in_terminal(const QFileInfo& info);
+ 
+   void handle_new_figure_request (void);
+ 
+   void handle_new_variable_request (void);
+ 
+   void handle_enter_debugger (void);
+   void handle_exit_debugger (void);
+   void debug_continue (void);
+@@ -208,16 +209,17 @@ private:
+ 
+   void resize_command_window_callback (void);
+ 
+   void clear_workspace_callback (void);
+ 
+   void clear_history_callback (void);
+ 
+   void execute_command_callback (const std::string& command);
++  void run_file_callback (const QFileInfo& info);
+ 
+   void new_figure_callback (void);
+ 
+   void change_directory_callback (const std::string& directory);
+ 
+   void debug_continue_callback (void);
+ 
+   void debug_step_into_callback (void);
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -24,20 +24,23 @@ along with Octave; see the file COPYING.
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include <QStringList>
+ 
+ #include "str-vec.h"
+-
+ #include "dialog.h"
+ #include "error.h"
+ #include "workspace-element.h"
++#include "builtin-defun-decls.h"
++#include "load-path.h"
++#include "oct-env.h"
++#include "utils.h"
+ 
+ #include "octave-qt-link.h"
+ 
+ octave_qt_link::octave_qt_link (octave_main_thread *mt)
+   : octave_link (), main_thread (mt)
+ { }
+ 
+ octave_qt_link::~octave_qt_link (void) { }
+@@ -418,8 +421,73 @@ octave_qt_link::do_insert_debugger_point
+   emit insert_debugger_pointer_signal (QString::fromStdString (file), line);
+ }
+ 
+ void
+ octave_qt_link::do_delete_debugger_pointer (const std::string& file, int line)
+ {
+   emit delete_debugger_pointer_signal (QString::fromStdString (file), line);
+ }
++
++
++bool
++octave_qt_link::file_in_path (const std::string& file, const std::string& dir)
++{
++
++  bool ok = false;
++  bool addpath_option = true;
++
++  std::string curr_dir = octave_env::get_current_directory ();
++
++  if (same_file (curr_dir, dir))
++    ok = true;
++  else
++    {
++      bool dir_in_load_path = load_path::contains_canonical (dir);
++
++      std::string base_file = octave_env::base_pathname (file);
++      std::string lp_file = load_path::find_file (base_file);
++
++      if (dir_in_load_path)
++        {
++          if (same_file (lp_file, file))
++            ok = true;
++        }
++      else
++        {
++          // File directory is not in path.  Is the file in the path in
++          // the current directory?  If so, then changing the current
++          // directory will be needed.  Adding directory to path is
++          // not enough because the file in the current directory would
++          // still be found.
++
++          if (same_file (lp_file, base_file))
++            {
++              if (same_file (curr_dir, dir))
++                ok = true;
++              else
++                addpath_option = false;
++            }
++        }
++    }
++
++  if (! ok)
++    {
++      int action = debug_cd_or_addpath_error (file, dir, addpath_option);
++      switch (action)
++        {
++        case 1:
++          Fcd (ovl (dir));
++          ok = true;
++          break;
++
++        case 2:
++          load_path::prepend (dir);
++          ok = true;
++          break;
++
++        default:
++          break;
++        }
++    }
++
++  return ok;
++}
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -114,16 +114,17 @@ public:
+   void do_execute_in_debugger_event (const std::string& file, int line);
+   void do_exit_debugger_event (void);
+ 
+   void do_update_breakpoint (bool insert, const std::string& file, int line);
+ 
+   void do_set_default_prompts (std::string& ps1, std::string& ps2,
+                                std::string& ps4);
+ 
++  static bool file_in_path (const std::string& file, const std::string& dir);
+ 
+ private:
+ 
+   // No copying!
+ 
+   octave_qt_link (const octave_qt_link&);
+ 
+   octave_qt_link& operator = (const octave_qt_link&);

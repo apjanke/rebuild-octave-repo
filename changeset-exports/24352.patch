@@ -1,0 +1,973 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1512072612 18000
+#      Thu Nov 30 15:10:12 2017 -0500
+# Node ID bff8e3884a88c6bf1b1c08998596b913caca266d
+# Parent  bccb495737863f2e91a17fddf9f6b85c31ce3a23
+restructure global variable handling in symbol table
+
+* symrec.h, symrec.cc
+(symbol_record::symbol_record_rep::xglobal_varref,
+symbol_record::symbol_record_rep::xglobal_varval): Delete.
+(symbol_record::find): Don't treat globals specially.
+(symbol_record::symbol_record_rep::varref,
+(symbol_record::symbol_record_rep::varval): Handle globals like other
+variables, but with context always equal to 0.
+(symbol_record::symbol_record_rep::clear): For globals, unbind forward
+rep instead of calling unmark_global.
+(symbol_record::symbol_record_rep::unmark_global): Delete.
+(symbol_record::symbol_record_rep::mark_global): Don't forward.
+(symbol_record::symbol_record_rep::bind_fwd_rep,
+symbol_record::symbol_record_rep::unbind_fwd_rep): Do forward.
+(symbol_record::varref, symbol_record::unmark_global): Delete.
+
+* symscope.h, symscope.cc (symbol_scope::clear_global_pattern,
+symbol_scope::clear_global, symbol_scope::varref): Delete.
+
+* symtab.h, symtab.cc (symbol_table::find_global_symbol,
+symbol_table::clear_global_pattern, symbol_table::clear_global):
+New functions.
+(symbol_table::erase_global, symbol_table::global_varref): Delete.
+(symbol_table::clear_all): Call clear_variables for the global scope
+instead of clear_global_pattern for the current scope.
+(symbol_table::m_global_symbols): Delete variable and all uses.
+
+* variables.cc (do_clear_globals): Call clear_variable for the
+symbols in the current scope that are linked to global symbols and
+symtab::clear_global for the actual global symbols.
+
+* pt-eval.cc (tree_evaluator::visit_tree_decl_elt): Find global symbol
+and link ID to it instead of calling mark_global for ID.
+
+* pt-id.h, pt-id.cc (tree_identifier::link_to_global): New function.
+(tree_identifier::mark_global): Delete.
+
+diff --git a/libinterp/corefcn/symrec.cc b/libinterp/corefcn/symrec.cc
+--- a/libinterp/corefcn/symrec.cc
++++ b/libinterp/corefcn/symrec.cc
+@@ -89,66 +89,38 @@ namespace octave
+     octave_value val = varval ();
+ 
+     if (val.is_defined ())
+       m["value"] = val;
+ 
+     return octave_value (m);
+   }
+ 
+-  octave_value&
+-  symbol_record::symbol_record_rep::xglobal_varref (void)
+-  {
+-    if (auto t_fwd_rep = m_fwd_rep.lock ())
+-      return t_fwd_rep->xglobal_varref ();
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varref");
+-
+-    return symtab.global_varref (m_name);
+-  }
+-
+-  octave_value
+-  symbol_record::symbol_record_rep::xglobal_varval (void) const
+-  {
+-    if (auto t_fwd_rep = m_fwd_rep.lock ())
+-      return t_fwd_rep->xglobal_varval ();
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varval");
+-
+-    return symtab.global_varval (m_name);
+-  }
+-
+   symbol_record::symbol_record (void)
+     : m_rep (new symbol_record_rep (__get_current_scope__ ("symbol_record"),
+                                     "", octave_value (), local))
+ 
+   { }
+ 
+   octave_value
+   symbol_record::find (const octave_value_list& args) const
+   {
+     octave_value retval;
+ 
+     symbol_table& symtab
+       = __get_symbol_table__ ("symbol_record::find");
+ 
+-    if (is_global ())
+-      retval = symtab.global_varval (name ());
+-    else
+-      {
+-        retval = varval ();
++    retval = varval ();
+ 
+-        if (retval.is_undefined ())
+-          {
+-            retval = symtab.find_function (name (), args);
++    if (retval.is_undefined ())
++      {
++        // FIXME
++        retval = symtab.find_function (name (), args);
+ 
+-            if (retval.is_defined ())
+-              return retval;
+-          }
++        if (retval.is_defined ())
++          return retval;
+       }
+ 
+     return retval;
+   }
+ 
+   octave_value symbol_record::dummy_octave_value;
+ }
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+--- a/libinterp/corefcn/symrec.h
++++ b/libinterp/corefcn/symrec.h
+@@ -157,42 +157,36 @@ namespace octave
+ 
+       context_id get_decl_scope_context (void) const;
+ 
+       octave_value& varref (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->varref ();
+ 
+-        if (is_global ())
+-          return xglobal_varref ();
+-
+         context_id context = 0;
+ 
+-        if (m_decl_scope && ! is_persistent ())
++        if (m_decl_scope && ! (is_persistent () || is_global ()))
+           context = get_decl_scope_context ();
+ 
+         context_id n = m_value_stack.size ();
+         while (n++ <= context)
+           m_value_stack.push_back (octave_value ());
+ 
+         return m_value_stack[context];
+       }
+ 
+       octave_value varval (void) const
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->varval ();
+ 
+-        if (is_global ())
+-          return xglobal_varval ();
+-
+         context_id context = 0;
+ 
+-        if (m_decl_scope && ! is_persistent ())
++        if (m_decl_scope && ! (is_persistent () || is_global ()))
+           context = get_decl_scope_context ();
+ 
+         if (context < m_value_stack.size ())
+           return m_value_stack[context];
+         else
+           return octave_value ();
+       }
+ 
+@@ -250,17 +244,17 @@ namespace octave
+         // that we clear the first element of the value stack.
+ 
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return;
+ 
+         if (! (is_hidden () || is_inherited ()))
+           {
+             if (is_global ())
+-              unmark_global ();
++              unbind_fwd_rep ();
+ 
+             assign (octave_value ());
+ 
+             if (is_persistent ())
+               unmark_persistent ();
+           }
+       }
+ 
+@@ -402,27 +396,22 @@ namespace octave
+           {
+             t_fwd_rep->mark_inherited ();
+             return;
+           }
+ 
+         m_storage_class |= inherited;
+       }
+ 
++      // This flag should only be set for a symbol record that is
++      // actually in the global symbol_scope, and that should only
++      // happen when it is added to the global symbol_scope.
++
+       void mark_global (void)
+       {
+-        if (auto t_fwd_rep = m_fwd_rep.lock ())
+-          {
+-            t_fwd_rep->mark_global ();
+-            return;
+-          }
+-
+-        if (is_persistent ())
+-          error ("can't make persistent variable %s global", m_name.c_str ());
+-
+         m_storage_class |= global;
+       }
+ 
+       void mark_persistent (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           {
+             t_fwd_rep->mark_persistent ();
+@@ -496,27 +485,16 @@ namespace octave
+           {
+             t_fwd_rep->unmark_inherited ();
+             return;
+           }
+ 
+         m_storage_class &= ~inherited;
+       }
+ 
+-      void unmark_global (void)
+-      {
+-        if (auto t_fwd_rep = m_fwd_rep.lock ())
+-          {
+-            t_fwd_rep->unmark_global ();
+-            return;
+-          }
+-
+-        m_storage_class &= ~global;
+-      }
+-
+       void unmark_persistent (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           {
+             t_fwd_rep->unmark_persistent ();
+             return;
+           }
+ 
+@@ -552,25 +530,31 @@ namespace octave
+       symbol_scope *decl_scope (void)
+       {
+         if (auto t_fwd_rep = m_fwd_rep.lock ())
+           return t_fwd_rep->decl_scope ();
+ 
+         return m_decl_scope;
+       }
+ 
+-      // We don't forward more than once, so no need to forward the
+-      // next two.
+-
+       void bind_fwd_rep (const std::shared_ptr<symbol_record_rep>& fwd_rep)
+       {
++        if (auto t_fwd_rep = m_fwd_rep.lock ())
++          t_fwd_rep->bind_fwd_rep (fwd_rep);
++
+         m_fwd_rep = fwd_rep;
+       }
+ 
+-      void unbind_fwd_rep (void) { m_fwd_rep.reset (); }
++      void unbind_fwd_rep (void)
++      {
++        if (auto t_fwd_rep = m_fwd_rep.lock ())
++          t_fwd_rep->unbind_fwd_rep ();
++
++        m_fwd_rep.reset ();
++      }
+ 
+       symbol_record_rep * dup (symbol_scope *new_scope) const;
+ 
+       octave_value dump (void) const;
+ 
+       std::string name (void) const { return m_name; }
+ 
+       void rename (const std::string& new_name) { m_name = new_name; }
+@@ -583,22 +567,16 @@ namespace octave
+ 
+       std::weak_ptr<symbol_record_rep> m_fwd_rep;
+ 
+       std::deque<octave_value> m_value_stack;
+ 
+       unsigned int m_storage_class;
+ 
+       bool m_valid;
+-
+-    private:
+-
+-      octave_value& xglobal_varref (void);
+-
+-      octave_value xglobal_varval (void) const;
+     };
+ 
+   public:
+ 
+     symbol_record (void);
+ 
+     symbol_record (symbol_scope *s, const std::string& nm = "",
+                    const octave_value& v = octave_value (),
+@@ -648,22 +626,16 @@ namespace octave
+ 
+     void do_non_const_unary_op (octave_value::unary_op op,
+                                 const std::string& type,
+                                 const std::list<octave_value_list>& idx)
+     {
+       m_rep->do_non_const_unary_op (op, type, idx);
+     }
+ 
+-    // Delete when deprecated varref functions are removed.
+-    octave_value& varref (void)
+-    {
+-      return m_rep->varref ();
+-    }
+-
+     octave_value varval (void) const
+     {
+       return m_rep->varval ();
+     }
+ 
+     void push_context (void) { m_rep->push_context (); }
+ 
+     size_t pop_context (void) { return m_rep->pop_context (); }
+@@ -708,17 +680,16 @@ namespace octave
+     void mark_persistent (void) { m_rep->mark_persistent (); }
+     void mark_added_static (void) { m_rep->mark_added_static (); }
+ 
+     void unmark_local (void) { m_rep->unmark_local (); }
+     void unmark_automatic (void) { m_rep->unmark_automatic (); }
+     void unmark_formal (void) { m_rep->unmark_formal (); }
+     void unmark_hidden (void) { m_rep->unmark_hidden (); }
+     void unmark_inherited (void) { m_rep->unmark_inherited (); }
+-    void unmark_global (void) { m_rep->unmark_global (); }
+     void unmark_persistent (void) { m_rep->unmark_persistent (); }
+     void unmark_added_static (void) { m_rep->unmark_added_static (); }
+ 
+     void init_persistent (void) { m_rep->init_persistent (); }
+ 
+     void invalidate (void) { m_rep->invalidate (); }
+ 
+     symbol_scope *decl_scope (void) { return m_rep->decl_scope (); }
+diff --git a/libinterp/corefcn/symscope.cc b/libinterp/corefcn/symscope.cc
+--- a/libinterp/corefcn/symscope.cc
++++ b/libinterp/corefcn/symscope.cc
+@@ -101,54 +101,16 @@ namespace octave
+ 
+             return m_symbols[name] = ret;
+           }
+       }
+     else
+       return p->second;
+   }
+ 
+-  void
+-  symbol_scope::clear_global (const std::string& name)
+-  {
+-    table_iterator p = m_symbols.find (name);
+-
+-    if (p != m_symbols.end ())
+-      {
+-        symbol_record& sr = p->second;
+-
+-        if (sr.is_global ())
+-          sr.unmark_global ();
+-      }
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_scope::clear_global");
+-
+-    symtab.erase_global (name);
+-  }
+-
+-  void
+-  symbol_scope::clear_global_pattern (const std::string& pat)
+-  {
+-    glob_match pattern (pat);
+-
+-    for (auto& nm_sr : m_symbols)
+-      {
+-        symbol_record& sr = nm_sr.second;
+-
+-        if (sr.is_global () && pattern.match (sr.name ()))
+-          sr.unmark_global ();
+-      }
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_scope::clear_global_pattern");
+-
+-    symtab.erase_global_pattern (pattern);
+-  }
+-
+   std::list<workspace_element>
+   symbol_scope::workspace_info (void) const
+   {
+     std::list<workspace_element> retval;
+ 
+     for (const auto& nm_sr : m_symbols)
+       {
+         std::string nm = nm_sr.first;
+diff --git a/libinterp/corefcn/symscope.h b/libinterp/corefcn/symscope.h
+--- a/libinterp/corefcn/symscope.h
++++ b/libinterp/corefcn/symscope.h
+@@ -213,32 +213,16 @@ namespace octave
+           symbol_record& sr = insert (name, true);
+ 
+           sr.assign (value);
+         }
+       else
+         p->second.assign (value);
+     }
+ 
+-    // Use assign (name, value, force_add) instead.
+-    // Delete when deprecated varref functions are removed.
+-    octave_value& varref (const std::string& name, bool force_add)
+-    {
+-      table_iterator p = m_symbols.find (name);
+-
+-      if (p == m_symbols.end ())
+-        {
+-          symbol_record& sr = insert (name, force_add);
+-
+-          return sr.varref ();
+-        }
+-      else
+-        return p->second.varref ();
+-    }
+-
+     octave_value varval (const std::string& name) const
+     {
+       table_const_iterator p = m_symbols.find (name);
+ 
+       return (p != m_symbols.end ()
+               ? p->second.varval () : octave_value ());
+     }
+ 
+@@ -300,28 +284,24 @@ namespace octave
+         {
+           symbol_record& sr = nm_sr.second;
+           octave_value val = sr.varval ();
+           if (val.isobject ())
+             nm_sr.second.clear ();
+         }
+     }
+ 
+-    void clear_global (const std::string& name);
+-
+     void clear_variable (const std::string& name)
+     {
+       table_iterator p = m_symbols.find (name);
+ 
+       if (p != m_symbols.end ())
+         p->second.clear ();
+     }
+ 
+-    void clear_global_pattern (const std::string& pat);
+-
+     void clear_variable_pattern (const std::string& pat)
+     {
+       glob_match pattern (pat);
+ 
+       for (auto& nm_sr : m_symbols)
+         {
+           symbol_record& sr = nm_sr.second;
+ 
+diff --git a/libinterp/corefcn/symtab.cc b/libinterp/corefcn/symtab.cc
+--- a/libinterp/corefcn/symtab.cc
++++ b/libinterp/corefcn/symtab.cc
+@@ -288,36 +288,25 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   void
+-  symbol_table::erase_global (const std::string& name)
++  symbol_table::clear_global (const std::string& name)
+   {
+-    global_symbols_iterator q = m_global_symbols.find (name);
+-
+-    if (q != m_global_symbols.end ())
+-      m_global_symbols.erase (q);
++    m_global_scope->clear_variable (name);
+   }
+ 
+   void
+-  symbol_table::erase_global_pattern (const glob_match& pattern)
++  symbol_table::clear_global_pattern (const std::string& pattern)
+   {
+-    global_symbols_iterator q = m_global_symbols.begin ();
+-
+-    while (q != m_global_symbols.end ())
+-      {
+-        if (pattern.match (q->first))
+-          m_global_symbols.erase (q++);
+-        else
+-          q++;
+-      }
++    m_global_scope->clear_variable_pattern (pattern);
+   }
+ 
+   // Insert INF_CLASS in the set of class names that are considered
+   // inferior to SUP_CLASS.  Return FALSE if INF_CLASS is currently
+   // marked as superior to SUP_CLASS.
+ 
+   bool
+   symbol_table::set_class_relationship (const std::string& sup_class,
+@@ -539,17 +528,16 @@ namespace octave
+     return octave_value (m);
+   }
+ 
+   void
+   symbol_table::cleanup (void)
+   {
+     clear_all (true);
+ 
+-    m_global_symbols.clear ();
+     m_fcn_table.clear ();
+     m_class_precedence_table.clear ();
+     m_parent_map.clear ();
+   }
+ 
+   octave_value
+   symbol_table::dump_fcn_table_map (void) const
+   {
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -55,17 +55,17 @@ namespace octave
+ 
+     typedef octave::symbol_record symbol_record;
+     typedef octave::symbol_scope scope;
+     typedef octave::fcn_info fcn_info;
+ 
+     typedef scope::context_id context_id;
+ 
+     symbol_table (void)
+-      : m_global_symbols (), m_fcn_table (), m_class_precedence_table (),
++      : m_fcn_table (), m_class_precedence_table (),
+         m_parent_map (), m_global_scope (new scope ("global scope")),
+         m_top_scope (new symbol_scope ("top scope")),
+         m_current_scope (m_top_scope)
+       { }
+ 
+     // No copying!
+ 
+     symbol_table (const symbol_table&) = delete;
+@@ -117,16 +117,25 @@ namespace octave
+       return sid ? sid->find_symbol (name) : symbol_record ();
+     }
+ 
+     symbol_record find_symbol (const std::string& name)
+     {
+       return find_symbol (name, m_current_scope);
+     }
+ 
++    symbol_record find_global_symbol (const std::string& name)
++    {
++      symbol_record sym = find_symbol (name, m_global_scope);
++
++      sym.mark_global ();
++
++      return sym;
++    }
++
+     void inherit (symbol_scope *recipient_scope, symbol_scope *donor_scope)
+     {
+       if (recipient_scope)
+         recipient_scope->inherit (donor_scope);
+     }
+ 
+     void inherit (symbol_scope *recipient_scope)
+     {
+@@ -156,41 +165,25 @@ namespace octave
+     }
+ 
+     octave_value varval (const std::string& name) const
+     {
+       return (m_current_scope
+               ? m_current_scope->varval (name) : octave_value ());
+     }
+ 
+-    void
+-      global_assign (const std::string& name,
+-                     const octave_value& value = octave_value ())
++    void global_assign (const std::string& name,
++                        const octave_value& value = octave_value ())
+     {
+-      global_symbols_iterator p = m_global_symbols.find (name);
+-
+-      if (p == m_global_symbols.end ())
+-        m_global_symbols[name] = value;
+-      else
+-        p->second = value;
+-    }
+-
+-    octave_value& global_varref (const std::string& name)
+-    {
+-      global_symbols_iterator p = m_global_symbols.find (name);
+-
+-      return (p == m_global_symbols.end ()
+-              ? m_global_symbols[name] : p->second);
++      m_global_scope->assign (name, value);
+     }
+ 
+     octave_value global_varval (const std::string& name) const
+     {
+-      global_symbols_const_iterator p = m_global_symbols.find (name);
+-
+-      return (p != m_global_symbols.end ()) ? p->second : octave_value ();
++      return m_global_scope->varval (name);
+     }
+ 
+     void
+       top_level_assign (const std::string& name,
+                         const octave_value& value = octave_value ())
+     {
+       m_top_scope->assign (name, value);
+     }
+@@ -373,24 +366,27 @@ namespace octave
+ 
+           m_fcn_table[name] = finfo;
+         }
+     }
+ 
+     void clear_all (bool force = false)
+     {
+       if (m_current_scope)
+-        {
+-          m_current_scope->clear_variables ();
+-          m_current_scope->clear_global_pattern ("*");
+-        }
++        m_current_scope->clear_variables ();
++
++      m_global_scope->clear_variables ();
+ 
+       clear_functions (force);
+     }
+ 
++    void clear_global (const std::string& name);
++
++    void clear_global_pattern (const std::string& pattern);
++
+     // This is written as two separate functions instead of a single
+     // function with default values so that it will work properly with
+     // unwind_protect.
+ 
+     void clear_functions (bool force = false)
+     {
+       fcn_table_iterator p = m_fcn_table.begin ();
+ 
+@@ -470,20 +466,16 @@ namespace octave
+     void clear_mex_functions (void)
+     {
+       fcn_table_iterator p = m_fcn_table.begin ();
+ 
+       while (p != m_fcn_table.end ())
+         (p++)->second.clear_mex_function ();
+     }
+ 
+-    void erase_global (const std::string& name);
+-
+-    void erase_global_pattern (const glob_match& pattern);
+-
+     bool set_class_relationship (const std::string& sup_class,
+                                  const std::string& inf_class);
+ 
+     bool is_superiorto (const std::string& a, const std::string& b);
+ 
+     void alias_built_in_function (const std::string& alias,
+                                   const std::string& name)
+     {
+@@ -517,56 +509,25 @@ namespace octave
+     }
+ 
+     std::list<symbol_record> glob (const std::string& pattern)
+     {
+       return (m_current_scope
+               ? m_current_scope->glob (pattern) : std::list<symbol_record> ());
+     }
+ 
+-    std::list<symbol_record>
+-      glob_global_variables (const std::string& pattern)
++    std::list<symbol_record> glob_global_variables (const std::string& pattern)
+     {
+-      std::list<symbol_record> retval;
+-
+-      glob_match pat (pattern);
+-
+-      for (const auto& nm_val : m_global_symbols)
+-        {
+-          // We generate a list of symbol_record objects so that the results from
+-          // glob_variables and glob_global_variables may be handled the same
+-          // way.
+-          if (pat.match (nm_val.first))
+-            retval.push_back (symbol_record (m_global_scope,
+-                                             nm_val.first, nm_val.second,
+-                                             symbol_record::global));
+-        }
+-
+-      return retval;
++      return m_global_scope->glob (pattern);
+     }
+ 
+     std::list<symbol_record>
+-      regexp_global_variables (const std::string& pattern)
++    regexp_global_variables (const std::string& pattern)
+     {
+-      std::list<symbol_record> retval;
+-
+-      octave::regexp pat (pattern);
+-
+-      for (const auto& nm_val : m_global_symbols)
+-        {
+-          // We generate a list of symbol_record objects so that the results from
+-          // regexp_variables and regexp_global_variables may be handled the same
+-          // way.
+-          if (pat.is_match (nm_val.first))
+-            retval.push_back (symbol_record (m_global_scope,
+-                                             nm_val.first, nm_val.second,
+-                                             symbol_record::global));
+-        }
+-
+-      return retval;
++      return m_global_scope->regexp (pattern);
+     }
+ 
+     std::list<symbol_record> glob_variables (const string_vector& patterns)
+     {
+       std::list<symbol_record> retval;
+ 
+       if (! m_current_scope)
+         return retval;
+@@ -615,24 +576,17 @@ namespace octave
+       if (! retval.empty ())
+         retval.sort ();
+ 
+       return retval;
+     }
+ 
+     std::list<std::string> global_variable_names (void)
+     {
+-      std::list<std::string> retval;
+-
+-      for (const auto& nm_val : m_global_symbols)
+-        retval.push_back (nm_val.first);
+-
+-      retval.sort ();
+-
+-      return retval;
++      return m_global_scope->variable_names ();
+     }
+ 
+     std::list<std::string> top_level_variable_names (void)
+     {
+       return (m_top_scope
+               ? m_top_scope->variable_names () : std::list<std::string> ());
+     }
+ 
+@@ -731,19 +685,16 @@ namespace octave
+     typedef std::map<std::string, octave_value>::iterator
+       global_symbols_iterator;
+ 
+     typedef std::map<std::string, fcn_info>::const_iterator
+       fcn_table_const_iterator;
+     typedef std::map<std::string, fcn_info>::iterator
+       fcn_table_iterator;
+ 
+-    // Map from names of global variables to values.
+-    std::map<std::string, octave_value> m_global_symbols;
+-
+     // Map from function names to function info (private
+     // functions, class constructors, class methods, etc.)
+     // Note that subfunctions are defined in the scope that contains
+     // them.
+     std::map<std::string, fcn_info> m_fcn_table;
+ 
+     // Map from class names to set of classes that have lower
+     // precedence.
+diff --git a/libinterp/corefcn/variables.cc b/libinterp/corefcn/variables.cc
+--- a/libinterp/corefcn/variables.cc
++++ b/libinterp/corefcn/variables.cc
+@@ -2107,38 +2107,51 @@ do_clear_globals (octave::symbol_table& 
+ 
+   if (idx == argc)
+     {
+       string_vector gvars = symtab.global_variable_names ();
+ 
+       int gcount = gvars.numel ();
+ 
+       for (int i = 0; i < gcount; i++)
+-        scope->clear_global (gvars[i]);
++        {
++          std::string name = gvars[i];
++
++          scope->clear_variable (name);
++          symtab.clear_global (name);
++        }
+     }
+   else
+     {
+       if (exclusive)
+         {
+           string_vector gvars = symtab.global_variable_names ();
+ 
+           int gcount = gvars.numel ();
+ 
+           for (int i = 0; i < gcount; i++)
+             {
+-              std::string nm = gvars[i];
+-
+-              if (! name_matches_any_pattern (nm, argv, argc, idx))
+-                scope->clear_global (nm);
++              std::string name = gvars[i];
++
++              if (! name_matches_any_pattern (name, argv, argc, idx))
++                {
++                  scope->clear_variable (name);
++                  symtab.clear_global (name);
++                }
+             }
+         }
+       else
+         {
+           while (idx < argc)
+-            scope->clear_global_pattern (argv[idx++]);
++            {
++              std::string pattern = argv[idx++];
++
++              scope->clear_variable_pattern (pattern);
++              symtab.clear_global_pattern (pattern);
++            }
+         }
+     }
+ }
+ 
+ static void
+ do_clear_variables (octave::symbol_table& symtab,
+                     const string_vector& argv, int argc, int idx,
+                     bool exclusive = false, bool have_regexp = false)
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -706,17 +706,23 @@ namespace octave
+   void
+   tree_evaluator::visit_decl_elt (tree_decl_elt& elt)
+   {
+     tree_identifier *id = elt.ident ();
+ 
+     if (id)
+       {
+         if (elt.is_global ())
+-          id->mark_global ();
++          {
++            symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++            symbol_record global_sym = symtab.find_global_symbol (id->name ());
++
++            id->link_to_global (global_sym);
++          }
+         else if (elt.is_persistent ())
+           id->mark_persistent ();
+         else
+           error ("declaration list element not global or persistent");
+ 
+         octave_lvalue ult = id->lvalue (this);
+ 
+         if (ult.is_undefined ())
+diff --git a/libinterp/parse-tree/pt-id.cc b/libinterp/parse-tree/pt-id.cc
+--- a/libinterp/parse-tree/pt-id.cc
++++ b/libinterp/parse-tree/pt-id.cc
+@@ -25,26 +25,32 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #include "error.h"
+ #include "interpreter-private.h"
+ #include "oct-lvalue.h"
+ #include "parse.h"
+ #include "pt-const.h"
+ #include "pt-id.h"
+-#include "symtab.h"
++#include "symscope.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ namespace octave
+ {
+   // Symbols from the symbol table.
+ 
+   class tree_evaluator;
+ 
++  void tree_identifier::link_to_global (const symbol_record& global_sym)
++  {
++    if (! sym.is_global ())
++      sym.bind_fwd_rep (global_sym);
++  }
++
+   void
+   tree_identifier::eval_undefined_error (void)
+   {
+     int l = line ();
+     int c = column ();
+ 
+     maybe_missing_function_hook (name ());
+ 
+diff --git a/libinterp/parse-tree/pt-id.h b/libinterp/parse-tree/pt-id.h
+--- a/libinterp/parse-tree/pt-id.h
++++ b/libinterp/parse-tree/pt-id.h
+@@ -31,17 +31,17 @@ along with Octave; see the file COPYING.
+ class octave_value;
+ class octave_value_list;
+ class octave_function;
+ 
+ #include "oct-lvalue.h"
+ #include "pt-bp.h"
+ #include "pt-exp.h"
+ #include "pt-walk.h"
+-#include "symtab.h"
++#include "symscope.h"
+ 
+ namespace octave
+ {
+   class tree_evaluator;
+ 
+   // Symbols from the symbol table.
+ 
+   class tree_identifier : public tree_expression
+@@ -64,18 +64,16 @@ namespace octave
+     tree_identifier& operator = (const tree_identifier&) = delete;
+ 
+     ~tree_identifier (void) = default;
+ 
+     bool has_magic_end (void) const { return (name () == "end"); }
+ 
+     bool is_identifier (void) const { return true; }
+ 
+-    // The name doesn't change with scope, so use sym instead of
+-    // accessing it through sym so that this function may remain const.
+     std::string name (void) const { return sym.name (); }
+ 
+     bool is_defined (void) { return sym.is_defined (); }
+ 
+     virtual bool is_variable (void) const { return sym.is_variable (); }
+ 
+     virtual bool is_black_hole (void) { return false; }
+ 
+@@ -95,17 +93,17 @@ namespace octave
+     //     then .mex files, then .m files.
+ 
+     octave_value
+     do_lookup (const octave_value_list& args = octave_value_list ())
+     {
+       return sym.find (args);
+     }
+ 
+-    void mark_global (void) { sym.mark_global (); }
++    void link_to_global (const symbol_record& global_sym);
+ 
+     void mark_persistent (void) { sym.init_persistent (); }
+ 
+     void mark_as_formal_parameter (void) { sym.mark_formal (); }
+ 
+     // We really need to know whether this symbol referst to a variable
+     // or a function, but we may not know that yet.
+ 

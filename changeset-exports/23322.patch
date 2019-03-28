@@ -1,0 +1,496 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1490124327 -3600
+#      Tue Mar 21 20:25:27 2017 +0100
+# Node ID c4aebfe51a1705835f7b97b923bdd990484850e6
+# Parent  ac4d0a72927aa0ca58fed287d01b62c10d102931
+provide a context menu and shortcuts for the doc browser tab bar (bug #44605)
+
+* documentation-dock-widget.cc (constructor): set focus proxy to _webinfo;
+  (notice_settings): new slot, just calling the settings method in _webinfo;
+
+* documentation-dock-widget.h: new slot notice_settings
+
+* webinfo.cc (webinfo::webinfo): add close actions to the tab bar;
+  (webinfo::add_action): new helper function for adding actions to a menu;
+  (webinfo::request_close_tab): new slot for tab closing action;
+  (webinfo::request_close_other_tabs): new slot for closing all other tabs;
+  (webinfo::tab_state_changed): function called when a new tab gets focus
+  for dis-/enabling actions and setting the focus to the new tab;
+  (webinfo::current_tab_changed, webinfo::addNewTab, webinfo::close_tab):
+  use new function tab_state_changed;
+  (webinfo::notice_settings): new function called from dock widget when
+  settings have changed, sets the close shortcuts (same as in editor);
+  (webinfo_tab_bar::webinfo_tab_bar): initialize the new context menu;
+  (webinfo_tab_bar::~webinfo_tab_bar): delete the context menu;
+  (webinfo_tab_bar::mousePressEvent): extend event handler by the right
+  click for showing the context menu
+
+* webinfo.h (webinfo_tab_bar): class variable _context_menu and public
+  method returning this menu, constructor and destructor in webinfo.cc
+  (webinfo): new methods add_action and notice_settings, new slots
+  request_close_tab and request_close_other_tabs, new actions for tab closing
+
+diff --git a/libgui/src/documentation-dock-widget.cc b/libgui/src/documentation-dock-widget.cc
+--- a/libgui/src/documentation-dock-widget.cc
++++ b/libgui/src/documentation-dock-widget.cc
+@@ -31,16 +31,17 @@ documentation_dock_widget::documentation
+ {
+   setObjectName ("DocumentationDockWidget");
+   setWindowIcon (QIcon (":/actions/icons/logo.png"));
+   set_title (tr ("Documentation"));
+   setStatusTip (tr ("See the documentation for help."));
+ 
+   _webinfo = new webinfo (this);
+   setWidget (_webinfo);
++  setFocusProxy (_webinfo);
+ 
+   connect (p, SIGNAL (show_doc_signal (const QString &)),
+            this, SLOT (showDoc (const QString &)));
+ }
+ 
+ void
+ documentation_dock_widget::copyClipboard ()
+ {
+@@ -63,8 +64,14 @@ documentation_dock_widget::showDoc (cons
+   // show the doc pane without focus for carrying on typing in the console
+   if (! isVisible ())
+     setVisible (true);
+   raise ();
+ 
+   _webinfo->load_ref (name);
+ 
+ }
++
++void
++documentation_dock_widget::notice_settings (const QSettings *settings)
++{
++  _webinfo->notice_settings (settings);
++}
+diff --git a/libgui/src/documentation-dock-widget.h b/libgui/src/documentation-dock-widget.h
+--- a/libgui/src/documentation-dock-widget.h
++++ b/libgui/src/documentation-dock-widget.h
+@@ -30,20 +30,25 @@ along with Octave; see the file COPYING.
+ class documentation_dock_widget : public octave_dock_widget
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+   documentation_dock_widget (QWidget *parent = 0);
+ 
++public slots:
++
++  void notice_settings (const QSettings *settings);
++
+ protected slots:
+   void copyClipboard ();
+   void pasteClipboard ();
+   void selectAll ();
+ 
+   void showDoc (const QString & name);
++
+ private:
+ 
+   webinfo *_webinfo;
+ };
+ 
+ #endif
+diff --git a/libgui/src/qtinfo/webinfo.cc b/libgui/src/qtinfo/webinfo.cc
+--- a/libgui/src/qtinfo/webinfo.cc
++++ b/libgui/src/qtinfo/webinfo.cc
+@@ -33,16 +33,17 @@ along with Octave; see the file COPYING.
+ #include <QHBoxLayout>
+ #include <QApplication>
+ #include <QClipboard>
+ 
+ #include "file-ops.h"
+ #include "help.h"
+ #include "defaults.h"
+ #include "resource-manager.h"
++#include "shortcut-manager.h"
+ 
+ 
+ webinfo::webinfo (QWidget *p)
+   : QWidget (p)
+ {
+   _font_web = font ();
+ 
+   QVBoxLayout *vbox_layout = new QVBoxLayout ();
+@@ -82,16 +83,25 @@ webinfo::webinfo (QWidget *p)
+   _search_line_edit->setPlaceholderText (
+     tr ("Type here and press \'Return\' to search"));
+ #endif
+   hbox_layout->addWidget (_search_line_edit);
+ 
+   _search_check_box = new QCheckBox (tr ("Global search"));
+   hbox_layout->addWidget (_search_check_box);
+ 
++  _close_action = add_action (_tab_bar->get_context_menu (),
++        resource_manager::icon ("window-close",false), tr ("&Close"),
++        SLOT (request_close_tab (bool)));
++  _close_others_action = add_action (_tab_bar->get_context_menu (),
++        resource_manager::icon ("window-close",false), tr ("Close &Other Tabs"),
++        SLOT (request_close_other_tabs (bool)));
++  _close_action->setEnabled (false);
++  _close_others_action->setEnabled (false);
++
+   connect (_tab_bar, SIGNAL (tabCloseRequested (int)), this,
+            SLOT (close_tab (int)));
+   connect (_tab_bar, SIGNAL (currentChanged (int)), this,
+            SLOT (current_tab_changed (int)));
+   connect (_zoom_in_button, SIGNAL (clicked ()), this, SLOT (zoom_in ()));
+   connect (_zoom_out_button, SIGNAL (clicked ()), this, SLOT (zoom_out ()));
+   connect (_search_line_edit, SIGNAL (returnPressed ()), this, SLOT (search ()));
+ 
+@@ -107,16 +117,57 @@ webinfo::webinfo (QWidget *p)
+       QString msg_text = QString (
+           "<html><body><br><br><center><b>%1</b></center></body></html>").
+           arg (tr ("The info file<p>%1<p>or compressed versions do not exist").
+           arg (QString::fromStdString (Vinfo_file)));
+       msg->setHtml (msg_text);
+     }
+ }
+ 
++// Add an action to a menu or the widget itself
++QAction*
++webinfo::add_action (QMenu *menu, const QIcon &icon, const QString &text,
++                         const char *member)
++{
++  QAction *a;
++
++  if (menu)
++    a = menu->addAction (icon, text, this, member);
++  else
++    {
++      a = new QAction (this);
++      connect (a, SIGNAL (triggered ()), this, member);
++    }
++
++  addAction (a);  // important for shortcut context
++  a->setShortcutContext (Qt::WidgetWithChildrenShortcut);
++
++  return a;
++}
++
++// Slot for the close tab action
++void
++webinfo::request_close_tab (bool)
++{
++  close_tab (_tab_bar->currentIndex ());
++}
++
++// Slot for the close other tabs action
++void
++webinfo::request_close_other_tabs (bool)
++{
++  int current = _tab_bar->currentIndex ();
++
++  for (int index = _tab_bar->count ()-1; index >= 0; index--)
++  {
++    if (current != index)
++      close_tab (index);
++  }
++}
++
+ bool
+ webinfo::set_info_path (const QString& info_path)
+ {
+   if (_parser.set_info_path (info_path))
+     {
+       load_node ("Top");
+       return true;
+     }
+@@ -158,27 +209,37 @@ webinfo::link_clicked (const QUrl & link
+   QString node = link.toString ();
+   if (node.at (0) != '#')
+     load_node (node);
+   else
+     _text_browser->scrollToAnchor (node);
+ }
+ 
+ void
++webinfo::tab_state_changed ()
++{
++  _close_action->setEnabled (_tab_bar->count () > 1);
++  _close_others_action->setEnabled (_tab_bar->count () > 1);
++  setFocusProxy (_stacked_widget->currentWidget ());
++}
++
++void
+ webinfo::current_tab_changed (int index)
+ {
+   QVariant tab_data = _tab_bar->tabData (index);
+   _text_browser = static_cast<QTextBrowser*> (tab_data.value<void*> ());
+ 
+   _stacked_widget->setCurrentIndex (_stacked_widget->indexOf (_text_browser));
+ 
+   if (_text_browser->font () != _font_web)
+     {
+       _text_browser->setFont (_font_web);
+     }
++
++  tab_state_changed ();
+ }
+ 
+ QTextBrowser *
+ webinfo::addNewTab (const QString& name)
+ {
+   _text_browser = new QTextBrowser (this);
+   _text_browser->setOpenLinks (false);
+   _text_browser->show ();
+@@ -195,16 +256,18 @@ webinfo::addNewTab (const QString& name)
+   _tab_bar->setCurrentIndex (nt);
+   QVariant tab_data;
+   tab_data.setValue (static_cast<void*> (_text_browser));
+   _tab_bar->setTabData (nt, tab_data);
+ 
+   connect (_tab_bar, SIGNAL (currentChanged (int)), this,
+            SLOT (current_tab_changed (int)));
+ 
++  tab_state_changed ();
++
+   if (_text_browser->font () != _font_web)
+     {
+       _text_browser->setFont (_font_web);
+     }
+   return _text_browser;
+ }
+ 
+ void
+@@ -214,16 +277,18 @@ webinfo::close_tab (int index)
+     {
+       QVariant tab_data = _tab_bar->tabData (index);
+       QWidget *w = static_cast<QWidget*> (tab_data.value<void*> ());
+       _stacked_widget->removeWidget (w);
+       delete w;
+ 
+       _tab_bar->removeTab (index);
+     }
++
++  tab_state_changed ();
+ }
+ 
+ void
+ webinfo::load_ref (const QString &ref_name)
+ {
+   QString text = _parser.find_ref (ref_name);
+   if (text.length () > 0)
+     {
+@@ -308,41 +373,108 @@ webinfo::pasteClipboard ()
+     {
+       QClipboard *clipboard = QApplication::clipboard ();
+       QString str = clipboard->text ();
+       if (str.length () > 0)
+         _search_line_edit->insert (str);
+     }
+ }
+ 
++void
++webinfo::notice_settings (const QSettings* settings)
++{
++  shortcut_manager::set_shortcut (_close_action, "editor_file:close");
++  shortcut_manager::set_shortcut (_close_others_action, "editor_file:close_other");
++}
+ 
+ //
+ // Functions of the the reimplemented tab bar
+ //
+ 
++webinfo_tab_bar::webinfo_tab_bar (QWidget *p) : QTabBar (p)
++{
++  // prepare the context menu of the tab bar
++  _context_menu = new QMenu (this);
++}
++
++webinfo_tab_bar::~webinfo_tab_bar ()
++{
++  delete _context_menu;
++}
++
+ // Reimplement mouse event for filtering out the desired mouse clicks
+ void
+ webinfo_tab_bar::mousePressEvent (QMouseEvent *me)
+ {
+-  if (count () > 1 &&
+-      ((me->type () == QEvent::MouseButtonDblClick &&
+-        me->button() == Qt::LeftButton) ||
+-       (me->type () != QEvent::MouseButtonDblClick &&
+-        me->button() == Qt::MidButton)))
++  QPoint click_pos;
++  int clicked_idx = -1;
++
++  // detect the tab where the click occured
++  for (int i = 0; i < count (); i++)
++    {
++      click_pos = mapToGlobal (me->pos ());
++      if (tabRect (i).contains (mapFromGlobal (click_pos)))
++        {
++          clicked_idx = i;
++          break;
++        }
++    }
++
++  // If a tab was clicked
++  if (clicked_idx >= 0)
+     {
+-      // Middle click into the tabbar -> close the tab
+-      for (int i = 0; i < count (); i++)
++      int current_idx = currentIndex ();
++      // detect the mouse click
++      if ((me->type () == QEvent::MouseButtonDblClick &&
++           me->button() == Qt::LeftButton) ||
++          (me->type () != QEvent::MouseButtonDblClick &&
++           me->button() == Qt::MidButton))
++        {
++          // Middle click or double click -> close the tab
++          // Make the clicked tab the current one and close it
++          emit tabCloseRequested (clicked_idx);
++          // Was the closed tab before or after the previously current tab?
++          // According to the result, use previous index or reduce it by one
++          if (current_idx - clicked_idx > 0)
++            setCurrentIndex (current_idx - 1);
++          else if (current_idx - clicked_idx < 0)
++            setCurrentIndex (current_idx);
++        }
++      else if (me->type () != QEvent::MouseButtonDblClick &&
++               me->button() == Qt::RightButton)
+         {
+-          QPoint clickPos = mapToGlobal (me->pos ());
+-          if (tabRect (i).contains (mapFromGlobal (clickPos)))
++          setCurrentIndex (clicked_idx);
++          if (! _context_menu->exec (click_pos))
++            {
++              // No action selected, back to previous tab
++              setCurrentIndex (current_idx);
++            }
++          else
+             {
+-              emit tabCloseRequested (i);
+-              break;
++              // Was the possibly only closed tab before or after the
++              // previously current tab? According to the result, use previous
++              // index or reduce it by one. Also prevent using a too large
++              // if other or all files were closed.
++              int new_idx = count () - 1;
++              if (new_idx > 0)
++                {
++                  if (current_idx - clicked_idx > 0)
++                    new_idx = current_idx - 1;
++                  else if (current_idx - clicked_idx < 0)
++                    new_idx = current_idx;
++                }
++              if (new_idx >= 0)
++                setCurrentIndex (new_idx);
+             }
+         }
++      else
++        {
++          // regular handling of the mouse event
++          QTabBar::mousePressEvent (me);
++        }
+     }
+   else
+     {
+       // regular handling of the mouse event
+       QTabBar::mousePressEvent (me);
+     }
+ }
+ 
+diff --git a/libgui/src/qtinfo/webinfo.h b/libgui/src/qtinfo/webinfo.h
+--- a/libgui/src/qtinfo/webinfo.h
++++ b/libgui/src/qtinfo/webinfo.h
+@@ -30,65 +30,90 @@ along with Octave; see the file COPYING.
+ #include <QTextBrowser>
+ #include "parser.h"
+ #include <QStackedWidget>
+ #include <QTabBar>
+ #include <QPushButton>
+ #include <QLineEdit>
+ #include <QCheckBox>
+ #include <QToolButton>
++#include <QMenu>
++#include <QAction>
+ #include <QMouseEvent>
++#include <QSettings>
+ 
+ // subclassed QTabWidget for usable tab-bar and reimplemented mouse event
+ class webinfo_tab_bar : public QTabBar
+ {
+   Q_OBJECT
+ 
+ public:
+ 
+-  webinfo_tab_bar (QWidget *p) : QTabBar (p) { }
++  webinfo_tab_bar (QWidget *p);
++  ~webinfo_tab_bar ();
++  QMenu *get_context_menu () { return _context_menu; }
+ 
+-  ~webinfo_tab_bar () { }
++public slots:
+ 
+ protected:
+ 
+   void mousePressEvent(QMouseEvent *event);
++
++private:
++
++  QMenu *_context_menu;
++
+ };
+ 
++
+ // The webinfo class
+ class webinfo : public QWidget
+ {
+   Q_OBJECT
++
+ public:
++
+   webinfo (QWidget *parent = 0);
+   bool set_info_path (const QString& info_path);
+   void load_node (const QString& node_name);
+-
+   void load_ref (const QString &ref_name);
++  void notice_settings (const QSettings *settings);
+ 
+ public slots:
++
+   void link_clicked (const QUrl& link);
+   void current_tab_changed (int index);
+   void close_tab (int index);
+   void search ();
+   void zoom_in ();
+   void zoom_out ();
+ 
+   void copyClipboard ();
+   void pasteClipboard ();
+   void selectAll ();
+ 
++  void request_close_tab (bool);
++  void request_close_other_tabs (bool);
++
+ private:
++
++  QAction *add_action (QMenu *menu, const QIcon &icon, const QString &text,
++                       const char *member);
++  void tab_state_changed (void);
++
+   QTextBrowser        *_text_browser;
+   webinfo_tab_bar     *_tab_bar;
+   QStackedWidget      *_stacked_widget;
+   QLineEdit           *_search_line_edit;
+   QCheckBox           *_search_check_box;
+   QToolButton         *_zoom_in_button;
+   QToolButton         *_zoom_out_button;
+ 
+   parser              _parser;
+   QFont               _font_web;
+ 
+   QTextBrowser *addNewTab (const QString& name);
++  QAction *_close_action;
++  QAction *_close_others_action;
++
+ };
+ 
+ #endif

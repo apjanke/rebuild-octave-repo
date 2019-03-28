@@ -1,0 +1,323 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1364430546 14400
+#      Wed Mar 27 20:29:06 2013 -0400
+# Node ID 389b09a914e264bbac1d4dacc9c9536265eee079
+# Parent  f33dcbd6a005f38fbb3664e13bc9bc5620d89c45
+allow gui to force readline to return from its idle/read loop
+
+* cmd-edit.h, cmd-edit.cc (command_editor::interrupt,
+command_editor::do_interrupt): New functions.
+(gnu_readline::do_interrupt): New function.
+* oct-rl-edit.h, oct-rl-edit.c (octave_rl_done): New function.
+
+* main-window.cc (main_window::debug_step_into_callback,
+main_window::debug_step_over_callback,
+main_window::debug_step_out_callback):
+Call command_editor::interrupt.
+
+* input.cc (get_debug_input): Reset command_editor::interrutp state.
+If previous state is true, then exit early.
+
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -45,16 +45,17 @@ along with Octave; see the file COPYING.
+ #include "settings-dialog.h"
+ 
+ #include "builtins.h"
+ #include "defaults.h"
+ #include "load-save.h"
+ #include "toplev.h"
+ #include "version.h"
+ 
++#include "cmd-edit.h"
+ #include "cmd-hist.h"
+ #include "oct-env.h"
+ 
+ main_window::main_window (QWidget *p)
+   : QMainWindow (p)
+ {
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
+@@ -1210,32 +1211,45 @@ main_window::change_directory_callback (
+ }
+ 
+ void
+ main_window::debug_continue_callback (void)
+ {
+   Fdbcont ();
+ }
+ 
++// The next three callbacks are invoked by GUI buttons.  Those buttons
++// should only be active when we are doing debugging, which means that
++// Octave is waiting for input in get_debug_input.  Calling
++// command_editor::interrupt will force readline to return even if it
++// has not read any input, and then get_debug_input will return,
++// allowing the evaluator to continue and execute the next statement.
++
+ void
+ main_window::debug_step_into_callback (void)
+ {
+   Fdbstep (ovl ("in"));
++
++  command_editor::interrupt (true);
+ }
+ 
+ void
+ main_window::debug_step_over_callback (void)
+ {
+   Fdbstep ();
++
++  command_editor::interrupt (true);
+ }
+ 
+ void
+ main_window::debug_step_out_callback (void)
+ {
+   Fdbstep (ovl ("out"));
++
++  command_editor::interrupt (true);
+ }
+ 
+ void
+ main_window::debug_quit_callback (void)
+ {
+   Fdbquit ();
+ }
+ 
+diff --git a/libinterp/interpfcn/input.cc b/libinterp/interpfcn/input.cc
+--- a/libinterp/interpfcn/input.cc
++++ b/libinterp/interpfcn/input.cc
+@@ -549,25 +549,30 @@ get_debug_input (const std::string& prom
+       unwind_protect middle_frame;
+ 
+       reset_error_handler ();
+ 
+       curr_parser.reset ();
+ 
+       int retval = curr_parser.run ();
+ 
+-      if (retval == 0 && curr_parser.stmt_list)
++      if (command_editor::interrupt (false))
++        break;
++      else
+         {
+-          curr_parser.stmt_list->accept (*current_evaluator);
++          if (retval == 0 && curr_parser.stmt_list)
++            {
++              curr_parser.stmt_list->accept (*current_evaluator);
+ 
+-          if (octave_completion_matches_called)
+-            octave_completion_matches_called = false;
++              if (octave_completion_matches_called)
++                octave_completion_matches_called = false;
++            }
++
++          octave_quit ();
+         }
+-
+-      octave_quit ();
+     }
+ }
+ 
+ const std::string octave_base_reader::in_src ("invalid");
+ 
+ const std::string octave_terminal_reader::in_src ("terminal");
+ 
+ std::string
+diff --git a/liboctave/util/cmd-edit.cc b/liboctave/util/cmd-edit.cc
+--- a/liboctave/util/cmd-edit.cc
++++ b/liboctave/util/cmd-edit.cc
+@@ -158,16 +158,18 @@ public:
+   void do_read_init_file (const std::string& file);
+ 
+   void do_re_read_init_file (void);
+ 
+   bool do_filename_completion_desired (bool);
+ 
+   bool do_filename_quoting_desired (bool);
+ 
++  void do_interrupt (bool);
++
+   static int operate_and_get_next (int, int);
+ 
+   static int history_search_backward (int, int);
+ 
+   static int history_search_forward (int, int);
+ 
+ private:
+ 
+@@ -582,16 +584,22 @@ gnu_readline::do_filename_completion_des
+ }
+ 
+ bool
+ gnu_readline::do_filename_quoting_desired (bool arg)
+ {
+   return ::octave_rl_filename_quoting_desired (arg);
+ }
+ 
++void
++gnu_readline::do_interrupt (bool arg)
++{
++  ::octave_rl_done (arg);
++}
++
+ int
+ gnu_readline::operate_and_get_next (int /* count */, int /* c */)
+ {
+   // Accept the current line.
+ 
+   command_editor::accept_line ();
+ 
+   // Find the current line, and find the next line to use.
+@@ -1265,16 +1273,36 @@ command_editor::filename_completion_desi
+ 
+ bool
+ command_editor::filename_quoting_desired (bool arg)
+ {
+   return (instance_ok ())
+     ? instance->do_filename_quoting_desired (arg) : false;
+ }
+ 
++bool
++command_editor::interrupt (bool arg)
++{
++  bool retval;
++
++  if (instance_ok ())
++    {
++      // Return the current interrupt state.
++      retval = instance->interrupted;
++
++      instance->do_interrupt (arg);
++
++      instance->interrupted = arg;
++    }
++  else
++    retval = false;
++
++  return retval;
++}
++
+ // Return a string which will be printed as a prompt.  The string may
+ // contain special characters which are decoded as follows:
+ //
+ //      \a      bell (ascii 07)
+ //      \d      the date
+ //      \e      escape (ascii 033)
+ //      \h      the hostname up to the first '.'
+ //      \H      the hostname
+diff --git a/liboctave/util/cmd-edit.h b/liboctave/util/cmd-edit.h
+--- a/liboctave/util/cmd-edit.h
++++ b/liboctave/util/cmd-edit.h
+@@ -32,17 +32,17 @@ along with Octave; see the file COPYING.
+ 
+ class
+ OCTAVE_API
+ command_editor
+ {
+ protected:
+ 
+   command_editor (void)
+-    : command_number (0) { }
++    : command_number (0), interrupted (false) { }
+ 
+ public:
+ 
+   typedef int (*startup_hook_fcn) (void);
+ 
+   typedef int (*event_hook_fcn) (void);
+ 
+   typedef std::string (*completion_fcn) (const std::string&, int);
+@@ -142,16 +142,18 @@ public:
+   static void read_init_file (const std::string& file = std::string ());
+ 
+   static void re_read_init_file (void);
+ 
+   static bool filename_completion_desired (bool);
+ 
+   static bool filename_quoting_desired (bool);
+ 
++  static bool interrupt (bool);
++
+   static int current_command_number (void);
+ 
+   static void reset_current_command_number (int n);
+ 
+   static void increment_current_command_number (void);
+ 
+   static void force_default_editor (void);
+ 
+@@ -282,19 +284,23 @@ protected:
+   virtual void do_read_init_file (const std::string&) { }
+ 
+   virtual void do_re_read_init_file (void) { }
+ 
+   virtual bool do_filename_completion_desired (bool) { return false; }
+ 
+   virtual bool do_filename_quoting_desired (bool) { return false; }
+ 
++  virtual void do_interrupt (bool) { }
++
+   int read_octal (const std::string& s);
+ 
+   void error (int);
+ 
+   void error (const std::string&);
+ 
+   // The current command number.
+   int command_number;
++
++  bool interrupted;
+ };
+ 
+ #endif
+diff --git a/liboctave/util/oct-rl-edit.c b/liboctave/util/oct-rl-edit.c
+--- a/liboctave/util/oct-rl-edit.c
++++ b/liboctave/util/oct-rl-edit.c
+@@ -213,16 +213,22 @@ octave_rl_filename_completion_desired (i
+ int
+ octave_rl_filename_quoting_desired (int arg)
+ {
+   int retval = rl_filename_quoting_desired;
+   rl_filename_quoting_desired = arg;
+   return retval;
+ }
+ 
++void
++octave_rl_done (int arg)
++{
++  rl_done = arg;
++}
++
+ char *
+ octave_rl_filename_completion_function (const char *text, int state)
+ {
+   return rl_filename_completion_function (text, state);
+ }
+ 
+ void
+ octave_rl_set_basic_word_break_characters (const char *s)
+diff --git a/liboctave/util/oct-rl-edit.h b/liboctave/util/oct-rl-edit.h
+--- a/liboctave/util/oct-rl-edit.h
++++ b/liboctave/util/oct-rl-edit.h
+@@ -85,16 +85,18 @@ extern FILE *octave_rl_get_output_stream
+ extern void octave_rl_read_init_file (const char *);
+ 
+ extern void octave_rl_re_read_init_file (void);
+ 
+ extern int octave_rl_filename_completion_desired (int);
+ 
+ extern int octave_rl_filename_quoting_desired (int);
+ 
++extern void octave_rl_done (int);
++
+ extern char *octave_rl_filename_completion_function (const char *, int);
+ 
+ extern void octave_rl_set_basic_word_break_characters (const char *);
+ 
+ extern void octave_rl_set_completer_word_break_characters (const char *);
+ 
+ extern void octave_rl_set_basic_quote_characters (const char *);
+ 

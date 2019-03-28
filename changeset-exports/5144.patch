@@ -1,0 +1,220 @@
+# HG changeset patch
+# User jwe
+# Date 1108469204 0
+#      Tue Feb 15 12:06:44 2005 +0000
+# Node ID 25b090e1be9f3cdd1df5f60fbc58873707311987
+# Parent  d6e99e773993fac7db016f8328c7c02534dafc3b
+[project @ 2005-02-15 12:06:05 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,21 @@
++2005-02-15  John W. Eaton  <jwe@octave.org>
++
++	* pt-mat.cc (tree_matrix::rvalue): Min size of ra_idx is 2.
++
++	* file-io.cc (Ffclear): New function.
++
++	* sighandlers.h: Define SIGCHLD if it is not already defined and
++	SIGCLD is defined.
++
++	* sighandlers.cc (octave_set_signal_handler): Request system calls
++	restarted if interrupted by signals (except for SIGALRM).
++	* dirfns.cc (Fls): Don't bother with sleeping or checking errno.
++
+ 2005-02-11  John W. Eaton  <jwe@octave.org>
+ 
+ 	* sighandlers.cc (sigpipe_handler): Don't try to take action.
+ 	Set octave_signal_caught and octave_signals_caught here.
+ 	(sigchld_handler): Call octave_child_list::wait here.
+ 	Set octave_signal_caught and octave_signals_caught here.
+ 	(octave_signals_caught): New static file-scope variable.
+ 	(sigint_handler): Also set octave_signal_caught.
+diff --git a/src/dirfns.cc b/src/dirfns.cc
+--- a/src/dirfns.cc
++++ b/src/dirfns.cc
+@@ -177,48 +177,31 @@ from system to system.\n\
+   ls_buf << OSSTREAM_ENDS;
+ 
+   iprocstream *cmd = new iprocstream (OSSTREAM_STR (ls_buf));
+ 
+   OSSTREAM_FREEZE (ls_buf);
+ 
+   unwind_protect::add (cleanup_iprocstream, cmd);
+ 
+-  // XXX FIXME XXX -- Perhaps we should read more than one character
+-  // at a time and find a way to avoid the call to octave_usleep as
+-  // well?
+-
+   if (cmd && *cmd)
+     {
+-      // This is a bit of a kluge...
+-
+-      octave_usleep (100);
+-
+       char ch;
+ 
+       OSSTREAM output_buf;
+ 
+       for (;;)
+ 	{
+ 	  if (cmd->get (ch))
+ 	    {
+ 	      octave_stdout << ch;
+ 	      output_buf << ch;
+ 	    }
+ 	  else
+-	    {
+-	      if (! cmd->eof () && errno == EAGAIN)
+-		{
+-		  cmd->clear ();
+-
+-		  octave_usleep (100);
+-		}
+-	      else
+-		break;
+-	    }
++	    break;
+ 	}
+ 
+       output_buf << OSSTREAM_ENDS;
+ 
+       if (nargout > 0)
+ 	retval = OSSTREAM_STR (output_buf);
+ 
+       OSSTREAM_FREEZE (output_buf);
+diff --git a/src/file-io.cc b/src/file-io.cc
+--- a/src/file-io.cc
++++ b/src/file-io.cc
+@@ -214,16 +214,41 @@ otherwise, it returns -1.\n\
+   if (nargin == 1)
+     retval = octave_stream_list::remove (args(0), "fclose");
+   else
+     print_usage ("fclose");
+ 
+   return retval;
+ }
+ 
++DEFUN (fclear, args, ,
++  "-*- texinfo -*-\n\
++@deftypefn {Built-in Function} {} fclear (@var{fid})\n\
++Clear the stream state for the specified file.\n\
++@end deftypefn")
++{
++  octave_value retval;
++
++  int nargin = args.length ();
++
++  if (nargin == 1)
++    {
++      int fid = octave_stream_list::get_file_number (args (0));
++
++      octave_stream os = octave_stream_list::lookup (fid, "fclear");
++
++      if (! error_state)
++	os.clearerr ();
++    }
++  else
++    print_usage ("fclear");
++
++  return retval;
++}
++
+ DEFUN (fflush, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} fflush (@var{fid})\n\
+ Flush output to @var{fid}.  This is useful for ensuring that all\n\
+ pending output makes it to the screen before some other event occurs.\n\
+ For example, it is always a good idea to flush the standard output\n\
+ stream before calling @code{input}.\n\
+ \n\
+diff --git a/src/pt-mat.cc b/src/pt-mat.cc
+--- a/src/pt-mat.cc
++++ b/src/pt-mat.cc
+@@ -598,17 +598,18 @@ tree_matrix::rvalue (void)
+ 	    ctmp = (*(tmp.begin() -> begin())).resize (dim_vector (0,0)).resize (dv);
+ 	}
+ 
+       if (error_state)
+ 	goto done;
+ 
+       // Now, extract the values from the individual elements and
+       // insert them in the result matrix.
+-      Array<int> ra_idx (dv.length (), 0);
++      int dv_len = dv.length ();
++      Array<int> ra_idx (dv_len > 1 ? dv_len : 2, 0);
+       for (tm_const::iterator p = tmp.begin (); p != tmp.end (); p++)
+ 	{
+ 	  tm_row_const row = *p;
+ 	  for (tm_row_const::iterator q = row.begin (); q != row.end (); q++)
+ 	    {
+ 	      octave_value elt = *q;
+ 
+ 	      ctmp = do_cat_op (ctmp, elt, ra_idx);
+diff --git a/src/sighandlers.cc b/src/sighandlers.cc
+--- a/src/sighandlers.cc
++++ b/src/sighandlers.cc
+@@ -171,21 +171,38 @@ my_friendly_exit (const char *sig_name, 
+     }
+ }
+ 
+ sig_handler *
+ octave_set_signal_handler (int sig, sig_handler *handler)
+ {
+ #if defined (HAVE_POSIX_SIGNALS)
+   struct sigaction act, oact;
++
+   act.sa_handler = handler;
+   act.sa_flags = 0;
++
++  if (sig == SIGALRM)
++    {
++#if defined (SA_INTERRUPT)
++      act.sa_flags |= SA_INTERRUPT;
++#endif
++    }
++  else
++    {
++#if defined (SA_RESTART)
++      act.sa_flags |= SA_RESTART;
++#endif
++    }
++
+   sigemptyset (&act.sa_mask);
+   sigemptyset (&oact.sa_mask);
++
+   sigaction (sig, &act, &oact);
++
+   return oact.sa_handler;
+ #else
+   return signal (sig, handler);
+ #endif
+ }
+ 
+ static RETSIGTYPE
+ generic_sig_handler (int sig)
+diff --git a/src/sighandlers.h b/src/sighandlers.h
+--- a/src/sighandlers.h
++++ b/src/sighandlers.h
+@@ -56,16 +56,20 @@ Free Software Foundation, Inc.
+     { \
+       sigemptyset (&nvar); \
+       sigaddset (&nvar, sig); \
+       sigemptyset (&ovar); \
+       sigprocmask (SIG_BLOCK, &nvar, &ovar); \
+     } \
+   while (0)
+ 
++#if !defined (SIGCHLD) && defined (SIGCLD)
++#define SIGCHLD SIGCLD
++#endif
++
+ #if defined (HAVE_POSIX_SIGNALS)
+ #define BLOCK_CHILD(nvar, ovar) BLOCK_SIGNAL (SIGCHLD, nvar, ovar)
+ #define UNBLOCK_CHILD(ovar) sigprocmask (SIG_SETMASK, &ovar, 0)
+ #else
+ #define BLOCK_CHILD(nvar, ovar) ovar = sigblock (sigmask (SIGCHLD))
+ #define UNBLOCK_CHILD(ovar) sigsetmask (ovar)
+ #endif
+ 

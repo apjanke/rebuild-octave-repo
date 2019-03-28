@@ -1,0 +1,279 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1339587278 -7200
+#      Wed Jun 13 13:34:38 2012 +0200
+# Branch gui
+# Node ID 8c4d5029d933f86f5c35beeaabceb98caa2d9b08
+# Parent  ace446cda345a2153da6175a0588c504edd9d486
+Collapsing/Expanding items now works with a workaround.
+
+* workspace-model.cc: Calling beginResetModel and endResetModel instead of reset.
+* workspace-model.h: Changed signal name to model_changed ().
+* workspace-view.cc: Added logic to preserve data about collapsed/expanded tree items.
+* workspace-view.h: Added new slots and status flag struct.
+
+diff --git a/gui/src/workspace-model.cc b/gui/src/workspace-model.cc
+--- a/gui/src/workspace-model.cc
++++ b/gui/src/workspace-model.cc
+@@ -65,16 +65,17 @@ workspace_model::event_accepted (octave_
+       for (std::list < symbol_table::symbol_record > ::iterator iterator = symbolTable.begin ();
+          iterator != symbolTable.end (); iterator++)
+       {
+         symbol_information symbolInformation;
+         symbolInformation.from_symbol_record (*iterator);
+         _symbol_information.push_back (symbolInformation);
+       }
+ 
++      beginResetModel();
+       top_level_item (0)->delete_child_items ();
+       top_level_item (1)->delete_child_items ();
+       top_level_item (2)->delete_child_items ();
+       top_level_item (3)->delete_child_items ();
+ 
+       foreach (const symbol_information& s, _symbol_information)
+         {
+           tree_item *child = new tree_item ();
+@@ -87,18 +88,18 @@ workspace_model::event_accepted (octave_
+             {
+               case symbol_information::local:       top_level_item (0)->add_child (child); break;
+               case symbol_information::global:      top_level_item (1)->add_child (child); break;
+               case symbol_information::persistent:  top_level_item (2)->add_child (child); break;
+               case symbol_information::hidden:      top_level_item (3)->add_child (child); break;
+             }
+         }
+ 
+-      reset();
+-      emit expand_request();
++      endResetModel();
++      emit model_changed();
+     }
+ 
+   // Post a new event in a given time.
+   // This prevents flooding the event queue when no events are being processed.
+   _update_workspace_model_timer.start ();
+   delete e;
+ }
+ 
+diff --git a/gui/src/workspace-model.h b/gui/src/workspace-model.h
+--- a/gui/src/workspace-model.h
++++ b/gui/src/workspace-model.h
+@@ -130,17 +130,17 @@ public:
+ 
+   void insert_top_level_item (int at, tree_item *treeItem);
+   tree_item *top_level_item (int at);
+ 
+ public slots:
+   void request_update_workspace ();
+ 
+ signals:
+-  void expand_request();
++  void model_changed();
+ 
+ private:
+   /** Timer for periodically updating the workspace model from the current
+     * symbol information. */
+   QTimer _update_workspace_model_timer;
+ 
+   /** Stores the current symbol information. */
+   QList <symbol_information> _symbol_information;
+diff --git a/gui/src/workspace-view.cc b/gui/src/workspace-view.cc
+--- a/gui/src/workspace-view.cc
++++ b/gui/src/workspace-view.cc
+@@ -26,37 +26,152 @@ workspace_view::workspace_view (QWidget 
+   setObjectName ("WorkspaceView");
+   setWindowTitle (tr ("Workspace"));
+ 
+   _workspace_model = new workspace_model ();
+ 
+   _workspace_tree_view = new QTreeView (this);
+   _workspace_tree_view->setHeaderHidden (false);
+   _workspace_tree_view->setAlternatingRowColors (true);
+-  _workspace_tree_view->setAnimated (true);
++  //_workspace_tree_view->setAnimated (true);
+   _workspace_tree_view->setModel (_workspace_model);
+ 
+   setWidget (new QWidget (this));
+   QVBoxLayout *layout = new QVBoxLayout ();
+   layout->addWidget (_workspace_tree_view);
+   layout->setMargin (2);
+   widget ()->setLayout (layout);
+ 
+   connect (this, SIGNAL (visibilityChanged (bool)),
+            this, SLOT(handle_visibility_changed (bool)));
+ 
+-  connect (_workspace_model, SIGNAL(expand_request()),
+-           _workspace_tree_view, SLOT(expandAll()));
++  connect (_workspace_model, SIGNAL (model_changed ()),
++           this, SLOT (model_changed ()));
++
++  connect (_workspace_tree_view, SIGNAL (collapsed (QModelIndex)),
++           this, SLOT (collapse_requested (QModelIndex)));
++  connect (_workspace_tree_view, SIGNAL (expanded (QModelIndex)),
++           this, SLOT (expand_requested (QModelIndex)));
++
++  _explicit_collapse.local = false;
++  _explicit_collapse.global = false;
++  _explicit_collapse.persistent = false;
++  _explicit_collapse.hidden = false;
+ }
+ 
+ void
+ workspace_view::handle_visibility_changed (bool visible)
+ {
+   if (visible)
+-  emit active_changed (true);
++    emit active_changed (true);
++}
++
++void
++workspace_view::model_changed ()
++{
++  // This code is very quirky and requires some explanation.
++  // Usually, we should not deal with collapsing or expanding ourselves,
++  // because the view itself determines (based on the model) whether it
++  // is appropriate to collapse or expand items.
++  //
++  // Now, the logic requires that we update our model item by item, which
++  // would make it work correctly, but this is extremely slow and scales
++  // very bad (O(n^2)). That's why we throw away our model and rebuild it
++  // completely from scratch (O(n)), which is why the view renders all
++  // displayed data as invalid.
++  //
++  // In order to make collapsing/expanding work again, we need to set
++  // flags ourselves here.
++
++  QModelIndex local_model_index = _workspace_model->index (0, 0);
++  QModelIndex global_model_index = _workspace_model->index (1, 0);
++  QModelIndex persistent_model_index = _workspace_model->index (2, 0);
++  QModelIndex hidden_model_index = _workspace_model->index (3, 0);
++
++  if (_explicit_collapse.local) {
++    _workspace_tree_view->collapse (local_model_index);
++  } else {
++    _workspace_tree_view->expand (local_model_index);
++  }
++
++  if (_explicit_collapse.global) {
++    _workspace_tree_view->collapse (global_model_index);
++  } else {
++    _workspace_tree_view->expand (global_model_index);
++  }
++
++  if (_explicit_collapse.persistent) {
++    _workspace_tree_view->collapse (persistent_model_index);
++  } else {
++    _workspace_tree_view->expand (persistent_model_index);
++  }
++
++  if (_explicit_collapse.hidden) {
++    _workspace_tree_view->collapse (hidden_model_index);
++  } else {
++    _workspace_tree_view->expand (hidden_model_index);
++  }
++}
++
++void
++workspace_view::collapse_requested (QModelIndex index)
++{
++  // This code is very quirky and requires some explanation.
++  // Usually, we should not deal with collapsing or expanding ourselves,
++  // because the view itself determines (based on the model) whether it
++  // is appropriate to collapse or expand items.
++  //
++  // Now, the logic requires that we update our model item by item, which
++  // would make it work correctly, but this is extremely slow and scales
++  // very bad (O(n^2)). That's why we throw away our model and rebuild it
++  // completely from scratch (O(n)), which is why the view renders all
++  // displayed data as invalid.
++  //
++  // In order to make collapsing/expanding work again, we need to set
++  // flags ourselves here.
++  QMap<int, QVariant> item_data
++      = _workspace_model->itemData (index);
++
++  if (item_data[0] == "Local")
++    _explicit_collapse.local = true;
++  if (item_data[0] == "Global")
++    _explicit_collapse.global = true;
++  if (item_data[0] == "Persistent")
++    _explicit_collapse.persistent = true;
++  if (item_data[0] == "Hidden")
++    _explicit_collapse.hidden = true;
++}
++
++void
++workspace_view::expand_requested (QModelIndex index)
++{
++  // This code is very quirky and requires some explanation.
++  // Usually, we should not deal with collapsing or expanding ourselves,
++  // because the view itself determines (based on the model) whether it
++  // is appropriate to collapse or expand items.
++  //
++  // Now, the logic requires that we update our model item by item, which
++  // would make it work correctly, but this is extremely slow and scales
++  // very bad (O(n^2)). That's why we throw away our model and rebuild it
++  // completely from scratch (O(n)), which is why the view renders all
++  // displayed data as invalid.
++  //
++  // In order to make collapsing/expanding work again, we need to do set
++  // flags ourselves here.
++  QMap<int, QVariant> item_data
++      = _workspace_model->itemData (index);
++
++  if (item_data[0] == "Local")
++    _explicit_collapse.local = false;
++  if (item_data[0] == "Global")
++    _explicit_collapse.global = false;
++  if (item_data[0] == "Persistent")
++    _explicit_collapse.persistent = false;
++  if (item_data[0] == "Hidden")
++    _explicit_collapse.hidden = false;
+ }
+ 
+ void
+ workspace_view::closeEvent (QCloseEvent *event)
+ {
+   emit active_changed (false);
+   QDockWidget::closeEvent (event);
+ }
+diff --git a/gui/src/workspace-view.h b/gui/src/workspace-view.h
+--- a/gui/src/workspace-view.h
++++ b/gui/src/workspace-view.h
+@@ -27,24 +27,37 @@
+ class workspace_view : public QDockWidget
+ {
+   Q_OBJECT
+ public:
+   workspace_view (QWidget * parent = 0);
+ 
+ public slots:
+   void handle_visibility_changed (bool visible);
++  void model_changed ();
+ 
+ signals:
+   /** Custom signal that tells if a user has clicke away that dock widget. */
+   void active_changed (bool active);
+ 
+ protected:
+   void closeEvent (QCloseEvent *event);
+ 
++protected slots:
++  void collapse_requested (QModelIndex index);
++  void expand_requested (QModelIndex index);
++
+ private:
+   QTreeView *_workspace_tree_view;
+ 
+   /** Stores the current workspace model. */
+   workspace_model *_workspace_model;
++
++  struct
++  {
++    bool local;
++    bool global;
++    bool persistent;
++    bool hidden;
++  } _explicit_collapse;
+ };
+ 
+ #endif // WORKSPACEVIEW_H

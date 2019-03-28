@@ -1,0 +1,349 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1497651707 14400
+#      Fri Jun 16 18:21:47 2017 -0400
+# Node ID 8a47d4735655919078b6514010d7e68cbd072422
+# Parent  b1880535047311b8666782d1110ebbf39d8fa77a
+avoid memory leak in interpreter
+
+* interpreter.h, interpreter.cc (interpreter::m_evaluator):
+Don't declare as a pointer.  Change all uses.
+
+* call-stack.h, call-stack.cc: Don't include interpreter.h here.  Move
+function definitions from header to source file as needed.
+
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -20,22 +20,24 @@ along with Octave; see the file COPYING.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include "call-stack.h"
++#include "input.h"
+ #include "interpreter.h"
+ #include "oct-map.h"
+ #include "ov.h"
+ #include "ov-fcn.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
++#include "pager.h"
+ 
+ // Use static fields for the best efficiency.
+ // NOTE: C++0x will allow these two to be merged into one.
+ static const char *bt_fieldnames[] =
+   { "file", "name", "line", "column", "scope", "context", 0 };
+ static const octave_fields bt_fields (bt_fieldnames);
+ 
+ namespace octave
+@@ -345,16 +347,37 @@ namespace octave
+             retval = false;
+             break;
+           }
+       }
+ 
+     return retval;
+   }
+ 
++  void
++  call_stack::push (octave_function *fcn)
++  {
++    symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++    push (fcn, symtab.current_scope (), symtab.current_context ());
++  }
++
++  void
++  call_stack::push (octave_function *fcn, symbol_table::scope *scope,
++                    symbol_table::context_id context)
++  {
++    size_t prev_frame = curr_frame;
++    curr_frame = cs.size ();
++    cs.push_back (stack_frame (fcn, scope, context, prev_frame));
++
++    symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++    symtab.set_scope_and_context (scope, context);
++  }
++
+   bool
+   call_stack::goto_frame (size_t n, bool verbose)
+   {
+     bool retval = false;
+ 
+     if (n < cs.size ())
+       {
+         retval = true;
+@@ -572,13 +595,37 @@ namespace octave
+ 
+         k++;
+       }
+ 
+     return retval;
+   }
+ 
+   octave_map
++  call_stack::backtrace (size_t nskip)
++  {
++    octave_idx_type curr_user_frame = -1;
++
++    return backtrace (nskip, curr_user_frame, true);
++  }
++
++  octave_map
+   call_stack::empty_backtrace (void) const
+   {
+     return octave_map (dim_vector (0, 1), bt_fields);
+   }
++
++  void
++  call_stack::pop (void)
++  {
++    if (cs.size () > 1)
++      {
++        const stack_frame& elt = cs.back ();
++        curr_frame = elt.m_prev;
++        cs.pop_back ();
++        const stack_frame& new_elt = cs[curr_frame];
++
++        symbol_table& symtab = m_interpreter.get_symbol_table ();
++
++        symtab.set_scope_and_context (new_elt.m_scope, new_elt.m_context);
++      }
++  }
+ }
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -24,26 +24,26 @@ along with Octave; see the file COPYING.
+ #define octave_call_stack_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <deque>
+ #include <string>
+ 
+ class octave_function;
++class octave_map;
+ class octave_user_code;
+ class octave_user_script;
+ 
+-#include "input.h"
+-#include "interpreter.h"
+-#include "oct-map.h"
+ #include "symtab.h"
+ 
+ namespace octave
+ {
++  class interpreter;
++
+   class
+   OCTINTERP_API
+   call_stack
+   {
+   public:
+ 
+     class stack_frame
+     {
+@@ -167,34 +167,19 @@ namespace octave
+     int debug_user_code_line (void) const;
+ 
+     // Column number in current function that we are debugging.
+     int debug_user_code_column (void) const;
+ 
+     // Return TRUE if all elements on the call stack are scripts.
+     bool all_scripts (void) const;
+ 
+-    void push (octave_function *fcn)
+-    {
+-      symbol_table& symtab = m_interpreter.get_symbol_table ();
+-
+-      push (fcn, symtab.current_scope (), symtab.current_context ());
+-    }
+-
++    void push (octave_function *fcn);
+     void push (octave_function *fcn, symbol_table::scope *scope,
+-               symbol_table::context_id context)
+-    {
+-      size_t prev_frame = curr_frame;
+-      curr_frame = cs.size ();
+-      cs.push_back (stack_frame (fcn, scope, context, prev_frame));
+-
+-      symbol_table& symtab = m_interpreter.get_symbol_table ();
+-
+-      symtab.set_scope_and_context (scope, context);
+-    }
++               symbol_table::context_id context);
+ 
+     void push (void)
+     {
+       push (nullptr);
+     }
+ 
+     void push (symbol_table::scope *scope, symbol_table::context_id context)
+     {
+@@ -254,39 +239,21 @@ namespace octave
+       octave_idx_type curr_user_frame = -1;
+ 
+       return backtrace_frames (nskip, curr_user_frame);
+     }
+ 
+     octave_map backtrace (size_t nskip, octave_idx_type& curr_user_frame,
+                           bool print_subfn = true) const;
+ 
+-    octave_map backtrace (size_t nskip = 0)
+-    {
+-      octave_idx_type curr_user_frame = -1;
+-
+-      return backtrace (nskip, curr_user_frame, true);
+-    }
++    octave_map backtrace (size_t nskip = 0);
+ 
+     octave_map empty_backtrace (void) const;
+ 
+-    void pop (void)
+-    {
+-      if (cs.size () > 1)
+-        {
+-          const stack_frame& elt = cs.back ();
+-          curr_frame = elt.m_prev;
+-          cs.pop_back ();
+-          const stack_frame& new_elt = cs[curr_frame];
+-
+-          symbol_table& symtab = m_interpreter.get_symbol_table ();
+-
+-          symtab.set_scope_and_context (new_elt.m_scope, new_elt.m_context);
+-        }
+-    }
++    void pop (void);
+ 
+     void clear (void) { cs.clear (); }
+ 
+   private:
+ 
+     // The current call stack.
+     std::deque<stack_frame> cs;
+ 
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -371,17 +371,17 @@ namespace octave
+   // point of setting reading command history and setting the load
+   // path.
+ 
+   interpreter::interpreter (application *app_context)
+     : m_app_context (app_context),
+       m_dynamic_loader (*this),
+       m_load_path (),
+       m_symbol_table (),
+-      m_evaluator (new tree_evaluator (*this)),
++      m_evaluator (*this),
+       m_interactive (false),
+       m_read_site_files (true),
+       m_read_init_files (m_app_context != 0),
+       m_verbose (false),
+       m_inhibit_startup_message (false),
+       m_load_path_initialized (false),
+       m_history_initialized (false),
+       m_initialized (false)
+@@ -961,17 +961,17 @@ namespace octave
+               octave::tree_evaluator::reset_debug_state ();
+ 
+             retval = parser.run ();
+ 
+             if (retval == 0)
+               {
+                 if (parser.stmt_list)
+                   {
+-                    parser.stmt_list->accept (*m_evaluator);
++                    parser.stmt_list->accept (m_evaluator);
+ 
+                     octave_quit ();
+ 
+                     if (! octave::application::interactive ())
+                       {
+                         bool quit = (tree_return_command::returning
+                                      || tree_break_command::breaking);
+ 
+@@ -1158,17 +1158,17 @@ namespace octave
+     //
+     // OCTAVE_SAFE_CALL (singleton_cleanup_list::cleanup, ());
+ 
+     OCTAVE_SAFE_CALL (octave::chunk_buffer::clear, ());
+   }
+ 
+   tree_evaluator& interpreter::get_evaluator (void)
+   {
+-    return *m_evaluator;
++    return m_evaluator;
+   }
+ 
+   symbol_table::scope *
+   interpreter::get_current_scope (void)
+   {
+     return m_symbol_table.current_scope ();
+   }
+ 
+@@ -1180,17 +1180,17 @@ namespace octave
+     if (! scope)
+       error ("%s: symbol table scope missing", who.c_str ());
+ 
+     return scope;
+   }
+ 
+   call_stack& interpreter::get_call_stack (void)
+   {
+-    return m_evaluator->get_call_stack ();
++    return m_evaluator.get_call_stack ();
+   }
+ 
+   void interpreter::recover_from_exception (void)
+   {
+     octave::can_interrupt = true;
+     octave_interrupt_immediately = 0;
+     octave_interrupt_state = 0;
+     octave_signal_caught = 0;
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -27,16 +27,17 @@ along with Octave; see the file COPYING.
+ 
+ #include <string>
+ 
+ #include "quit.h"
+ #include "str-vec.h"
+ 
+ #include "dynamic-ld.h"
+ #include "load-path.h"
++#include "pt-eval.h"
+ #include "symtab.h"
+ 
+ extern OCTINTERP_API bool quit_allowed;
+ 
+ // TRUE means we are ready to interpret commands, but not everything
+ // is ready for interactive use.
+ extern OCTINTERP_API bool octave_interpreter_ready;
+ 
+@@ -188,17 +189,17 @@ namespace octave
+     application *m_app_context;
+ 
+     dynamic_loader m_dynamic_loader;
+ 
+     load_path m_load_path;
+ 
+     symbol_table m_symbol_table;
+ 
+-    tree_evaluator *m_evaluator;
++    tree_evaluator m_evaluator;
+ 
+     // TRUE means this is an interactive interpreter (forced or not).
+     bool m_interactive;
+ 
+     bool m_read_site_files;
+ 
+     bool m_read_init_files;
+ 

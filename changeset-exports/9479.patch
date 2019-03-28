@@ -1,0 +1,1085 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1249307560 -7200
+#      Mon Aug 03 15:52:40 2009 +0200
+# Node ID d9716e3ee0ddb0477491f5db1e87fc029a03415e
+# Parent  7e1e90837fefe239a8749a8532beb793dbd2c7e6
+supply optimized compiled sub2ind & ind2sub
+
+diff --git a/liboctave/Array-util.cc b/liboctave/Array-util.cc
+--- a/liboctave/Array-util.cc
++++ b/liboctave/Array-util.cc
+@@ -22,16 +22,17 @@ along with Octave; see the file COPYING.
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "Array-util.h"
+ #include "dim-vector.h"
+ #include "lo-error.h"
++#include "oct-locbuf.h"
+ 
+ bool
+ index_in_bounds (const Array<octave_idx_type>& ra_idx,
+ 		 const dim_vector& dimensions)
+ {
+   bool retval = true;
+ 
+   int n = ra_idx.length ();
+@@ -470,16 +471,140 @@ zero_dims_inquire (const idx_vector& i, 
+         rdv(1) = rhdv0(k++);
+       else if (! j.is_scalar ())
+         k++;
+     }
+ 
+   return rdv;
+ }
+ 
++// A helper class.
++struct sub2ind_helper
++{
++  octave_idx_type *ind, n;
++  sub2ind_helper (octave_idx_type *_ind, octave_idx_type _n)
++    : ind(_ind), n(_n) { }
++  void operator ()(octave_idx_type k) { (*ind++ *= n) += k; }
++};
++
++idx_vector sub2ind (const dim_vector& dv, const Array<idx_vector>& idxa)
++{
++  idx_vector retval;
++  octave_idx_type len = idxa.length ();
++
++  if (len >= 2)
++    {
++      const dim_vector dvx = dv.redim (len);
++      bool all_ranges = true;
++      octave_idx_type clen = -1;
++
++      for (octave_idx_type i = 0; i < len; i++)
++        {
++          idx_vector idx = idxa(i);
++          octave_idx_type n = dvx(i);
++
++          all_ranges = all_ranges && idx.is_range ();
++          if (clen < 0)
++            clen = idx.length (n);
++          else if (clen != idx.length (n))
++            current_liboctave_error_handler ("sub2ind: lengths of indices must match");
++
++          if (idx.extent (n) > n)
++            current_liboctave_error_handler ("sub2ind: index out of range");
++        }
++
++      if (clen == 1)
++        {
++          // All scalars case - the result is a scalar.
++          octave_idx_type idx = idxa(len-1)(0);
++          for (octave_idx_type i = len - 2; i >= 0; i--)
++            idx = idx * dvx(i) + idxa(i)(0);
++          retval = idx_vector (idx);
++        }
++      else if (all_ranges && clen != 0)
++        {
++          // All ranges case - the result is a range.
++          octave_idx_type start = 0, step = 0;
++          for (octave_idx_type i = len - 1; i >= 0; i--)
++            {
++              octave_idx_type xstart = idxa(i)(0), xstep = idxa(i)(1) - xstart;
++              start = start * dvx(i) + xstart;
++              step = step * dvx(i) + xstep;
++            }
++          retval = idx_vector::make_range (start, step, clen);
++        }
++      else
++        {
++          Array<octave_idx_type> idx (idxa(0).orig_dimensions ());
++          octave_idx_type *idx_vec = idx.fortran_vec ();
++
++          for (octave_idx_type i = len - 1; i >= 0; i--)
++            {
++              if (i < len - 1)
++                idxa(i).loop (clen, sub2ind_helper (idx_vec, dvx(i)));
++              else
++                idxa(i).copy_data (idx_vec);
++            }
++
++          retval = idx_vector (idx);
++        }
++    }
++  else
++    current_liboctave_error_handler ("sub2ind: needs at least 2 indices");
++
++  return retval;
++}
++
++Array<idx_vector> ind2sub (const dim_vector& dv, const idx_vector& idx)
++{
++  octave_idx_type len = idx.length (0), n = dv.length ();
++  Array<idx_vector> retval(n);
++  octave_idx_type numel = dv.numel ();
++
++  if (idx.extent (numel) > numel)
++    current_liboctave_error_handler ("ind2sub: index out of range");
++  else
++    {
++      if (idx.is_scalar ())
++        {
++          octave_idx_type k = idx(0);
++          for (octave_idx_type j = 0; j < n; j++)
++            {
++              retval(j) = k % dv(j);
++              k /= dv(j);
++            }
++        }
++      else
++        {
++          OCTAVE_LOCAL_BUFFER (Array<octave_idx_type>, rdata, n);
++
++          dim_vector odv = idx.orig_dimensions ();
++          for (octave_idx_type j = 0; j < n; j++)
++            rdata[j] = Array<octave_idx_type> (odv);
++
++          for (octave_idx_type i = 0; i < len; i++)
++            {
++              octave_idx_type k = idx(i);
++              for (octave_idx_type j = 0; j < n; j++)
++                {
++                  rdata[j](i) = k % dv(j);
++                  k /= dv(j);
++                }
++            }
++
++          for (octave_idx_type j = 0; j < n; j++)
++            retval(j) = rdata[j];
++        }
++
++
++    }
++
++  return retval;
++}
++
+ int
+ permute_vector_compare (const void *a, const void *b)
+ {
+   const permute_vector *pva = static_cast<const permute_vector *> (a);
+   const permute_vector *pvb = static_cast<const permute_vector *> (b);
+ 
+   return pva->pidx > pvb->pidx;
+ }
+diff --git a/liboctave/Array-util.h b/liboctave/Array-util.h
+--- a/liboctave/Array-util.h
++++ b/liboctave/Array-util.h
+@@ -73,16 +73,20 @@ extern OCTAVE_API Array<octave_idx_type>
+ extern OCTAVE_API Array<octave_idx_type> get_ra_idx (octave_idx_type idx, const dim_vector& dims);
+ 
+ extern OCTAVE_API dim_vector zero_dims_inquire (const Array<idx_vector>& ia,
+                                                 const dim_vector& rhdv);
+ 
+ extern OCTAVE_API dim_vector zero_dims_inquire (const idx_vector& i, const idx_vector& j,
+                                                 const dim_vector& rhdv);
+ 
++extern OCTAVE_API idx_vector sub2ind (const dim_vector& dv, const Array<idx_vector>& idxa);
++
++extern OCTAVE_API Array<idx_vector> ind2sub (const dim_vector& dv, const idx_vector& idx);
++
+ struct
+ permute_vector
+ {
+   octave_idx_type pidx;
+   octave_idx_type iidx;
+ };
+ 
+ extern int OCTAVE_API permute_vector_compare (const void *a, const void *b);
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,16 @@
++2009-07-31  Jaroslav Hajek  <highegg@gmail.com>
++
++	* idx-vector.h (idx_vector::is_range): New method.
++	(idx_vector::copy_data, idx_vector::unconvert): New method decls.
++	* idx-vector.cc (idx_vector::copy_data, idx_vector::unconvert): New
++	methods.
++	* Array-utils.cc (sub2ind, ind2sub): New functions.
++
+ 2009-07-29  John W. Eaton  <jwe@octave.org>
+ 
+ 	* fMatrix.cc (operator >>): Use template function to read value.
+ 	* fNDArray.cc (operator >>): Likeise.
+ 	* fCMatrix.cc (operator >>): Use template function to read value.
+ 	* fCNDArray.cc (operator >>): Likeise.
+ 	* dMatrix.cc (operator >>): Use template function to read value.
+ 	* dNDArray.cc (operator >>): Likeise.
+diff --git a/liboctave/idx-vector.cc b/liboctave/idx-vector.cc
+--- a/liboctave/idx-vector.cc
++++ b/liboctave/idx-vector.cc
+@@ -535,16 +535,59 @@ idx_vector::is_cont_range (octave_idx_ty
+       break;
+     default:
+       break;
+     }
+ 
+   return res;
+ }
+ 
++void
++idx_vector::copy_data (octave_idx_type *data) const
++{
++  octave_idx_type len = rep->length (0);
++
++  switch (rep->idx_class ())
++    {
++    case class_colon:
++      current_liboctave_error_handler ("colon not allowed");
++      break;
++    case class_range:
++        {
++          idx_range_rep * r = dynamic_cast<idx_range_rep *> (rep);
++          octave_idx_type start = r->get_start (), step = r->get_step ();
++          octave_idx_type i, j;
++          if (step == 1)
++            for (i = start, j = start + len; i < j; i++) *data++ = i;
++          else if (step == -1)
++            for (i = start, j = start - len; i > j; i--) *data++ = i;
++          else
++            for (i = 0, j = start; i < len; i++, j += step) *data++ = j;
++        }
++      break;
++    case class_scalar:
++        {
++          idx_scalar_rep * r = dynamic_cast<idx_scalar_rep *> (rep);
++          *data = r->get_data ();
++        }
++      break;
++    case class_vector:
++        {
++          idx_vector_rep * r = dynamic_cast<idx_vector_rep *> (rep);
++          const octave_idx_type *rdata = r->get_data ();
++          std::copy (rdata, rdata + len, data);
++        }
++      break;
++    default:
++      assert (false);
++      break;
++    }
++
++}
++
+ idx_vector
+ idx_vector::complement (octave_idx_type n) const
+ {
+   OCTAVE_LOCAL_BUFFER_INIT (bool, left, n, true);
+ 
+   octave_idx_type cnt = n;
+ 
+   for (octave_idx_type i = 0, len = length (); i < len; i++)
+@@ -591,16 +634,53 @@ idx_vector::is_permutation (octave_idx_t
+             }
+         }
+ 
+     }
+ 
+   return retval;
+ }
+ 
++void idx_vector::unconvert (idx_class_type& iclass,
++                            double& scalar, Range& range, Array<double>& array) const
++{
++  iclass = idx_class ();
++  switch (iclass)
++    {
++    case class_colon:
++      break;
++    case class_range:
++        {
++          idx_range_rep * r = dynamic_cast<idx_range_rep *> (rep);
++          double start = r->get_start (), step = r->get_step ();
++          range = Range (start+1, step, r->length (0));
++        }
++      break;
++    case class_scalar:
++        {
++          idx_scalar_rep * r = dynamic_cast<idx_scalar_rep *> (rep);
++          scalar = r->get_data () + 1;
++        }
++      break;
++    case class_vector:
++        {
++          idx_vector_rep * r = dynamic_cast<idx_vector_rep *> (rep);
++          const octave_idx_type *data = r->get_data ();
++          array = Array<double> (r->orig_dimensions ());
++          octave_idx_type len = r->length (0);
++          for (octave_idx_type i = 0; i < len; i++)
++            array.xelem (i) = data[i] + 1;
++        }
++      break;
++    default:
++      assert (false);
++      break;
++    }
++}
++
+ octave_idx_type 
+ idx_vector::freeze (octave_idx_type z_len, const char *, bool resize_ok)
+ {
+   if (! resize_ok && extent (z_len) > z_len)
+     {
+       (*current_liboctave_error_handler)
+         ("invalid matrix index = %d", extent (z_len));
+       rep->err = true;
+diff --git a/liboctave/idx-vector.h b/liboctave/idx-vector.h
+--- a/liboctave/idx-vector.h
++++ b/liboctave/idx-vector.h
+@@ -366,16 +366,23 @@ public:
+   idx_vector (octave_idx_type i) : rep (new idx_scalar_rep (i)) 
+     { chkerr (); }
+ 
+   idx_vector (octave_idx_type start, octave_idx_type limit,
+               octave_idx_type step = 1)
+     : rep (new idx_range_rep (start, limit, step)) 
+     { chkerr (); }
+ 
++  static idx_vector 
++    make_range (octave_idx_type start, octave_idx_type step,
++                octave_idx_type len)
++    {
++      return idx_vector (new idx_range_rep (start, len, step, DIRECT));
++    }
++
+   idx_vector (const Array<octave_idx_type>& inda) 
+     : rep (new idx_vector_rep (inda))
+     { chkerr (); }
+ 
+   // Colon is best constructed by simply copying (or referencing) this member.
+   static const idx_vector colon;
+ 
+   // or passing ':' here
+@@ -461,16 +468,19 @@ public:
+     { return ! rep->err; }
+ 
+   bool is_colon (void) const 
+     { return rep->idx_class () == class_colon; }
+ 
+   bool is_scalar (void) const 
+     { return rep->idx_class () == class_scalar; }
+ 
++  bool is_range (void) const
++    { return rep->idx_class () == class_range; }
++
+   bool is_colon_equiv (octave_idx_type n) const
+     { return rep->is_colon_equiv (n); }
+ 
+   idx_vector sorted (bool uniq = false) const
+     { return idx_vector (rep->sort_uniq_clone (uniq)); }
+ 
+   dim_vector orig_dimensions (void) const { return rep->orig_dimensions (); }
+ 
+@@ -785,16 +795,23 @@ public:
+   bool is_cont_range (octave_idx_type n,
+                       octave_idx_type& l, octave_idx_type& u) const;
+ 
+   idx_vector
+   complement (octave_idx_type n) const;
+ 
+   bool is_permutation (octave_idx_type n) const;
+ 
++  // Copies all the indices to a given array. Not allowed for colons.
++  void copy_data (octave_idx_type *data) const;
++
++  // Unconverts the index to a scalar, Range or double array.
++  void unconvert (idx_class_type& iclass,
++                  double& scalar, Range& range, Array<double>& array) const;
++    
+   // FIXME -- these are here for compatibility.  They should be removed
+   // when no longer in use.
+ 
+   octave_idx_type elem (octave_idx_type n) const 
+     { return (*this) (n); }
+ 
+   bool is_colon_equiv (octave_idx_type n, int) const
+     { return is_colon_equiv (n); }
+diff --git a/scripts/ChangeLog b/scripts/ChangeLog
+--- a/scripts/ChangeLog
++++ b/scripts/ChangeLog
+@@ -1,8 +1,14 @@
++2009-08-03  Jaroslav Hajek  <highegg@gmail.com>
++
++	* general/sub2ind.m: Remove source.
++	* general/ind2sub.m: Remove source.
++	* general/Makefile.in: Update.
++
+ 2009-08-02  Ben Abbott <bpabbott@mac.com>
+ 
+ 	* plot/gnuplot_drawnow.m: Avoid the flickering x11 window seen with
+ 	rapid replots by avoidng setting multiplot mode. This fix only
+ 	functions for a single axes with no image objects.
+ 	* plot/__go_draw_figure__.m: Move 'set multiplot' to gnuplot_drawnow.
+ 
+ 2009-07-31  Jaroslav Hajek  <highegg@gmail.com>
+diff --git a/scripts/general/Makefile.in b/scripts/general/Makefile.in
+--- a/scripts/general/Makefile.in
++++ b/scripts/general/Makefile.in
+@@ -32,25 +32,25 @@ include $(TOPDIR)/Makeconf
+ INSTALL = @INSTALL@
+ INSTALL_PROGRAM = @INSTALL_PROGRAM@
+ INSTALL_DATA = @INSTALL_DATA@
+ 
+ SOURCES = __isequal__.m __splinen__.m accumarray.m arrayfun.m \
+   bicubic.m bitcmp.m bitget.m bitset.m blkdiag.m cart2pol.m \
+   cart2sph.m cellidx.m cell2mat.m celldisp.m circshift.m colon.m common_size.m \
+   cplxpair.m cumtrapz.m dblquad.m deal.m del2.m diff.m display.m flipdim.m \
+-  fliplr.m flipud.m genvarname.m gradient.m idivide.m ind2sub.m int2str.m \
++  fliplr.m flipud.m genvarname.m gradient.m idivide.m int2str.m \
+   interp1.m interp1q.m interp2.m interp3.m interpn.m interpft.m \
+   is_duplicate_entry.m isa.m isdefinite.m isdir.m isequal.m \
+   isequalwithequalnans.m isscalar.m issquare.m issymmetric.m \
+   isvector.m loadobj.m logical.m logspace.m mod.m nargchk.m \
+   nargoutchk.m nextpow2.m nthroot.m num2str.m perror.m pol2cart.m \
+   polyarea.m postpad.m prepad.m quadgk.m quadl.m quadv.m randperm.m rat.m \
+   rem.m repmat.m rot90.m rotdim.m runlength.m saveobj.m shift.m shiftdim.m \
+-  sortrows.m sph2cart.m strerror.m structfun.m sub2ind.m subsindex.m \
++  sortrows.m sph2cart.m strerror.m structfun.m subsindex.m \
+   triplequad.m trapz.m tril.m triu.m
+ 
+ DISTFILES = $(addprefix $(srcdir)/, Makefile.in $(SOURCES))
+ 
+ FCN_FILES = $(addprefix $(srcdir)/, $(SOURCES))
+ FCN_FILES_NO_DIR = $(notdir $(FCN_FILES))
+ 
+ all: PKG_ADD
+diff --git a/scripts/general/ind2sub.m b/scripts/general/ind2sub.m
+deleted file mode 100644
+--- a/scripts/general/ind2sub.m
++++ /dev/null
+@@ -1,86 +0,0 @@
+-## Copyright (C) 2001, 2003, 2004, 2005, 2006, 2007, 2008, 2009
+-##               Paul Kienzle
+-##
+-## This file is part of Octave.
+-##
+-## Octave is free software; you can redistribute it and/or modify it
+-## under the terms of the GNU General Public License as published by
+-## the Free Software Foundation; either version 3 of the License, or (at
+-## your option) any later version.
+-##
+-## Octave is distributed in the hope that it will be useful, but
+-## WITHOUT ANY WARRANTY; without even the implied warranty of
+-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-## General Public License for more details.
+-##
+-## You should have received a copy of the GNU General Public License
+-## along with Octave; see the file COPYING.  If not, see
+-## <http://www.gnu.org/licenses/>.
+-
+-## -*- texinfo -*-
+-## @deftypefn {Function File} {[@var{s1}, @var{s2}, @dots{}, @var{sN}] =} ind2sub (@var{dims}, @var{ind})
+-## Convert a linear index into subscripts.
+-##
+-## The following example shows how to convert the linear index @code{8}
+-## in a 3-by-3 matrix into a subscript.  The matrix is linearly indexed
+-## moving from one column to next, filling up all rows in each column.
+-## @example
+-## @group
+-## [r, c] = ind2sub ([3, 3], 8)
+-## @result{} r =  2
+-## c =  3
+-## @end group
+-## @end example
+-## @seealso{sub2ind}
+-## @end deftypefn
+-
+-## Author: Paul Kienzle <pkienzle@kienzle.powernet.co.uk>
+-## Adapted-by: jwe
+-
+-function varargout = ind2sub (dims, ind)
+-
+-  if (nargin == 2)
+-    if (isvector (dims) && all (round (dims) == dims))
+-      if (isnumeric (ind) && all (round (ind) == ind))
+-	ntot = prod (dims);
+-	if (all (ind > 0 & ind <= ntot))
+-	  nd = length (dims);
+-	  if (nargout > 0)
+-	    vlen = nargout;
+-	  else
+-	    vlen = 1;
+-	  endif
+-	  if (nd > vlen);
+-	    dims(vlen) = prod (dims(vlen:nd));
+-	    dims(vlen+1:nd) = [];
+-	  endif
+-	  nd = length (dims);
+-	  scale = [1; cumprod(dims(:))];
+-	  for i = nd:-1:2
+-	    k = (ind >= scale(i));
+-	    r = ones (size (ind));
+-	    t = zeros (size (ind));
+-	    t(k) = floor ((ind(k) - 1) / scale(i));
+-	    r(k) = t(k) + 1;
+-	    varargout{i} = r;
+-	    ind(k) -= t(k) * scale(i);
+-	  endfor
+-	  varargout{1} = ind;
+-	  for i = nd+1:vlen
+-	    varargout{i} = ones (size (ind));
+-	  endfor
+-	else
+-	  error ("ind2sub: index out of range");
+-	endif
+-      else
+-	error ("ind2sub: expecting integer-valued index argument");
+-      endif
+-    else
+-      error ("ind2sub: expecting dims to be an integer vector");
+-    endif
+-  else
+-    print_usage ();
+-  endif
+-
+-
+-endfunction
+diff --git a/scripts/general/sub2ind.m b/scripts/general/sub2ind.m
+deleted file mode 100644
+--- a/scripts/general/sub2ind.m
++++ /dev/null
+@@ -1,128 +0,0 @@
+-## Copyright (C) 2001, 2003, 2004, 2005, 2006, 2007, 2008,
+-##               2009 Paul Kienzle
+-##
+-## This file is part of Octave.
+-##
+-## Octave is free software; you can redistribute it and/or modify it
+-## under the terms of the GNU General Public License as published by
+-## the Free Software Foundation; either version 3 of the License, or (at
+-## your option) any later version.
+-##
+-## Octave is distributed in the hope that it will be useful, but
+-## WITHOUT ANY WARRANTY; without even the implied warranty of
+-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+-## General Public License for more details.
+-##
+-## You should have received a copy of the GNU General Public License
+-## along with Octave; see the file COPYING.  If not, see
+-## <http://www.gnu.org/licenses/>.
+-
+-## -*- texinfo -*-
+-## @deftypefn {Function File} {@var{ind} =} sub2ind (@var{dims}, @var{i}, @var{j})
+-## @deftypefnx {Function File} {@var{ind} =} sub2ind (@var{dims}, @var{s1}, @var{s2}, @dots{}, @var{sN})
+-## Convert subscripts into a linear index.
+-##
+-## The following example shows how to convert the two-dimensional
+-## index @code{(2,3)} of a 3-by-3 matrix to a linear index.  The matrix
+-## is linearly indexed moving from one column to next, filling up
+-## all rows in each column.
+-##
+-## @example
+-## @group
+-## linear_index = sub2ind ([3, 3], 2, 3)
+-## @result{} 8
+-## @end group
+-## @end example
+-## @seealso{ind2sub}
+-## @end deftypefn
+-
+-## Author: Paul Kienzle <pkienzle@kienzle.powernet.co.uk>
+-## Adapted-by: jwe
+-
+-function ind = sub2ind (dims, varargin)
+-
+-  if (nargin > 1)
+-    if (isvector (dims) && all (round (dims) == dims))
+-      nd = length (dims);
+-      vlen = length (varargin);
+-      dims(vlen) = prod (dims(vlen:nd));
+-      dims(vlen+1:nd) = [];
+-      scale = cumprod (dims(:));
+-      for i = 1:vlen
+-	arg = varargin{i};
+-	if (isnumeric (arg) && isequal (round (arg), arg))
+-	  if (i == 1)
+-	    if (all (arg(:) > 0 & arg(:) <= dims(i)))
+-	      ind = first_arg = arg;
+-	    else
+-	      error ("sub2ind: index out of range");
+-	    endif
+-	  else
+-	    if (size_equal (first_arg, arg))
+-	      if ((i > nd && arg == 1) || all (arg(:) > 0 & arg(:) <= dims(i)))
+-		ind += scale(i-1) * (arg - 1);
+-	      else
+-		error ("sub2ind: index out of range");
+-	      endif
+-	    else
+-	      error ("sub2ind: all index arguments must be the same size");
+-	    endif
+-	  endif
+-	else
+-	  error ("sub2ind: expecting integer-valued index arguments");
+-	endif
+-      endfor
+-    else
+-      error ("sub2ind: expecting dims to be an integer vector");
+-    endif
+-  else
+-    print_usage ();
+-  endif
+-
+-
+-endfunction
+-
+-# Test input validation
+-%!error <sub2ind: expecting dims to be an integer vector> sub2ind([10 10.5], 1, 1);
+-%!error <sub2ind: expecting integer-valued index arguments> sub2ind([10 10], 1.5, 1);
+-%!error <sub2ind: expecting integer-valued index arguments> sub2ind([10 10], 1, 1.5);
+-
+-# Test evaluation
+-%!shared s1, s2, s3, in
+-%! s1 = [   1   1   1   1 ;   2   2   2   2 ];
+-%! s2 = [   1   1   2   2 ;   1   1   2   2 ];
+-%! s3 = [   1   2   1   2 ;   1   2   1   2 ];
+-%! in = [   1 101  11 111 ;   2 102  12 112 ];
+-%!assert (sub2ind([10 10 10], s1, s2, s3), in);
+-%!shared
+-
+-# Test low index
+-%!assert (sub2ind([10 10 10], 1, 1, 1), 1);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 0, 1, 1);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 1, 0, 1);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 1, 1, 0);
+-
+-# Test high index
+-%!assert (sub2ind([10 10 10], 10, 10, 10), 1000);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 11, 10, 10);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 10, 11, 10);
+-%!error <sub2ind: index out of range> sub2ind([10 10 10], 10, 10, 11);
+-
+-# Test high index in the trailing dimensions
+-%!assert (sub2ind([10], 2, 1, 1), 2);
+-%!error <sub2ind: index out of range> sub2ind([10], 1, 2, 1);
+-%!error <sub2ind: index out of range> sub2ind([10], 1, 1, 2);
+-%!assert (sub2ind([10 10], 2, 2, 1), 12);
+-%!error <sub2ind: index out of range> sub2ind([10 10], 2, 1, 2);
+-%!error <sub2ind: index out of range> sub2ind([10 10], 1, 2, 2);
+-
+-# Test handling of empty arguments
+-%!assert (sub2ind([10 10], zeros(0,0), zeros(0,0)), zeros(0,0));
+-%!assert (sub2ind([10 10], zeros(2,0), zeros(2,0)), zeros(2,0));
+-%!assert (sub2ind([10 10], zeros(0,2), zeros(0,2)), zeros(0,2));
+-%!error <sub2ind: all index arguments must be the same size> sub2ind([10 10 10], zeros(0,2), zeros(2,0));
+-
+-# Test handling of arguments of different size
+-%!error <sub2ind: all index arguments must be the same size> sub2ind([10 10], ones(1,2), ones(1,3));
+-%!error <sub2ind: all index arguments must be the same size> sub2ind([10 10], ones(1,2), ones(2,1));
+-
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,20 @@
++2009-08-03  Jaroslav Hajek  <highegg@gmail.com>
++
++	* DLD-FUNCTIONS/sub2ind.cc: New source.
++	* Makefile.in: Include it.
++	* ov-range.h (octave_range::octave_range (const Range&, const
++	idx_vector&)): New constructor.
++	* ov-re-mat.h (octave_matrix::octave_matrix (const NDArray&, const
++	idx_vector&)): New constructor.
++	* ov.cc (octave_value::octave_value (const idx_vector&)): New
++	constructor.
++	* ov.h: Declare it.
++
+ 2009-07-30  Ryan Rusaw  <rrusaw@gmail.com>
+ 
+ 	* input.cc (reading_classdef_file): New file-scope variable.
+ 	(gnu_readline): Also set curr_stream if reading_classdef_file.
+ 	(octave_gets, get_input_from_file):
+ 	Handle classdef files like other input files.
+ 	* input.h (reading_classdef_file): Provide decl.
+ 
+diff --git a/src/DLD-FUNCTIONS/sub2ind.cc b/src/DLD-FUNCTIONS/sub2ind.cc
+new file mode 100644
+--- /dev/null
++++ b/src/DLD-FUNCTIONS/sub2ind.cc
+@@ -0,0 +1,212 @@
++/*
++
++Copyright (C) 2009 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include "quit.h"
++
++#include "defun-dld.h"
++#include "error.h"
++#include "gripes.h"
++#include "oct-obj.h"
++
++
++static dim_vector 
++get_dim_vector (const octave_value& val,
++                const char *name)
++{
++  RowVector dimsv = val.row_vector_value (false, true);
++  dim_vector dv;
++  octave_idx_type n = dimsv.length ();
++
++  if (n < 2)
++    error ("%s: dimension vector must have at least 2 elements", name);
++  else
++    {
++      dv.resize (n);
++      for (octave_idx_type i = 0; i < dimsv.length (); i++)
++        {
++          octave_idx_type ii = static_cast<int> (dimsv(i));
++          if (ii == dimsv(i) && ii >= 0)
++            dv(i) = ii;
++          else
++            {
++              error ("%s: dimension vector must contain integers", name);
++              break;
++            }
++        }
++    }
++
++  return dv;
++}
++
++DEFUN_DLD (sub2ind, args, ,
++  "-*- texinfo -*-\n\
++@deftypefn {Function File} {@var{ind} =} sub2ind (@var{dims}, @var{i}, @var{j})\n\
++@deftypefnx {Function File} {@var{ind} =} sub2ind (@var{dims}, @var{s1}, @var{s2}, @dots{}, @var{sN})\n\
++Convert subscripts into a linear index.\n\
++\n\
++The following example shows how to convert the two-dimensional\n\
++index @code{(2,3)} of a 3-by-3 matrix to a linear index.  The matrix\n\
++is linearly indexed moving from one column to next, filling up\n\
++all rows in each column.\n\
++\n\
++@example\n\
++@group\n\
++linear_index = sub2ind ([3, 3], 2, 3)\n\
++@result{} 8\n\
++@end group\n\
++@end example\n\
++@seealso{ind2sub}\n\
++@end deftypefn")
++{
++  int nargin = args.length ();
++  octave_value retval;
++
++  if (nargin < 3)
++    print_usage ();
++  else
++    {
++      dim_vector dv = get_dim_vector (args(0), "sub2ind");
++      Array<idx_vector> idxa (nargin - 1);
++      dim_vector idims;
++
++      if (! error_state)
++        {
++          dv = dv.redim (nargin - 1);
++          for (int j = 0; j < nargin - 1; j++)
++            {
++              if (args(j+1).is_numeric_type ())
++                {
++                  idxa(j) = args(j+1).index_vector ();
++                  if (error_state)
++                    break;
++                  else if (j > 0 && args(j+1).dims () != args(1).dims ())
++                    error ("sub2ind: all subscripts must be of the same size");
++                }
++              else
++                error ("sub2ind: subscripts must be numeric");
++
++              if (error_state)
++                break;
++            }
++        }
++
++      if (! error_state)
++        {
++          idx_vector idx = sub2ind (dv, idxa);
++          retval = idx;
++        }
++    }
++
++  return retval;
++}
++
++/*
++
++# Test input validation
++%!error <sub2ind: dimension vector .*> sub2ind([10 10.5], 1, 1);
++%!error <subscript indices .*> sub2ind([10 10], 1.5, 1);
++%!error <subscript indices .*> sub2ind([10 10], 1, 1.5);
++
++# Test evaluation
++%!shared s1, s2, s3, in
++%! s1 = [   1   1   1   1 ;   2   2   2   2 ];
++%! s2 = [   1   1   2   2 ;   1   1   2   2 ];
++%! s3 = [   1   2   1   2 ;   1   2   1   2 ];
++%! in = [   1 101  11 111 ;   2 102  12 112 ];
++%!assert (sub2ind([10 10 10], s1, s2, s3), in);
++%!shared
++
++# Test low index
++%!assert (sub2ind([10 10 10], 1, 1, 1), 1);
++%!error <subscript indices .*> sub2ind([10 10 10], 0, 1, 1);
++%!error <subscript indices .*> sub2ind([10 10 10], 1, 0, 1);
++%!error <subscript indices .*> sub2ind([10 10 10], 1, 1, 0);
++
++# Test high index
++%!assert (sub2ind([10 10 10], 10, 10, 10), 1000);
++%!error <sub2ind: index out of range> sub2ind([10 10 10], 11, 10, 10);
++%!error <sub2ind: index out of range> sub2ind([10 10 10], 10, 11, 10);
++%!error <sub2ind: index out of range> sub2ind([10 10 10], 10, 10, 11);
++
++# Test high index in the trailing dimensions
++%!assert (sub2ind([10, 1], 2, 1, 1), 2);
++%!error <sub2ind: index out of range> sub2ind([10, 1], 1, 2, 1);
++%!error <sub2ind: index out of range> sub2ind([10, 1], 1, 1, 2);
++%!assert (sub2ind([10 10], 2, 2, 1), 12);
++%!error <sub2ind: index out of range> sub2ind([10 10], 2, 1, 2);
++%!error <sub2ind: index out of range> sub2ind([10 10], 1, 2, 2);
++
++# Test handling of empty arguments
++%!assert (sub2ind([10 10], zeros(0,0), zeros(0,0)), zeros(0,0));
++%!assert (sub2ind([10 10], zeros(2,0), zeros(2,0)), zeros(2,0));
++%!assert (sub2ind([10 10], zeros(0,2), zeros(0,2)), zeros(0,2));
++%!error <sub2ind: all subscripts .* same size> sub2ind([10 10 10], zeros(0,2), zeros(2,0));
++
++# Test handling of arguments of different size
++%!error <sub2ind: all subscripts .* same size> sub2ind([10 10], ones(1,2), ones(1,3));
++%!error <sub2ind: all subscripts .* same size> sub2ind([10 10], ones(1,2), ones(2,1));
++
++*/
++
++DEFUN_DLD (ind2sub, args, nargout,
++  "-*- texinfo -*-\n\
++@deftypefn {Function File} {[@var{s1}, @var{s2}, @dots{}, @var{sN}] =} ind2sub (@var{dims}, @var{ind})\n\
++Convert a linear index into subscripts.\n\
++\n\
++The following example shows how to convert the linear index @code{8}\n\
++in a 3-by-3 matrix into a subscript.  The matrix is linearly indexed\n\
++moving from one column to next, filling up all rows in each column.\n\
++@example\n\
++@group\n\
++[r, c] = ind2sub ([3, 3], 8)\n\
++@result{} r =  2\n\
++c =  3\n\
++@end group\n\
++@end example\n\
++@seealso{sub2ind}\n\
++@end deftypefn")
++{
++  int nargin = args.length ();
++  octave_value_list retval;
++
++  if (nargin != 2)
++    print_usage ();
++  else
++    {
++      dim_vector dv = get_dim_vector (args(0), "ind2sub");
++      idx_vector idx = args(1).index_vector ();
++      if (! error_state)
++        {
++          if (nargout > dv.length ())
++            dv = dv.redim (nargout);
++
++          Array<idx_vector> idxa = ind2sub (dv, idx); 
++          retval = Array<octave_value> (idxa);
++        }
++    }
++
++  return retval;
++}
+diff --git a/src/Makefile.in b/src/Makefile.in
+--- a/src/Makefile.in
++++ b/src/Makefile.in
+@@ -67,17 +67,17 @@ DLD_XSRC := amd.cc balance.cc besselj.cc
+ 	cellfun.cc chol.cc ccolamd.cc colamd.cc colloc.cc \
+ 	conv2.cc convhulln.cc daspk.cc dasrt.cc dassl.cc det.cc \
+ 	dispatch.cc dlmread.cc dmperm.cc eig.cc eigs.cc fft.cc \
+ 	fft2.cc fftn.cc fftw.cc filter.cc find.cc fltk_backend.cc \
+ 	gammainc.cc gcd.cc getgrent.cc getpwent.cc getrusage.cc \
+ 	givens.cc hess.cc hex2num.cc inv.cc kron.cc lookup.cc \
+ 	lsode.cc lu.cc luinc.cc matrix_type.cc max.cc md5sum.cc \
+ 	pinv.cc qr.cc quad.cc qz.cc rand.cc rcond.cc regexp.cc \
+-	schur.cc sparse.cc spparms.cc sqrtm.cc svd.cc syl.cc \
++	schur.cc sparse.cc spparms.cc sqrtm.cc sub2ind.cc svd.cc syl.cc \
+ 	symrcm.cc symbfact.cc time.cc tsearch.cc typecast.cc \
+ 	urlwrite.cc __contourc__.cc __delaunayn__.cc \
+ 	__dsearchn__.cc __glpk__.cc __lin_interpn__.cc \
+ 	__magick_read__.cc __pchip_deriv__.cc __qp__.cc \
+ 	__voronoi__.cc __convn__.cc
+ 
+ DLD_SRC := $(addprefix DLD-FUNCTIONS/, $(DLD_XSRC))
+ 
+diff --git a/src/ov-range.h b/src/ov-range.h
+--- a/src/ov-range.h
++++ b/src/ov-range.h
+@@ -72,16 +72,22 @@ public:
+ 	  ::error ("invalid range");
+       }
+ 
+   octave_range (const octave_range& r)
+     : octave_base_value (), range (r.range), 
+       idx_cache (r.idx_cache ? new idx_vector (*r.idx_cache) : 0)
+     { }
+ 
++  octave_range (const Range& r, const idx_vector& cache)
++    : octave_base_value (), range (r), idx_cache ()
++      {
++        set_idx_cache (cache);
++      }
++
+   ~octave_range (void) { clear_cached_info (); }
+ 
+   octave_base_value *clone (void) const { return new octave_range (*this); }
+ 
+   // A range is really just a special kind of real matrix object.  In
+   // the places where we need to call empty_clone, it makes more sense
+   // to create an empty matrix (0x0) instead of an empty range (1x0).
+   octave_base_value *empty_clone (void) const { return new octave_matrix (); }
+diff --git a/src/ov-re-mat.h b/src/ov-re-mat.h
+--- a/src/ov-re-mat.h
++++ b/src/ov-re-mat.h
+@@ -85,16 +85,22 @@ public:
+                  bool zero_based = false, bool cache_index = false)
+     : octave_base_matrix<NDArray> (NDArray (idx, zero_based))
+     {
+       // Auto-create cache to speed up subsequent indexing.
+       if (zero_based && cache_index)
+         set_idx_cache (idx_vector (idx));
+     }
+ 
++  octave_matrix (const NDArray& nda, const idx_vector& cache)
++    : octave_base_matrix<NDArray> (nda) 
++    { 
++      set_idx_cache (idx_vector (cache));
++    }
++
+   ~octave_matrix (void) { }
+ 
+   octave_base_value *clone (void) const { return new octave_matrix (*this); }
+   octave_base_value *empty_clone (void) const { return new octave_matrix (); }
+ 
+   type_conv_info numeric_demotion_function (void) const;
+ 
+   octave_base_value *try_narrowing_conversion (void);
+diff --git a/src/ov.cc b/src/ov.cc
+--- a/src/ov.cc
++++ b/src/ov.cc
+@@ -976,16 +976,49 @@ octave_value::octave_value (const ArrayN
+ 
+ octave_value::octave_value (const Array<octave_idx_type>& inda, bool zero_based,
+                             bool cache_index)
+   : rep (new octave_matrix (inda, zero_based, cache_index))
+ {
+   maybe_mutate ();
+ }
+ 
++octave_value::octave_value (const idx_vector& idx)
++  : rep ()
++{
++  double scalar;
++  Range range;
++  NDArray array;
++  idx_vector::idx_class_type idx_class;
++
++  idx.unconvert (idx_class, scalar, range, array);
++
++  switch (idx_class)
++    {
++    case idx_vector::class_colon:
++      rep = new octave_magic_colon ();
++      break;
++    case idx_vector::class_range:
++      rep = new octave_range (range, idx);
++      break;
++    case idx_vector::class_scalar:
++      rep = new octave_scalar (scalar);
++      break;
++    case idx_vector::class_vector:
++      rep = new octave_matrix (array, idx);
++      break;
++    default:
++      assert (false);
++      break;
++    }
++
++  // FIXME: needed?
++  maybe_mutate ();
++}
++
+ octave_value::octave_value (double base, double limit, double inc)
+   : rep (new octave_range (base, limit, inc))
+ {
+   maybe_mutate ();
+ }
+ 
+ octave_value::octave_value (const Range& r)
+   : rep (new octave_range (r))
+@@ -1508,18 +1541,18 @@ convert_to_octave_idx_type_array (const 
+     gripe_truncated_conversion (octave_int<T>::type_name (), "int");
+ 
+   octave_int<int>::clear_conv_flag ();
+ 
+   return retval;
+ }
+ 
+ Array<octave_idx_type>
+-octave_value::octave_idx_type_vector_value (bool force_string_conv,
+-					    bool require_int,
++octave_value::octave_idx_type_vector_value (bool require_int,
++                                            bool force_string_conv,
+ 					    bool force_vector_conversion) const
+ {
+   Array<octave_idx_type> retval;
+ 
+   if (is_integer_type ())
+     {
+       if (is_int32_type ())
+         retval = convert_to_octave_idx_type_array (int32_array_value ());
+diff --git a/src/ov.h b/src/ov.h
+--- a/src/ov.h
++++ b/src/ov.h
+@@ -258,16 +258,17 @@ public:
+   octave_value (const uint16NDArray& inda);
+   octave_value (const ArrayN<octave_uint16>& inda);
+   octave_value (const uint32NDArray& inda);
+   octave_value (const ArrayN<octave_uint32>& inda);
+   octave_value (const uint64NDArray& inda);
+   octave_value (const ArrayN<octave_uint64>& inda);
+   octave_value (const Array<octave_idx_type>& inda, 
+                 bool zero_based = false, bool cache_index = false);
++  octave_value (const idx_vector& idx);
+   octave_value (double base, double limit, double inc);
+   octave_value (const Range& r);
+   octave_value (const Octave_map& m);
+   octave_value (const Octave_map& m, const std::string& id);
+   octave_value (const octave_value_list& m, bool is_cs_list = false);
+   octave_value (octave_value::magic_colon);
+ 
+   octave_value (octave_base_value *new_rep);

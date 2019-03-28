@@ -1,0 +1,397 @@
+# HG changeset patch
+# User Jacob Dawid <jacob.dawid@googlemail.com>
+# Date 1338840198 -7200
+#      Mon Jun 04 22:03:18 2012 +0200
+# Branch gui
+# Node ID ec76264adca9fc4970239dc351d3530582dc006e
+# Parent  cecc7da96e2a9391aba104cf2cedc4a368cb4c4d
+Removed last bits of Qt from octave_link.
+
+* main-window: Made subclass from octave_event_observer.
+* octave-event-listener: Added new listener method to interface.
+* octave-link: Removed last bits of Qt.
+* octave-qt-event-listener: Implemented new listener method.
+
+diff --git a/gui/src/main-window.cc b/gui/src/main-window.cc
+--- a/gui/src/main-window.cc
++++ b/gui/src/main-window.cc
+@@ -25,17 +25,18 @@
+ #include <QFileDialog>
+ #include <QMessageBox>
+ #include <QIcon>
+ 
+ #include "main-window.h"
+ #include "file-editor.h"
+ #include "settings-dialog.h"
+ 
+-main_window::main_window (QWidget * parent):QMainWindow (parent)
++main_window::main_window (QWidget * parent)
++  : QMainWindow (parent), octave_event_observer ()
+ {
+   // We have to set up all our windows, before we finally launch octave.
+   construct ();
+   _octave_qt_event_listener = new octave_qt_event_listener ();
+   octave_link::instance ()->register_event_listener (_octave_qt_event_listener);
+ 
+   connect (_octave_qt_event_listener,
+            SIGNAL (current_directory_changed(QString)),
+@@ -45,16 +46,28 @@ main_window::main_window (QWidget * pare
+   octave_link::instance ()->launch_octave();
+ }
+ 
+ main_window::~main_window ()
+ {
+ }
+ 
+ void
++main_window::event_accepted (octave_event *e)
++{
++  delete e;
++}
++
++void
++main_window::event_reject (octave_event *e)
++{
++  delete e;
++}
++
++void
+ main_window::new_file ()
+ {
+   _file_editor->request_new_file ();
+ }
+ 
+ void
+ main_window::open_file ()
+ {
+@@ -172,24 +185,27 @@ void
+ main_window::change_current_working_directory ()
+ {
+   QString selectedDirectory =
+       QFileDialog::getExistingDirectory(this, tr ("Set working direcotry"));
+ 
+   if (!selectedDirectory.isEmpty ())
+     {
+       octave_link::instance ()
+-          ->request_working_directory_change (selectedDirectory.toStdString ());
++          ->post_event (new octave_change_directory_event (*this,
++                        selectedDirectory.toStdString ()));
+     }
+ }
+ 
+ void
+ main_window::change_current_working_directory (QString directory)
+ {
+-  octave_link::instance ()->request_working_directory_change (directory.toStdString ());
++  octave_link::instance ()
++      ->post_event (new octave_change_directory_event (*this,
++                    directory.toStdString ()));
+ }
+ 
+ void
+ main_window::current_working_directory_up ()
+ {
+   _terminal->sendText ("cd ..\n");
+   _terminal->setFocus ();
+ }
+@@ -218,17 +234,17 @@ main_window::show_about_octave ()
+ 
+   QMessageBox::about (this, tr ("About Octave"), message);
+ }
+ 
+ void
+ main_window::closeEvent (QCloseEvent * closeEvent)
+ {
+   closeEvent->ignore ();
+-  octave_link::instance ()->request_octave_exit ();
++  octave_link::instance ()->post_event (new octave_exit_event (*this));
+  }
+ 
+ void
+ main_window::read_settings ()
+ {
+   QSettings *settings = resource_manager::instance ()->get_settings ();
+   restoreGeometry (settings->value ("MainWindow/geometry").toByteArray ());
+   restoreState (settings->value ("MainWindow/windowState").toByteArray ());
+diff --git a/gui/src/main-window.h b/gui/src/main-window.h
+--- a/gui/src/main-window.h
++++ b/gui/src/main-window.h
+@@ -40,28 +40,33 @@
+ // Own includes
+ #include "resource-manager.h"
+ #include "octave-link.h"
+ #include "workspace-view.h"
+ #include "history-dockwidget.h"
+ #include "files-dockwidget.h"
+ #include "terminal-dockwidget.h"
+ #include "octave-qt-event-listener.h"
++#include "octave-event-observer.h"
+ 
+ /**
+   * \class MainWindow
+   *
+   * Represents the main window.
+   */
+-class main_window:public QMainWindow
++class main_window
++    : public QMainWindow, public octave_event_observer
+ {
+ Q_OBJECT public:
+   main_window (QWidget * parent = 0);
+   ~main_window ();
+ 
++  void event_accepted (octave_event *e);
++  void event_reject (octave_event *e);
++
+   QTerminal *get_terminal_view () { return _terminal; }
+   history_dock_widget *get_history_dock_widget () { return _history_dock_widget; }
+   files_dock_widget *get_files_dock_widget () { return _files_dock_widget; }
+   bool is_closing () { return _closing; }
+ 
+ signals:
+   void settings_changed ();
+ 
+diff --git a/gui/src/octave-adapter/octave-event-listener.h b/gui/src/octave-adapter/octave-event-listener.h
+--- a/gui/src/octave-adapter/octave-event-listener.h
++++ b/gui/src/octave-adapter/octave-event-listener.h
+@@ -22,11 +22,12 @@
+ 
+ class octave_event_listener
+ {
+   public:
+     octave_event_listener () { }
+     virtual ~octave_event_listener () { }
+ 
+     virtual void current_directory_has_changed (std::string directory) = 0;
++    virtual void about_to_exit () = 0;
+ };
+ 
+ #endif // OCTAVEEVENTLISTENER_H
+diff --git a/gui/src/octave-adapter/octave-link.cc b/gui/src/octave-adapter/octave-link.cc
+--- a/gui/src/octave-adapter/octave-link.cc
++++ b/gui/src/octave-adapter/octave-link.cc
+@@ -12,37 +12,35 @@
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #include "octave-link.h"
+ #include "load-path.h"
+-#include <QDir>
+-#include <QApplication>
+ 
+ int octave_readline_hook ()
+ {
+   octave_link::instance ()->generate_events ();
+   octave_link::instance ()->process_events ();
+   return 0;
+ }
+ 
+ void octave_exit_hook (int status)
+ {
+-  Q_UNUSED (status);
+-  qApp->quit ();
++  (void) status;
++  octave_link::instance ()->about_to_exit ();
+ }
+ 
+ octave_link octave_link::_singleton;
+ 
+ octave_link::octave_link ()
+ {
+-  _event_queue_semaphore = new QSemaphore (1);
++  _event_queue_mutex = new octave_mutex ();
+   _last_working_directory = "";
+ }
+ 
+ octave_link::~octave_link ()
+ {
+ }
+ 
+ void
+@@ -72,47 +70,46 @@ octave_link::generate_events ()
+         _octave_event_listener
+             ->current_directory_has_changed (_last_working_directory);
+     }
+ }
+ 
+ void
+ octave_link::process_events ()
+ {
+-  _event_queue_semaphore->acquire ();
++  _event_queue_mutex->lock ();
+   while (_event_queue.size () > 0)
+     {
+       octave_event * e = _event_queue.front ();
+       _event_queue.pop ();
+       if (e->perform ())
+         e->accept ();
+       else
+         e->reject ();
+     }
+-  _event_queue_semaphore->release ();
++  _event_queue_mutex->unlock ();
+ }
+ 
+ void
+ octave_link::post_event (octave_event *e)
+ {
+   if (e)
+     {
+-      _event_queue_semaphore->acquire ();
++      _event_queue_mutex->lock ();
+       _event_queue.push (e);
+-      _event_queue_semaphore->release ();
++      _event_queue_mutex->unlock ();
+     }
+ }
+ 
+ void
+ octave_link::event_accepted (octave_event *e)
+ { delete e; }
+ 
+ void
+ octave_link::event_reject (octave_event *e)
+ { delete e; }
+ 
+ void
+-octave_link::request_working_directory_change (std::string directory)
+-{ post_event (new octave_change_directory_event (*this, directory)); }
+-
+-void
+-octave_link::request_octave_exit ()
+-{ post_event (new octave_exit_event (*this)); }
++octave_link::about_to_exit ()
++{
++  if (_octave_event_listener)
++    _octave_event_listener->about_to_exit ();
++}
+diff --git a/gui/src/octave-adapter/octave-link.h b/gui/src/octave-adapter/octave-link.h
+--- a/gui/src/octave-adapter/octave-link.h
++++ b/gui/src/octave-adapter/octave-link.h
+@@ -48,27 +48,25 @@
+ #include "octave/procstream.h"
+ #include "octave/sighandlers.h"
+ #include "octave/debug.h"
+ #include "octave/sysdep.h"
+ #include "octave/ov.h"
+ #include "octave/unwind-prot.h"
+ #include "octave/utils.h"
+ #include "octave/variables.h"
++#include "oct-mutex.h"
+ 
+ // Standard includes
+ #include <iostream>
+ #include <string>
+ #include <vector>
+ #include <readline/readline.h>
+ #include <queue>
+ 
+-// Qt includes
+-#include <QSemaphore>
+-
+ #include "workspace-model.h"
+ #include "octave-main-thread.h"
+ #include "octave-event.h"
+ #include "octave-event-observer.h"
+ #include "octave-event-listener.h"
+ #include "symbol-information.h"
+ 
+ /**
+@@ -78,44 +76,41 @@
+   * This class is a wrapper around octave and provides threadsafety by
+   * buffering access operations to octave and executing them in the readline
+   * event hook, which lives in the octave thread.
+   */
+ class octave_link : public octave_event_observer
+ {
+ public:
+   /** Provides a way to access the unique octave_link object. */
+-  static octave_link *
+-  instance () { return &_singleton; }
++  static octave_link * instance () { return &_singleton; }
+ 
+   /** Starts octave. */
+   void launch_octave ();
+   void register_event_listener (octave_event_listener *oel);
+ 
+   void generate_events ();
+   void process_events ();
+   void post_event (octave_event *e);
+   void event_accepted (octave_event *e);
+   void event_reject (octave_event *e);
+ 
+-  void request_working_directory_change (std::string directory);
+-  void request_octave_exit ();
+-
++  void about_to_exit ();
+ private:
+   /** Singleton. */
+   octave_link ();
+   ~octave_link ();
+ 
+   octave_event_listener *_octave_event_listener;
+ 
+   /** Thread running octave_main. */
+   octave_main_thread *_octave_main_thread;
+ 
+   /** Semaphore to lock access to the event queue. */
+-  QSemaphore *_event_queue_semaphore;
++  octave_mutex *_event_queue_mutex;
+ 
+   /** Buffer for queueing events until they will be processed. */
+   std::queue <octave_event *> _event_queue;
+ 
+   /** Stores the last known current working directory of octave. */
+   std::string _last_working_directory;
+ 
+   /** Unique instance. Singelton! */
+diff --git a/gui/src/octave-qt-event-listener.cc b/gui/src/octave-qt-event-listener.cc
+--- a/gui/src/octave-qt-event-listener.cc
++++ b/gui/src/octave-qt-event-listener.cc
+@@ -11,17 +11,24 @@
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU General Public License for more details.
+  *
+  * You should have received a copy of the GNU General Public License
+  * along with this program. If not, see <http://www.gnu.org/licenses/>.
+  */
+ 
+ #include "octave-qt-event-listener.h"
++#include <QApplication>
+ 
+ octave_qt_event_listener::octave_qt_event_listener (QObject *parent)
+   : QObject (parent), octave_event_listener ()
+ {
+ }
+ 
+ void
+ octave_qt_event_listener::current_directory_has_changed (std::string directory)
+ { emit current_directory_changed (QString::fromStdString (directory)); }
++
++void
++octave_qt_event_listener::about_to_exit ()
++{
++  qApp->quit ();
++}
+diff --git a/gui/src/octave-qt-event-listener.h b/gui/src/octave-qt-event-listener.h
+--- a/gui/src/octave-qt-event-listener.h
++++ b/gui/src/octave-qt-event-listener.h
+@@ -25,14 +25,15 @@
+ class octave_qt_event_listener
+     : public QObject, public octave_event_listener
+ {
+     Q_OBJECT
+   public:
+     octave_qt_event_listener (QObject *parent = 0);
+ 
+     void current_directory_has_changed (std::string directory);
++    void about_to_exit ();
+ 
+   signals:
+     void current_directory_changed (QString directory);
+ };
+ 
+ #endif // OCTAVEQTEVENTLISTENER_H

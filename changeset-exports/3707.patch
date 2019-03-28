@@ -1,0 +1,523 @@
+# HG changeset patch
+# User jwe
+# Date 964777254 0
+#      Fri Jul 28 09:40:54 2000 +0000
+# Node ID 58140935c8128a06330ebb26e331a780f8a53213
+# Parent  6581e686f83fc54af3f2a50b47a99c5e57ec30a6
+[project @ 2000-07-28 09:40:52 by jwe]
+
+diff --git a/liboctave/lo-cutils.c b/liboctave/lo-cutils.c
+--- a/liboctave/lo-cutils.c
++++ b/liboctave/lo-cutils.c
+@@ -37,13 +37,15 @@ octave_qsort (void *base, size_t n, size
+ extern char *strptime ();
+ 
+ char *
+ oct_strptime (const char *buf, const char *format, struct tm *tm)
+ {
+   return strptime (buf, format, tm);
+ }
+ 
++
++
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,28 @@
++2000-07-28  John W. Eaton  <jwe@bevo.che.wisc.edu>
++
++	Debug-on-error stuff based on a patch submitted by Paul Kienzle
++	<pkienzle@kienzle.powernet.co.uk> for 2.0.x.
++
++	* error.cc (Vdebug_on_warning): New static flag variable.
++	(debug_on_warning): New function.
++	(symbols_of_warning): DEFVAR debug_on_warning.
++	(warning): Handle debug_on_warning here.
++
++	* input.cc (do_keyboard): New function.
++	(Fkeyboard): Use it to do the real work.
++	* pt-stmt.cc (curr_statement): New static variable.
++	(tree_statement::eval): Save and restore it here.
++	* error.cc (Vdebug_on_error): New static flag variable.
++	(debug_on_error): New function.
++	(symbols_of_error): DEFVAR debug_on_error.
++	(pr_where, pr_where_1): New functions.
++	(error): Handle debug_on_error here.
++
+ 2000-07-20  Joao Cardoso  <jcardoso@inescporto.pt>
+ 
+ 	* Makefile.in (octave): Link with $(LD_CXX) instead of $(CXX)
+ 
+ 2000-07-20  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* oct-stream.cc (octave_base_stream::oscanf): Advance to next
+ 	format element before attempting to pick up any trailing stuff.
+diff --git a/src/error.cc b/src/error.cc
+--- a/src/error.cc
++++ b/src/error.cc
+@@ -27,26 +27,41 @@ Software Foundation, 59 Temple Place - S
+ #include <cstdarg>
+ #include <cstring>
+ 
+ #include <strstream>
+ #include <string>
+ 
+ #include "defun.h"
+ #include "error.h"
++#include "input.h"
+ #include "pager.h"
+ #include "oct-obj.h"
+ #include "utils.h"
+ #include "ov.h"
++#include "ov-usr-fcn.h"
++#include "pt-pr-code.h"
++#include "pt-stmt.h"
++#include "toplev.h"
++#include "unwind-prot.h"
+ #include "variables.h"
+ 
+ // TRUE means that Octave will try to beep obnoxiously before printing
+ // error messages.
+ static bool Vbeep_on_error;
+ 
++// TRUE means that Octave will try to enter the debugger when an error
++// is encountered.  This will also inhibit printing of the normal
++// traceback message (you will only see the top-level error message).
++static bool Vdebug_on_error;
++
++// TRUE means that Octave will try to enter the debugger when a warning
++// is encountered.
++static bool Vdebug_on_warning;
++
+ // Current error state.
+ int error_state = 0;
+ 
+ // Current warning state.
+ int warning_state = 0;
+ 
+ // Tell the error handler whether to print messages, or just store
+ // them for later.  Used for handling errors in eval() and
+@@ -190,33 +205,107 @@ usage (const char *fmt, ...)
+ {
+   va_list args;
+   va_start (args, fmt);
+   error_state = -1;
+   verror ("usage", fmt, args);
+   va_end (args);
+ }
+ 
++static void
++pr_where_1 (const char *fmt, ...)
++{
++  va_list args;
++  va_start (args, fmt);
++  error_1 (0, fmt, args);
++  va_end (args);
++}
++
++static void
++pr_where (void)
++{
++  if (curr_statement)
++    {
++      std::string fcn_name = curr_function->function_name ();
++      std::string file_name = curr_function->fcn_file_name ();
++
++      const char *nm
++	= file_name.empty () ? fcn_name.c_str () : file_name.c_str ();
++
++      int l = curr_statement->line ();
++      int c = curr_statement->column ();
++
++      pr_where_1 ("error: in %s near line %d, column %d:", nm, l, c);
++
++      // Oops, note that the column number may not be correct
++      // since the code is being reproduced from the parse tree.
++
++      std::ostrstream output_buf;
++
++      tree_print_code tpc (output_buf, "    ");
++
++      curr_statement->accept (tpc);
++
++      output_buf << ends;
++
++      char *msg = output_buf.str ();
++
++      pr_where_1 (msg);
++
++      delete [] msg;
++    }
++}
++
+ void
+ warning (const char *fmt, ...)
+ {
+   va_list args;
+   va_start (args, fmt);
+   warning_state = 1;
+   vwarning ("warning", fmt, args);
+   va_end (args);
++
++  if ((interactive || forced_interactive)
++      && Vdebug_on_warning && curr_function)
++    {
++      unwind_protect_bool (Vdebug_on_warning);
++      Vdebug_on_warning = false;
++
++      pr_where ();
++
++      do_keyboard (octave_value_list ());
++
++      unwind_protect::run ();
++    }
+ }
+ 
+ void
+ error (const char *fmt, ...)
+ {
++  int init_state = error_state;
++
+   va_list args;
+   va_start (args, fmt);
+   error_1 ("error", fmt, args);
+   va_end (args);
++
++  if ((interactive || forced_interactive)
++      && Vdebug_on_error && init_state == 0 && curr_function)
++    {
++      unwind_protect_bool (Vdebug_on_error);
++      Vdebug_on_error = false;
++
++      pr_where ();
++
++      error_state = 0;
++
++      do_keyboard (octave_value_list ());
++
++      unwind_protect::run ();
++    }
+ }
+ 
+ void
+ parse_error (const char *fmt, ...)
+ {
+   va_list args;
+   va_start (args, fmt);
+   error_1 (0, fmt, args);
+@@ -430,27 +519,60 @@ clear_global_error_variable (void *)
+ static int
+ beep_on_error (void)
+ {
+   Vbeep_on_error = check_preference ("beep_on_error");
+ 
+   return 0;
+ }
+ 
++static int
++debug_on_error (void)
++{
++  Vdebug_on_error = check_preference ("debug_on_error");
++
++  return 0;
++}
++
++static int
++debug_on_warning (void)
++{
++  Vdebug_on_warning = check_preference ("debug_on_warning");
++
++  return 0;
++}
++
+ void
+ symbols_of_error (void)
+ {
+   DEFVAR (beep_on_error, 0.0, beep_on_error,
+     "-*- texinfo -*-\n\
+ @defvr {Built-in Variable} beep_on_error\n\
+ If the value of @code{beep_on_error} is nonzero, Octave will try\n\
+ to ring your terminal's bell before printing an error message.  The\n\
+ default value is 0.\n\
+ @end defvr");
+ 
++  DEFVAR (debug_on_error, 0.0, debug_on_error,
++    "-*- texinfo -*-\n\
++@defvr {Built-in Variable} debug_on_error\n\
++If the value of @code{debug_on_error} is nonzero, Octave will try\n\
++to enter the debugger when an error is encountered.  This will also\n\
++inhibit printing of the normal traceback message (you will only see\n\
++the top-level error message).  The default value is 0.\n\
++@end defvr");
++
++  DEFVAR (debug_on_warning, 0.0, debug_on_warning,
++    "-*- texinfo -*-\n\
++@defvr {Built-in Variable} debug_on_warning\n\
++If the value of @code{debug_on_warning} is nonzero, Octave will try\n\
++to enter the debugger when a warning is encountered.  The default\n\
++value is 0.\n\
++@end defvr");
++
+   DEFCONST (error_text, "",
+     "-*- texinfo -*-\n\
+ @defvr {Built-in Variable} error_text\n\
+ This variable contains the text of error messages that would have\n\
+ been printed in the body of the most recent @code{unwind_protect} or\n\
+ @code{try} statement or the @var{try} part of the most recent call to\n\
+ the @code{eval} function.  Outside of the @code{unwind_protect} and\n\
+ @code{try} statements or the @code{eval} function, or if no error has\n\
+diff --git a/src/input.cc b/src/input.cc
+--- a/src/input.cc
++++ b/src/input.cc
+@@ -499,24 +499,24 @@ get_user_input (const octave_value_list&
+   int read_as_string = 0;
+ 
+   if (nargin == 2)
+     read_as_string++;
+ 
+   std::string prompt ("debug> ");
+ 
+   if (nargin > 0)
+-   {
+-     prompt = args(0).string_value ();
++    {
++      prompt = args(0).string_value ();
+ 
+-     if (error_state)
+-       {
+-	 error ("input: unrecognized argument");
+-	 return retval;
+-       }
++      if (error_state)
++	{
++	  error ("input: unrecognized argument");
++	  return retval;
++	}
+     }
+ 
+  again:
+ 
+   flush_octave_stdout ();
+ 
+   std::string input_buf = gnu_readline (prompt.c_str (), true);
+ 
+@@ -635,16 +635,45 @@ the screen before your prompt.  @xref{In
+ }
+ 
+ static void
+ restore_command_history (void *)
+ {
+   command_history::ignore_entries (! Vsaving_history);
+ }
+ 
++octave_value
++do_keyboard (const octave_value_list& args)
++{
++  octave_value retval;
++
++  int nargin = args.length ();
++
++  assert (nargin == 0 || nargin == 1);
++
++  unwind_protect::begin_frame ("do_keyboard");
++
++  // XXX FIXME XXX -- we shouldn't need both the
++  // command_history object and the
++  // Vsaving_history variable...
++  command_history::ignore_entries (false);
++
++  unwind_protect::add (restore_command_history, 0);
++
++  unwind_protect_bool (Vsaving_history);
++
++  Vsaving_history = true;
++
++  retval = get_user_input (args, true, 0);
++
++  unwind_protect::run_frame ("do_keyboard");
++
++  return retval;
++}
++
+ DEFUN (keyboard, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} keyboard (@var{prompt})\n\
+ This function is normally used for simple debugging.  When the\n\
+ @code{keyboard} function is executed, Octave prints a prompt and waits\n\
+ for user input.  The input strings are then evaluated and the results\n\
+ are printed.  This makes it possible to examine the values of variables\n\
+ within a function, and to assign new values to variables.  No value is\n\
+@@ -655,34 +684,17 @@ If @code{keyboard} is invoked without an
+ @samp{debug> } is used.\n\
+ @end deftypefn")
+ {
+   octave_value_list retval;
+ 
+   int nargin = args.length ();
+ 
+   if (nargin == 0 || nargin == 1)
+-    {
+-      unwind_protect::begin_frame ("keyboard");
+-
+-      // XXX FIXME XXX -- we shouldn't need both the
+-      // command_history object and the
+-      // Vsaving_history variable...
+-      command_history::ignore_entries (false);
+-
+-      unwind_protect::add (restore_command_history, 0);
+-
+-      unwind_protect_bool (Vsaving_history);
+-
+-      Vsaving_history = true;
+-
+-      retval = get_user_input (args, true, 0);
+-
+-      unwind_protect::run_frame ("keyboard");
+-    }
++    do_keyboard (args);
+   else
+     print_usage ("keyboard");
+ 
+   return retval;
+ }
+ 
+ DEFUN_TEXT(echo, args, ,
+   "-*- texinfo -*-\n\
+diff --git a/src/input.h b/src/input.h
+--- a/src/input.h
++++ b/src/input.h
+@@ -26,16 +26,19 @@ Software Foundation, 59 Temple Place - S
+ #define octave_input_h 1
+ 
+ #include <cstdio>
+ 
+ #include <string>
+ 
+ #include "oct-time.h"
+ 
++class octave_value;
++class octave_value_list;
++
+ extern int octave_read (char *buf, unsigned max_size);
+ extern FILE *get_input_from_file (const std::string& name, int warn = 1);
+ extern FILE *get_input_from_stdin (void);
+ 
+ // Global pointer for eval().
+ extern std::string current_eval_string;
+ 
+ // TRUE means get input from current_eval_string.
+@@ -70,16 +73,18 @@ extern std::string current_input_line;
+ 
+ // TRUE after a call to completion_matches().
+ extern bool octave_completion_matches_called;
+ 
+ extern std::string gnu_readline (const std::string& s, bool force_readline = false);
+ 
+ extern void initialize_command_input (void);
+ 
++extern octave_value do_keyboard (const octave_value_list& args);
++
+ extern std::string Vps4;
+ 
+ enum echo_state
+ {
+   ECHO_OFF = 0,
+   ECHO_SCRIPTS = 1,
+   ECHO_FUNCTIONS = 2,
+   ECHO_CMD_LINE = 4
+diff --git a/src/pt-stmt.cc b/src/pt-stmt.cc
+--- a/src/pt-stmt.cc
++++ b/src/pt-stmt.cc
+@@ -38,23 +38,27 @@ Software Foundation, 59 Temple Place - S
+ #include "pager.h"
+ #include "pt-cmd.h"
+ #include "pt-id.h"
+ #include "pt-idx.h"
+ #include "pt-jump.h"
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
++#include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+ // If TRUE, turn off printing of results in functions (as if a
+ // semicolon has been appended to each statement).
+ static bool Vsilent_functions;
+ 
++// Pointer to the current statement being executed.
++tree_statement *curr_statement = 0;
++
+ // A list of commands to be executed.
+ 
+ tree_statement::~tree_statement (void)
+ {
+   delete cmd;
+   delete expr;
+   delete comm;
+ }
+@@ -149,30 +153,37 @@ tree_statement_list::eval (bool silent, 
+     {
+       tree_statement *elt = this->operator () (p);
+ 
+       if (elt)
+ 	{
+ 	  bool silent_flag =
+ 	    silent ? true : (function_body ? Vsilent_functions : false);
+ 
++	  unwind_protect_ptr (curr_statement);
++	  curr_statement = elt;
++
+ 	  retval = elt->eval (silent_flag, nargout, function_body);
+ 
++	  unwind_protect::run ();
++
+ 	  if (error_state)
+ 	    break;
+ 
+ 	  if (tree_break_command::breaking
+ 	      || tree_continue_command::continuing)
+ 	    break;
+ 
+ 	  if (tree_return_command::returning)
+ 	    break;
+ 	}
+       else
+ 	error ("invalid statement found in statement list!");
++
++
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ tree_statement_list::accept (tree_walker& tw)
+ {
+diff --git a/src/pt-stmt.h b/src/pt-stmt.h
+--- a/src/pt-stmt.h
++++ b/src/pt-stmt.h
+@@ -141,15 +141,18 @@ private:
+ 
+   // No copying!
+ 
+   tree_statement_list (const tree_statement_list&);
+ 
+   tree_statement_list& operator = (const tree_statement_list&);
+ };
+ 
++// Pointer to the current statement being executed.
++extern tree_statement *curr_statement;
++
+ #endif
+ 
+ /*
+ ;;; Local Variables: ***
+ ;;; mode: C++ ***
+ ;;; End: ***
+ */

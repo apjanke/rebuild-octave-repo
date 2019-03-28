@@ -1,0 +1,296 @@
+# HG changeset patch
+# User Torsten <ttl@justmail.de>
+# Date 1407770677 -7200
+#      Mon Aug 11 17:24:37 2014 +0200
+# Branch gui-release
+# Node ID e87e65bc71ae08017e2886d750a60a2c24c90898
+# Parent  00b1d60500bd76f5bd80b3457b3f6c5e7ed0dad2
+improved finding a function file for editing in gui (bug #41509)
+
+* octave-qscintilla.h: new signal context_menu_edit_signal
+
+* octave-qscintilla.cc (contextmenu_edit): only emit a new signal, handling
+  of this menu action has been moved to file_editor_tab
+
+* file-editor-tab.h: new slot handle_context_menu_edit
+
+* file-editor-tab.cc (constructor): connect new signal from octave-qscintilla
+  to the related new slot for handling the edit function event;
+  (handle_context_menu_edit): new slot searching for a matching subfunction,
+  a private function or one within the same directory when __which__ returns an
+  empty type; old contents from contextmenu_edit has moved here as well
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -55,16 +55,17 @@ along with Octave; see the file COPYING.
+ 
+ #include "file-ops.h"
+ 
+ #include "debug.h"
+ #include "octave-qt-link.h"
+ #include "version.h"
+ #include "utils.h"
+ #include "defaults.h"
++#include <oct-map.h>
+ 
+ // Make parent null for the file editor tab so that warning
+ // WindowModal messages don't affect grandparents.
+ file_editor_tab::file_editor_tab (const QString& directory_arg)
+ {
+   QString directory = directory_arg;
+   _lexer_apis = 0;
+   _app_closing = false;
+@@ -90,16 +91,18 @@ file_editor_tab::file_editor_tab (const 
+ 
+   connect (_edit_area,
+            SIGNAL (cursorPositionChanged (int, int)),
+            this,
+            SLOT (handle_cursor_moved (int,int)));
+ 
+   connect (_edit_area, SIGNAL (create_context_menu_signal (QMenu*)),
+            this, SLOT (create_context_menu (QMenu*)));
++  connect (_edit_area, SIGNAL (context_menu_edit_signal (const QString&)),
++           this, SLOT (handle_context_menu_edit (const QString&)));
+ 
+   // create statusbar for row/col indicator
+   _status_bar = new QStatusBar (this);
+ 
+   _row_indicator = new QLabel ("", this);
+   _row_indicator->setMinimumSize (30,0);
+   QLabel *row_label = new QLabel (tr ("Line:"), this);
+   _col_indicator = new QLabel ("", this);
+@@ -200,16 +203,118 @@ file_editor_tab::closeEvent (QCloseEvent
+ 
+ void
+ file_editor_tab::execute_command_in_terminal (const QString& command)
+ {
+   emit execute_command_in_terminal_signal (command); // connected to main window
+ }
+ 
+ void
++file_editor_tab::handle_context_menu_edit (const QString& word_at_cursor)
++{
++  // search for a subfunction in actual file (this is done at first because
++  // octave finds this function before other with same name in the search path
++  QRegExp rxfun1 ("^[\t ]*function[^=]+=[\t ]*"
++      + word_at_cursor + "[\t ]*\\([^\\)]*\\)[\t ]*$");
++  QRegExp rxfun2 ("^[\t ]*function[\t ]+"
++      + word_at_cursor + "[\t ]*\\([^\\)]*\\)[\t ]*$");
++  QRegExp rxfun3 ("^[\t ]*function[\t ]+"
++      + word_at_cursor + "[\t ]*$");
++  QRegExp rxfun4 ("^[\t ]*function[^=]+=[\t ]*"
++      + word_at_cursor + "[\t ]*$");
++
++  int pos_fct = -1;
++  QStringList lines = _edit_area->text ().split ("\n");
++
++  int line;
++  for (line = 0; line < lines.count (); line++)
++    {
++      if ((pos_fct = rxfun1.indexIn (lines.at (line))) != -1)
++        break;
++      if ((pos_fct = rxfun2.indexIn (lines.at (line))) != -1)
++        break;
++      if ((pos_fct = rxfun3.indexIn (lines.at (line))) != -1)
++        break;
++      if ((pos_fct = rxfun4.indexIn (lines.at (line))) != -1)
++        break;
++    }
++
++  if (pos_fct > -1)
++    { // reg expr. found: it is an internal function
++      _edit_area->setCursorPosition (line, pos_fct);
++      _edit_area->SendScintilla (2613, line); // SCI_SETFIRSTVISIBLELINE
++      return;
++    }
++
++  // Is it a regular function within the search path? (Call __which__)
++  octave_value_list fct = F__which__ (ovl (word_at_cursor.toStdString ()),0);
++  octave_map map = fct(0).map_value ();
++
++  QString type = QString::fromStdString (
++                         map.contents ("type").data ()[0].string_value ());
++  QString name = QString::fromStdString (
++                         map.contents ("name").data ()[0].string_value ());
++
++  QString message = QString ();
++  QString filename = QString ();
++
++  if (type == QString("built-in function"))
++    { // built in function: can't edit
++      message = tr ("%1 is a built-in function");
++    }
++  else if (type.isEmpty ())
++    {
++      // function not known to octave -> try directory of edited file
++      QFileInfo file = QFileInfo (_file_name);
++      file = QFileInfo (QDir (file.canonicalPath ()), word_at_cursor + ".m");
++
++      if (file.exists ())
++        {
++          filename = file.canonicalFilePath (); // local file exists
++        }
++      else
++        { // local file does not exist -> try private directory
++          file = QFileInfo (_file_name);
++          file = QFileInfo (QDir (file.canonicalPath () + "/private"),
++                            word_at_cursor + ".m");
++
++          if (file.exists ())
++            {
++              filename = file.canonicalFilePath ();  // private function exists
++            }
++          else
++            {
++              message = tr ("Can not find function %1");  // no file found
++            }
++        }
++    }
++
++  if (! message.isEmpty ())
++    {
++      QMessageBox *msgBox
++          = new QMessageBox (QMessageBox::Critical,
++                             tr ("Octave Editor"),
++                             message.arg (name),
++                             QMessageBox::Ok, this);
++
++      msgBox->setWindowModality (Qt::NonModal);
++      msgBox->setAttribute (Qt::WA_DeleteOnClose);
++      msgBox->show ();
++      return;
++    }
++
++  if ( filename.isEmpty ())
++    filename = QString::fromStdString (
++                           map.contents ("file").data ()[0].string_value ());
++
++  emit execute_command_in_terminal_signal (QString("edit ")
++                                           + "\""+filename+"\"");
++}
++
++void
+ file_editor_tab::set_file_name (const QString& fileName)
+ {
+   // update tracked file if we really have a file on disk
+   QStringList trackedFiles = _file_system_watcher.files ();
+   if (!trackedFiles.isEmpty ())
+     _file_system_watcher.removePath (_file_name);
+   if (!fileName.isEmpty ())
+     _file_system_watcher.addPath (fileName);
+diff --git a/libgui/src/m-editor/file-editor-tab.h b/libgui/src/m-editor/file-editor-tab.h
+--- a/libgui/src/m-editor/file-editor-tab.h
++++ b/libgui/src/m-editor/file-editor-tab.h
+@@ -115,16 +115,17 @@ public slots:
+   QString load_file (const QString& fileName);
+   void new_file (const QString& commands = QString ());
+ 
+   void file_has_changed (const QString& fileName);
+ 
+   void execute_command_in_terminal (const QString& command);
+   void edit_area_has_focus (bool foucs);
+   void create_context_menu (QMenu *);
++  void handle_context_menu_edit (const QString&);
+ 
+ signals:
+ 
+   void file_name_changed (const QString& fileName, const QString& toolTip);
+   void editor_state_changed (bool copy_available, const QString& fileName,
+                              bool is_octave_file);
+   void tab_remove_request ();
+   void add_filename_to_list (const QString&, QWidget *);
+diff --git a/libgui/src/m-editor/octave-qscintilla.cc b/libgui/src/m-editor/octave-qscintilla.cc
+--- a/libgui/src/m-editor/octave-qscintilla.cc
++++ b/libgui/src/m-editor/octave-qscintilla.cc
+@@ -27,17 +27,16 @@ along with Octave; see the file COPYING.
+ #endif
+ 
+ #ifdef HAVE_QSCINTILLA
+ 
+ #include <Qsci/qscilexer.h>
+ #include <Qsci/qscicommandset.h>
+ #include <QShortcut>
+ #include <QMessageBox>
+-#include <oct-map.h>
+ 
+ #include "octave-qscintilla.h"
+ #include "file-editor-tab.h"
+ #include "shortcut-manager.h"
+ 
+ octave_qscintilla::octave_qscintilla (QWidget *p)
+   : QsciScintilla (p)
+ {
+@@ -262,50 +261,17 @@ octave_qscintilla::contextmenu_help_doc 
+   else
+     command = "help ";
+   emit execute_command_in_terminal_signal (command + _word_at_cursor);
+ }
+ 
+ void
+ octave_qscintilla::contextmenu_edit (bool)
+ {
+-  octave_value_list fct = F__which__ (ovl (_word_at_cursor.toStdString ()),0);
+-  octave_map map = fct(0).map_value ();
+-
+-  QString type = QString::fromStdString (
+-                         map.contents ("type").data ()[0].string_value ());
+-  QString name = QString::fromStdString (
+-                         map.contents ("name").data ()[0].string_value ());
+-
+-  QString message = QString ();
+-
+-  if (type.isEmpty ())
+-    message = tr ("Can not find function %1");
+-  else if (type == QString("built-in function"))
+-    message = tr ("%1 is a built-in function");
+-
+-  if (! message.isEmpty ())
+-    {
+-      QMessageBox *msgBox
+-          = new QMessageBox (QMessageBox::Critical,
+-                             tr ("Octave Editor"),
+-                             message.arg (name),
+-                             QMessageBox::Ok, this);
+-
+-      msgBox->setWindowModality (Qt::NonModal);
+-      msgBox->setAttribute (Qt::WA_DeleteOnClose);
+-      msgBox->show ();
+-      return;
+-    }
+-
+-  QString filename = QString::fromStdString (
+-                         map.contents ("file").data ()[0].string_value ());
+-
+-  emit execute_command_in_terminal_signal (QString("edit ")
+-                                           + "\""+filename+"\"");
++  emit context_menu_edit_signal (_word_at_cursor);
+ }
+ 
+ void
+ octave_qscintilla::contextmenu_run (bool)
+ {
+   QStringList commands = selectedText ().split (QRegExp("[\r\n]"),
+                                                 QString::SkipEmptyParts);
+   for (int i = 0; i < commands.size (); i++ )
+diff --git a/libgui/src/m-editor/octave-qscintilla.h b/libgui/src/m-editor/octave-qscintilla.h
+--- a/libgui/src/m-editor/octave-qscintilla.h
++++ b/libgui/src/m-editor/octave-qscintilla.h
+@@ -46,16 +46,17 @@ public:
+   void context_run ();
+   void get_global_textcursor_pos (QPoint *global_pos, QPoint *local_pos);
+   bool get_actual_word ();
+ 
+ signals:
+ 
+   void execute_command_in_terminal_signal (const QString&);
+   void create_context_menu_signal (QMenu*);
++  void context_menu_edit_signal (const QString&);
+   void qsci_has_focus_signal (bool);
+   void status_update (bool,bool);
+ 
+ private slots:
+ 
+   void contextmenu_help (bool);
+   void contextmenu_doc (bool);
+   void contextmenu_help_doc (bool);

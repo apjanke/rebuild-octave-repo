@@ -1,0 +1,458 @@
+# HG changeset patch
+# User Pantxo Diribarne <pantxo.diribarne@gmail.com>
+# Date 1551790276 -3600
+#      Tue Mar 05 13:51:16 2019 +0100
+# Node ID 0adb232f93b9853cf466a59f7656b4ddab81e230
+# Parent  65c036b78040e18f8737dc17e5f0e633dc0d516c
+Implement axes and text "fontsmoothing" property (bug #55833).
+
+* NEWS: Announce new property.
+
+* base-text-renderer.h (base_text_renderer::set_anti_aliasing): New pure virtual
+  method
+
+* ft-text-renderer.[h,cc] (text_renderer::m_antialias): New bool data member.
+  (ft_text_renderer::set_anti_aliasing): Implement
+  base_text_renderer::set_anti_aliasing.
+  (is_opaque): New function to determine if a pixel is opaque.
+  (ft_text_renderer::process_charater): Render glyph monochrome or antialiased
+  depending on m_antialias.
+
+* text-renderer.[h,cc] (text_renderer::set_anti_aliasing): New method.
+
+* graphics.in.h (axes::properties::fontsmoothing): Add "u" and corresponding
+  updater.
+  (text::properties::fontsmoothing,text::properties::update_fontsmoothing): New
+  property and corresponding updater.
+
+* grpahics.cc (text::properties::update_font): Update the text_renderer
+  anti-aliasing.
+
+* grpahics.cc (opengl_renderer::set_font): Update the text-renderer
+  anti-aliasing.
+
+* genpropdoc: Document "fontsmoothnig" property.
+
+diff --git a/NEWS b/NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -9,16 +9,21 @@ Summary of important user-visible change
+ 
+ #### Graphics backend
+ 
+ - Graphic primitives now accept a color property value of `"none"`
+   which is useful when a particular primitive needs to be hidden
+   (for example, the Y-axis of an axes object with `"ycolor" = "none"`)
+   without hiding the entire primitive `"visibility" = "off"`.
+ 
++- A new property `"FontSmoothing"` has been added to text and axes
++  objects that controls whether anti-aliasing is used during the
++  rendering of characters.  The default is "on" which produces smooth,
++  more visually appealing text. 
++
+ - The appearance of patterned lines `"LineStyle" = ":"|"--"|"-."` has
+   been improved for small widths (`"LineWidth"` less than 1.5 pixels)
+   which is a common scenario.
+ 
+ - Printing to EPS files now uses a tight bounding box (`"-tight"`
+   argument to print) by default.  This makes more sense for EPS
+   files which are normally embedded within other documents, and is
+   Matlab compatible.  If necessary use the `"-loose"` option to
+diff --git a/doc/interpreter/genpropdoc.m b/doc/interpreter/genpropdoc.m
+--- a/doc/interpreter/genpropdoc.m
++++ b/doc/interpreter/genpropdoc.m
+@@ -691,22 +691,22 @@ to be the same as the length of 2 units 
+       case "fontname"
+         s.doc = doc_fontname;
+         s.valid = valid_string;
+ 
+       case "fontsize"
+         s.doc = doc_fontsize;
+         s.valid = "scalar";
+ 
++      case "fontsmoothing"
++        s.doc = "Control whether any text associated with __objname__ is anti-aliased.";
++
+       case "fontunits"
+         s.doc = doc_fontunits;
+ 
+-      case "fontsmoothing"
+-        s.doc = doc_unused;
+-
+       case "fontweight"
+         s.doc = doc_fontweight;
+ 
+       case "gridalpha"
+         s.doc = sprintf (doc_notimpl, "Transparency");
+ 
+       case "gridalphamode"
+         s.doc = doc_unused;
+@@ -1077,16 +1077,19 @@ and location of the text string.";
+ 
+       case "fontangle"
+         s.doc = doc_fontangle;
+ 
+       case "fontname"
+         s.doc = doc_fontname;
+         s.valid = valid_string;
+ 
++      case "fontsmoothing"
++        s.doc = "Control whether anti-aliasing is used when rendering text.";
++
+       case "fontsize"
+         s.doc = doc_fontsize;
+         s.valid = "scalar";
+ 
+       case "fontunits"
+         s.doc = doc_fontunits;
+ 
+       case "fontweight"
+diff --git a/libinterp/corefcn/base-text-renderer.h b/libinterp/corefcn/base-text-renderer.h
+--- a/libinterp/corefcn/base-text-renderer.h
++++ b/libinterp/corefcn/base-text-renderer.h
+@@ -47,16 +47,19 @@ namespace octave
+     // No copying!
+ 
+     base_text_renderer (const base_text_renderer&) = delete;
+ 
+     base_text_renderer& operator = (const base_text_renderer&) = delete;
+ 
+     virtual ~base_text_renderer (void) = default;
+ 
++    virtual void
++    set_anti_aliasing (bool val) = 0;
++
+     virtual Matrix
+     get_extent (text_element *elt, double rotation) = 0;
+ 
+     virtual Matrix
+     get_extent (const std::string& txt, double rotation,
+                 const caseless_str& interpreter) = 0;
+ 
+     virtual void
+diff --git a/libinterp/corefcn/ft-text-renderer.cc b/libinterp/corefcn/ft-text-renderer.cc
+--- a/libinterp/corefcn/ft-text-renderer.cc
++++ b/libinterp/corefcn/ft-text-renderer.cc
+@@ -364,17 +364,17 @@ namespace octave
+ 
+   public:
+ 
+     ft_text_renderer (void)
+       : base_text_renderer (), font (), bbox (1, 4, 0.0), halign (0),
+         xoffset (0), line_yoffset (0), yoffset (0), mode (MODE_BBOX),
+         color (dim_vector (1, 3), 0), m_do_strlist (false), m_strlist (),
+         line_xoffset (0), m_ymin (0), m_ymax (0), m_deltax (0),
+-        m_max_fontsize (0)
++        m_max_fontsize (0), m_antialias (true)
+     { }
+ 
+     // No copying!
+ 
+     ft_text_renderer (const ft_text_renderer&) = delete;
+ 
+     ft_text_renderer& operator = (const ft_text_renderer&) = delete;
+ 
+@@ -408,16 +408,18 @@ namespace octave
+ 
+     uint8NDArray render (text_element *elt, Matrix& box,
+                          int rotation = ROTATION_0);
+ 
+     Matrix get_extent (text_element *elt, double rotation = 0.0);
+     Matrix get_extent (const std::string& txt, double rotation,
+                        const caseless_str& interpreter);
+ 
++    void set_anti_aliasing (bool val) { m_antialias = val; };
++
+     void set_font (const std::string& name, const std::string& weight,
+                    const std::string& angle, double size);
+ 
+     void set_color (const Matrix& c);
+ 
+     void set_mode (int m);
+ 
+     void text_to_pixels (const std::string& txt,
+@@ -532,16 +534,19 @@ namespace octave
+     FT_Pos m_ymin;
+     FT_Pos m_ymax;
+ 
+     // Difference between the advance and the actual extent of the latest glyph
+     FT_Pos m_deltax;
+ 
+     // Used for computing the distance between lines.
+     double m_max_fontsize;
++    
++    // Anti-aliasing.
++    bool m_antialias;
+ 
+   };
+ 
+   void
+   ft_text_renderer::set_font (const std::string& name, const std::string& weight,
+                               const std::string& angle, double size)
+   {
+     // FIXME: take "fontunits" into account
+@@ -698,17 +703,27 @@ namespace octave
+           }
+         break;
+ 
+       default:
+         error ("ft_text_renderer: invalid mode '%d'", mode);
+         break;
+       }
+   }
+-
++  bool is_opaque (const FT_GlyphSlot &glyph, const int x, const int y)
++  {
++    // Borrowed from https://stackoverflow.com/questions/14800827/
++    //    indexing-pixels-in-a-monochrome-freetype-glyph-buffer
++    int pitch = std::abs (glyph->bitmap.pitch);
++    unsigned char *row = &glyph->bitmap.buffer[pitch * y];
++    char cvalue = row[x >> 3];
++    
++    return ((cvalue & (128 >> (x & 7))) != 0);
++  }
++  
+   FT_UInt
+   ft_text_renderer::process_character (FT_ULong code, FT_UInt previous)
+   {
+     FT_Face face = font.get_face ();
+     FT_UInt glyph_index = 0;
+ 
+     if (face)
+       {
+@@ -740,17 +755,19 @@ namespace octave
+                 xoffset = (1 + std::floor (1. * xoffset / x_tab)) * x_tab;
+               }
+           }
+         else
+           {
+             switch (mode)
+               {
+               case MODE_RENDER:
+-                if (FT_Render_Glyph (face->glyph, FT_RENDER_MODE_NORMAL))
++                if (FT_Render_Glyph (face->glyph, (m_antialias
++                                                   ? FT_RENDER_MODE_NORMAL
++                                                   : FT_RENDER_MODE_MONO)))
+                   {
+                     glyph_index = 0;
+                     warn_glyph_render (code);
+                   }
+                 else
+                   {
+                     FT_Bitmap& bitmap = face->glyph->bitmap;
+                     int x0, y0;
+@@ -772,17 +789,21 @@ namespace octave
+                     // of bound, and assumes we've allocated the right amount of
+                     // horizontal space in the bbox.
+                     if (x0 < 0)
+                       x0 = 0;
+ 
+                     for (int r = 0; static_cast<unsigned int> (r) < bitmap.rows; r++)
+                       for (int c = 0; static_cast<unsigned int> (c) < bitmap.width; c++)
+                         {
+-                          unsigned char pix = bitmap.buffer[r*bitmap.width+c];
++                          unsigned char pix
++                            = (m_antialias
++                               ? bitmap.buffer[r*bitmap.width+c]
++                               : (is_opaque (face->glyph, c, r) ? 255 : 0));
++                          
+                           if (x0+c < 0 || x0+c >= pixels.dim2 ()
+                               || y0-r < 0 || y0-r >= pixels.dim3 ())
+                             {
+                               // ::warning ("ft_text_renderer: x %d,  y %d",
+                               //            x0+c, y0-r);
+                             }
+                           else if (pixels(3, x0+c, y0-r).value () == 0)
+                             {
+diff --git a/libinterp/corefcn/gl-render.cc b/libinterp/corefcn/gl-render.cc
+--- a/libinterp/corefcn/gl-render.cc
++++ b/libinterp/corefcn/gl-render.cc
+@@ -4003,16 +4003,18 @@ namespace octave
+     panic_impossible ();
+ 
+ #endif
+   }
+ 
+   void
+   opengl_renderer::set_font (const base_properties& props)
+   {
++    bool do_anti_alias = props.get ("fontsmoothing").string_value () == "on";
++    txt_renderer.set_anti_aliasing (do_anti_alias);
+     txt_renderer.set_font (props.get ("fontname").string_value (),
+                            props.get ("fontweight").string_value (),
+                            props.get ("fontangle").string_value (),
+                            props.get ("__fontsize_points__").double_value ()
+                            * m_devpixratio);
+   }
+ 
+   void
+diff --git a/libinterp/corefcn/graphics.cc b/libinterp/corefcn/graphics.cc
+--- a/libinterp/corefcn/graphics.cc
++++ b/libinterp/corefcn/graphics.cc
+@@ -9177,16 +9177,18 @@ text::properties::update_font (void)
+   double dpr = device_pixel_ratio (get___myhandle__ ());
+ 
+   gh_manager::auto_lock guard;
+   txt_renderer.set_font (get ("fontname").string_value (),
+                          get ("fontweight").string_value (),
+                          get ("fontangle").string_value (),
+                          get ("__fontsize_points__").double_value () * dpr);
+ 
++  txt_renderer.set_anti_aliasing (is_fontsmoothing ());
++
+   Matrix c = get_color_rgb ();
+   if (! c.isempty ())
+     txt_renderer.set_color (c);
+ 
+ }
+ 
+ void
+ text::properties::update_text_extent (void)
+@@ -9469,17 +9471,17 @@ patch::properties::update_data (void)
+               else
+                 valid_vert = idx(ii,jj);
+             }
+         }
+     }
+ 
+   // check coplanarity for 3D-faces with more than 3 corners
+   int fcmax = idx.rows ();
+-  if (fcmax > 3 && vert.columns () > 2 && 
++  if (fcmax > 3 && vert.columns () > 2 &&
+       ! (facecolor_is ("none") && edgecolor_is ("none")))
+     {
+       for (octave_idx_type jj = 0; jj < idx.columns (); jj++)
+         {
+           if (! octave::math::isnan (idx(3,jj)))
+             {
+               // find first element that is NaN to get number of corners
+               octave_idx_type nc = 3;
+diff --git a/libinterp/corefcn/graphics.in.h b/libinterp/corefcn/graphics.in.h
+--- a/libinterp/corefcn/graphics.in.h
++++ b/libinterp/corefcn/graphics.in.h
+@@ -3625,18 +3625,18 @@ public:
+       array_property colororder , default_colororder ()
+       double_property colororderindex , 1.0
+       array_property currentpoint , Matrix (2, 3, 0.0)
+       row_vector_property dataaspectratio mu , Matrix (1, 3, 1.0)
+       radio_property dataaspectratiomode u , "{auto}|manual"
+       radio_property fontangle u , "{normal}|italic"
+       string_property fontname u , OCTAVE_DEFAULT_FONTNAME
+       double_property fontsize u , 10
++      bool_property fontsmoothing u , "on"
+       radio_property fontunits SU , "{points}|inches|centimeters|normalized|pixels"
+-      bool_property fontsmoothing , "on"
+       radio_property fontweight u , "{normal}|bold"
+       double_property gridalpha m , 0.15
+       radio_property gridalphamode , "{auto}|manual"
+       color_property gridcolor m , color_property (color_values (0.15, 0.15, 0.15), radio_values ("none"))
+       radio_property gridcolormode , "{auto}|manual"
+       radio_property gridlinestyle , "{-}|--|:|-.|none"
+       double_property labelfontsizemultiplier u , 1.1
+       radio_property layer u , "{bottom}|top"
+@@ -3963,16 +3963,20 @@ public:
+       update_font ("fontname");
+       sync_positions ();
+     }
+     void update_fontsize (void)
+     {
+       update_font ("fontsize");
+       sync_positions ();
+     }
++    void update_fontsmoothing (void)
++    {
++      update_font ("fontsmoothing");
++    }
+     void update_fontangle (void)
+     {
+       update_font ("fontangle");
+       sync_positions ();
+     }
+     void update_fontweight (void)
+     {
+       update_font ("fontweight");
+@@ -4342,16 +4346,17 @@ public:
+       color_property color u , color_property (color_values (0, 0, 0), radio_values ("none"))
+       color_property edgecolor , color_property (radio_values ("{none}"), color_values (0, 0, 0))
+       bool_property editing , "off"
+       array_property extent rG , Matrix (1, 4, 0.0)
+       // FIXME: DEPRECATED: Remove "oblique" in version 7.
+       radio_property fontangle u , "{normal}|italic|oblique"
+       string_property fontname u , OCTAVE_DEFAULT_FONTNAME
+       double_property fontsize u , 10
++      bool_property fontsmoothing u , "on"
+       radio_property fontunits SU , "inches|centimeters|normalized|{points}|pixels"
+       radio_property fontweight u , "{normal}|bold"
+       radio_property horizontalalignment mu , "{left}|center|right"
+       radio_property interpreter u , "{tex}|none|latex"
+       radio_property linestyle , "{-}|--|:|-.|none"
+       double_property linewidth , 0.5
+       double_property margin , 3
+       array_property position smu , Matrix (1, 3, 0.0)
+@@ -4430,16 +4435,17 @@ public:
+     void update_rotationmode (void) { request_autopos (); }
+     void update_horizontalalignmentmode (void) { request_autopos (); }
+     void update_verticalalignmentmode (void) { request_autopos (); }
+ 
+     void update_string (void) { request_autopos (); update_text_extent (); }
+     void update_rotation (void) { update_text_extent (); }
+     void update_fontname (void) { update_font (); update_text_extent (); }
+     void update_fontsize (void) { update_font (); update_text_extent (); }
++    void update_fontsmoothing (void) { update_font (); update_text_extent (); }
+ 
+     void update_color (void)
+     {
+       if (! color.is ("none"))
+         {
+           update_font ();
+           update_text_extent ();
+         }
+diff --git a/libinterp/corefcn/text-renderer.cc b/libinterp/corefcn/text-renderer.cc
+--- a/libinterp/corefcn/text-renderer.cc
++++ b/libinterp/corefcn/text-renderer.cc
+@@ -82,16 +82,23 @@ namespace octave
+                              const caseless_str& interpreter)
+   {
+     static Matrix empty_extent (1, 4, 0.0);
+ 
+     return ok () ? rep->get_extent (txt, rotation, interpreter) : empty_extent;
+   }
+ 
+   void
++  text_renderer::set_anti_aliasing (bool val)
++  {
++    if (ok ())
++      rep->set_anti_aliasing (val);
++  }
++
++  void
+   text_renderer::set_font (const std::string& name, const std::string& weight,
+                            const std::string& angle, double size)
+   {
+     if (ok ())
+       rep->set_font (name, weight, angle, size);
+   }
+ 
+   void
+diff --git a/libinterp/corefcn/text-renderer.h b/libinterp/corefcn/text-renderer.h
+--- a/libinterp/corefcn/text-renderer.h
++++ b/libinterp/corefcn/text-renderer.h
+@@ -57,16 +57,18 @@ namespace octave
+ 
+     bool ok (void) const;
+ 
+     Matrix get_extent (text_element *elt, double rotation = 0.0);
+ 
+     Matrix get_extent (const std::string& txt, double rotation = 0.0,
+                        const caseless_str& interpreter = "tex");
+ 
++    void set_anti_aliasing (bool val);
++    
+     void set_font (const std::string& name, const std::string& weight,
+                    const std::string& angle, double size);
+ 
+     void set_color (const Matrix& c);
+ 
+     void text_to_pixels (const std::string& txt,
+                          uint8NDArray& pxls, Matrix& bbox,
+                          int halign, int valign, double rotation = 0.0,

@@ -1,0 +1,501 @@
+# HG changeset patch
+# User Torsten <mttl@mailbox.org>
+# Date 1505620353 -7200
+#      Sun Sep 17 05:52:33 2017 +0200
+# Node ID d3c6de326bae4b2b2f2fe898f19759224fb270ba
+# Parent  a3f2b06c599ae3e8759ccdd65be939a9347a141c
+close/reload editor tab when file is (re)moved in gui terminal (bug #43922)
+
+* file-editor.cc (handle_file_remove): new code structure
+
+* main-window.cc (construct): connect new signals from octave_qt_link to the
+  slot handle_file_renamed and the new proxy slot file_remove_proxy;
+  (file_remove_proxy): proxy calling handle_file_remove but protected by the
+  mutex of octave_qt_link synchronizing worker and gui thread
+
+* main-window.h: new slot file_remove_proxy
+
+* octave-qt-link.cc (do_file_remove): new method for renaming or removing
+  files which signals the editor (gui thread) for closing the files before
+  removing is carried out;
+  (do_file_renamed): new method for re-loading renamed files into editor;
+
+* octave-qt-link.h: new methods do_file_remove and do_file_renamed,
+  new signals used in the new methods for signaling the editor slots
+
+* dirfns.cc (rmdir): call the new static octave_link method for removing
+  a file, which might be opened in the editor before removing a dir;
+  (rename): call the new static octave_link method for renaming a file,
+  which might be opened in the editor before renaming it and call the method
+  for reloading the new renamed file;
+
+* octave-link.h (file_remove): new static method calling purely virtual method
+  do_file_remove, which is implemented in octave_qt_link;
+  (file_renamed): new static method calling purely virtual method
+  do_file_renamed, which is implemented in octave_qt_link
+
+* syscalls.cc (unlink): call the new static octave_link method for removing
+  a file, which might be opened in the editor before removing it
+
+diff --git a/libgui/src/m-editor/file-editor-interface.h b/libgui/src/m-editor/file-editor-interface.h
+--- a/libgui/src/m-editor/file-editor-interface.h
++++ b/libgui/src/m-editor/file-editor-interface.h
+@@ -68,16 +68,18 @@ namespace octave
+     virtual void empty_script (bool, bool) = 0;
+ 
+     virtual void restore_session (QSettings *) = 0;
+ 
+     virtual void enable_menu_shortcuts (bool enable) = 0;
+ 
+   public slots:
+ 
++    virtual void handle_file_remove (const QString& o, const QString& n) = 0;
++
+     virtual void request_new_file (const QString& command = QString ()) = 0;
+ 
+     virtual void request_open_file (const QString& openFileName,
+                                     const QString& encoding = QString (),
+                                     int line = -1,
+                                     bool debug_pointer = false,
+                                     bool breakpoint_marker = false,
+                                     bool insert = true,
+diff --git a/libgui/src/m-editor/file-editor.cc b/libgui/src/m-editor/file-editor.cc
+--- a/libgui/src/m-editor/file-editor.cc
++++ b/libgui/src/m-editor/file-editor.cc
+@@ -929,45 +929,46 @@ namespace octave
+     m_tmp_closed_files.clear ();
+ 
+     // Check if old name is a file or directory
+     QFileInfo old (old_name);
+     if (old.isDir ())
+       {
+         // Call the function which handles directories and return
+         handle_dir_remove (old_name, new_name);
+-        return;
+       }
+-
+-    // Is old file open?
+-    file_editor_tab *editor_tab
+-      = static_cast<file_editor_tab *> (find_tab_widget (old_name));
+-
+-    if (editor_tab)
++    else
+       {
+-        // Yes, close it silently
+-        m_no_focus = true;  // Remember for not focussing editor
+-        editor_tab->file_has_changed (QString (), true);  // Close the tab
+-        m_no_focus = false;  // Back to normal
+-
+-        m_tmp_closed_files << old_name;  // for reloading if error removing
+-
+-        if (! new_name.isEmpty ())
+-          m_tmp_closed_files << new_name;  // store new name
+-        else
+-          m_tmp_closed_files << ""; // no new name, just removing this file
+-
+-        // Get and store the related encoding
+-        for (auto p = m_editor_tab_map.cbegin ();
+-             p != m_editor_tab_map.cend (); p++)
++        // It is a single file. IT is open?
++        file_editor_tab *editor_tab
++          = static_cast<file_editor_tab *> (find_tab_widget (old_name));
++
++        if (editor_tab)
+           {
+-            if (editor_tab == p->second.fet_ID)
++            // Yes, close it silently
++            m_no_focus = true;  // Remember for not focussing editor
++            editor_tab->file_has_changed (QString (), true);  // Close the tab
++            m_no_focus = false;  // Back to normal
++
++            m_tmp_closed_files << old_name;  // for reloading if error removing
++
++            if (! new_name.isEmpty ())
++              m_tmp_closed_files << new_name;  // store new name
++            else
++              m_tmp_closed_files << ""; // no new name, just removing this file
++
++            // Get and store the related encoding
++            for (editor_tab_map_const_iterator p = m_editor_tab_map.begin ();
++                  p != m_editor_tab_map.end (); p++)
+               {
+-                m_tmp_closed_files << p->second.encoding;
+-                break;
++                if (editor_tab == p->second.fet_ID)
++                  {
++                    m_tmp_closed_files << p->second.encoding;
++                    break;
++                  }
+               }
+           }
+       }
+   }
+ 
+   // Slot for signal indicating that a file was renamed
+   void file_editor::handle_file_renamed (bool load_new)
+   {
+diff --git a/libgui/src/main-window.cc b/libgui/src/main-window.cc
+--- a/libgui/src/main-window.cc
++++ b/libgui/src/main-window.cc
+@@ -457,16 +457,29 @@ namespace octave
+       emit open_file_signal (file_name, QString (), line);
+   }
+ 
+   void main_window::edit_mfile (const QString& name, int line)
+   {
+     handle_edit_mfile_request (name, QString (), QString (), line);
+   }
+ 
++  void main_window::file_remove_proxy (const QString& o, const QString& n)
++  {
++    // Wait for worker to suspend
++    m_octave_qt_link->lock ();
++
++    // Close the file if opened
++    m_editor_window->handle_file_remove (o, n);
++
++    // We are done: Unlock and wake the worker thread
++    m_octave_qt_link->unlock ();
++    m_octave_qt_link->wake_all ();
++  }
++
+   void main_window::open_online_documentation_page (void)
+   {
+     QDesktopServices::openUrl (
+                                QUrl ("https://octave.org/doc/interpreter/index.html"));
+   }
+ 
+   void main_window::display_release_notes (void)
+   {
+@@ -1927,23 +1940,31 @@ namespace octave
+                  SIGNAL (update_breakpoint_marker_signal (bool, const QString&,
+                                                           int, const QString&)),
+                  m_editor_window,
+                  SLOT (handle_update_breakpoint_marker_request (bool,
+                                                                 const QString&,
+                                                                 int,
+                                                                 const QString&)));
+ 
++        // Signals for removing/renaming files/dirs in the file browser
+         connect (m_file_browser_window,
+                  SIGNAL (file_remove_signal (const QString&, const QString&)),
+                  m_editor_window,
+                  SLOT (handle_file_remove (const QString&, const QString&)));
+ 
+         connect (m_file_browser_window, SIGNAL (file_renamed_signal (bool)),
+                  m_editor_window, SLOT (handle_file_renamed (bool)));
++
++        // Signals for removing/renaming files/dirs in the temrinal window
++        connect (m_octave_qt_link,
++                 SIGNAL (file_remove_signal (const QString&, const QString&)),
++                 this, SLOT (file_remove_proxy (const QString&, const QString&)));
++        connect (m_octave_qt_link, SIGNAL (file_renamed_signal (bool)),
++                 m_editor_window, SLOT (handle_file_renamed (bool)));
+ #endif
+ 
+         octave_link::post_event (this,
+                                  &main_window::resize_command_window_callback);
+ 
+         configure_shortcuts ();
+       }
+   }
+diff --git a/libgui/src/main-window.h b/libgui/src/main-window.h
+--- a/libgui/src/main-window.h
++++ b/libgui/src/main-window.h
+@@ -150,16 +150,17 @@ namespace octave
+     void handle_clear_command_window_request (void);
+     void handle_clear_history_request (void);
+     void handle_undo_request (void);
+     void handle_rename_variable_request (const QString& old_name,
+                                          const QString& new_name);
+     void new_file (const QString& commands = QString ());
+     void open_file (const QString& file_name = QString (), int line = -1);
+     void edit_mfile (const QString&, int);
++    void file_remove_proxy (const QString& o, const QString& n);
+     void open_online_documentation_page (void);
+     void display_release_notes (void);
+     void load_and_display_community_news (int serial = -1);
+     void display_community_news (const QString& news);
+     void open_bug_tracker_page (void);
+     void open_octave_packages_page (void);
+     void open_contribute_page (void);
+     void open_donate_page (void);
+diff --git a/libgui/src/octave-qt-link.cc b/libgui/src/octave-qt-link.cc
+--- a/libgui/src/octave-qt-link.cc
++++ b/libgui/src/octave-qt-link.cc
+@@ -400,16 +400,36 @@ namespace octave
+     return retval;
+   }
+ 
+   void octave_qt_link::do_change_directory (const std::string& dir)
+   {
+     emit change_directory_signal (QString::fromStdString (dir));
+   }
+ 
++  void octave_qt_link::do_file_remove (const std::string& old_name,
++                                       const std::string& new_name)
++  {
++    // Lock the mutex before signaling
++    lock ();
++
++    // Emit the signal for the editor for closing the file if it is open
++    emit file_remove_signal (QString::fromStdString (old_name),
++                             QString::fromStdString (new_name));
++
++    // Wait for the GUI and unlock when resumed
++    wait ();
++    unlock ();
++  }
++
++  void octave_qt_link::do_file_renamed (bool load_new)
++  {
++    emit file_renamed_signal (load_new);
++  }
++
+   void octave_qt_link::do_execute_command_in_terminal
+     (const std::string& command)
+   {
+     emit execute_command_in_terminal_signal (QString::fromStdString (command));
+   }
+ 
+   void octave_qt_link::do_set_workspace (bool top_level, bool debug,
+                                          const symbol_scope& scope,
+diff --git a/libgui/src/octave-qt-link.h b/libgui/src/octave-qt-link.h
+--- a/libgui/src/octave-qt-link.h
++++ b/libgui/src/octave-qt-link.h
+@@ -107,16 +107,20 @@ namespace octave
+ 
+     int
+     do_debug_cd_or_addpath_error (const std::string& file,
+                                   const std::string& dir,
+                                   bool addpath_option);
+ 
+     void do_change_directory (const std::string& dir);
+ 
++    void do_file_remove (const std::string& old_name,
++                         const std::string& new_name);
++    void do_file_renamed (bool load_new = true);
++
+     void do_execute_command_in_terminal (const std::string& command);
+ 
+     void do_set_workspace (bool top_level, bool debug,
+                            const symbol_scope& scope,
+                            bool update_variable_editor);
+ 
+     void do_clear_workspace (void);
+ 
+@@ -168,16 +172,19 @@ namespace octave
+   signals:
+ 
+     void copy_image_to_clipboard_signal (const QString& file, bool remove_file);
+ 
+     void edit_file_signal (const QString& file);
+ 
+     void change_directory_signal (const QString& dir);
+ 
++    void file_remove_signal (const QString& old_name, const QString& new_name);
++    void file_renamed_signal (bool load_new);
++
+     void execute_command_in_terminal_signal (const QString& command);
+ 
+     void set_workspace_signal (bool top_level, bool debug,
+                                const symbol_scope& scope);
+ 
+     void clear_workspace_signal (void);
+ 
+     void set_history_signal (const QStringList& hist);
+diff --git a/libinterp/corefcn/dirfns.cc b/libinterp/corefcn/dirfns.cc
+--- a/libinterp/corefcn/dirfns.cc
++++ b/libinterp/corefcn/dirfns.cc
+@@ -293,20 +293,28 @@ identifier.
+           octave::input_system& input_sys = interp.get_input_system ();
+ 
+           std::string prompt = "remove entire contents of " + fulldir + "? ";
+ 
+           doit = input_sys.yes_or_no (prompt);
+         }
+ 
+       if (doit)
+-        status = octave::sys::recursive_rmdir (fulldir, msg);
++        {
++          octave_link::file_remove (fulldir, "");
++          status = octave::sys::recursive_rmdir (fulldir, msg);
++        }
+     }
+   else
+-    status = octave::sys::rmdir (fulldir, msg);
++    {
++      octave_link::file_remove (fulldir, "");
++      status = octave::sys::rmdir (fulldir, msg);
++    }
++
++  octave_link::file_renamed (status >= 0);
+ 
+   if (status < 0)
+     return ovl (false, msg, "rmdir");
+   else
+     return ovl (true, "", "");
+ }
+ 
+ DEFUNX ("link", Flink, args, ,
+@@ -419,22 +427,30 @@ error message.
+   std::string from = args(0).xstring_value ("rename: OLD must be a string");
+   std::string to = args(1).xstring_value ("rename: NEW must be a string");
+ 
+   from = octave::sys::file_ops::tilde_expand (from);
+   to = octave::sys::file_ops::tilde_expand (to);
+ 
+   std::string msg;
+ 
++  octave_link::file_remove (from, to);
++
+   int status = octave::sys::rename (from, to, msg);
+ 
+   if (status < 0)
+-    return ovl (-1.0, msg);
++    {
++      octave_link::file_renamed (false);
++      return ovl (-1.0, msg);
++    }
+   else
+-    return ovl (status, "");
++    {
++      octave_link::file_renamed (true);
++      return ovl (status, "");
++    }
+ }
+ 
+ DEFUN (glob, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn {} {} glob (@var{pattern})
+ Given an array of pattern strings (as a char array or a cell array) in
+ @var{pattern}, return a cell array of filenames that match any of
+ them, or an empty cell array if no patterns match.
+diff --git a/libinterp/corefcn/octave-link.h b/libinterp/corefcn/octave-link.h
+--- a/libinterp/corefcn/octave-link.h
++++ b/libinterp/corefcn/octave-link.h
+@@ -26,17 +26,17 @@ along with Octave; see the file COPYING.
+ #define octave_octave_link_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <list>
+ #include <string>
+ 
+ #include "oct-mutex.h"
+-
++#include "octave.h"
+ #include "event-queue.h"
+ 
+ class octave_value;
+ class string_vector;
+ 
+ namespace octave
+ {
+   class symbol_scope;
+@@ -216,16 +216,30 @@ public:
+   }
+ 
+   static void change_directory (const std::string& dir)
+   {
+     if (enabled ())
+       instance->do_change_directory (dir);
+   }
+ 
++  // Methods for removing/renaming files which might be open in editor
++  static void file_remove (const std::string& old_name,
++                           const std::string& new_name)
++  {
++    if (octave::application::is_gui_running () && enabled ())
++      instance->do_file_remove (old_name, new_name);
++  }
++
++  static void file_renamed (bool load_new)
++  {
++    if (octave::application::is_gui_running () && enabled ())
++      instance->do_file_renamed (load_new);
++  }
++
+   // Preserves pending input.
+   static void execute_command_in_terminal (const std::string& command)
+   {
+     if (enabled ())
+       instance->do_execute_command_in_terminal (command);
+   }
+ 
+   static void set_workspace (void);
+@@ -511,16 +525,20 @@ protected:
+ 
+   virtual int
+   do_debug_cd_or_addpath_error (const std::string& file,
+                                 const std::string& dir,
+                                 bool addpath_option) = 0;
+ 
+   virtual void do_change_directory (const std::string& dir) = 0;
+ 
++  virtual void do_file_remove (const std::string& old_name,
++                               const std::string& new_name) = 0;
++  virtual void do_file_renamed (bool) = 0;
++
+   virtual void do_execute_command_in_terminal (const std::string& command) = 0;
+ 
+   virtual void
+   do_set_workspace (bool top_level, bool debug,
+                     const octave::symbol_scope& scope,
+                     bool update_variable_editor) = 0;
+ 
+   virtual void do_clear_workspace (void) = 0;
+diff --git a/libinterp/corefcn/syscalls.cc b/libinterp/corefcn/syscalls.cc
+--- a/libinterp/corefcn/syscalls.cc
++++ b/libinterp/corefcn/syscalls.cc
+@@ -37,26 +37,26 @@ along with Octave; see the file COPYING.
+ #include "cmd-hist.h"
+ #include "fcntl-wrappers.h"
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "lo-utils.h"
+ #include "oct-env.h"
+ #include "oct-syscalls.h"
+ #include "oct-uname.h"
+-
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "interpreter.h"
+ #include "oct-hist.h"
+ #include "oct-map.h"
+ #include "ovl.h"
+ #include "oct-stdstrm.h"
+ #include "oct-stream.h"
++#include "octave-link.h"
+ #include "sysdep.h"
+ #include "utils.h"
+ #include "variables.h"
+ #include "input.h"
+ 
+ static octave_scalar_map
+ mk_stat_map (const octave::sys::base_file_stat& fs)
+ {
+@@ -1083,18 +1083,22 @@ error message.
+ {
+   if (args.length () != 1)
+     print_usage ();
+ 
+   std::string name = args(0).xstring_value ("unlink: FILE must be a string");
+ 
+   std::string msg;
+ 
++  octave_link::file_remove (name, "");
++
+   int status = octave::sys::unlink (name, msg);
+ 
++  octave_link::file_renamed (status == 0);
++
+   return ovl (status, msg);
+ }
+ 
+ DEFUNX ("waitpid", Fwaitpid, args, ,
+         doc: /* -*- texinfo -*-
+ @deftypefn {} {[@var{pid}, @var{status}, @var{msg}] =} waitpid (@var{pid}, @var{options})
+ Wait for process @var{pid} to terminate.
+ 

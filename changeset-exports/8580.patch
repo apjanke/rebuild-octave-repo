@@ -1,0 +1,852 @@
+# HG changeset patch
+# User Jaroslav Hajek <highegg@gmail.com>
+# Date 1232712819 -3600
+#      Fri Jan 23 13:13:39 2009 +0100
+# Node ID 188d38a553c73e5b99e3d1b7c338a6661e548c87
+# Parent  7e0f36dfefbe6c10c08fc5d12ca56be1a8c7a85d
+further indexing optimization touches
+
+diff --git a/liboctave/Array.cc b/liboctave/Array.cc
+--- a/liboctave/Array.cc
++++ b/liboctave/Array.cc
+@@ -1211,23 +1211,28 @@ Array<T>::assign (const idx_vector& i, c
+   octave_idx_type n = numel (), rhl = rhs.numel ();
+ 
+   if (rhl == 1 || i.length (n) == rhl)
+     {
+       octave_idx_type nx = i.extent (n);
+       // Try to resize first if necessary. 
+       if (nx != n)
+         {
+-          // A simple optimization. Things like A(1:N) = x will skip fill on
+-          // resizing, if A is 0x0.
++          // Optimize case A = []; A(1:n) = X with A empty. 
+           if (rows () == 0 && columns () == 0 && ndims () == 2
+-              && rhl == 1 && i.is_colon_equiv (nx))
+-            *this = Array<T> (dim_vector (1, nx));
+-          else
+-            resize_fill (nx, rfv);      
++              && i.is_colon_equiv (nx))
++            {
++              if (rhl == 1)
++                *this = Array<T> (dim_vector (1, nx), rhs(0));
++              else
++                *this = Array<T> (rhs, dim_vector (1, nx));
++              return;
++            }
++
++          resize_fill (nx, rfv);      
+           n = numel ();
+         }
+ 
+       // If the resizing was ambiguous, resize has already griped.
+       if (nx == n)
+         {
+           if (i.is_colon ())
+             {
+@@ -1279,16 +1284,27 @@ Array<T>::assign (const idx_vector& i, c
+ 		|| (rhdv.length () == 2 && il == rhdv(0) && jl == rhdv(1)));
+   match = match || (il == 1 && jl == rhdv(0) && rhdv(1) == 1);
+ 
+   if (match)
+     {
+       // Resize if requested.
+       if (rdv != dv)
+         {
++          // Optimize case A = []; A(1:m, 1:n) = X
++          if (dv.all_zero () && i.is_colon_equiv (rdv(0))
++              && j.is_colon_equiv (rdv(1)))
++            {
++              if (isfill)
++                *this = Array<T> (rdv, rhs(0));
++              else
++                *this = Array<T> (rhs, rdv);
++              return;
++            }
++
+           resize (rdv, rfv);
+           dv = dimensions;
+         }
+ 
+       // If the resizing was invalid, resize has already griped.
+       if (dv == rdv)
+         {
+           if (i.is_colon () && j.is_colon ())
+diff --git a/liboctave/ChangeLog b/liboctave/ChangeLog
+--- a/liboctave/ChangeLog
++++ b/liboctave/ChangeLog
+@@ -1,8 +1,15 @@
++2009-01-23  Jaroslav Hajek  <highegg@gmail.com>
++
++	* Array.cc (Array<T>::assign (const idx_vector&, const Array<T>&)):
++	Optimize assignment to an empty array.
++	(Array<T>::assign (const idx_vector&, const idx_vector&, const Array<T>&)):
++	Optimize assignment to an empty array.
++
+ 2009-01-22  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* Array2.h (Array2<T>::index): Declare resize_ok as bool.
+ 	* ArrayN.h (ArrayN<T>::index): Dtto. Declare index vectors as const
+ 	refs.
+ 
+ 2009-01-22  Jaroslav Hajek  <highegg@gmail.com>
+ 
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,18 +1,30 @@
+ 2009-01-23  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* gripes.cc (gripe_indexed_cs_list, gripe_invalid_inquiry_subscript):
+ 	New functions.
+ 	* gripes.h: Declare them.
+ 	* pt-idx.cc: Remove definitions of the above funcs.
+-	* ov-cell.cc (octave_cell::subsasgn): Remove dead branch.
+-	* ov-struct.cc (octave_struct::subsasgn): Remove dead branch.
++	* ov-cell.cc (octave_cell::subsref): Declare constants as const.
++	(octave_cell::subsasgn): Remove dead branch, declare constants as const.
++	(octave_cell::list_value): Optimize.
++	* ov-struct.cc 
++	(octave_struct::subsref): Declare constants as const.
++	(octave_struct::subsasgn): Remove dead branch, declare constants as const.
+ 	* ov-cs-list.cc (octave_cs_list::octave_cs_list (const Cell&)):
+ 	Optimize.
++	* oct-obj.cc (octave_value_list::octave_value_list (const
++	std::list<octave_value_list>&)): New constructor.
++	* oct-obj.h: Declare it.
++	* pt-arg-list.cc (convert_to_const_vector): Optimize.
++	* symtab.cc (symbol_table::fcn_info::fcn_info_rep::find): Use const
++	reference to avoid redundant copy.
++	* ov-usr-fcn.cc (octave_user_function::bind_automatic_vars): Optimize.
++	(octave_user_function::octave_all_va_args): Optimize.
+ 
+ 2009-01-22  Jaroslav Hajek  <highegg@gmail.com>
+ 
+ 	* Cell.h (Cell::Cell (octave_value_list)): Only declare.
+ 	(Cell::index (*)): Change resize_ok type to bool.
+ 	* Cell.cc (Cell::Cell (octave_value_list)): Redefine.
+ 	* oct-obj.h, oct-obj.cc: Change octave_value_list::data to
+ 	Cell variable, reflect changes.
+diff --git a/src/oct-obj.cc b/src/oct-obj.cc
+--- a/src/oct-obj.cc
++++ b/src/oct-obj.cc
+@@ -1,12 +1,13 @@
+ /*
+ 
+ Copyright (C) 1994, 1995, 1996, 1997, 1998, 1999, 2000, 2002, 2003,
+               2004, 2005, 2006, 2007 John W. Eaton
++Copyright (C) 2009 VZLU Prague
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -24,16 +25,46 @@ along with Octave; see the file COPYING.
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+ #include "error.h"
+ #include "oct-obj.h"
+ #include "Cell.h"
+ 
++octave_value_list::octave_value_list (const std::list<octave_value_list>& lst)
++{
++  octave_idx_type n = 0, nel = 0;
++
++  // Determine number.
++  for (std::list<octave_value_list>::const_iterator p = lst.begin ();
++       p != lst.end (); p++)
++    {
++      n++;
++      nel += p->length ();
++    }
++
++  // Optimize single-element case
++  if (n == 1)
++    data = lst.front ().data;
++  else if (nel > 0)
++    {
++      data.resize (nel);
++      octave_idx_type k = 0;
++      for (std::list<octave_value_list>::const_iterator p = lst.begin ();
++           p != lst.end (); p++)
++        {
++          data.assign (idx_vector (k, k + p->length ()), p->data);
++          k += p->length ();
++        }
++      assert (k == nel);
++    }
++
++}
++
+ octave_allocator
+ octave_value_list::allocator (sizeof (octave_value_list));
+ 
+ octave_value_list&
+ octave_value_list::prepend (const octave_value& val)
+ {
+   octave_idx_type n = length ();
+ 
+diff --git a/src/oct-obj.h b/src/oct-obj.h
+--- a/src/oct-obj.h
++++ b/src/oct-obj.h
+@@ -1,12 +1,13 @@
+ /*
+ 
+ Copyright (C) 1994, 1995, 1996, 1997, 1998, 2000, 2002, 2003, 2004,
+               2005, 2006, 2007 John W. Eaton
++Copyright (C) 2009 VZLU Prague
+ 
+ This file is part of Octave.
+ 
+ Octave is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License as published by the
+ Free Software Foundation; either version 3 of the License, or (at your
+ option) any later version.
+ 
+@@ -53,16 +54,19 @@ public:
+     : data (d.reshape (dim_vector (1, d.numel ()))) { }
+ 
+   octave_value_list (const Cell& tc)
+     : data (tc.reshape (dim_vector (1, tc.numel ()))) { }
+ 
+   octave_value_list (const octave_value_list& obj)
+     : data (obj.data), names (obj.names) { }
+ 
++  // Concatenation constructor.
++  octave_value_list (const std::list<octave_value_list>&);
++
+   ~octave_value_list (void) { }
+ 
+   void *operator new (size_t size)
+     { return allocator.alloc (size); }
+ 
+   void operator delete (void *p, size_t size)
+     { allocator.free (p, size); }
+ 
+diff --git a/src/ov-cell.cc b/src/ov-cell.cc
+--- a/src/ov-cell.cc
++++ b/src/ov-cell.cc
+@@ -131,17 +131,17 @@ octave_cell::subsref (const std::string&
+       break;
+ 
+     case '{':
+       {
+ 	octave_value tmp = do_index_op (idx.front (), auto_add);
+ 
+ 	if (! error_state)
+ 	  {
+-	    Cell tcell = tmp.cell_value ();
++	    const Cell tcell = tmp.cell_value ();
+ 
+ 	    if (tcell.length () == 1)
+ 	      retval = tcell(0,0);
+ 	    else
+               retval = octave_value (octave_value_list (tcell), true);
+ 	  }
+       }
+       break;
+@@ -226,22 +226,26 @@ octave_cell::subsasgn (const std::string
+ 
+                 next_idx.erase (next_idx.begin ());
+ 
+                 std::string next_type = type.substr (1);
+ 
+                 if (tmpc.numel () == 1)
+ 		  {
+ 		    octave_value tmp = tmpc(0);
++                    tmpc = Cell ();
+ 
+ 		    if (! tmp.is_defined () || tmp.is_zero_by_zero ())
+-                      tmp = octave_value::empty_conv (type.substr (1), rhs);
++                      {
++                        tmp = octave_value::empty_conv (type.substr (1), rhs);
++                        tmp.make_unique (); // probably a no-op.
++                      }
+                     else
+-                      // optimization: ignore the copy still stored inside our array and in tmpc.
+-                      tmp.make_unique (2);
++                      // optimization: ignore the copy still stored inside our array. 
++                      tmp.make_unique (1);
+ 
+ 		    if (! error_state)
+ 		      t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+ 		  }
+                 else
+                   gripe_indexed_cs_list ();
+ 	      }
+ 	  }
+@@ -351,39 +355,17 @@ octave_cell::byte_size (void) const
+     retval += matrix(i).byte_size ();
+ 
+   return retval;
+ }
+ 
+ octave_value_list
+ octave_cell::list_value (void) const
+ {
+-  octave_value_list retval;
+-
+-  octave_idx_type nr = rows ();
+-  octave_idx_type nc = columns ();
+-
+-  if (nr == 1 && nc > 0)
+-    {
+-      retval.resize (nc);
+-
+-      for (octave_idx_type i = 0; i < nc; i++)
+-	retval(i) = matrix(0,i);
+-    }
+-  else if (nc == 1 && nr > 0)
+-    {
+-      retval.resize (nr);
+-
+-      for (octave_idx_type i = 0; i < nr; i++)
+-	retval(i) = matrix(i,0);
+-    }
+-  else
+-    error ("invalid conversion from cell array to list");
+-
+-  return retval;
++  return octave_value_list (matrix);
+ }
+ 
+ string_vector
+ octave_cell::all_strings (bool pad) const
+ {
+   string_vector retval;
+ 
+   octave_idx_type nel = numel ();
+diff --git a/src/ov-struct.cc b/src/ov-struct.cc
+--- a/src/ov-struct.cc
++++ b/src/ov-struct.cc
+@@ -112,21 +112,21 @@ octave_struct::subsref (const std::strin
+     {
+     case '(':
+       {
+ 	if (type.length () > 1 && type[1] == '.')
+ 	  {
+ 	    std::list<octave_value_list>::const_iterator p = idx.begin ();
+ 	    octave_value_list key_idx = *++p;
+ 
+-	    Cell tmp = dotref (key_idx);
++	    const Cell tmp = dotref (key_idx);
+ 
+ 	    if (! error_state)
+ 	      {
+-		Cell t = tmp.index (idx.front ());
++		const Cell t = tmp.index (idx.front ());
+ 
+ 		retval(0) = (t.length () == 1) ? t(0) : octave_value (t, true);
+ 
+ 		// We handled two index elements, so tell
+ 		// next_subsref to skip both of them.
+ 
+ 		skip++;
+ 	      }
+@@ -135,17 +135,17 @@ octave_struct::subsref (const std::strin
+ 	  retval(0) = map.index (idx.front ());
+       }
+       break;
+ 
+     case '.':
+       {
+ 	if (map.numel() > 0)
+ 	  {
+-	    Cell t = dotref (idx.front ());
++	    const Cell t = dotref (idx.front ());
+ 
+ 	    retval(0) = (t.length () == 1) ? t(0) : octave_value (t, true);
+ 	  }
+       }
+       break;
+ 
+     case '{':
+       gripe_invalid_index_type (type_name (), type[0]);
+@@ -178,21 +178,21 @@ octave_struct::subsref (const std::strin
+     {
+     case '(':
+       {
+ 	if (type.length () > 1 && type[1] == '.')
+ 	  {
+ 	    std::list<octave_value_list>::const_iterator p = idx.begin ();
+ 	    octave_value_list key_idx = *++p;
+ 
+-	    Cell tmp = dotref (key_idx, auto_add);
++	    const Cell tmp = dotref (key_idx, auto_add);
+ 
+ 	    if (! error_state)
+ 	      {
+-		Cell t = tmp.index (idx.front (), auto_add);
++		const Cell t = tmp.index (idx.front (), auto_add);
+ 
+ 		retval = (t.length () == 1) ? t(0) : octave_value (t, true);
+ 
+ 		// We handled two index elements, so tell
+ 		// next_subsref to skip both of them.
+ 
+ 		skip++;
+ 	      }
+@@ -201,17 +201,17 @@ octave_struct::subsref (const std::strin
+ 	  retval = map.index (idx.front (), auto_add);
+       }
+       break;
+ 
+     case '.':
+       {
+ 	if (map.numel() > 0)
+ 	  {
+-	    Cell t = dotref (idx.front (), auto_add);
++	    const Cell t = dotref (idx.front (), auto_add);
+ 
+ 	    retval = (t.length () == 1) ? t(0) : octave_value (t, true);
+ 	  }
+       }
+       break;
+ 
+     case '{':
+       gripe_invalid_index_type (type_name (), type[0]);
+@@ -291,33 +291,33 @@ octave_struct::subsasgn (const std::stri
+ 
+                 next_idx.erase (next_idx.begin ());
+                 next_idx.erase (next_idx.begin ());
+ 
+                 std::string next_type = type.substr (2);
+ 
+                 // cast map to const reference to avoid forced key insertion.
+                 Cell tmpc = cmap.contents (key).index (idx.front (), true);
+-                tmpc.make_unique ();
+ 
+                 // FIXME: better code reuse? cf. octave_cell::subsasgn and the case below.
+ 		if (! error_state)
+ 		  {
+                     if (tmpc.numel () == 1)
+                       {
+                         octave_value tmp = tmpc(0);
++                        tmpc = Cell ();
+ 
+                         if (! tmp.is_defined () || tmp.is_zero_by_zero ())
+                           {
+                             tmp = octave_value::empty_conv (next_type, rhs);
+                             tmp.make_unique (); // probably a no-op.
+                           }
+                         else
+-                          // optimization: ignore the copy still stored inside our map and in tmpc.
+-                          tmp.make_unique (2);
++                          // optimization: ignore the copy still stored inside our map.
++                          tmp.make_unique (1);
+ 
+                         if (! error_state)
+                           t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+                       }
+                     else
+                       gripe_indexed_cs_list ();
+ 		  }
+ 	      }
+@@ -335,31 +335,30 @@ octave_struct::subsasgn (const std::stri
+ 	    std::string key = key_idx(0).string_value ();
+ 
+             std::list<octave_value_list> next_idx (idx);
+ 
+             next_idx.erase (next_idx.begin ());
+ 
+             std::string next_type = type.substr (1);
+ 
+-            Cell tmpc1 = octave_value ();
+-            Cell& tmpc = (map.contains (key)) ? map.contents (key) : tmpc1;
+-
+-            tmpc.make_unique ();
++            Cell tmpc (1, 1);
++            if (map.contains (key)) tmpc = cmap.contents (key);
+ 
+             // FIXME: better code reuse?
+             if (! error_state)
+               {
+                 if (tmpc.numel () == 1)
+                   {
+                     octave_value tmp = tmpc(0);
++                    tmpc = Cell ();
+ 
+                     if (! tmp.is_defined () || tmp.is_zero_by_zero ())
+                       {
+-                        tmp = octave_value::empty_conv (type.substr (1), rhs);
++                        tmp = octave_value::empty_conv (next_type, rhs);
+                         tmp.make_unique (); // probably a no-op.
+                       }
+                     else
+                       // optimization: ignore the copy still stored inside our map.
+                       tmp.make_unique (1);
+ 
+                     if (! error_state)
+                       t_rhs = tmp.subsasgn (next_type, next_idx, rhs);
+diff --git a/src/ov-usr-fcn.cc b/src/ov-usr-fcn.cc
+--- a/src/ov-usr-fcn.cc
++++ b/src/ov-usr-fcn.cc
+@@ -258,26 +258,20 @@ octave_user_function::unlock_subfunction
+   symbol_table::unlock_subfunctions (local_scope);
+ }
+ 
+ octave_value_list
+ octave_user_function::octave_all_va_args (void)
+ {
+   octave_value_list retval;
+ 
+-  int n = num_args_passed - num_named_args;
++  octave_idx_type n = num_args_passed - num_named_args;
+ 
+   if (n > 0)
+-    {
+-      retval.resize (n);
+-
+-      int k = 0;
+-      for (int i = num_named_args; i < num_args_passed; i++)
+-	retval(k++) = args_passed(i);
+-    }
++    retval = args_passed.slice (num_named_args, n);
+ 
+   return retval;
+ }
+ 
+ static void
+ clear_param_list (void *lst)
+ {
+   tree_parameter_list *tmp = static_cast<tree_parameter_list *> (lst);
+@@ -534,26 +528,17 @@ octave_user_function::bind_automatic_var
+ 
+   symbol_table::varref (".nargin.") = nargin;
+   symbol_table::varref (".nargout.") = nargout;
+ 
+   symbol_table::mark_hidden (".nargin.");
+   symbol_table::mark_hidden (".nargout.");
+ 
+   if (takes_varargs ())
+-    {
+-      int n = va_args.length ();
+-
+-      Cell varargin (1, n);
+-
+-      for (int i = 0; i < n; i++)
+-	varargin(0,i) = va_args(i);
+-
+-      symbol_table::varref ("varargin") = varargin;
+-    }
++    symbol_table::varref ("varargin") = va_args.cell_value ();
+ }
+ 
+ DEFUN (nargin, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} nargin ()\n\
+ @deftypefnx {Built-in Function} {} nargin (@var{fcn_name})\n\
+ Within a function, return the number of arguments passed to the function.\n\
+ At the top level, return the number of command line arguments passed to\n\
+diff --git a/src/pt-arg-list.cc b/src/pt-arg-list.cc
+--- a/src/pt-arg-list.cc
++++ b/src/pt-arg-list.cc
+@@ -169,22 +169,19 @@ tree_argument_list::convert_to_const_vec
+ 
+       unwind_protect_const_ptr (indexed_object);
+ 
+       indexed_object = object;
+     }
+ 
+   int len = length ();
+ 
+-  octave_value_list args;
+-  int args_len = len;
+-  args.resize (args_len);
++  std::list<octave_value_list> args;
+ 
+   iterator p = begin ();
+-  int j = 0;
+   for (int k = 0; k < len; k++)
+     {
+       if (stash_object)
+ 	{
+ 	  unwind_protect_int (index_position);
+ 	  unwind_protect_int (num_indices);
+ 
+ 	  index_position = k;
+@@ -195,43 +192,34 @@ tree_argument_list::convert_to_const_vec
+ 
+       if (elt)
+ 	{
+ 	  octave_value tmp = elt->rvalue ();
+ 
+ 	  if (error_state)
+ 	    {
+ 	      ::error ("evaluating argument list element number %d", k+1);
+-	      args = octave_value_list ();
++	      args.clear ();
+ 	      break;
+ 	    }
+ 	  else
+ 	    {
+ 	      if (tmp.is_cs_list ())
+-		{
+-		  octave_value_list tl = tmp.list_value ();
+-		  int n = tl.length ();
+-		  args_len += n - 1;
+-		  args.resize (args_len);
+-		  for (int i = 0; i < n; i++)
+-		    args(j++) = tl(i);
+-		}
++                args.push_back (tmp.list_value ());
+ 	      else if (tmp.is_defined ())
+-		args(j++) = tmp;
++                args.push_back (tmp);
+ 	    }
+ 	}
+       else
+ 	{
+-	  args(j++) = octave_value ();
++	  args.push_back (octave_value ());
+ 	  break;
+ 	}
+     }
+ 
+-  args.resize (j);
+-
+   if (stash_object)
+     unwind_protect::run_frame ("convert_to_const_vector");
+ 
+   return args;
+ }
+ 
+ std::list<octave_lvalue>
+ tree_argument_list::lvalue_list (void)
+diff --git a/src/pt-assign.cc b/src/pt-assign.cc
+--- a/src/pt-assign.cc
++++ b/src/pt-assign.cc
+@@ -212,17 +212,17 @@ tree_simple_assignment::rvalue (void)
+ 	    {
+ 	      error ("value on right hand side of assignment is undefined");
+ 	      return retval;
+ 	    }
+ 	  else
+ 	    {
+ 	      if (rhs_val.is_cs_list ())
+ 		{
+-		  octave_value_list lst = rhs_val.list_value ();
++		  const octave_value_list lst = rhs_val.list_value ();
+ 
+ 		  if (! lst.empty ())
+ 		    rhs_val = lst(0);
+ 		  else
+ 		    {
+ 		      error ("invalid number of elements on RHS of assignment");
+ 		      return retval;
+ 		    }
+@@ -310,17 +310,17 @@ tree_multi_assignment::~tree_multi_assig
+   delete rhs;
+ }
+ 
+ octave_value
+ tree_multi_assignment::rvalue (void)
+ {
+   octave_value retval;
+ 
+-  octave_value_list tmp = rvalue (1);
++  const octave_value_list tmp = rvalue (1);
+ 
+   if (! tmp.empty ())
+     retval = tmp(0);
+ 
+   return retval;
+ }
+ 
+ // FIXME -- this works, but it would look a little better if
+@@ -354,17 +354,20 @@ tree_multi_assignment::rvalue (int)
+ 
+       int n_out = 0;
+ 
+       for (std::list<octave_lvalue>::const_iterator p = lvalue_list.begin ();
+ 	   p != lvalue_list.end ();
+ 	   p++)
+ 	n_out += p->numel ();
+ 
+-      octave_value_list rhs_val = rhs->rvalue (n_out);
++      // The following trick is used to keep rhs_val constant.
++      const octave_value_list rhs_val1 = rhs->rvalue (n_out);
++      const octave_value_list rhs_val = (rhs_val1.length () == 1 && rhs_val1(0).is_cs_list ()
++                                         ? rhs_val1(0).list_value () : rhs_val1);
+ 
+       if (error_state)
+ 	return retval;
+ 
+       if (rhs_val.empty ())
+ 	{
+ 	  if (n_out > 0)
+ 	    {
+@@ -373,28 +376,19 @@ tree_multi_assignment::rvalue (int)
+ 	    }
+ 	}
+       else
+ 	{
+ 	  octave_idx_type k = 0;
+ 
+ 	  octave_idx_type n = rhs_val.length ();
+ 
+-	  if (n == 1)
+-	    {
+-	      octave_value tmp = rhs_val(0);
+-
+-	      if (tmp.is_cs_list ())
+-		{
+-		  rhs_val = tmp.list_value ();
+-		  n = rhs_val.length ();
+-		}
+-	    }
+-
+-	  retval.resize (n, octave_value ());
++          // To avoid copying per elements and possible optimizations, we
++          // postpone joining the final values.
++          std::list<octave_value_list> retval_list;
+ 
+ 	  tree_argument_list::iterator q = lhs->begin ();
+ 
+ 	  for (std::list<octave_lvalue>::iterator p = lvalue_list.begin ();
+ 	       p != lvalue_list.end ();
+ 	       p++)
+ 	    {
+ 	      tree_expression *lhs_elt = *q++;
+@@ -404,27 +398,24 @@ tree_multi_assignment::rvalue (int)
+ 	      octave_idx_type nel = ult.numel ();
+ 
+ 	      if (nel > 1)
+ 		{
+ 		  if (k + nel <= n)
+ 		    {
+ 		      if (etype == octave_value::op_asn_eq)
+ 			{
+-			  octave_value_list ovl (nel, octave_value ());
+-
+-			  for (octave_idx_type j = 0; j < nel; j++)
+-			    ovl(j) = rhs_val(k+j);
++                          // This won't do a copy.
++			  octave_value_list ovl  = rhs_val.slice (k, nel);
+ 
+ 			  ult.assign (etype, octave_value (ovl, true));
+ 
+ 			  if (! error_state)
+ 			    {
+-			      for (octave_idx_type j = 0; j < nel; j++)
+-				retval(k+j) = rhs_val(k+j);
++                              retval_list.push_back (ovl);
+ 
+ 			      k += nel;
+ 			    }
+ 			}
+ 		      else
+ 			{
+ 			  std::string op = octave_value::assign_op_as_string (etype);
+ 			  error ("operator %s unsupported for comma-separated list assignment",
+@@ -438,19 +429,19 @@ tree_multi_assignment::rvalue (int)
+ 		{
+ 		  if (k < n)
+ 		    {
+ 		      ult.assign (etype, rhs_val(k));
+ 
+ 		      if (! error_state)
+ 			{
+ 			  if (etype == octave_value::op_asn_eq)
+-			    retval(k) = rhs_val(k);
++                            retval_list.push_back (rhs_val(k));
+ 			  else
+-			    retval(k) = ult.value ();
++                            retval_list.push_back (ult.value ());
+ 
+ 			  k++;
+ 			}
+ 		    }
+ 		  else
+ 		    error ("element number %d undefined in return list", k+1);
+ 		}
+ 
+@@ -471,16 +462,19 @@ tree_multi_assignment::rvalue (int)
+ 		    lhs_val.print_with_name (octave_stdout,
+ 					     lhs_elt->name ());
+ 		}
+ 
+ 	      if (error_state)
+ 		break;
+ 
+ 	    }
++          
++          // Concatenate return values.
++          retval = retval_list;
+ 	}
+     }
+ 
+   first_execution = false;
+ 
+   return retval;
+ }
+ 
+diff --git a/src/pt-idx.cc b/src/pt-idx.cc
+--- a/src/pt-idx.cc
++++ b/src/pt-idx.cc
+@@ -326,17 +326,17 @@ tree_index_expression::rvalue (int nargo
+ 		  //   x{end}.a(end)
+ 		  //
+ 		  // and we are looking at the argument list that
+ 		  // contains the second (or third, etc.) "end" token,
+ 		  // so we must evaluate everything up to the point of
+ 		  // that argument list so we can pass the appropriate
+ 		  // value to the built-in __end__ function.
+ 
+-		  octave_value_list tmp_list
++		  const octave_value_list tmp_list
+ 		    = tmp.subsref (type.substr (tmpi, i - tmpi), idx, nargout);
+ 
+ 		  tmp = tmp_list(0);
+                   tmpi = i;
+                   idx.clear ();
+                   
+                   if (tmp.is_cs_list ())
+                     gripe_indexed_cs_list ();
+@@ -385,17 +385,17 @@ tree_index_expression::rvalue (int nargo
+   return retval;
+ }
+ 
+ octave_value
+ tree_index_expression::rvalue (void)
+ {
+   octave_value retval;
+ 
+-  octave_value_list tmp = rvalue (1);
++  const octave_value_list tmp = rvalue (1);
+ 
+   if (! tmp.empty ())
+     retval = tmp(0);
+ 
+   return retval;
+ }
+ 
+ octave_lvalue
+diff --git a/src/symtab.cc b/src/symtab.cc
+--- a/src/symtab.cc
++++ b/src/symtab.cc
+@@ -626,17 +626,18 @@ symbol_table::fcn_info::fcn_info_rep::fi
+     }
+ 
+   // Legacy dispatch.  We just check args_evaluated here because the
+   // actual evaluation will have happened already when searching for
+   // class methods.
+ 
+   if (args_evaluated && ! dispatch_map.empty ())
+     {
+-      std::string dispatch_type = evaluated_args(0).type_name ();
++      std::string dispatch_type = 
++        const_cast<const octave_value_list&>(evaluated_args)(0).type_name ();
+ 
+       std::string fname;
+ 
+       dispatch_map_iterator p = dispatch_map.find (dispatch_type);
+ 
+       if (p == dispatch_map.end ())
+ 	p = dispatch_map.find ("any");
+ 

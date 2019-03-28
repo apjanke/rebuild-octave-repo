@@ -1,0 +1,1056 @@
+# HG changeset patch
+# User jwe
+# Date 941233950 0
+#      Fri Oct 29 21:52:30 1999 +0000
+# Node ID c19f4b9484afcd583fbfa36038fd67948739478f
+# Parent  2efa28a91e7acae1df0ee4c3b9dbd3f056d59bc8
+[project @ 1999-10-29 21:52:12 by jwe]
+
+diff --git a/liboctave/oct-shlib.cc b/liboctave/oct-shlib.cc
+new file mode 100644
+--- /dev/null
++++ b/liboctave/oct-shlib.cc
+@@ -0,0 +1,420 @@
++/*
++
++Copyright (C) 1999 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 2, or (at your option) any
++later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, write to the Free
++Software Foundation, 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++
++*/
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#if defined (WITH_SHL)
++#include <cerrno>
++#include <cstring>
++#endif
++
++#include <strstream.h>
++
++extern "C"
++{
++#if defined (WITH_DL)
++#if defined (HAVE_DLFCN_H)
++#include <dlfcn.h>
++#else
++extern void *dlopen (const char *, int);
++extern const char *dlerror (void);
++extern void *dlsym (void *, const char *);
++extern int dlclose (void *);
++#endif
++#ifndef RTLD_LAZY
++#define RTLD_LAZY 1
++#endif
++#elif defined (WITH_SHL)
++#include <dl.h>
++#endif
++}
++
++#include "file-stat.h"
++#include "lo-error.h"
++#include "oct-shlib.h"
++#include "str-vec.h"
++
++class
++octave_base_shlib : public octave_shlib
++{
++public:
++
++  octave_base_shlib (void)
++    : octave_shlib (octave_xshlib ()), file (), fcn_names (),
++      tm_loaded (static_cast<time_t> (0))
++  { count = 1; }
++
++  octave_base_shlib (const string& f)
++    : octave_shlib (octave_xshlib ()), file (f), fcn_names (),
++      tm_loaded (static_cast<time_t> (0))
++  { count = 1; }
++
++  ~octave_base_shlib (void) { }
++
++  void open (const string&, bool = false) { }
++
++  void *search (const string&, name_mangler = 0) { return 0; }
++
++  void close (octave_shlib::close_hook = 0) { }
++
++  bool remove (const string& fcn_name);
++
++  bool is_open (void) const { return false; }
++
++  bool is_out_of_date (void) const;
++
++  int number_of_functions_loaded (void) const { return fcn_names.length (); }
++
++  string file_name (void) const { return file; }
++
++  octave_time time_loaded (void) const { return tm_loaded; }
++
++protected:
++
++  string file;
++
++  string_vector fcn_names;
++
++  octave_time tm_loaded;
++
++  void stamp_time (bool warn_future = false);
++
++  void add_to_fcn_names (const string& name);
++
++  void do_close_hook (octave_shlib::close_hook = 0);
++
++  void tabula_rasa (void);
++
++  // No copying!
++
++  octave_base_shlib (const octave_base_shlib&);
++
++  octave_base_shlib& operator = (const octave_base_shlib&);
++};
++
++bool
++octave_base_shlib::remove (const string& fcn_name)
++{
++  bool retval = false;
++
++  int n = number_of_functions_loaded ();
++
++  string_vector new_fcn_names (n);
++
++  int k = 0;
++
++  for (int i = 0; i < n; i++)
++    {
++      if (fcn_names(i) == fcn_name)
++	retval = true;
++      else
++	new_fcn_names(k++) = fcn_names(i);
++    }
++
++  new_fcn_names.resize (k);
++
++  fcn_names = new_fcn_names;
++
++  return retval;
++}
++
++bool
++octave_base_shlib::is_out_of_date (void) const
++{
++  file_stat fs (file);
++
++  return fs.is_newer (tm_loaded);
++}
++
++void
++octave_base_shlib::stamp_time (bool warn_future)
++{
++  tm_loaded.stamp ();
++
++  if (warn_future)
++    {
++      file_stat fs (file);
++
++      if (fs.is_newer (tm_loaded))
++	(*current_liboctave_warning_handler)
++	  ("timestamp on file %s is in the future", file.c_str ());
++    }
++}
++
++void
++octave_base_shlib::add_to_fcn_names (const string& name)
++{
++  int n = number_of_functions_loaded ();
++
++  for (int i = 0; i < n; i++)
++    if (fcn_names(i) == name)
++      return;
++
++  fcn_names.resize (n+1);
++
++  fcn_names(n) = name;
++}
++
++void
++octave_base_shlib::do_close_hook (octave_shlib::close_hook cl_hook)
++{
++  int n = number_of_functions_loaded ();
++
++  for (int i = 0; i < n; i++)
++    cl_hook (fcn_names(i));
++}
++
++void
++octave_base_shlib::tabula_rasa (void)
++{
++  file = "";
++
++  fcn_names.resize (0);
++
++  tm_loaded = static_cast<time_t> (0);
++}
++
++#if defined (WITH_DL)
++
++class
++octave_dlopen_shlib : public octave_base_shlib
++{
++public:
++
++  octave_dlopen_shlib (void);
++
++  ~octave_dlopen_shlib (void);
++
++  void open (const string& f, bool warn_future = false);
++
++  void *search (const string& name, name_mangler mangler = 0);
++
++  void close (octave_shlib::close_hook cl_hook = 0);
++
++  bool is_open (void) const { return (library != 0); }
++
++private:
++
++  // No copying!
++
++  octave_dlopen_shlib (const octave_dlopen_shlib&);
++
++  octave_dlopen_shlib& operator = (const octave_dlopen_shlib&);
++
++  void *library;
++};
++
++octave_dlopen_shlib::octave_dlopen_shlib (void)
++  : octave_base_shlib (), library (0)
++{
++}
++
++octave_dlopen_shlib::~octave_dlopen_shlib (void)
++{
++  close ();
++}
++
++void
++octave_dlopen_shlib::open (const string& f, bool warn_future)
++{
++  if (! is_open ())
++    {
++      file = f;
++
++      library = dlopen (file.c_str (), RTLD_LAZY);
++
++      if (library)
++	stamp_time (warn_future);
++      else
++	{
++	  const char *msg = dlerror ();
++
++	  if (msg)
++	    (*current_liboctave_error_handler) ("%s", msg);
++	}
++    }
++  else
++    (*current_liboctave_error_handler)
++      ("shared library %s is already open", file.c_str ());
++}
++
++void *
++octave_dlopen_shlib::search (const string& name,
++			     octave_shlib::name_mangler mangler)
++{
++  void *function = 0;
++
++  if (is_open ())
++    {
++      string sym_name = name;
++
++      if (mangler)
++	sym_name = mangler (name);
++
++      function = dlsym (library, sym_name.c_str ());
++
++      if (function)
++	add_to_fcn_names (name);
++    }
++  else
++    (*current_liboctave_error_handler)
++      ("shared library %s is not open", file.c_str ());
++
++  return function;
++}
++
++void
++octave_dlopen_shlib::close (octave_shlib::close_hook cl_hook)
++{
++  if (is_open ())
++    {
++      do_close_hook (cl_hook);
++
++      dlclose (library);
++
++      library = 0;
++
++      tabula_rasa ();
++    }
++}
++
++#elif defined (WITH_SHL)
++
++class
++octave_shl_load_shlib : public octave_base_shlib
++{
++public:
++
++  octave_shl_load_shlib (void);
++
++  ~octave_shl_load_shlib (void);
++
++  void open (const string& f, bool warn_future = false);
++
++  void *search (const string& name, name_mangler mangler = 0);
++
++  void close (octave_shlib::close_hook cl_hook = 0);
++
++  bool is_open (void) const { return { library != 0); }
++
++private:
++
++  // No copying!
++
++  octave_shl_load_shlib (const octave_shl_load_shlib&);
++
++  octave_shl_load_shlib& operator = (const octave_shl_load_shlib&);
++
++  shl_t library;
++};
++
++octave_shl_load_shlib::octave_shl_load_shlib (void)
++  : octave_base_shlib (), library (0)
++{
++}
++
++octave_shl_load_shlib::~octave_shl_load_shlib (void)
++{
++  close ();
++}
++
++void
++octave_shl_load_shlib::open (const string& f, bool warn_future)
++{
++  if (! is_open ())
++    {
++      file = f;
++
++      library = shl_load (file.c_str (), BIND_DEFERRED, 0L);
++
++      if (library)
++	stamp_time (warn_future);
++      else
++	(*current_liboctave_error_handler) ("%s", strerror (errno));
++    }
++  else
++    (*current_liboctave_error_handler)
++      ("shared library %s is already open", file.c_str ());
++}
++
++void *
++octave_shl_load_shlib::search (const string& name,
++			       octave_shlib::name_mangler mangler)
++{
++  void *function = 0;
++
++  if (is_open ())
++    {
++      string sym_name = name;
++
++      if (mangler)
++	sym_name = mangler (name);
++	
++      int status = shl_findsym (&library, sym_name.c_str (),
++				TYPE_UNDEFINED, &function);
++
++      if (status == 0)
++	add_to_fcn_names (name);
++    }
++  else
++    (*current_liboctave_error_handler)
++      ("shared library %s is not open", file.c_str ());
++
++  return function;
++}
++
++void
++octave_shl_load_shlib::close (octave_shlib::close_hook cl_hook)
++{
++  if (is_open ())
++    {
++      do_close_hook (cl_hook);
++
++      shl_unload (library);
++
++      library = 0;
++
++      tabula_rasa ();
++    }
++}
++
++#endif
++
++octave_shlib *
++octave_shlib::make_shlib (void)
++{
++#if defined (WITH_DL)
++  return new octave_dlopen_shlib ();
++#elif defined (WITH_SHL)
++  return new octave_shl_load_shlib ();
++#else
++  return new octave_base_shlib ();
++#endif
++}
++
++/*
++;;; Local Variables: ***
++;;; mode: C++ ***
++;;; End: ***
++*/
+diff --git a/liboctave/oct-shlib.h b/liboctave/oct-shlib.h
+new file mode 100644
+--- /dev/null
++++ b/liboctave/oct-shlib.h
+@@ -0,0 +1,137 @@
++/*
++
++Copyright (C) 1999 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 2, or (at your option) any
++later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, write to the Free
++Software Foundation, 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
++
++*/
++
++#if !defined (octave_shlib_h)
++#define octave_shlib_h 1
++
++#include <string>
++
++#include <oct-time.h>
++
++// This just provides a way to avoid infinite recursion when building
++// octave_shlib objects.
++
++class
++octave_xshlib
++{
++public:
++
++  octave_xshlib (void) { }
++};
++
++class
++octave_shlib
++{
++public:
++
++  typedef string (*name_mangler) (const string&);
++
++  typedef void (*close_hook) (const string&);
++
++  octave_shlib (void) : rep (make_shlib ()) { }
++
++  octave_shlib::octave_shlib (const string& f, bool warn_future)
++    : rep (make_shlib ())
++  {
++    open (f, warn_future);
++  }
++
++  virtual ~octave_shlib (void)
++    {
++      if (rep && --rep->count == 0)
++	{
++	  delete rep;
++	  rep = 0;
++	}
++    }
++
++  octave_shlib (const octave_shlib& sl)
++    {
++      rep = sl.rep;
++      rep->count++;
++    }
++
++  octave_shlib& operator = (const octave_shlib& sl)
++    {
++      if (rep != sl.rep)
++	{
++	  if (--rep->count == 0)
++	    delete rep;
++
++	  rep = sl.rep;
++	  rep->count++;
++	}
++
++      return *this;
++    }
++
++  bool operator == (const octave_shlib& sl) const
++    { return (rep == sl.rep); }
++
++  operator bool () const { return is_open (); }
++
++  virtual void open (const string& f, bool warn_future = false)
++    { rep->open (f, warn_future); }
++  
++  virtual void *search (const string& nm, name_mangler mangler = 0)
++    { return rep->search (nm, mangler); }
++
++  virtual void close (close_hook cl_hook = 0)
++    { rep->close (cl_hook); }
++
++  virtual bool remove (const string& fcn_name)
++    { return rep->remove (fcn_name); }
++
++  virtual bool is_out_of_date (void) const
++    { return rep->is_out_of_date (); }
++
++  virtual int number_of_functions_loaded (void) const
++    { return rep->number_of_functions_loaded (); }
++
++  virtual string file_name (void) const
++    { return rep->file_name (); }
++
++  virtual octave_time time_loaded (void) const
++    { return rep->time_loaded (); }
++
++protected:
++
++  octave_shlib (const octave_xshlib&) : rep (0) { }
++
++  virtual bool is_open (void) const { return rep->is_open (); }
++
++  static octave_shlib *make_shlib (void);
++
++  union
++    {
++      octave_shlib *rep;
++      int count;
++    };
++};
++
++#endif
++
++/*
++;;; Local Variables: ***
++;;; mode: C++ ***
++;;; End: ***
++*/
+diff --git a/src/DLList.cc b/src/DLList.cc
+new file mode 100644
+--- /dev/null
++++ b/src/DLList.cc
+@@ -0,0 +1,331 @@
++// This may look like C code, but it is really -*- C++ -*-
++/* 
++Copyright (C) 1988 Free Software Foundation
++    written by Doug Lea (dl@rocky.oswego.edu)
++
++This file is part of the GNU C++ Library.  This library is free
++software; you can redistribute it and/or modify it under the terms of
++the GNU Library General Public License as published by the Free
++Software Foundation; either version 2 of the License, or (at your
++option) any later version.  This library is distributed in the hope
++that it will be useful, but WITHOUT ANY WARRANTY; without even the
++implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++PURPOSE.  See the GNU Library General Public License for more details.
++You should have received a copy of the GNU Library General Public
++License along with this library; if not, write to the Free Software
++Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++#if defined (__GNUG__)
++#pragma implementation
++#endif
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <climits>
++
++#include "DLList.h"
++
++#include "error.h"
++
++void BaseDLList::error(const char* msg) const
++{
++  ::error ("DLList: %s", msg);
++}
++
++int BaseDLList::length() const
++{
++  int l = 0;
++  BaseDLNode* t = h;
++  if (t != 0) do { ++l; t = t->fd; } while (t != h);
++  return l;
++}
++
++// Note:  This is an internal method.  It does *not* free old contents!
++
++void BaseDLList::copy(const BaseDLList& a)
++{
++  if (a.h == 0)
++    h = 0;
++  else
++  {
++    BaseDLNode* p = a.h;
++    BaseDLNode* t = copy_node(p->item());
++    h = t;
++    p = p->fd;
++    while (p != a.h)
++    {
++      BaseDLNode* n = copy_node(p->item());
++      t->fd = n;
++      n->bk = t;
++      t = n;
++      p = p->fd;
++    }
++    t->fd = h;
++    h->bk = t;
++    return;
++  }
++}
++
++void BaseDLList::clear()
++{
++  if (h == 0)
++    return;
++
++  BaseDLNode* p = h->fd;
++  h->fd = 0;
++  h = 0;
++
++  while (p != 0)
++  {
++    BaseDLNode* nxt = p->fd;
++    delete_node(p);
++    p = nxt;
++  }
++}
++
++BaseDLList& BaseDLList::operator = (const BaseDLList& a)
++{
++  if (h != a.h)
++  {
++    clear();
++    copy(a);
++  }
++  return *this;
++}
++
++
++Pix BaseDLList::prepend(const void *datum)
++{
++  BaseDLNode* t = copy_node(datum);
++  if (h == 0)
++    t->fd = t->bk = h = t;
++  else
++  {
++    t->fd = h;
++    t->bk = h->bk;
++    h->bk->fd = t;
++    h->bk = t;
++    h = t;
++  }
++  return Pix(t);
++}
++
++Pix BaseDLList::append(const void *datum)
++{
++  BaseDLNode* t = copy_node(datum);
++  if (h == 0)
++    t->fd = t->bk = h = t;
++  else
++  {
++    t->bk = h->bk;
++    t->bk->fd = t;
++    t->fd = h;
++    h->bk = t;
++  }
++  return Pix(t);
++}
++
++Pix BaseDLList::ins_after(Pix p, const void *datum)
++{
++  if (p == 0) return prepend(datum);
++  BaseDLNode* u = (BaseDLNode*) p;
++  BaseDLNode* t = copy_node(datum);
++  t->bk = u;
++  t->fd = u->fd;
++  u->fd->bk = t;
++  u->fd = t;
++  return Pix(t);
++}
++
++Pix BaseDLList::ins_before(Pix p, const void *datum)
++{
++  if (p == 0) error("null Pix");
++  BaseDLNode* u = (BaseDLNode*) p;
++  BaseDLNode* t = copy_node(datum);
++  t->bk = u->bk;
++  t->fd = u;
++  u->bk->fd = t;
++  u->bk = t;
++  if (u == h) h = t;
++  return Pix(t);
++}
++
++void BaseDLList::join(BaseDLList& b)
++{
++  BaseDLNode* t = b.h;
++  b.h = 0;
++  if (h == 0)
++    h = t;
++  else if (t != 0)
++  {
++    BaseDLNode* l = t->bk;
++    h->bk->fd = t;
++    t->bk = h->bk;
++    h->bk = l;
++    l->fd = h;
++  }
++}
++
++int BaseDLList::owns(Pix p) const
++{
++  BaseDLNode* t = h;
++  if (t != 0 && p != 0)
++  {
++    do
++    {
++      if (Pix(t) == p) return 1;
++      t = t->fd;
++    } while (t != h);
++  }
++  return 0;
++}
++
++void BaseDLList::del(Pix& p, int dir)
++{
++  if (p == 0) error("null Pix");
++  BaseDLNode* t = (BaseDLNode*) p;
++  if (t->fd == t)
++  {
++    h = 0;
++    p = 0;
++  }
++  else
++  {
++    if (dir < 0)
++    {
++      if (t == h)
++        p = 0;
++      else
++        p = Pix(t->bk);
++    }
++    else
++    {
++      if (t == h->bk)
++        p = 0;
++      else
++        p = Pix(t->fd);
++    }
++    t->bk->fd = t->fd;
++    t->fd->bk = t->bk;
++    if (t == h) h = t->fd;
++  }
++  delete_node(t);
++}
++
++void BaseDLList::del_after(Pix& p)
++{
++  if (p == 0)
++  {
++    del_front();
++    return;
++  }
++
++  BaseDLNode* b = (BaseDLNode*) p;
++  BaseDLNode* t = b->fd;
++
++  if (b == t)
++  {
++    h = 0;
++    p = 0;
++  }
++  else
++  {
++    t->bk->fd = t->fd;
++    t->fd->bk = t->bk;
++    if (t == h) h = t->fd;
++  }
++  delete_node(t);
++}
++
++void BaseDLList::remove_front(void *dst)
++{
++  if (h == 0)
++    error("remove_front of empty list");
++  else {
++      BaseDLNode* t = h;
++      copy_item(dst, t->item());
++      if (h->fd == h)
++	  h = 0;
++      else
++	  {
++	      h->fd->bk = h->bk;
++	      h->bk->fd = h->fd;
++	      h = h->fd;
++	  }
++      delete_node(t);
++  }
++}
++
++void BaseDLList::del_front()
++{
++  if (h == 0)
++    error("del_front of empty list");
++  BaseDLNode* t = h;
++  if (h->fd == h)
++    h = 0;
++  else
++  {
++    h->fd->bk = h->bk;
++    h->bk->fd = h->fd;
++    h = h->fd;
++  }
++  delete_node(t);
++}
++
++void BaseDLList::remove_rear(void *dst)
++{
++  if (h == 0)
++    error("remove_rear of empty list");
++  else
++    {
++      BaseDLNode* t = h->bk;
++      copy_item(dst, t->item());
++      if (h->fd == h)
++	h = 0;
++      else
++	{
++	  t->fd->bk = t->bk;
++	  t->bk->fd = t->fd;
++        }
++      delete_node(t);
++    }
++}
++
++void BaseDLList::del_rear()
++{
++  if (h == 0)
++    error("del_rear of empty list");
++  BaseDLNode* t = h->bk;
++  if (h->fd == h)
++    h = 0;
++  else
++  {
++    t->fd->bk = t->bk;
++    t->bk->fd = t->fd;
++  }
++  delete_node(t);
++}
++
++
++int BaseDLList::OK() const
++{
++  int v = 1;
++  if (h != 0)
++  {
++    BaseDLNode* t = h;
++    long count = LONG_MAX;      // Lots of chances to find h!
++    do
++    {
++      count--;
++      v &= t->bk->fd == t;
++      v &= t->fd->bk == t;
++      t = t->fd;
++    } while (v && count > 0 && t != h);
++    v &= count > 0;
++  }
++  if (!v) error("invariant failure");
++  return v;
++}
+diff --git a/src/DLList.h b/src/DLList.h
+new file mode 100644
+--- /dev/null
++++ b/src/DLList.h
+@@ -0,0 +1,140 @@
++// This may look like C code, but it is really -*- C++ -*-
++/* 
++Copyright (C) 1988 Free Software Foundation
++    written by Doug Lea (dl@rocky.oswego.edu)
++
++This file is part of the GNU C++ Library.  This library is free
++software; you can redistribute it and/or modify it under the terms of
++the GNU Library General Public License as published by the Free
++Software Foundation; either version 2 of the License, or (at your
++option) any later version.  This library is distributed in the hope
++that it will be useful, but WITHOUT ANY WARRANTY; without even the
++implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR
++PURPOSE.  See the GNU Library General Public License for more details.
++You should have received a copy of the GNU Library General Public
++License along with this library; if not, write to the Free Software
++Foundation, 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
++*/
++
++
++#ifndef _DLList_h
++#define _DLList_h 1
++
++#if defined (__GNUG__)
++#pragma interface
++#endif
++
++#undef OK
++
++#include <Pix.h>
++
++struct BaseDLNode {
++    BaseDLNode *bk;
++    BaseDLNode *fd;
++    void *item() {return (void*)(this+1);} //Return ((DLNode<T>*)this)->hd
++};
++
++template<class T>
++class DLNode : public BaseDLNode
++{
++  public:
++    T hd;
++    DLNode() { }
++    DLNode(const T& h, DLNode* p = 0, DLNode* n = 0)
++        : hd(h) { bk = p; fd = n; }
++    ~DLNode() { }
++};
++
++class BaseDLList {
++  protected:
++    BaseDLNode *h;
++
++    BaseDLList() { h = 0; }
++    void copy(const BaseDLList&);
++    BaseDLList& operator= (const BaseDLList& a);
++    virtual void delete_node(BaseDLNode*node) = 0;
++    virtual BaseDLNode* copy_node(const void* datum) = 0;
++    virtual void copy_item(void *dst, void *src) = 0;
++    virtual ~BaseDLList() { }
++
++    Pix                   prepend(const void*);
++    Pix                   append(const void*);
++    Pix ins_after(Pix p, const void *datum);
++    Pix ins_before(Pix p, const void *datum);
++    void remove_front(void *dst);
++    void remove_rear(void *dst);
++    void join(BaseDLList&);
++
++  public:
++    int                   empty() const { return h == 0; }
++    int                   length() const;
++    void                  clear();
++    void                  error(const char* msg) const;
++    int                   owns(Pix p) const;
++    int                   OK() const;
++    void                  del(Pix& p, int dir = 1);
++    void                  del_after(Pix& p);
++    void                  del_front();
++    void                  del_rear();
++};
++
++template <class T>
++class DLList : public BaseDLList {
++    //friend class          <T>DLListTrav;
++
++    virtual void delete_node(BaseDLNode *node) { delete (DLNode<T>*)node; }
++    virtual BaseDLNode* copy_node(const void *datum)
++	{ return new DLNode<T>(*(const T*)datum); }
++    virtual void copy_item(void *dst, void *src) { *(T*)dst = *(T*)src; }
++
++  public:
++    DLList() : BaseDLList() { }
++    DLList(const DLList<T>& a) : BaseDLList() { copy(a); }
++
++    DLList<T>&            operator = (const DLList<T>& a)
++	{ BaseDLList::operator=((const BaseDLList&) a); return *this; }
++    virtual ~DLList() { clear(); }
++
++    Pix prepend(const T& item) {return BaseDLList::prepend(&item);}
++    Pix append(const T& item) {return BaseDLList::append(&item);}
++
++    void join(DLList<T>& a) { BaseDLList::join(a); }
++
++    T& front() {
++	if (h == 0) error("front: empty list");
++	return ((DLNode<T>*)h)->hd; }
++    T& rear() {
++	if (h == 0) error("rear: empty list");
++	return ((DLNode<T>*)h->bk)->hd;
++    }
++    const T& front() const {
++	if (h == 0) error("front: empty list");
++	return ((DLNode<T>*)h)->hd; }
++    const T& rear() const {
++	if (h == 0) error("rear: empty list");
++	return ((DLNode<T>*)h->bk)->hd;
++    }
++    T remove_front() { T dst; BaseDLList::remove_front(&dst); return dst; }
++    T remove_rear() { T dst; BaseDLList::remove_rear(&dst); return dst; }
++
++    T&                  operator () (Pix p) {
++	if (p == 0) error("null Pix");
++	return ((DLNode<T>*)p)->hd;
++    }
++    const T&              operator () (Pix p) const {
++	if (p == 0) error("null Pix");
++	return ((DLNode<T>*)p)->hd;
++    }
++    Pix                   first() const { return Pix(h); }
++    Pix                   last()  const { return (h == 0) ? 0 : Pix(h->bk); }
++    void                  next(Pix& p) const
++	{ p = (p == 0 || h == 0 || p == h->bk)? 0 : Pix(((DLNode<T>*)p)->fd); }
++    void                  prev(Pix& p) const
++	{ p = (p == 0 || p == h)? 0 : Pix(((DLNode<T>*)p)->bk); }
++    Pix ins_after(Pix p, const T& item)
++      {return BaseDLList::ins_after(p, &item); }
++    Pix ins_before(Pix p, const T& item)
++      {return BaseDLList::ins_before(p, &item);}
++};
++
++#endif

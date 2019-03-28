@@ -1,0 +1,6679 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1510866391 18000
+#      Thu Nov 16 16:06:31 2017 -0500
+# Node ID 3b302b2890d7686b3a7e23bebeb74e63ba49797b
+# Parent  554c630c9835d461201d7c5b2400f7a29d8a1e8a
+disentangle symbol_record, scope, and fcn_info from symbol_table class
+
+* fcn-info.cc, fcn-info.h, scope.cc, scope.h, symrec.cc, symrec.h:
+New files extracted from symtab.h and symtab.cc.
+* libinterp/corefcn/module.mk: Update.
+
+* symrec.cc (symbol_record::symbol_record_rep::xglobal_varref):
+Don't access private symbol_table internals directly.
+
+* scope.h, scope.cc (scope::find, scope::builtin_find,
+scope::clear_global, scope::clear_global_pattern):
+Don't access private symbol_table internals directly.
+
+* symtab.h, symtab.cc (symbol_table::builtin_find): Don't forward to
+current scope.  Look directly in fcn_info table.
+(symbol_table::global_varref, symbol_table::fcn_table_find,
+symbol_table::erase_global, symbol_table::erase_global_pattern):
+New functions.
+
+* scope.h (scope::context_id): New typedef.
+* symrec.h (symbol_record::context_id): New typedef.
+* symtab.h (symbol_table::context_id): Update.
+
+* symtab.h, symtab.cc (symbol_table::dummy_octave_value):
+Delete static data member.
+* symtab.h (symbol_table::context_id): Delete typedef.
+(symbol_table::symbol_record, symbol_table::scope,
+symbol_table::fcn_info): New typedefs.
+
+diff --git a/libinterp/corefcn/fcn-info.cc b/libinterp/corefcn/fcn-info.cc
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/fcn-info.cc
+@@ -0,0 +1,845 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague, a.s.
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include "file-ops.h"
++
++#include "fcn-info.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "load-path.h"
++#include "ov-fcn.h"
++#include "ov-usr-fcn.h"
++#include "parse.h"
++#include "scope.h"
++#include "symrec.h"
++#include "symtab.h"
++
++namespace octave
++{
++  octave_value
++  fcn_info::fcn_info_rep::load_private_function (const std::string& dir_name)
++  {
++    octave_value retval;
++
++    load_path& lp
++      = __get_load_path__ ("fcn_info::fcn_info_rep::load_private_function");
++
++    std::string file_name = lp.find_private_fcn (dir_name, name);
++
++    if (file_name.empty ())
++      return retval;
++
++    octave_value ov_fcn = load_fcn_from_file (file_name, dir_name);
++
++    if (ov_fcn.is_undefined ())
++      return retval;
++
++    octave_function *tmpfcn = ov_fcn.function_value ();
++
++    if (! tmpfcn)
++      return retval;
++
++    std::string class_name;
++
++    size_t pos = dir_name.find_last_of (sys::file_ops::dir_sep_chars ());
++
++    if (pos != std::string::npos)
++      {
++        std::string tmp = dir_name.substr (pos+1);
++
++        if (tmp[0] == '@')
++          class_name = tmp.substr (1);
++      }
++
++    tmpfcn->mark_as_private_function (class_name);
++
++    private_functions[dir_name] = ov_fcn;
++
++    return ov_fcn;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::load_class_constructor (void)
++  {
++    octave_value retval;
++
++    std::string dir_name;
++
++    load_path& lp
++      = __get_load_path__ ("fcn_info::fcn_info_rep::load_class_constructor");
++
++    std::string file_name = lp.find_method (name, name, dir_name, package_name);
++
++    if (! file_name.empty ())
++      {
++        octave_value ov_fcn
++          = load_fcn_from_file (file_name, dir_name, name,
++                                        package_name);
++
++        if (ov_fcn.is_defined ())
++          {
++            // Note: ov_fcn may be an octave_classdef_meta object instead
++            // of the actual constructor function.
++
++            retval = ov_fcn;
++
++            class_constructors[name] = retval;
++            class_methods[name] = retval;
++          }
++      }
++    else
++      {
++        // Classdef constructors can be defined anywhere in the path, not
++        // necessarily in @-folders.  Look for a normal function and load it.
++        // If the loaded function is a classdef constructor, store it as such
++        // and restore function_on_path to its previous value.
++
++        octave_value old_function_on_path = function_on_path;
++
++        octave_value maybe_cdef_ctor = find_user_function ();
++
++        if (maybe_cdef_ctor.is_defined ())
++          {
++            octave_function *fcn = maybe_cdef_ctor.function_value (true);
++
++            if (fcn && fcn->is_classdef_constructor ())
++              {
++                retval = maybe_cdef_ctor;
++
++                class_constructors[name] = retval;
++                class_methods[name] = retval;
++
++                function_on_path = old_function_on_path;
++              }
++          }
++      }
++
++    return retval;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::load_class_method (const std::string& dispatch_type)
++  {
++    octave_value retval;
++
++    if (full_name () == dispatch_type)
++      retval = load_class_constructor ();
++    else
++      {
++        cdef_manager& cdm
++          = __get_cdef_manager__ ("fcn_info::fcn_info_rep::load_class_method");
++
++        octave_function *cm = cdm.find_method_symbol (name, dispatch_type);
++
++        if (cm)
++          retval = octave_value (cm);
++
++        if (! retval.is_defined ())
++          {
++            std::string dir_name;
++
++            load_path& lp = __get_load_path__ ("fcn_info::fcn_info_rep::load_class_method");
++
++            std::string file_name = lp.find_method (dispatch_type, name,
++                                                    dir_name);
++
++            if (! file_name.empty ())
++              {
++                octave_value ov_fcn
++                  = load_fcn_from_file (file_name, dir_name,
++                                                dispatch_type);
++
++                if (ov_fcn.is_defined ())
++                  {
++                    octave_function *tmpfcn = ov_fcn.function_value ();
++
++                    if (tmpfcn && tmpfcn->is_class_method (dispatch_type))
++                      {
++                        retval = ov_fcn;
++
++                        class_methods[dispatch_type] = retval;
++                      }
++                  }
++              }
++
++            if (retval.is_undefined ())
++              {
++                // Search parent classes
++
++                symbol_table& symtab
++                  = __get_symbol_table__ ("fcn_info::fcn_info_rep::load_class_method");
++
++                const std::list<std::string>& plist =
++                  symtab.parent_classes (dispatch_type);
++
++                std::list<std::string>::const_iterator it = plist.begin ();
++
++                while (it != plist.end ())
++                  {
++                    retval = find_method (*it);
++
++                    if (retval.is_defined ())
++                      {
++                        class_methods[dispatch_type] = retval;
++                        break;
++                      }
++
++                    it++;
++                  }
++              }
++
++            if (retval.is_undefined ())
++              {
++                // Search for built-in functions that are declared to
++                // handle specific types.
++
++                if (built_in_function.is_defined ())
++                  {
++                    octave_function *fcn = built_in_function.function_value ();
++
++                    if (fcn && fcn->handles_dispatch_class (dispatch_type))
++                      {
++                        retval = built_in_function;
++
++                        class_methods[dispatch_type] = retval;
++                      }
++                  }
++              }
++          }
++      }
++
++    return retval;
++  }
++}
++
++// :-) JWE, can you parse this? Returns a 2D array with second dimension equal
++// to btyp_num_types (static constant).  Only the leftmost dimension can be
++// variable in C/C++.  Typedefs are boring.
++
++static builtin_type_t (*build_sup_table (void))[btyp_num_types]
++{
++  static builtin_type_t sup_table[btyp_num_types][btyp_num_types];
++  for (int i = 0; i < btyp_num_types; i++)
++    for (int j = 0; j < btyp_num_types; j++)
++      {
++        builtin_type_t ityp = static_cast<builtin_type_t> (i);
++        builtin_type_t jtyp = static_cast<builtin_type_t> (j);
++        // FIXME: Is this really right?
++        bool use_j =
++          (jtyp == btyp_func_handle || ityp == btyp_bool
++           || (btyp_isarray (ityp)
++               && (! btyp_isarray (jtyp)
++                   || (btyp_isinteger (jtyp) && ! btyp_isinteger (ityp))
++                   || ((ityp == btyp_double || ityp == btyp_complex
++                        || ityp == btyp_char)
++                       && (jtyp == btyp_float
++                           || jtyp == btyp_float_complex)))));
++
++        sup_table[i][j] = (use_j ? jtyp : ityp);
++      }
++
++  return sup_table;
++}
++
++namespace octave
++{
++  std::string
++  get_dispatch_type (const octave_value_list& args,
++                     builtin_type_t& builtin_type)
++  {
++    static builtin_type_t (*sup_table)[btyp_num_types] = build_sup_table ();
++    std::string dispatch_type;
++
++    int n = args.length ();
++
++    if (n > 0)
++      {
++        int i = 0;
++        builtin_type = args(0).builtin_type ();
++        if (builtin_type != btyp_unknown)
++          {
++            for (i = 1; i < n; i++)
++              {
++                builtin_type_t bti = args(i).builtin_type ();
++                if (bti != btyp_unknown)
++                  builtin_type = sup_table[builtin_type][bti];
++                else
++                  {
++                    builtin_type = btyp_unknown;
++                    break;
++                  }
++              }
++          }
++
++        if (builtin_type == btyp_unknown)
++          {
++            // There's a non-builtin class in the argument list.
++            dispatch_type = args(i).class_name ();
++
++            symbol_table& symtab = __get_symbol_table__ ("get_dispatch_type");
++
++            for (int j = i+1; j < n; j++)
++              {
++                octave_value arg = args(j);
++
++                if (arg.builtin_type () == btyp_unknown)
++                  {
++                    std::string cname = arg.class_name ();
++
++                    // Only switch to type of ARG if it is marked superior
++                    // to the current DISPATCH_TYPE.
++                    if (! symtab.is_superiorto (dispatch_type, cname)
++                        && symtab.is_superiorto (cname, dispatch_type))
++                      dispatch_type = cname;
++                  }
++              }
++          }
++        else
++          dispatch_type = btyp_class_name[builtin_type];
++      }
++    else
++      builtin_type = btyp_unknown;
++
++    return dispatch_type;
++  }
++
++  std::string
++  get_dispatch_type (const octave_value_list& args)
++  {
++    builtin_type_t builtin_type;
++    return get_dispatch_type (args, builtin_type);
++  }
++
++  // Find function definition according to the following precedence list:
++  //
++  //   private function
++  //   class method
++  //   class constructor
++  //   command-line function
++  //   autoload function
++  //   function on the path
++  //   built-in function
++  //
++  // Matlab documentation states that constructors have higher precedence
++  // than methods, but that does not seem to be the case.
++
++  octave_value
++  fcn_info::fcn_info_rep::find (const octave_value_list& args, bool local_funcs)
++  {
++    octave_value retval = xfind (args, local_funcs);
++
++    if (retval.is_undefined ())
++      {
++        // It is possible that the user created a file on the fly since
++        // the last prompt or chdir, so try updating the load path and
++        // searching again.
++
++        load_path& lp = __get_load_path__ ("fcn_info::fcn_info_rep::find");
++
++        lp.update ();
++
++        retval = xfind (args, local_funcs);
++      }
++
++    return retval;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::xfind (const octave_value_list& args,
++                                 bool local_funcs)
++  {
++    if (local_funcs)
++      {
++        scope *curr_scope
++          = __get_current_scope__ ("fcn_info::fcn_info_rep::xfind");
++
++        octave_user_function *current_fcn
++          = curr_scope ? curr_scope->function () : nullptr;
++
++        // Local function.
++
++        if (current_fcn)
++          {
++            std::string fcn_file = current_fcn->fcn_file_name ();
++
++            // For anonymous functions we look at the parent scope so that if
++            // they were defined within class methods and use local functions
++            // (helper functions) we can still use those anonymous functions
++
++            if (current_fcn->is_anonymous_function ())
++              {
++                if (fcn_file.empty ()
++                    && curr_scope->parent_scope () != nullptr
++                    && curr_scope->parent_scope ()->function () != nullptr)
++                  fcn_file
++                    = curr_scope->parent_scope ()->function ()->fcn_file_name();
++              }
++
++            if (! fcn_file.empty ())
++              {
++                str_val_iterator r = local_functions.find (fcn_file);
++
++                if (r != local_functions.end ())
++                  {
++                    // We shouldn't need an out-of-date check here since
++                    // local functions may ultimately be called only from
++                    // a primary function or method defined in the same
++                    // file.
++
++                    return r->second;
++                  }
++              }
++          }
++
++        // Private function.
++
++        if (current_fcn)
++          {
++            std::string dir_name = current_fcn->dir_name ();
++
++            if (! dir_name.empty ())
++              {
++                str_val_iterator q = private_functions.find (dir_name);
++
++                if (q == private_functions.end ())
++                  {
++                    octave_value val = load_private_function (dir_name);
++
++                    if (val.is_defined ())
++                      return val;
++                  }
++                else
++                  {
++                    octave_value& fval = q->second;
++
++                    if (fval.is_defined ())
++                      out_of_date_check (fval, "", false);
++
++                    if (fval.is_defined ())
++                      return fval;
++                    else
++                      {
++                        octave_value val = load_private_function (dir_name);
++
++                        if (val.is_defined ())
++                          return val;
++                      }
++                  }
++              }
++          }
++      }
++
++    // Class methods.
++
++    if (! args.empty ())
++      {
++        std::string dispatch_type = get_dispatch_type (args);
++
++        octave_value fcn = find_method (dispatch_type);
++
++        if (fcn.is_defined ())
++          return fcn;
++      }
++
++    // Class constructors.  The class name and function name are the same.
++
++    str_val_iterator q = class_constructors.find (name);
++
++    if (q == class_constructors.end ())
++      {
++        octave_value val = load_class_constructor ();
++
++        if (val.is_defined ())
++          return val;
++      }
++    else
++      {
++        octave_value& fval = q->second;
++
++        if (fval.is_defined ())
++          out_of_date_check (fval, name);
++
++        if (fval.is_defined ())
++          return fval;
++        else
++          {
++            octave_value val = load_class_constructor ();
++
++            if (val.is_defined ())
++              return val;
++          }
++      }
++
++    // Command-line function.
++
++    if (cmdline_function.is_defined ())
++      return cmdline_function;
++
++    // Autoload?
++
++    octave_value fcn = find_autoload ();
++
++    if (fcn.is_defined ())
++      return fcn;
++
++    // Function on the path.
++
++    fcn = find_user_function ();
++
++    if (fcn.is_defined ())
++      return fcn;
++
++    // Package
++
++    fcn = find_package ();
++
++    if (fcn.is_defined ())
++      return fcn;
++
++    // Built-in function (might be undefined).
++
++    return built_in_function;
++  }
++
++  // Find the definition of NAME according to the following precedence
++  // list:
++  //
++  //   built-in function
++  //   function on the path
++  //   autoload function
++  //   command-line function
++  //   private function
++  //   subfunction
++
++  // This function is used to implement the "builtin" function, which
++  // searches for "built-in" functions.  In Matlab, "builtin" only
++  // returns functions that are actually built-in to the interpreter.
++  // But since the list of built-in functions is different in Octave and
++  // Matlab, we also search up the precedence list until we find
++  // something that matches.  Note that we are only searching by name,
++  // so class methods and constructors are skipped.
++
++  octave_value
++  fcn_info::fcn_info_rep::builtin_find (void)
++  {
++    octave_value retval = x_builtin_find ();
++
++    if (! retval.is_defined ())
++      {
++        // It is possible that the user created a file on the fly since
++        // the last prompt or chdir, so try updating the load path and
++        // searching again.
++
++        load_path& lp = __get_load_path__ ("fcn_info::fcn_info_rep::builtin_find");
++
++        lp.update ();
++
++        retval = x_builtin_find ();
++      }
++
++    return retval;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::x_builtin_find (void)
++  {
++    // Built-in function.
++    if (built_in_function.is_defined ())
++      return built_in_function;
++
++    // Function on the path.
++
++    octave_value fcn = find_user_function ();
++
++    if (fcn.is_defined ())
++      return fcn;
++
++    // Autoload?
++
++    fcn = find_autoload ();
++
++    if (fcn.is_defined ())
++      return fcn;
++
++    // Command-line function.
++
++    if (cmdline_function.is_defined ())
++      return cmdline_function;
++
++    // Private function.
++
++    scope *curr_scope
++      = __get_current_scope__ ("fcn_info::fcn_info_rep::x_builtin_find");
++
++    octave_user_function *current_fcn = curr_scope ? curr_scope->function () : nullptr;
++
++    if (current_fcn)
++      {
++        std::string dir_name = current_fcn->dir_name ();
++
++        if (! dir_name.empty ())
++          {
++            str_val_iterator q = private_functions.find (dir_name);
++
++            if (q == private_functions.end ())
++              {
++                octave_value val = load_private_function (dir_name);
++
++                if (val.is_defined ())
++                  return val;
++              }
++            else
++              {
++                octave_value& fval = q->second;
++
++                if (fval.is_defined ())
++                  out_of_date_check (fval);
++
++                if (fval.is_defined ())
++                  return fval;
++                else
++                  {
++                    octave_value val = load_private_function (dir_name);
++
++                    if (val.is_defined ())
++                      return val;
++                  }
++              }
++          }
++      }
++
++    // Local function.
++
++    if (current_fcn)
++      {
++        std::string fcn_file = current_fcn->fcn_file_name ();
++
++        if (! fcn_file.empty ())
++          {
++            str_val_iterator r = local_functions.find (fcn_file);
++
++            if (r != local_functions.end ())
++              {
++                // We shouldn't need an out-of-date check here since local
++                // functions may ultimately be called only from a primary
++                // function or method defined in the same file.
++
++                return r->second;
++              }
++          }
++      }
++
++    // Subfunction.  I think it only makes sense to check for
++    // subfunctions if we are currently executing a function defined
++    // from a .m file.
++
++    if (curr_scope)
++      {
++        octave_value val = curr_scope->find_subfunction (name);
++
++        if (val.is_defined ())
++          return val;
++      }
++
++    return octave_value ();
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::find_method (const std::string& dispatch_type)
++  {
++    octave_value retval;
++
++    str_val_iterator q = class_methods.find (dispatch_type);
++
++    if (q == class_methods.end ())
++      {
++        octave_value val = load_class_method (dispatch_type);
++
++        if (val.is_defined ())
++          return val;
++      }
++    else
++      {
++        octave_value& fval = q->second;
++
++        if (fval.is_defined ())
++          out_of_date_check (fval, dispatch_type);
++
++        if (fval.is_defined ())
++          return fval;
++        else
++          {
++            octave_value val = load_class_method (dispatch_type);
++
++            if (val.is_defined ())
++              return val;
++          }
++      }
++
++    return retval;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::find_autoload (void)
++  {
++    // Autoloaded function.
++
++    if (autoload_function.is_defined ())
++      out_of_date_check (autoload_function);
++
++    if (! autoload_function.is_defined ())
++      {
++        std::string file_name = lookup_autoload (name);
++
++        if (! file_name.empty ())
++          {
++            size_t pos = file_name.find_last_of (sys::file_ops::dir_sep_chars ());
++
++            std::string dir_name = file_name.substr (0, pos);
++
++            octave_value ov_fcn
++              = load_fcn_from_file (file_name, dir_name, "", "",
++                                            name, true);
++
++            if (ov_fcn.is_defined ())
++              autoload_function = octave_value (ov_fcn);
++          }
++      }
++
++    return autoload_function;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::find_user_function (void)
++  {
++    // Function on the path.
++
++    if (function_on_path.is_defined ())
++      out_of_date_check (function_on_path);
++
++    if (function_on_path.is_undefined ())
++      {
++        std::string dir_name;
++
++        load_path& lp = __get_load_path__ ("fcn_info::fcn_info_rep::find_user_function");
++
++
++        std::string file_name = lp.find_fcn (name, dir_name, package_name);
++
++        if (! file_name.empty ())
++          {
++            octave_value ov_fcn
++              = load_fcn_from_file (file_name, dir_name, "",
++                                            package_name);
++
++            if (ov_fcn.is_defined ())
++              function_on_path = ov_fcn;
++          }
++      }
++
++    return function_on_path;
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::find_package (void)
++  {
++    // FIXME: implement correct way to check out of date package
++    //if (package.is_defined ())
++    //  out_of_date_check (package);
++
++    if (package.is_undefined ())
++      {
++        cdef_manager& cdm
++          = __get_cdef_manager__ ("fcn_info::fcn_info_rep::find_package");
++
++        octave_function *fcn = cdm.find_package_symbol (full_name ());
++
++        if (fcn)
++          package = octave_value (fcn);
++      }
++
++    return package;
++  }
++
++  void
++  fcn_info::fcn_info_rep::install_built_in_dispatch (const std::string& klass)
++  {
++    if (built_in_function.is_defined ())
++      {
++        octave_function *fcn = built_in_function.function_value ();
++
++        if (fcn)
++          {
++            if (fcn->handles_dispatch_class (klass))
++              warning ("install_built_in_dispatch: '%s' already defined for class '%s'",
++                       name.c_str (), klass.c_str ());
++            else
++              fcn->push_dispatch_class (klass);
++          }
++      }
++    else
++      error ("install_built_in_dispatch: '%s' is not a built-in function",
++             name.c_str ());
++  }
++
++  octave_value
++  fcn_info::fcn_info_rep::dump (void) const
++  {
++    std::map<std::string, octave_value> m
++      = {{ "name", full_name () },
++         { "refcount", count.value () },
++         { "package", package.dump () },
++         { "local_functions", dump_function_map (local_functions) },
++         { "private_functions", dump_function_map (private_functions) },
++         { "class_methods", dump_function_map (class_methods) },
++         { "class_constructors", dump_function_map (class_constructors) },
++         { "cmdline_function", cmdline_function.dump () },
++         { "autoload_function", autoload_function.dump () },
++         { "function_on_path", function_on_path.dump () },
++         { "built_in_function", built_in_function.dump () }};
++
++    return octave_value (m);
++  }
++
++  octave_value
++  dump_function_map (const std::map<std::string, octave_value>& fcn_map)
++  {
++    if (fcn_map.empty ())
++      return octave_value (Matrix ());
++
++    std::map<std::string, octave_value> info_map;
++
++    for (const auto& nm_fcn : fcn_map)
++      {
++        std::string nm = nm_fcn.first;
++        const octave_value& fcn = nm_fcn.second;
++        info_map[nm] = fcn.dump ();
++      }
++
++    return octave_value (info_map);
++  }
++}
+diff --git a/libinterp/corefcn/fcn-info.h b/libinterp/corefcn/fcn-info.h
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/fcn-info.h
+@@ -0,0 +1,362 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_fcn_info_h)
++#define octave_fcn_info_h 1
++
++#include "octave-config.h"
++
++#include <list>
++#include <map>
++#include <string>
++
++#include "oct-refcount.h"
++
++#include "ov.h"
++#include "ovl.h"
++
++namespace octave
++{
++  class fcn_info
++  {
++  public:
++
++    typedef std::map<std::string, octave_value>::const_iterator
++    str_val_const_iterator;
++    typedef std::map<std::string, octave_value>::iterator str_val_iterator;
++
++  private:
++
++    class fcn_info_rep
++    {
++    public:
++
++      fcn_info_rep (const std::string& nm)
++        : name (nm), package_name (), local_functions (),
++          private_functions (), class_constructors (), class_methods (),
++          cmdline_function (), autoload_function (), function_on_path (),
++          built_in_function (), count (1)
++      {
++        size_t pos = name.rfind ('.');
++
++        if (pos != std::string::npos)
++          {
++            package_name = name.substr (0, pos);
++            name = name.substr (pos+1);
++          }
++      }
++
++      // No copying!
++
++      fcn_info_rep (const fcn_info_rep&) = delete;
++
++      fcn_info_rep& operator = (const fcn_info_rep&) = delete;
++
++      ~fcn_info_rep (void) = default;
++
++      octave_value install_local_function (const std::string& file_name);
++
++      octave_value load_private_function (const std::string& dir_name);
++
++      octave_value load_class_constructor (void);
++
++      octave_value load_class_method (const std::string& dispatch_type);
++
++      octave_value find (const octave_value_list& args, bool local_funcs);
++
++      octave_value builtin_find (void);
++
++      octave_value find_method (const std::string& dispatch_type);
++
++      octave_value find_autoload (void);
++
++      octave_value find_package (void);
++
++      octave_value find_user_function (void);
++
++      bool is_user_function_defined (void) const
++      {
++        return function_on_path.is_defined ();
++      }
++
++      octave_value find_function (const octave_value_list& args,
++                                  bool local_funcs)
++      {
++        return find (args, local_funcs);
++      }
++
++      void install_cmdline_function (const octave_value& f)
++      {
++        cmdline_function = f;
++      }
++
++      void install_local_function (const octave_value& f,
++                                   const std::string& file_name)
++      {
++        local_functions[file_name] = f;
++      }
++
++      void install_user_function (const octave_value& f)
++      {
++        function_on_path = f;
++      }
++
++      void install_built_in_function (const octave_value& f)
++      {
++        built_in_function = f;
++      }
++
++      void install_built_in_dispatch (const std::string& klass);
++
++      template <typename T>
++      void
++      clear_map (std::map<T, octave_value>& map, bool force = false)
++      {
++        typename std::map<T, octave_value>::iterator p = map.begin ();
++
++        while (p != map.end ())
++          {
++            if (force || ! p->second.islocked ())
++              map.erase (p++);
++            else
++              p++;
++          }
++      }
++
++      void clear_autoload_function (bool force = false)
++      {
++        if (force || ! autoload_function.islocked ())
++          autoload_function = octave_value ();
++      }
++
++      // We also clear command line functions here, as these are both
++      // "user defined"
++      void clear_user_function (bool force = false)
++      {
++        clear_autoload_function (force);
++
++        if (force || ! function_on_path.islocked ())
++          function_on_path = octave_value ();
++
++        if (force || ! cmdline_function.islocked ())
++          cmdline_function = octave_value ();
++      }
++
++      void clear_mex_function (void)
++      {
++        if (function_on_path.is_mex_function ())
++          clear_user_function ();
++      }
++
++      void clear_package (void)
++      {
++        package = octave_value ();
++      }
++
++      void clear (bool force = false)
++      {
++        clear_map (local_functions, force);
++        clear_map (private_functions, force);
++        clear_map (class_constructors, force);
++        clear_map (class_methods, force);
++
++        clear_autoload_function (force);
++        clear_user_function (force);
++        clear_package ();
++      }
++
++      octave_value dump (void) const;
++
++      std::string full_name (void) const
++      {
++        if (package_name.empty ())
++          return name;
++        else
++          return package_name + '.' + name;
++      }
++
++      std::string name;
++
++      std::string package_name;
++
++      // File name to function object.
++      std::map<std::string, octave_value> local_functions;
++
++      // Directory name to function object.
++      std::map<std::string, octave_value> private_functions;
++
++      // Class name to function object.
++      std::map<std::string, octave_value> class_constructors;
++
++      // Dispatch type to function object.
++      std::map<std::string, octave_value> class_methods;
++
++      octave_value cmdline_function;
++
++      octave_value autoload_function;
++
++      octave_value function_on_path;
++
++      octave_value package;
++
++      octave_value built_in_function;
++
++      refcount<size_t> count;
++
++    private:
++
++      octave_value xfind (const octave_value_list& args, bool local_funcs);
++
++      octave_value x_builtin_find (void);
++    };
++
++  public:
++
++    fcn_info (const std::string& nm = "")
++      : rep (new fcn_info_rep (nm)) { }
++
++    fcn_info (const fcn_info& fi) : rep (fi.rep)
++    {
++      rep->count++;
++    }
++
++    fcn_info& operator = (const fcn_info& fi)
++    {
++      if (this != &fi)
++        {
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = fi.rep;
++          rep->count++;
++        }
++
++      return *this;
++    }
++
++    ~fcn_info (void)
++    {
++      if (--rep->count == 0)
++        delete rep;
++    }
++
++    octave_value find (const octave_value_list& args = octave_value_list (),
++                       bool local_funcs = true)
++    {
++      return rep->find (args, local_funcs);
++    }
++
++    octave_value builtin_find (void)
++    {
++      return rep->builtin_find ();
++    }
++
++    octave_value find_method (const std::string& dispatch_type) const
++    {
++      return rep->find_method (dispatch_type);
++    }
++
++    octave_value find_built_in_function (void) const
++    {
++      return rep->built_in_function;
++    }
++
++    octave_value find_cmdline_function (void) const
++    {
++      return rep->cmdline_function;
++    }
++
++    octave_value find_autoload (void)
++    {
++      return rep->find_autoload ();
++    }
++
++    octave_value find_user_function (void)
++    {
++      return rep->find_user_function ();
++    }
++
++    bool is_user_function_defined (void) const
++    {
++      return rep->is_user_function_defined ();
++    }
++
++    octave_value find_function (const octave_value_list& args
++                                = octave_value_list (),
++                                bool local_funcs = true)
++    {
++      return rep->find_function (args, local_funcs);
++    }
++
++    void install_cmdline_function (const octave_value& f)
++    {
++      rep->install_cmdline_function (f);
++    }
++
++    void install_local_function (const octave_value& f,
++                                 const std::string& file_name)
++    {
++      rep->install_local_function (f, file_name);
++    }
++
++    void install_user_function (const octave_value& f)
++    {
++      rep->install_user_function (f);
++    }
++
++    void install_built_in_function (const octave_value& f)
++    {
++      rep->install_built_in_function (f);
++    }
++
++    void install_built_in_dispatch (const std::string& klass)
++    {
++      rep->install_built_in_dispatch (klass);
++    }
++
++    void clear (bool force = false) { rep->clear (force); }
++
++    void clear_user_function (bool force = false)
++    {
++      rep->clear_user_function (force);
++    }
++
++    void clear_autoload_function (bool force = false)
++    {
++      rep->clear_autoload_function (force);
++    }
++
++    void clear_mex_function (void) { rep->clear_mex_function (); }
++
++    octave_value dump (void) const { return rep->dump (); }
++
++  private:
++
++    fcn_info_rep *rep;
++  };
++
++  octave_value
++  dump_function_map (const std::map<std::string, octave_value>& fcn_map);
++}
++
++#endif
+diff --git a/libinterp/corefcn/module.mk b/libinterp/corefcn/module.mk
+--- a/libinterp/corefcn/module.mk
++++ b/libinterp/corefcn/module.mk
+@@ -29,16 +29,17 @@ COREFCN_INC = \
+   %reldir%/defun.h \
+   %reldir%/dirfns.h \
+   %reldir%/display.h \
+   %reldir%/dynamic-ld.h \
+   %reldir%/environment.h \
+   %reldir%/error.h \
+   %reldir%/errwarn.h \
+   %reldir%/event-queue.h \
++  %reldir%/fcn-info.h \
+   %reldir%/file-io.h \
+   %reldir%/ft-text-renderer.h \
+   %reldir%/gl-render.h \
+   %reldir%/gl2ps-print.h \
+   %reldir%/graphics-handle.h \
+   %reldir%/graphics-toolkit.h \
+   %reldir%/gripes.h \
+   %reldir%/gtk-manager.h \
+@@ -73,19 +74,21 @@ COREFCN_INC = \
+   %reldir%/oct-stream.h \
+   %reldir%/oct-strstrm.h \
+   %reldir%/oct.h \
+   %reldir%/octave-default-image.h \
+   %reldir%/octave-link.h \
+   %reldir%/pager.h \
+   %reldir%/pr-output.h \
+   %reldir%/procstream.h \
++  %reldir%/scope.h \
+   %reldir%/sighandlers.h \
+   %reldir%/sparse-xdiv.h \
+   %reldir%/sparse-xpow.h \
++  %reldir%/symrec.h \
+   %reldir%/symtab.h \
+   %reldir%/sysdep.h \
+   %reldir%/text-renderer.h \
+   %reldir%/toplev.h \
+   %reldir%/txt-eng.h \
+   %reldir%/url-handle-manager.h \
+   %reldir%/utils.h \
+   %reldir%/variables.h \
+@@ -140,16 +143,17 @@ COREFCN_SRC = \
+   %reldir%/dot.cc \
+   %reldir%/dynamic-ld.cc \
+   %reldir%/eig.cc \
+   %reldir%/ellipj.cc \
+   %reldir%/environment.cc \
+   %reldir%/error.cc \
+   %reldir%/errwarn.cc \
+   %reldir%/event-queue.cc \
++  %reldir%/fcn-info.cc \
+   %reldir%/fft.cc \
+   %reldir%/fft2.cc \
+   %reldir%/fftn.cc \
+   %reldir%/file-io.cc \
+   %reldir%/filter.cc \
+   %reldir%/find.cc \
+   %reldir%/ft-text-renderer.cc \
+   %reldir%/gammainc.cc \
+@@ -216,28 +220,30 @@ COREFCN_SRC = \
+   %reldir%/psi.cc \
+   %reldir%/quad.cc \
+   %reldir%/quadcc.cc \
+   %reldir%/qz.cc \
+   %reldir%/rand.cc \
+   %reldir%/rcond.cc \
+   %reldir%/regexp.cc \
+   %reldir%/schur.cc \
++  %reldir%/scope.cc \
+   %reldir%/sighandlers.cc \
+   %reldir%/sparse-xdiv.cc \
+   %reldir%/sparse-xpow.cc \
+   %reldir%/sparse.cc \
+   %reldir%/spparms.cc \
+   %reldir%/sqrtm.cc \
+   %reldir%/str2double.cc \
+   %reldir%/strfind.cc \
+   %reldir%/strfns.cc \
+   %reldir%/sub2ind.cc \
+   %reldir%/svd.cc \
+   %reldir%/sylvester.cc \
++  %reldir%/symrec.cc \
+   %reldir%/symtab.cc \
+   %reldir%/syscalls.cc \
+   %reldir%/sysdep.cc \
+   %reldir%/time.cc \
+   %reldir%/text-renderer.cc \
+   %reldir%/toplev.cc \
+   %reldir%/tril.cc \
+   %reldir%/tsearch.cc \
+diff --git a/libinterp/corefcn/scope.cc b/libinterp/corefcn/scope.cc
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/scope.cc
+@@ -0,0 +1,368 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague, a.s.
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include <sstream>
++
++#include "fcn-info.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "ov-fcn.h"
++#include "ov-usr-fcn.h"
++#include "scope.h"
++#include "symrec.h"
++#include "symtab.h"
++#include "utils.h"
++
++namespace octave
++{
++  octave_value
++  scope::find (const std::string& name, const octave_value_list& args,
++               bool skip_variables, bool local_funcs)
++  {
++    // Variable.
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("scope::find");
++
++    if (! skip_variables)
++      {
++        table_iterator p = m_symbols.find (name);
++
++        if (p != m_symbols.end ())
++          {
++            symbol_record sr = p->second;
++
++            if (sr.is_global ())
++              return symtab.global_varval (name);
++            else
++              {
++                octave_value val = sr.varval ();
++
++                if (val.is_defined ())
++                  return val;
++              }
++          }
++      }
++
++    if (local_funcs)
++      {
++        // Subfunction.  I think it only makes sense to check for
++        // subfunctions if we are currently executing a function defined
++        // from a .m file.
++
++        octave_value fcn = find_subfunction (name);
++
++        if (fcn.is_defined ())
++          return fcn;
++      }
++
++    return symtab.fcn_table_find (name, args, local_funcs);
++  }
++
++  symbol_record&
++  scope::insert (const std::string& name, bool force_add)
++  {
++    table_iterator p = m_symbols.find (name);
++
++    if (p == m_symbols.end ())
++      {
++        symbol_record ret (this, name);
++
++        if (m_is_nested && m_parent && m_parent->look_nonlocal (name, ret))
++          return m_symbols[name] = ret;
++        else
++          {
++            if (m_is_static && ! force_add)
++              ret.mark_added_static ();
++
++            return m_symbols[name] = ret;
++          }
++      }
++    else
++      return p->second;
++  }
++
++  void
++  scope::clear_global (const std::string& name)
++  {
++    table_iterator p = m_symbols.find (name);
++
++    if (p != m_symbols.end ())
++      {
++        symbol_record& sr = p->second;
++
++        if (sr.is_global ())
++          sr.unmark_global ();
++      }
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("scope::clear_global");
++
++    symtab.erase_global (name);
++  }
++
++  void
++  scope::clear_global_pattern (const std::string& pat)
++  {
++    glob_match pattern (pat);
++
++    for (auto& nm_sr : m_symbols)
++      {
++        symbol_record& sr = nm_sr.second;
++
++        if (sr.is_global () && pattern.match (sr.name ()))
++          sr.unmark_global ();
++      }
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("scope::clear_global_pattern");
++
++    symtab.erase_global_pattern (pattern);
++  }
++
++  std::list<workspace_element>
++  scope::workspace_info (void) const
++  {
++    std::list<workspace_element> retval;
++
++    for (const auto& nm_sr : m_symbols)
++      {
++        std::string nm = nm_sr.first;
++        symbol_record sr = nm_sr.second;
++
++        if (! sr.is_hidden ())
++          {
++            octave_value val = sr.varval ();
++
++            if (val.is_defined ())
++              {
++                // FIXME: fix size for objects, see kluge in variables.cc
++                //dim_vector dv = val.dims ();
++                octave_value tmp = val;
++                Matrix sz = tmp.size ();
++                dim_vector dv = dim_vector::alloc (sz.numel ());
++                for (octave_idx_type i = 0; i < dv.ndims (); i++)
++                  dv(i) = sz(i);
++
++                char storage = ' ';
++                if (sr.is_global ())
++                  storage = 'g';
++                else if (sr.is_persistent ())
++                  storage = 'p';
++                else if (sr.is_automatic ())
++                  storage = 'a';
++                else if (sr.is_formal ())
++                  storage = 'f';
++                else if (sr.is_hidden ())
++                  storage = 'h';
++                else if (sr.is_inherited ())
++                  storage = 'i';
++
++                std::ostringstream buf;
++                val.short_disp (buf);
++                std::string short_disp_str = buf.str ();
++
++                workspace_element elt (storage, nm, val.class_name (),
++                                       short_disp_str, dv.str (),
++                                       val.iscomplex ());
++
++                retval.push_back (elt);
++              }
++          }
++      }
++
++    return retval;
++  }
++
++  octave_value
++  scope::dump (void) const
++  {
++    std::map<std::string, octave_value> m
++      = {{ "name", m_name },
++         { "symbols", dump_symbols_map () },
++         { "persistent_variables", m_persistent_symbols },
++         { "subfunctions", dump_function_map (m_subfunctions) }};
++
++    return octave_value (m);
++  }
++
++  octave_value
++  scope::dump_symbols_map (void) const
++  {
++    std::map<std::string, octave_value> info_map;
++
++    for (const auto& nm_sr : m_symbols)
++      {
++        std::string nm = nm_sr.first;
++        const symbol_record& sr = nm_sr.second;
++        info_map[nm] = sr.dump ();
++      }
++
++    return octave_value (info_map);
++  }
++
++  void
++  scope::install_subfunction (const std::string& name,
++                              const octave_value& fval, bool is_nested)
++  {
++    m_subfunctions[name] = fval;
++
++    // This can be simpler once the scope object is stored in the function
++    // object...
++    octave_user_function *fcn = fval.user_function_value ();
++
++    scope *fcn_scope = fcn->scope ();
++
++    fcn_scope->set_parent (this);
++
++    if (is_nested)
++      {
++        m_children.push_back (fcn_scope);
++
++        fcn->mark_as_nested_function ();
++
++        fcn_scope->m_is_nested = true;
++      }
++
++  }
++
++  octave_value
++  scope::find_subfunction (const std::string& name) const
++  {
++    subfunctions_const_iterator p = m_subfunctions.find (name);
++
++    if (p != m_subfunctions.end ())
++      return p->second;
++
++    if (m_parent)
++      return m_parent->find_subfunction (name);
++
++    return octave_value ();
++  }
++
++  void
++  scope::mark_subfunctions_in_scope_as_private (const std::string& class_name)
++  {
++    for (auto& nm_sf : m_subfunctions)
++      {
++        octave_function *fcn = nm_sf.second.function_value ();
++
++        if (fcn)
++          fcn->mark_as_private_function (class_name);
++      }
++  }
++
++  void
++  scope::set_parent (scope *p)
++  {
++    m_parent = p;
++
++    if (m_parent)
++      {
++        // If m_parent is the top-level scope, there will be no parent
++        // function.
++
++        octave_function *current_fcn = function ();
++
++        if (current_fcn && current_fcn->is_anonymous_function ())
++          {
++            octave_function *parent_fcn = m_parent->function ();
++
++            if (parent_fcn)
++              m_parent_fcn = octave_value (parent_fcn, true);
++          }
++      }
++  }
++
++  void
++  scope::update_nest (void)
++  {
++    if (m_parent)
++      {
++        // fix bad symbol_records
++        for (auto& nm_sr : m_symbols)
++          {
++            symbol_record& ours = nm_sr.second;
++
++            if (! ours.is_formal ()
++                && m_is_nested && m_parent->look_nonlocal (nm_sr.first, ours))
++              {
++                if (ours.is_global () || ours.is_persistent ())
++                  error ("global and persistent may only be used in the topmost level in which a nested variable is used");
++              }
++            else
++              ours.set_curr_fcn (m_fcn);
++          }
++
++        // The scopes of nested functions are static.
++        m_is_static = true;
++      }
++    else if (m_children.size ())
++      {
++        // Parents of nested functions have static scopes.
++        m_is_static = true;
++
++        for (auto& nm_sr : m_symbols)
++          nm_sr.second.set_curr_fcn (m_fcn);
++      }
++
++    for (auto& symtab_p : m_children)
++      symtab_p->update_nest ();
++  }
++
++  bool
++  scope::look_nonlocal (const std::string& name, symbol_record& result)
++  {
++    table_iterator p = m_symbols.find (name);
++    if (p == m_symbols.end ())
++      {
++        if (m_is_nested && m_parent)
++          return m_parent->look_nonlocal (name, result);
++      }
++    else if (! p->second.is_automatic ())
++      {
++        result.bind_fwd_rep (p->second);
++        return true;
++      }
++
++    return false;
++  }
++
++  void
++  scope::bind_script_symbols (scope *curr_scope)
++  {
++    for (auto& nm_sr : m_symbols)
++      nm_sr.second.bind_fwd_rep (curr_scope->find_symbol (nm_sr.first));
++  }
++
++  void
++  scope::unbind_script_symbols (void)
++  {
++    for (auto& nm_sr : m_symbols)
++      nm_sr.second.unbind_fwd_rep ();
++  }
++}
+diff --git a/libinterp/corefcn/scope.h b/libinterp/corefcn/scope.h
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/scope.h
+@@ -0,0 +1,587 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_scope_h)
++#define octave_scope_h 1
++
++#include "octave-config.h"
++
++#include <deque>
++#include <limits>
++#include <list>
++#include <map>
++#include <set>
++#include <string>
++
++#include "glob-match.h"
++#include "lo-regexp.h"
++#include "oct-refcount.h"
++
++class tree_argument_list;
++class octave_user_function;
++
++#include "ov.h"
++#include "ovl.h"
++#include "symrec.h"
++#include "workspace-element.h"
++
++namespace octave
++{
++  class scope
++  {
++  public:
++
++    typedef symbol_record::context_id context_id;
++
++    typedef std::map<std::string, symbol_record>::const_iterator
++    table_const_iterator;
++    typedef std::map<std::string, symbol_record>::iterator
++    table_iterator;
++
++    typedef std::map<std::string, octave_value>::const_iterator
++    m_persistent_symbols_const_iterator;
++    typedef std::map<std::string, octave_value>::iterator
++    m_persistent_symbols_iterator;
++
++    typedef std::map<std::string, octave_value>::const_iterator
++    subfunctions_const_iterator;
++    typedef std::map<std::string, octave_value>::iterator
++    subfunctions_iterator;
++
++    scope (const std::string& name = "")
++      : m_name (name), m_symbols (), m_persistent_symbols (), m_subfunctions (),
++        m_fcn (nullptr), m_parent (nullptr), m_parent_fcn (), m_children (), m_is_nested (false),
++        m_is_static (false), m_context (0)
++    { }
++
++    // No copying!
++
++    scope (const scope&) = delete;
++
++    scope& operator = (const scope&) = delete;
++
++    ~scope (void) = default;
++
++    void insert_symbol_record (const symbol_record& sr)
++    {
++      m_symbols[sr.name ()] = sr;
++    }
++
++    bool is_nested (void) const { return m_is_nested; }
++
++    void mark_nested (void) { m_is_nested = true; }
++
++    bool is_static (void) const { return m_is_static; }
++
++    void mark_static (void) { m_is_static = true; }
++
++    scope * parent_scope (void) const { return m_parent; }
++    octave_value parent_fcn (void) const { return m_parent_fcn; }
++
++    scope * dup (void) const
++    {
++      scope *new_sid = new scope ();
++
++      for (const auto& nm_sr : m_symbols)
++        new_sid->insert_symbol_record (nm_sr.second.dup (new_sid));
++
++      new_sid->m_parent = m_parent;
++      new_sid->m_parent_fcn = m_parent_fcn;
++
++      return new_sid;
++    }
++
++    void set_context (context_id context) { m_context = context; }
++
++    context_id current_context (void) const { return m_context; }
++
++    symbol_record find_symbol (const std::string& name)
++    {
++      table_iterator p = m_symbols.find (name);
++
++      if (p == m_symbols.end ())
++        return insert (name);
++      else
++        return p->second;
++    }
++
++    void inherit_internal (scope& donor_scope)
++    {
++      for (auto& nm_sr : m_symbols)
++        {
++          symbol_record& sr = nm_sr.second;
++
++          if (! (sr.is_automatic () || sr.is_formal ()))
++            {
++              std::string nm = sr.name ();
++
++              if (nm != "__retval__")
++                {
++                  octave_value val = donor_scope.varval (nm);
++
++                  if (val.is_defined ())
++                    {
++                      sr.assign (val);
++
++                      sr.mark_inherited ();
++                    }
++                }
++            }
++        }
++    }
++
++    void inherit (scope *donor_scope)
++    {
++      while (donor_scope)
++        {
++          inherit_internal (*donor_scope);
++
++          if (donor_scope->is_nested ())
++            donor_scope = donor_scope->parent_scope ();
++          else
++            break;
++        }
++    }
++
++
++    octave_value
++    find (const std::string& name, const octave_value_list& args,
++          bool skip_variables, bool local_funcs);
++
++    symbol_record&
++    insert (const std::string& name, bool force_add = false);
++
++    void rename (const std::string& old_name, const std::string& new_name)
++    {
++      table_iterator p = m_symbols.find (old_name);
++
++      if (p != m_symbols.end ())
++        {
++          symbol_record sr = p->second;
++
++          sr.rename (new_name);
++
++          m_symbols.erase (p);
++
++          m_symbols[new_name] = sr;
++        }
++    }
++
++    void assign (const std::string& name, const octave_value& value,
++                 bool force_add)
++    {
++      table_iterator p = m_symbols.find (name);
++
++      if (p == m_symbols.end ())
++        {
++          symbol_record& sr = insert (name, force_add);
++
++          sr.assign (value);
++        }
++      else
++        p->second.assign (value);
++    }
++
++    void assign (const std::string& name,
++                 const octave_value& value = octave_value ())
++    {
++      assign (name, value, false);
++    }
++
++    void force_assign (const std::string& name, const octave_value& value)
++    {
++      table_iterator p = m_symbols.find (name);
++
++      if (p == m_symbols.end ())
++        {
++          symbol_record& sr = insert (name, true);
++
++          sr.assign (value);
++        }
++      else
++        p->second.assign (value);
++    }
++
++    // Use assign (name, value, force_add) instead.
++    // Delete when deprecated varref functions are removed.
++    octave_value& varref (const std::string& name, bool force_add)
++    {
++      table_iterator p = m_symbols.find (name);
++
++      if (p == m_symbols.end ())
++        {
++          symbol_record& sr = insert (name, force_add);
++
++          return sr.varref ();
++        }
++      else
++        return p->second.varref ();
++    }
++
++    octave_value varval (const std::string& name) const
++    {
++      table_const_iterator p = m_symbols.find (name);
++
++      return (p != m_symbols.end ()
++              ? p->second.varval () : octave_value ());
++    }
++
++    void persistent_assign (const std::string& name, const octave_value& value)
++    {
++      m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
++
++      if (p == m_persistent_symbols.end ())
++        m_persistent_symbols[name] = value;
++      else
++        p->second = value;
++    }
++
++    // Use persistent_assign (name, value) instead.
++    // Delete when deprecated varref functions are removed.
++    octave_value& persistent_varref (const std::string& name)
++    {
++      m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
++
++      return (p == m_persistent_symbols.end ()
++              ? m_persistent_symbols[name] : p->second);
++    }
++
++    octave_value persistent_varval (const std::string& name) const
++    {
++      m_persistent_symbols_const_iterator p = m_persistent_symbols.find (name);
++
++      return (p != m_persistent_symbols.end ()) ? p->second : octave_value ();
++    }
++
++    void erase_persistent (const std::string& name)
++    {
++      m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
++
++      if (p != m_persistent_symbols.end ())
++        m_persistent_symbols.erase (p);
++    }
++
++    bool is_variable (const std::string& name) const
++    {
++      bool retval = false;
++
++      table_const_iterator p = m_symbols.find (name);
++
++      if (p != m_symbols.end ())
++        {
++          const symbol_record& sr = p->second;
++
++          retval = sr.is_variable ();
++        }
++
++      return retval;
++    }
++
++    void push_context (void)
++    {
++      for (auto& nm_sr : m_symbols)
++        nm_sr.second.push_context (this);
++    }
++
++    void pop_context (void)
++    {
++      table_iterator tbl_it = m_symbols.begin ();
++
++      while (tbl_it != m_symbols.end ())
++        {
++          if (tbl_it->second.pop_context (this) == 0)
++            m_symbols.erase (tbl_it++);
++          else
++            tbl_it++;
++        }
++    }
++
++    void clear_variables (void)
++    {
++      for (auto& nm_sr : m_symbols)
++        nm_sr.second.clear (this);
++    }
++
++    void clear_objects (void)
++    {
++      for (auto& nm_sr : m_symbols)
++        {
++          symbol_record& sr = nm_sr.second;
++          octave_value val = sr.varval ();
++          if (val.isobject ())
++            nm_sr.second.clear (this);
++        }
++    }
++
++    void clear_global (const std::string& name);
++
++    void clear_variable (const std::string& name)
++    {
++      table_iterator p = m_symbols.find (name);
++
++      if (p != m_symbols.end ())
++        p->second.clear (this);
++    }
++
++    void clear_global_pattern (const std::string& pat);
++
++    void clear_variable_pattern (const std::string& pat)
++    {
++      glob_match pattern (pat);
++
++      for (auto& nm_sr : m_symbols)
++        {
++          symbol_record& sr = nm_sr.second;
++
++          if (sr.is_defined () || sr.is_global ())
++            {
++              if (pattern.match (sr.name ()))
++                sr.clear (this);
++            }
++        }
++    }
++
++    void clear_variable_regexp (const std::string& pat)
++    {
++      octave::regexp pattern (pat);
++
++      for (auto& nm_sr : m_symbols)
++        {
++          symbol_record& sr = nm_sr.second;
++
++          if (sr.is_defined () || sr.is_global ())
++            {
++              if (pattern.is_match (sr.name ()))
++                sr.clear (this);
++            }
++        }
++    }
++
++    void mark_automatic (const std::string& name)
++    {
++      insert (name).mark_automatic ();
++    }
++
++    void mark_hidden (const std::string& name)
++    {
++      insert (name).mark_hidden ();
++    }
++
++    void mark_global (const std::string& name)
++    {
++      insert (name).mark_global ();
++    }
++
++    std::list<symbol_record>
++    all_variables (bool defined_only = true,
++                   unsigned int exclude = symbol_record::hidden) const
++    {
++      std::list<symbol_record> retval;
++
++      for (const auto& nm_sr : m_symbols)
++        {
++          const symbol_record& sr = nm_sr.second;
++
++          if ((defined_only && ! sr.is_defined ())
++              || (sr.xstorage_class () & exclude))
++            continue;
++
++          retval.push_back (sr);
++        }
++
++      return retval;
++    }
++
++    std::list<symbol_record>
++    glob (const std::string& pattern, bool vars_only = false) const
++    {
++      std::list<symbol_record> retval;
++
++      glob_match pat (pattern);
++
++      for (const auto& nm_sr : m_symbols)
++        {
++          if (pat.match (nm_sr.first))
++            {
++              const symbol_record& sr = nm_sr.second;
++
++              if (vars_only && ! sr.is_variable ())
++                continue;
++
++              retval.push_back (sr);
++            }
++        }
++
++      return retval;
++    }
++
++    std::list<symbol_record>
++    regexp (const std::string& pattern, bool vars_only = false) const
++    {
++      std::list<symbol_record> retval;
++
++      octave::regexp pat (pattern);
++
++      for (const auto& nm_sr : m_symbols)
++        {
++          if (pat.is_match (nm_sr.first))
++            {
++              const symbol_record& sr = nm_sr.second;
++
++              if (vars_only && ! sr.is_variable ())
++                continue;
++
++              retval.push_back (sr);
++            }
++        }
++
++      return retval;
++    }
++
++    std::list<std::string> variable_names (void)
++    {
++      std::list<std::string> retval;
++
++      for (const auto& nm_sr : m_symbols)
++        {
++          if (nm_sr.second.is_variable ())
++            retval.push_back (nm_sr.first);
++        }
++
++      retval.sort ();
++
++      return retval;
++    }
++
++    bool is_local_variable (const std::string& name) const
++    {
++      table_const_iterator p = m_symbols.find (name);
++
++      return (p != m_symbols.end ()
++              && ! p->second.is_global ()
++              && p->second.is_defined ());
++    }
++
++    bool is_global (const std::string& name) const
++    {
++      table_const_iterator p = m_symbols.find (name);
++
++      return p != m_symbols.end () && p->second.is_global ();
++    }
++
++    void install_subfunction (const std::string& name,
++                              const octave_value& fval,
++                              bool is_nested = false);
++
++    void install_nestfunction (const std::string& name,
++                               const octave_value& fval)
++    {
++      install_subfunction (name, fval, true);
++    }
++
++    octave_value find_subfunction (const std::string& name) const;
++
++    void lock_subfunctions (void)
++    {
++      for (auto& nm_sf : m_subfunctions)
++        nm_sf.second.lock ();
++    }
++
++    void unlock_subfunctions (void)
++    {
++      for (auto& nm_sf : m_subfunctions)
++        nm_sf.second.unlock ();
++    }
++
++    std::map<std::string, octave_value> subfunctions (void)
++    {
++      return m_subfunctions;
++    }
++
++    void erase_subfunctions (void)
++    {
++      m_subfunctions.clear ();
++    }
++
++    void mark_subfunctions_in_scope_as_private (const std::string& class_name);
++
++    std::list<workspace_element> workspace_info (void) const;
++
++    octave_value dump (void) const;
++
++    std::string name (void) const { return m_name; }
++
++    void cache_name (const std::string& name) { m_name = name; }
++
++    octave_user_function *function (void) { return m_fcn; }
++
++    void set_function (octave_user_function *fcn) { m_fcn = fcn; }
++
++    void set_parent (scope *p);
++
++    void update_nest (void);
++
++    bool look_nonlocal (const std::string& name, symbol_record& result);
++
++    void bind_script_symbols (scope *curr_scope);
++
++    void unbind_script_symbols (void);
++
++  private:
++
++    // Name for this scope (usually the corresponding filename of the
++    // function corresponding to the scope).
++    std::string m_name;
++
++    // Map from symbol names to symbol info.
++    std::map<std::string, symbol_record> m_symbols;
++
++    // Map from names of persistent variables to values.
++    std::map<std::string, octave_value> m_persistent_symbols;
++
++    // Map from symbol names to subfunctions.
++    std::map<std::string, octave_value> m_subfunctions;
++
++    // The associated user code (may be null).
++    octave_user_function *m_fcn;
++
++    // Parent of nested function (may be null).
++    scope *m_parent;
++    octave_value m_parent_fcn;
++
++    // Child nested functions.
++    std::vector<scope*> m_children;
++
++    // If true, then this scope belongs to a nested function.
++    bool m_is_nested;
++
++    // If true then no variables can be added.
++    bool m_is_static;
++
++    context_id m_context;
++
++    octave_value dump_symbols_map (void) const;
++  };
++}
++
++#endif
+diff --git a/libinterp/corefcn/symrec.cc b/libinterp/corefcn/symrec.cc
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/symrec.cc
+@@ -0,0 +1,245 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague, a.s.
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if defined (HAVE_CONFIG_H)
++#  include "config.h"
++#endif
++
++#include <sstream>
++
++#include "file-ops.h"
++#include "file-stat.h"
++#include "oct-env.h"
++#include "oct-time.h"
++
++#include "fcn-info.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "scope.h"
++#include "symrec.h"
++#include "symtab.h"
++
++namespace octave
++{
++  symbol_record::context_id
++  symbol_record::symbol_record_rep::get_decl_scope_context (void) const
++  {
++    return m_decl_scope ? m_decl_scope->current_context () : 0;
++  }
++
++  void
++  symbol_record::symbol_record_rep::clear (scope *sid)
++  {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->clear (sid);
++        return;
++      }
++
++    if (! (is_hidden () || is_inherited ())
++        && sid == decl_scope ())
++      {
++        if (is_global ())
++          unmark_global ();
++
++        if (is_persistent ())
++          {
++            sid->persistent_assign (name, varval ());
++
++            unmark_persistent ();
++          }
++
++        assign (octave_value ());
++      }
++  }
++
++  void
++  symbol_record::symbol_record_rep::init_persistent (void)
++  {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->init_persistent ();
++        return;
++      }
++
++    scope *curr_scope
++      = __require_current_scope__ ("symbol_record::symbol_record_rep::init_persistent");
++
++    if (! is_defined ())
++      {
++        mark_persistent ();
++
++        assign (curr_scope->persistent_varval (name));
++      }
++    // FIXME: this causes trouble with recursive calls.
++    // else
++    //   error ("unable to declare existing variable persistent");
++  }
++
++  void
++  symbol_record::symbol_record_rep::erase_persistent (void)
++  {
++    if (m_fwd_rep)
++      {
++        m_fwd_rep->erase_persistent ();
++        return;
++      }
++
++    unmark_persistent ();
++
++    scope *curr_scope
++      = __require_current_scope__ ("symbol_record::symbol_record_rep::erase_persistent");
++
++    curr_scope->erase_persistent (name);
++  }
++
++  symbol_record::symbol_record_rep *
++  symbol_record::symbol_record_rep::dup (scope *new_scope) const
++  {
++    // FIXME: is this the right thing do to?
++    if (m_fwd_rep)
++      return m_fwd_rep->dup (new_scope);
++
++    return new symbol_record_rep (new_scope, name, varval (), storage_class);
++  }
++
++  octave_value
++  symbol_record::symbol_record_rep::dump (void) const
++  {
++    if (m_fwd_rep)
++      return m_fwd_rep->dump ();
++
++    std::map<std::string, octave_value> m
++      = {{ "name", name },
++         { "local", is_local () },
++         { "automatic", is_automatic () },
++         { "formal", is_formal () },
++         { "hidden", is_hidden () },
++         { "inherited", is_inherited () },
++         { "global", is_global () },
++         { "persistent", is_persistent () }};
++
++    octave_value val = varval ();
++
++    if (val.is_defined ())
++      m["value"] = val;
++
++    return octave_value (m);
++  }
++
++  octave_value&
++  symbol_record::symbol_record_rep::xglobal_varref (void)
++  {
++    if (m_fwd_rep)
++      return m_fwd_rep->xglobal_varref ();
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varref");
++
++    return symtab.global_varref (name);
++  }
++
++  octave_value&
++  symbol_record::symbol_record_rep::xpersistent_varref (void)
++  {
++    if (m_fwd_rep)
++      return m_fwd_rep->xpersistent_varref ();
++
++    scope *curr_scope
++      = __get_current_scope__ ("symbol_record::symbol_record_rep::xpersistent_varref");
++
++    return (curr_scope
++            ? curr_scope->persistent_varref (name) : dummy_octave_value);
++  }
++
++  octave_value
++  symbol_record::symbol_record_rep::xglobal_varval (void) const
++  {
++    if (m_fwd_rep)
++      return m_fwd_rep->xglobal_varval ();
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("symbol_record::symbol_record_rep::xglobal_varval");
++
++    return symtab.global_varval (name);
++  }
++
++  octave_value
++  symbol_record::symbol_record_rep::xpersistent_varval (void) const
++  {
++    if (m_fwd_rep)
++      return m_fwd_rep->xpersistent_varval ();
++
++    scope *curr_scope
++      = __get_current_scope__ ("symbol_record::symbol_record_rep::xpersistent_varval");
++
++    return curr_scope ? curr_scope->persistent_varval (name) : octave_value ();
++  }
++
++  symbol_record::symbol_record (void)
++    : rep (new symbol_record_rep (__get_current_scope__ ("symbol_record"),
++                                  "", octave_value (), local))
++
++  { }
++
++  octave_value
++  symbol_record::find (const octave_value_list& args) const
++  {
++    octave_value retval;
++
++    symbol_table& symtab
++      = __get_symbol_table__ ("symbol_record::find");
++
++    if (is_global ())
++      retval = symtab.global_varval (name ());
++    else
++      {
++        retval = varval ();
++
++        if (retval.is_undefined ())
++          {
++#if 0
++            // Use cached fcn_info pointer if possible.
++            if (rep->finfo)
++              retval = rep->finfo->find (args);
++            else
++#endif
++              {
++                retval = symtab.find_function (name (), args);
++
++                if (retval.is_defined ())
++                  return retval;
++#if 0
++                {
++                  rep->finfo = symtab.get_fcn_info (name ());
++                }
++#endif
++              }
++          }
++      }
++
++    return retval;
++  }
++
++  octave_value symbol_record::dummy_octave_value;
++}
+diff --git a/libinterp/corefcn/symrec.h b/libinterp/corefcn/symrec.h
+new file mode 100644
+--- /dev/null
++++ b/libinterp/corefcn/symrec.h
+@@ -0,0 +1,783 @@
++/*
++
++Copyright (C) 1993-2017 John W. Eaton
++Copyright (C) 2009 VZLU Prague
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by
++the Free Software Foundation; either version 3 of the License, or
++(at your option) any later version.
++
++Octave is distributed in the hope that it will be useful, but
++WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++#if ! defined (octave_symrec_h)
++#define octave_symrec_h 1
++
++#include "octave-config.h"
++
++#include <deque>
++#include <list>
++#include <string>
++
++#include "oct-refcount.h"
++
++class octave_user_function;
++
++#include "ov.h"
++#include "ovl.h"
++
++namespace octave
++{
++  class fcn_info;
++  class scope;
++
++  class symbol_record
++  {
++  public:
++
++    typedef size_t context_id;
++
++    // generic variable
++    static const unsigned int local = 1;
++
++    // varargin, argn, .nargin., .nargout.
++    // (FIXME: is this really used now?)
++    static const unsigned int automatic = 2;
++
++    // formal parameter
++    static const unsigned int formal = 4;
++
++    // not listed or cleared (.nargin., .nargout.)
++    static const unsigned int hidden = 8;
++
++    // inherited from parent scope; not cleared at function exit
++    static const unsigned int inherited = 16;
++
++    // global (redirects to global scope)
++    static const unsigned int global = 32;
++
++    // not cleared at function exit
++    static const unsigned int persistent = 64;
++
++    // this symbol may NOT become a variable.
++    // (symbol added to a static workspace)
++    static const unsigned int added_static = 128;
++
++  private:
++
++    class symbol_record_rep
++    {
++    public:
++
++      symbol_record_rep (scope *s, const std::string& nm,
++                         const octave_value& v, unsigned int sc)
++        : m_decl_scope (s), curr_fcn (nullptr), name (nm),
++          m_fwd_rep (nullptr), value_stack (),
++          storage_class (sc), /* finfo (), */ valid (true), count (1)
++      {
++        value_stack.push_back (v);
++      }
++
++      // No copying!
++
++      symbol_record_rep (const symbol_record_rep& ov) = delete;
++
++      symbol_record_rep& operator = (const symbol_record_rep&) = delete;
++
++      ~symbol_record_rep (void) = default;
++
++      void assign (const octave_value& value)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->assign (value);
++            return;
++          }
++
++        varref () = value;
++      }
++
++      void assign (octave_value::assign_op op,
++                   const std::string& type,
++                   const std::list<octave_value_list>& idx,
++                   const octave_value& value)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->assign (op, type, idx, value);
++            return;
++          }
++
++        varref().assign (op, type, idx, value);
++      }
++
++      void assign (octave_value::assign_op op, const octave_value& value)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->assign (op, value);
++            return;
++          }
++
++        varref().assign (op, value);
++      }
++
++      void do_non_const_unary_op (octave_value::unary_op op)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->do_non_const_unary_op (op);
++            return;
++          }
++
++        varref().do_non_const_unary_op (op);
++      }
++
++      void do_non_const_unary_op (octave_value::unary_op op,
++                                  const std::string& type,
++                                  const std::list<octave_value_list>& idx)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->do_non_const_unary_op (op, type, idx);
++            return;
++          }
++
++        varref().do_non_const_unary_op (op, type, idx);
++      }
++
++      context_id get_decl_scope_context (void) const;
++
++      octave_value& varref (void)
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->varref ();
++
++        context_id context = m_decl_scope ? get_decl_scope_context () : 0;
++
++        if (is_global ())
++          return xglobal_varref ();
++        else if (is_persistent ())
++          return xpersistent_varref ();
++        else
++          {
++            context_id n = value_stack.size ();
++            while (n++ <= context)
++              value_stack.push_back (octave_value ());
++
++            return value_stack[context];
++          }
++      }
++
++      octave_value varval (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->varval ();
++
++        context_id context = m_decl_scope ? get_decl_scope_context () : 0;
++
++        if (is_global ())
++          return xglobal_varval ();
++        else if (is_persistent ())
++          return xpersistent_varval ();
++        else
++          {
++            if (context < value_stack.size ())
++              return value_stack[context];
++            else
++              return octave_value ();
++          }
++      }
++
++      void push_context (scope *sid)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->push_context (sid);
++            return;
++          }
++
++        if (! (is_persistent () || is_global ())
++            && sid == decl_scope ())
++          value_stack.push_back (octave_value ());
++      }
++
++      // If pop_context returns 0, we are out of values and this element
++      // of the symbol table should be deleted.  This can happen for
++      // functions like
++      //
++      //   function foo (n)
++      //     if (n > 0)
++      //       foo (n-1);
++      //     else
++      //       eval ("x = 1");
++      //     endif
++      //   endfunction
++      //
++      // Here, X should only exist in the final stack frame.
++
++      size_t pop_context (scope *sid)
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->pop_context (sid);
++
++        size_t retval = 1;
++
++        if (! (is_persistent () || is_global ())
++            && sid == decl_scope ())
++          {
++            value_stack.pop_back ();
++            retval = value_stack.size ();
++          }
++
++        return retval;
++      }
++
++      void clear (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->clear ();
++            return;
++          }
++
++        clear (decl_scope ());
++      }
++
++      void clear (scope *sid);
++
++      bool is_defined (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_defined ();
++
++        return varval ().is_defined ();
++      }
++
++      bool is_valid (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_valid ();
++
++        return valid;
++      }
++
++      bool is_variable (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_variable ();
++
++        return (! is_local () || is_defined ());
++      }
++
++      bool is_local (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_local ();
++
++        return storage_class & local;
++      }
++
++      bool is_automatic (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_automatic ();
++
++        return storage_class & automatic;
++      }
++
++      bool is_formal (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_formal ();
++
++        return storage_class & formal;
++      }
++
++      bool is_hidden (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_hidden ();
++
++        return storage_class & hidden;
++      }
++
++      bool is_inherited (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_inherited ();
++
++        return storage_class & inherited;
++      }
++
++      bool is_global (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_global ();
++
++        return storage_class & global;
++      }
++
++      bool is_persistent (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_persistent ();
++
++        return storage_class & persistent;
++      }
++
++      bool is_added_static (void) const
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->is_added_static ();
++
++        return storage_class & added_static;
++      }
++
++      void mark_local (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_local ();
++            return;
++          }
++
++        storage_class |= local;
++      }
++
++      void mark_automatic (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_automatic ();
++            return;
++          }
++
++        storage_class |= automatic;
++      }
++
++      void mark_formal (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_formal ();
++            return;
++          }
++
++        storage_class |= formal;
++      }
++
++      void mark_hidden (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_hidden ();
++            return;
++          }
++
++        storage_class |= hidden;
++      }
++
++      void mark_inherited (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_inherited ();
++            return;
++          }
++
++        storage_class |= inherited;
++      }
++
++      void mark_global (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_global ();
++            return;
++          }
++
++        if (is_persistent ())
++          error ("can't make persistent variable %s global", name.c_str ());
++
++        storage_class |= global;
++      }
++
++      void mark_persistent (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_persistent ();
++            return;
++          }
++
++        if (is_global ())
++          error ("can't make global variable %s persistent", name.c_str ());
++
++        storage_class |= persistent;
++      }
++
++      void mark_added_static (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->mark_added_static ();
++            return;
++          }
++
++        storage_class |= added_static;
++      }
++
++      void unmark_local (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_local ();
++            return;
++          }
++
++        storage_class &= ~local;
++      }
++
++      void unmark_automatic (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_automatic ();
++            return;
++          }
++
++        storage_class &= ~automatic;
++      }
++
++      void unmark_formal (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_formal ();
++            return;
++          }
++
++        storage_class &= ~formal;
++      }
++
++      void unmark_hidden (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_hidden ();
++            return;
++          }
++
++        storage_class &= ~hidden;
++      }
++
++      void unmark_inherited (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_inherited ();
++            return;
++          }
++
++        storage_class &= ~inherited;
++      }
++
++      void unmark_global (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_global ();
++            return;
++          }
++
++        storage_class &= ~global;
++      }
++
++      void unmark_persistent (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_persistent ();
++            return;
++          }
++
++        storage_class &= ~persistent;
++      }
++
++      void unmark_added_static (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->unmark_added_static ();
++            return;
++          }
++
++        storage_class &= ~added_static;
++      }
++
++      void init_persistent (void);
++
++      void invalidate (void)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->invalidate ();
++            return;
++          }
++
++        valid = false;
++      }
++
++      void erase_persistent (void);
++
++      scope *decl_scope (void)
++      {
++        if (m_fwd_rep)
++          return m_fwd_rep->decl_scope ();
++
++        return m_decl_scope;
++      }
++
++      void set_curr_fcn (octave_user_function *fcn)
++      {
++        if (m_fwd_rep)
++          {
++            m_fwd_rep->set_curr_fcn (fcn);
++            return;
++          }
++
++        curr_fcn = fcn;
++      }
++
++      // We don't forward more than once, so no need to forward the
++      // next two.
++
++      void bind_fwd_rep (symbol_record_rep *fwd_rep) { m_fwd_rep = fwd_rep; }
++
++      void unbind_fwd_rep (void) { m_fwd_rep = nullptr; }
++
++      symbol_record_rep * dup (scope *new_scope) const;
++
++      octave_value dump (void) const;
++
++      scope *m_decl_scope;
++
++      octave_user_function *curr_fcn;
++
++      std::string name;
++
++      symbol_record_rep *m_fwd_rep;
++
++      std::deque<octave_value> value_stack;
++
++      unsigned int storage_class;
++
++      //      fcn_info *finfo;
++
++      bool valid;
++
++      refcount<size_t> count;
++
++    private:
++
++      octave_value& xglobal_varref (void);
++
++      octave_value& xpersistent_varref (void);
++
++      octave_value xglobal_varval (void) const;
++
++      octave_value xpersistent_varval (void) const;
++    };
++
++  public:
++
++    symbol_record (void);
++
++    symbol_record (scope *s, const std::string& nm = "",
++                   const octave_value& v = octave_value (),
++                   unsigned int sc = local)
++      : rep (new symbol_record_rep (s, nm, v, sc)) { }
++
++    symbol_record (const symbol_record& sr)
++      : rep (sr.rep)
++    {
++      rep->count++;
++    }
++
++    symbol_record& operator = (const symbol_record& sr)
++    {
++      if (this != &sr)
++        {
++          if (--rep->count == 0)
++            delete rep;
++
++          rep = sr.rep;
++          rep->count++;
++        }
++
++      return *this;
++    }
++
++    ~symbol_record (void)
++    {
++      if (--rep->count == 0)
++        delete rep;
++    }
++
++    symbol_record dup (scope *sid) const
++    {
++      return symbol_record (rep->dup (sid));
++    }
++
++    const std::string& name (void) const { return rep->name; }
++
++    void rename (const std::string& new_name) { rep->name = new_name; }
++
++    octave_value
++    find (const octave_value_list& args = octave_value_list ()) const;
++
++    void assign (const octave_value& value)
++    {
++      rep->assign (value);
++    }
++
++    void assign (octave_value::assign_op op,
++                 const std::string& type,
++                 const std::list<octave_value_list>& idx,
++                 const octave_value& value)
++    {
++      rep->assign (op, type, idx, value);
++    }
++
++    void assign (octave_value::assign_op op, const octave_value& value)
++    {
++      rep->assign (op, value);
++    }
++
++    void do_non_const_unary_op (octave_value::unary_op op)
++    {
++      rep->do_non_const_unary_op (op);
++    }
++
++    void do_non_const_unary_op (octave_value::unary_op op,
++                                const std::string& type,
++                                const std::list<octave_value_list>& idx)
++    {
++      rep->do_non_const_unary_op (op, type, idx);
++    }
++
++    // Delete when deprecated varref functions are removed.
++    octave_value& varref (void)
++    {
++      return rep->varref ();
++    }
++
++    octave_value varval (void) const
++    {
++      return rep->varval ();
++    }
++
++    void push_context (scope *sid) { rep->push_context (sid); }
++
++    size_t pop_context (scope *sid) { return rep->pop_context (sid); }
++
++    void clear (void) { rep->clear (); }
++
++    void clear (scope *sid) { rep->clear (sid); }
++
++    bool is_defined (void) const
++    {
++      return rep->is_defined ();
++    }
++
++    bool is_undefined (void) const
++    {
++      return ! rep->is_defined ();
++    }
++
++    bool is_valid (void) const
++    {
++      return rep->is_valid ();
++    }
++
++    bool is_variable (void) const
++    {
++      return rep->is_variable ();
++    }
++
++    bool is_local (void) const { return rep->is_local (); }
++    bool is_automatic (void) const { return rep->is_automatic (); }
++    bool is_formal (void) const { return rep->is_formal (); }
++    bool is_global (void) const { return rep->is_global (); }
++    bool is_hidden (void) const { return rep->is_hidden (); }
++    bool is_inherited (void) const { return rep->is_inherited (); }
++    bool is_persistent (void) const { return rep->is_persistent (); }
++    bool is_added_static (void) const { return rep->is_added_static (); }
++
++    void mark_local (void) { rep->mark_local (); }
++    void mark_automatic (void) { rep->mark_automatic (); }
++    void mark_formal (void) { rep->mark_formal (); }
++    void mark_hidden (void) { rep->mark_hidden (); }
++    void mark_inherited (void) { rep->mark_inherited (); }
++    void mark_global (void) { rep->mark_global (); }
++    void mark_persistent (void) { rep->mark_persistent (); }
++    void mark_added_static (void) { rep->mark_added_static (); }
++
++    void unmark_local (void) { rep->unmark_local (); }
++    void unmark_automatic (void) { rep->unmark_automatic (); }
++    void unmark_formal (void) { rep->unmark_formal (); }
++    void unmark_hidden (void) { rep->unmark_hidden (); }
++    void unmark_inherited (void) { rep->unmark_inherited (); }
++    void unmark_global (void) { rep->unmark_global (); }
++    void unmark_persistent (void) { rep->unmark_persistent (); }
++    void unmark_added_static (void) { rep->unmark_added_static (); }
++
++    void init_persistent (void) { rep->init_persistent (); }
++
++    void erase_persistent (void) { rep->erase_persistent (); }
++
++    void invalidate (void) { rep->invalidate (); }
++
++    scope *decl_scope (void) { return rep->decl_scope (); }
++
++    unsigned int xstorage_class (void) const { return rep->storage_class; }
++
++    void set_curr_fcn (octave_user_function *fcn)
++    {
++      rep->set_curr_fcn (fcn);
++    }
++
++    void bind_fwd_rep (const symbol_record& sr)
++    {
++      rep->bind_fwd_rep (sr.rep);
++    }
++
++    void unbind_fwd_rep (void) { rep->unbind_fwd_rep (); }
++
++    octave_value dump (void) const { return rep->dump (); }
++
++    const symbol_record_rep *xrep (void) const { return rep; }
++
++  private:
++
++    static octave_value dummy_octave_value;
++
++    symbol_record_rep *rep;
++
++    symbol_record (symbol_record_rep *new_rep) : rep (new_rep) { }
++  };
++}
++
++#endif
+diff --git a/libinterp/corefcn/symtab.cc b/libinterp/corefcn/symtab.cc
+--- a/libinterp/corefcn/symtab.cc
++++ b/libinterp/corefcn/symtab.cc
+@@ -30,236 +30,37 @@ along with Octave; see the file COPYING.
+ #include "file-ops.h"
+ #include "file-stat.h"
+ #include "oct-env.h"
+ #include "oct-time.h"
+ 
+ #include "bp-table.h"
+ #include "defun.h"
+ #include "dirfns.h"
++#include "fcn-info.h"
+ #include "input.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "load-path.h"
+ #include "ov-classdef.h"
+ #include "ov-fcn.h"
+ #include "ov-usr-fcn.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pt-pr-code.h"
++#include "scope.h"
++#include "symrec.h"
+ #include "symtab.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ 
+ // Should Octave always check to see if function files have changed
+ // since they were last compiled?
+ static int Vignore_function_time_stamp = 1;
+ 
+-namespace octave
+-{
+-  octave_value symbol_table::dummy_octave_value;
+-
+-  void
+-  symbol_table::symbol_record::symbol_record_rep::clear (scope *sid)
+-  {
+-    if (m_fwd_rep)
+-      {
+-        m_fwd_rep->clear (sid);
+-        return;
+-      }
+-
+-    if (! (is_hidden () || is_inherited ())
+-        && sid == decl_scope ())
+-      {
+-        if (is_global ())
+-          unmark_global ();
+-
+-        if (is_persistent ())
+-          {
+-            sid->persistent_assign (name, varval ());
+-
+-            unmark_persistent ();
+-          }
+-
+-        assign (octave_value ());
+-      }
+-  }
+-
+-  void
+-  symbol_table::symbol_record::symbol_record_rep::init_persistent (void)
+-  {
+-    if (m_fwd_rep)
+-      {
+-        m_fwd_rep->init_persistent ();
+-        return;
+-      }
+-
+-    symbol_table::scope *scope
+-      = __require_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::init_persistent");
+-
+-    if (! is_defined ())
+-      {
+-        mark_persistent ();
+-
+-        assign (scope->persistent_varval (name));
+-      }
+-    // FIXME: this causes trouble with recursive calls.
+-    // else
+-    //   error ("unable to declare existing variable persistent");
+-  }
+-
+-  void
+-  symbol_table::symbol_record::symbol_record_rep::erase_persistent (void)
+-  {
+-    if (m_fwd_rep)
+-      {
+-        m_fwd_rep->erase_persistent ();
+-        return;
+-      }
+-
+-    unmark_persistent ();
+-
+-    symbol_table::scope *scope
+-      = __require_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::erase_persistent");
+-
+-    scope->erase_persistent (name);
+-  }
+-
+-  symbol_table::symbol_record::symbol_record_rep *
+-  symbol_table::symbol_record::symbol_record_rep::dup (scope *new_scope) const
+-  {
+-    // FIXME: is this the right thing do to?
+-    if (m_fwd_rep)
+-      return m_fwd_rep->dup (new_scope);
+-
+-    return new symbol_record_rep (new_scope, name, varval (), storage_class);
+-  }
+-
+-  octave_value
+-  symbol_table::symbol_record::symbol_record_rep::dump (void) const
+-  {
+-    if (m_fwd_rep)
+-      return m_fwd_rep->dump ();
+-
+-    std::map<std::string, octave_value> m
+-      = {{ "name", name },
+-         { "local", is_local () },
+-         { "automatic", is_automatic () },
+-         { "formal", is_formal () },
+-         { "hidden", is_hidden () },
+-         { "inherited", is_inherited () },
+-         { "global", is_global () },
+-         { "persistent", is_persistent () }};
+-
+-    octave_value val = varval ();
+-
+-    if (val.is_defined ())
+-      m["value"] = val;
+-
+-    return octave_value (m);
+-  }
+-
+-  octave_value&
+-  symbol_table::symbol_record::symbol_record_rep::xglobal_varref (void)
+-  {
+-    if (m_fwd_rep)
+-      return m_fwd_rep->xglobal_varref ();
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::symbol_record::symbol_record_rep::xglobal_varref");
+-
+-    symbol_table::global_symbols_iterator p
+-      = symtab.m_global_symbols.find (name);
+-
+-    return (p == symtab.m_global_symbols.end ()
+-            ? symtab.m_global_symbols[name] : p->second);
+-  }
+-
+-  octave_value&
+-  symbol_table::symbol_record::symbol_record_rep::xpersistent_varref (void)
+-  {
+-    if (m_fwd_rep)
+-      return m_fwd_rep->xpersistent_varref ();
+-
+-    symbol_table::scope *scope
+-      = __get_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::xpersistent_varref");
+-
+-    return scope ? scope->persistent_varref (name) : dummy_octave_value;
+-  }
+-
+-  octave_value
+-  symbol_table::symbol_record::symbol_record_rep::xglobal_varval (void) const
+-  {
+-    if (m_fwd_rep)
+-      return m_fwd_rep->xglobal_varval ();
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::symbol_record::symbol_record_rep::xglobal_varval");
+-
+-    return symtab.global_varval (name);
+-  }
+-
+-  octave_value
+-  symbol_table::symbol_record::symbol_record_rep::xpersistent_varval (void) const
+-  {
+-    if (m_fwd_rep)
+-      return m_fwd_rep->xpersistent_varval ();
+-
+-    symbol_table::scope *scope
+-      = __get_current_scope__ ("symbol_table::symbol_record::symbol_record_rep::xpersistent_varval");
+-
+-    return scope ? scope->persistent_varval (name) : octave_value ();
+-  }
+-
+-  symbol_table::symbol_record::symbol_record (void)
+-    : rep (new symbol_record_rep (__get_current_scope__ ("symbol_record"),
+-                                  "", octave_value (), local))
+-
+-  { }
+-
+-  octave_value
+-  symbol_table::symbol_record::find (const octave_value_list& args) const
+-  {
+-    octave_value retval;
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::symbol_record::find");
+-
+-    if (is_global ())
+-      retval = symtab.global_varval (name ());
+-    else
+-      {
+-        retval = varval ();
+-
+-        if (retval.is_undefined ())
+-          {
+-#if 0
+-            // Use cached fcn_info pointer if possible.
+-            if (rep->finfo)
+-              retval = rep->finfo->find (args);
+-            else
+-#endif
+-              {
+-                retval = symtab.find_function (name (), args);
+-
+-                if (retval.is_defined ())
+-                  return retval;
+-#if 0
+-                {
+-                  rep->finfo = symtab.get_fcn_info (name ());
+-                }
+-#endif
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-}
+-
+ static void
+ split_name_with_package (const std::string& name, std::string& fname,
+                          std::string& pname)
+ {
+   size_t pos = name.rfind ('.');
+ 
+   fname.clear ();
+   pname.clear ();
+@@ -487,765 +288,37 @@ namespace octave
+                   }
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::load_private_function
+-  (const std::string& dir_name)
+-  {
+-    octave_value retval;
+-
+-    load_path& lp
+-      = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::load_private_function");
+-
+-    std::string file_name = lp.find_private_fcn (dir_name, name);
+-
+-    if (file_name.empty ())
+-      return retval;
+-
+-    octave_value ov_fcn = load_fcn_from_file (file_name, dir_name);
+-
+-    if (ov_fcn.is_undefined ())
+-      return retval;
+-
+-    octave_function *tmpfcn = ov_fcn.function_value ();
+-
+-    if (! tmpfcn)
+-      return retval;
+-
+-    std::string class_name;
+-
+-    size_t pos = dir_name.find_last_of (sys::file_ops::dir_sep_chars ());
+-
+-    if (pos != std::string::npos)
+-      {
+-        std::string tmp = dir_name.substr (pos+1);
+-
+-        if (tmp[0] == '@')
+-          class_name = tmp.substr (1);
+-      }
+-
+-    tmpfcn->mark_as_private_function (class_name);
+-
+-    private_functions[dir_name] = ov_fcn;
+-
+-    return ov_fcn;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::load_class_constructor (void)
++  void
++  symbol_table::erase_global (const std::string& name)
+   {
+-    octave_value retval;
+-
+-    std::string dir_name;
+-
+-    load_path& lp
+-      = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::load_class_constructor");
+-
+-    std::string file_name = lp.find_method (name, name, dir_name, package_name);
+-
+-    if (! file_name.empty ())
+-      {
+-        octave_value ov_fcn
+-          = load_fcn_from_file (file_name, dir_name, name,
+-                                        package_name);
+-
+-        if (ov_fcn.is_defined ())
+-          {
+-            // Note: ov_fcn may be an octave_classdef_meta object instead
+-            // of the actual constructor function.
+-
+-            retval = ov_fcn;
+-
+-            class_constructors[name] = retval;
+-            class_methods[name] = retval;
+-          }
+-      }
+-    else
+-      {
+-        // Classdef constructors can be defined anywhere in the path, not
+-        // necessarily in @-folders.  Look for a normal function and load it.
+-        // If the loaded function is a classdef constructor, store it as such
+-        // and restore function_on_path to its previous value.
+-
+-        octave_value old_function_on_path = function_on_path;
+-
+-        octave_value maybe_cdef_ctor = find_user_function ();
+-
+-        if (maybe_cdef_ctor.is_defined ())
+-          {
+-            octave_function *fcn = maybe_cdef_ctor.function_value (true);
+-
+-            if (fcn && fcn->is_classdef_constructor ())
+-              {
+-                retval = maybe_cdef_ctor;
+-
+-                class_constructors[name] = retval;
+-                class_methods[name] = retval;
+-
+-                function_on_path = old_function_on_path;
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::load_class_method
+-  (const std::string& dispatch_type)
+-  {
+-    octave_value retval;
+-
+-    if (full_name () == dispatch_type)
+-      retval = load_class_constructor ();
+-    else
+-      {
+-        cdef_manager& cdm
+-          = __get_cdef_manager__ ("symbol_table::fcn_info::fcn_info_rep::load_class_method");
+-
+-        octave_function *cm = cdm.find_method_symbol (name, dispatch_type);
+-
+-        if (cm)
+-          retval = octave_value (cm);
+-
+-        if (! retval.is_defined ())
+-          {
+-            std::string dir_name;
+-
+-            load_path& lp = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::load_class_method");
+-
+-            std::string file_name = lp.find_method (dispatch_type, name,
+-                                                    dir_name);
+-
+-            if (! file_name.empty ())
+-              {
+-                octave_value ov_fcn
+-                  = load_fcn_from_file (file_name, dir_name,
+-                                                dispatch_type);
+-
+-                if (ov_fcn.is_defined ())
+-                  {
+-                    octave_function *tmpfcn = ov_fcn.function_value ();
+-
+-                    if (tmpfcn && tmpfcn->is_class_method (dispatch_type))
+-                      {
+-                        retval = ov_fcn;
+-
+-                        class_methods[dispatch_type] = retval;
+-                      }
+-                  }
+-              }
+-
+-            if (retval.is_undefined ())
+-              {
+-                // Search parent classes
+-
+-                symbol_table& symtab
+-                  = __get_symbol_table__ ("symbol_table::fcn_info::fcn_info_rep::load_class_method");
+-
+-                const std::list<std::string>& plist =
+-                  symtab.parent_classes (dispatch_type);
+-
+-                std::list<std::string>::const_iterator it = plist.begin ();
+-
+-                while (it != plist.end ())
+-                  {
+-                    retval = find_method (*it);
++    global_symbols_iterator q = m_global_symbols.find (name);
+ 
+-                    if (retval.is_defined ())
+-                      {
+-                        class_methods[dispatch_type] = retval;
+-                        break;
+-                      }
+-
+-                    it++;
+-                  }
+-              }
+-
+-            if (retval.is_undefined ())
+-              {
+-                // Search for built-in functions that are declared to
+-                // handle specific types.
+-
+-                if (built_in_function.is_defined ())
+-                  {
+-                    octave_function *fcn = built_in_function.function_value ();
+-
+-                    if (fcn && fcn->handles_dispatch_class (dispatch_type))
+-                      {
+-                        retval = built_in_function;
+-
+-                        class_methods[dispatch_type] = retval;
+-                      }
+-                  }
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-}
+-
+-// :-) JWE, can you parse this? Returns a 2D array with second dimension equal
+-// to btyp_num_types (static constant).  Only the leftmost dimension can be
+-// variable in C/C++.  Typedefs are boring.
+-
+-static builtin_type_t (*build_sup_table (void))[btyp_num_types]
+-{
+-  static builtin_type_t sup_table[btyp_num_types][btyp_num_types];
+-  for (int i = 0; i < btyp_num_types; i++)
+-    for (int j = 0; j < btyp_num_types; j++)
+-      {
+-        builtin_type_t ityp = static_cast<builtin_type_t> (i);
+-        builtin_type_t jtyp = static_cast<builtin_type_t> (j);
+-        // FIXME: Is this really right?
+-        bool use_j =
+-          (jtyp == btyp_func_handle || ityp == btyp_bool
+-           || (btyp_isarray (ityp)
+-               && (! btyp_isarray (jtyp)
+-                   || (btyp_isinteger (jtyp) && ! btyp_isinteger (ityp))
+-                   || ((ityp == btyp_double || ityp == btyp_complex
+-                        || ityp == btyp_char)
+-                       && (jtyp == btyp_float
+-                           || jtyp == btyp_float_complex)))));
+-
+-        sup_table[i][j] = (use_j ? jtyp : ityp);
+-      }
+-
+-  return sup_table;
+-}
+-
+-namespace octave
+-{
+-  std::string
+-  get_dispatch_type (const octave_value_list& args,
+-                     builtin_type_t& builtin_type)
+-  {
+-    static builtin_type_t (*sup_table)[btyp_num_types] = build_sup_table ();
+-    std::string dispatch_type;
+-
+-    int n = args.length ();
+-
+-    if (n > 0)
+-      {
+-        int i = 0;
+-        builtin_type = args(0).builtin_type ();
+-        if (builtin_type != btyp_unknown)
+-          {
+-            for (i = 1; i < n; i++)
+-              {
+-                builtin_type_t bti = args(i).builtin_type ();
+-                if (bti != btyp_unknown)
+-                  builtin_type = sup_table[builtin_type][bti];
+-                else
+-                  {
+-                    builtin_type = btyp_unknown;
+-                    break;
+-                  }
+-              }
+-          }
+-
+-        if (builtin_type == btyp_unknown)
+-          {
+-            // There's a non-builtin class in the argument list.
+-            dispatch_type = args(i).class_name ();
+-
+-            symbol_table& symtab = __get_symbol_table__ ("get_dispatch_type");
+-
+-            for (int j = i+1; j < n; j++)
+-              {
+-                octave_value arg = args(j);
+-
+-                if (arg.builtin_type () == btyp_unknown)
+-                  {
+-                    std::string cname = arg.class_name ();
+-
+-                    // Only switch to type of ARG if it is marked superior
+-                    // to the current DISPATCH_TYPE.
+-                    if (! symtab.is_superiorto (dispatch_type, cname)
+-                        && symtab.is_superiorto (cname, dispatch_type))
+-                      dispatch_type = cname;
+-                  }
+-              }
+-          }
+-        else
+-          dispatch_type = btyp_class_name[builtin_type];
+-      }
+-    else
+-      builtin_type = btyp_unknown;
+-
+-    return dispatch_type;
+-  }
+-
+-  std::string
+-  get_dispatch_type (const octave_value_list& args)
+-  {
+-    builtin_type_t builtin_type;
+-    return get_dispatch_type (args, builtin_type);
+-  }
+-
+-  // Find function definition according to the following precedence list:
+-  //
+-  //   private function
+-  //   class method
+-  //   class constructor
+-  //   command-line function
+-  //   autoload function
+-  //   function on the path
+-  //   built-in function
+-  //
+-  // Matlab documentation states that constructors have higher precedence
+-  // than methods, but that does not seem to be the case.
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::find (const octave_value_list& args,
+-                                              bool local_funcs)
+-  {
+-    octave_value retval = xfind (args, local_funcs);
+-
+-    if (retval.is_undefined ())
+-      {
+-        // It is possible that the user created a file on the fly since
+-        // the last prompt or chdir, so try updating the load path and
+-        // searching again.
+-
+-        load_path& lp = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::find");
+-
+-        lp.update ();
+-
+-        retval = xfind (args, local_funcs);
+-      }
+-
+-    return retval;
++    if (q != m_global_symbols.end ())
++      m_global_symbols.erase (q);
+   }
+ 
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::xfind (const octave_value_list& args,
+-                                               bool local_funcs)
++  void
++  symbol_table::erase_global_pattern (const glob_match& pattern)
+   {
+-    if (local_funcs)
+-      {
+-        symbol_table::scope *scope
+-          = __get_current_scope__ ("symbol_table::fcn_info::fcn_info_rep::xfind");
+-
+-        octave_user_function *current_fcn = scope ? scope->function () : nullptr;
+-
+-        // Local function.
+-
+-        if (current_fcn)
+-          {
+-            std::string fcn_file = current_fcn->fcn_file_name ();
+-
+-            // For anonymous functions we look at the parent scope so that if
+-            // they were defined within class methods and use local functions
+-            // (helper functions) we can still use those anonymous functions
+-
+-            if (current_fcn->is_anonymous_function ())
+-              {
+-                if (fcn_file.empty ()
+-                    && scope->parent_scope () != nullptr
+-                    && scope->parent_scope ()->function () != nullptr)
+-                  fcn_file
+-                    = scope->parent_scope ()->function ()->fcn_file_name();
+-              }
+-
+-            if (! fcn_file.empty ())
+-              {
+-                str_val_iterator r = local_functions.find (fcn_file);
+-
+-                if (r != local_functions.end ())
+-                  {
+-                    // We shouldn't need an out-of-date check here since
+-                    // local functions may ultimately be called only from
+-                    // a primary function or method defined in the same
+-                    // file.
+-
+-                    return r->second;
+-                  }
+-              }
+-          }
+-
+-        // Private function.
+-
+-        if (current_fcn)
+-          {
+-            std::string dir_name = current_fcn->dir_name ();
+-
+-            if (! dir_name.empty ())
+-              {
+-                str_val_iterator q = private_functions.find (dir_name);
+-
+-                if (q == private_functions.end ())
+-                  {
+-                    octave_value val = load_private_function (dir_name);
+-
+-                    if (val.is_defined ())
+-                      return val;
+-                  }
+-                else
+-                  {
+-                    octave_value& fval = q->second;
+-
+-                    if (fval.is_defined ())
+-                      out_of_date_check (fval, "", false);
+-
+-                    if (fval.is_defined ())
+-                      return fval;
+-                    else
+-                      {
+-                        octave_value val = load_private_function (dir_name);
+-
+-                        if (val.is_defined ())
+-                          return val;
+-                      }
+-                  }
+-              }
+-          }
+-      }
+-
+-    // Class methods.
+-
+-    if (! args.empty ())
+-      {
+-        std::string dispatch_type = get_dispatch_type (args);
+-
+-        octave_value fcn = find_method (dispatch_type);
+-
+-        if (fcn.is_defined ())
+-          return fcn;
+-      }
+-
+-    // Class constructors.  The class name and function name are the same.
+-
+-    str_val_iterator q = class_constructors.find (name);
+-
+-    if (q == class_constructors.end ())
+-      {
+-        octave_value val = load_class_constructor ();
+-
+-        if (val.is_defined ())
+-          return val;
+-      }
+-    else
+-      {
+-        octave_value& fval = q->second;
+-
+-        if (fval.is_defined ())
+-          out_of_date_check (fval, name);
+-
+-        if (fval.is_defined ())
+-          return fval;
+-        else
+-          {
+-            octave_value val = load_class_constructor ();
+-
+-            if (val.is_defined ())
+-              return val;
+-          }
+-      }
+-
+-    // Command-line function.
+-
+-    if (cmdline_function.is_defined ())
+-      return cmdline_function;
+-
+-    // Autoload?
+-
+-    octave_value fcn = find_autoload ();
+-
+-    if (fcn.is_defined ())
+-      return fcn;
+-
+-    // Function on the path.
+-
+-    fcn = find_user_function ();
+-
+-    if (fcn.is_defined ())
+-      return fcn;
+-
+-    // Package
+-
+-    fcn = find_package ();
+-
+-    if (fcn.is_defined ())
+-      return fcn;
+-
+-    // Built-in function (might be undefined).
+-
+-    return built_in_function;
+-  }
+-
+-  // Find the definition of NAME according to the following precedence
+-  // list:
+-  //
+-  //   built-in function
+-  //   function on the path
+-  //   autoload function
+-  //   command-line function
+-  //   private function
+-  //   subfunction
+-
+-  // This function is used to implement the "builtin" function, which
+-  // searches for "built-in" functions.  In Matlab, "builtin" only
+-  // returns functions that are actually built-in to the interpreter.
+-  // But since the list of built-in functions is different in Octave and
+-  // Matlab, we also search up the precedence list until we find
+-  // something that matches.  Note that we are only searching by name,
+-  // so class methods and constructors are skipped.
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::builtin_find (void)
+-  {
+-    octave_value retval = x_builtin_find ();
+-
+-    if (! retval.is_defined ())
+-      {
+-        // It is possible that the user created a file on the fly since
+-        // the last prompt or chdir, so try updating the load path and
+-        // searching again.
+-
+-        load_path& lp = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::builtin_find");
+-
+-        lp.update ();
+-
+-        retval = x_builtin_find ();
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::x_builtin_find (void)
+-  {
+-    // Built-in function.
+-    if (built_in_function.is_defined ())
+-      return built_in_function;
+-
+-    // Function on the path.
+-
+-    octave_value fcn = find_user_function ();
+-
+-    if (fcn.is_defined ())
+-      return fcn;
++    global_symbols_iterator q = m_global_symbols.begin ();
+ 
+-    // Autoload?
+-
+-    fcn = find_autoload ();
+-
+-    if (fcn.is_defined ())
+-      return fcn;
+-
+-    // Command-line function.
+-
+-    if (cmdline_function.is_defined ())
+-      return cmdline_function;
+-
+-    // Private function.
+-
+-    symbol_table::scope *scope
+-      = __get_current_scope__ ("symbol_table::fcn_info::fcn_info_rep::x_builtin_find");
+-
+-    octave_user_function *current_fcn = scope ? scope->function () : nullptr;
+-
+-    if (current_fcn)
+-      {
+-        std::string dir_name = current_fcn->dir_name ();
+-
+-        if (! dir_name.empty ())
+-          {
+-            str_val_iterator q = private_functions.find (dir_name);
+-
+-            if (q == private_functions.end ())
+-              {
+-                octave_value val = load_private_function (dir_name);
+-
+-                if (val.is_defined ())
+-                  return val;
+-              }
+-            else
+-              {
+-                octave_value& fval = q->second;
+-
+-                if (fval.is_defined ())
+-                  out_of_date_check (fval);
+-
+-                if (fval.is_defined ())
+-                  return fval;
+-                else
+-                  {
+-                    octave_value val = load_private_function (dir_name);
+-
+-                    if (val.is_defined ())
+-                      return val;
+-                  }
+-              }
+-          }
+-      }
+-
+-    // Local function.
+-
+-    if (current_fcn)
+-      {
+-        std::string fcn_file = current_fcn->fcn_file_name ();
+-
+-        if (! fcn_file.empty ())
+-          {
+-            str_val_iterator r = local_functions.find (fcn_file);
+-
+-            if (r != local_functions.end ())
+-              {
+-                // We shouldn't need an out-of-date check here since local
+-                // functions may ultimately be called only from a primary
+-                // function or method defined in the same file.
+-
+-                return r->second;
+-              }
+-          }
+-      }
+-
+-    // Subfunction.  I think it only makes sense to check for
+-    // subfunctions if we are currently executing a function defined
+-    // from a .m file.
+-
+-    symbol_table::scope *curr_scope
+-      = __get_current_scope__ ("symbol_table::fcn_info::fcn_info_rep::x_builtin_find");
+-
+-    if (curr_scope)
+-      {
+-        octave_value val = curr_scope->find_subfunction (name);
+-
+-        if (val.is_defined ())
+-          return val;
+-      }
+-
+-    return octave_value ();
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::find_method
+-  (const std::string& dispatch_type)
+-  {
+-    octave_value retval;
+-
+-    str_val_iterator q = class_methods.find (dispatch_type);
+-
+-    if (q == class_methods.end ())
++    while (q != m_global_symbols.end ())
+       {
+-        octave_value val = load_class_method (dispatch_type);
+-
+-        if (val.is_defined ())
+-          return val;
+-      }
+-    else
+-      {
+-        octave_value& fval = q->second;
+-
+-        if (fval.is_defined ())
+-          out_of_date_check (fval, dispatch_type);
+-
+-        if (fval.is_defined ())
+-          return fval;
++        if (pattern.match (q->first))
++          m_global_symbols.erase (q++);
+         else
+-          {
+-            octave_value val = load_class_method (dispatch_type);
+-
+-            if (val.is_defined ())
+-              return val;
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::find_autoload (void)
+-  {
+-    // Autoloaded function.
+-
+-    if (autoload_function.is_defined ())
+-      out_of_date_check (autoload_function);
+-
+-    if (! autoload_function.is_defined ())
+-      {
+-        std::string file_name = lookup_autoload (name);
+-
+-        if (! file_name.empty ())
+-          {
+-            size_t pos = file_name.find_last_of (sys::file_ops::dir_sep_chars ());
+-
+-            std::string dir_name = file_name.substr (0, pos);
+-
+-            octave_value ov_fcn
+-              = load_fcn_from_file (file_name, dir_name, "", "",
+-                                            name, true);
+-
+-            if (ov_fcn.is_defined ())
+-              autoload_function = octave_value (ov_fcn);
+-          }
++          q++;
+       }
+-
+-    return autoload_function;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::find_user_function (void)
+-  {
+-    // Function on the path.
+-
+-    if (function_on_path.is_defined ())
+-      out_of_date_check (function_on_path);
+-
+-    if (function_on_path.is_undefined ())
+-      {
+-        std::string dir_name;
+-
+-        load_path& lp = __get_load_path__ ("symbol_table::fcn_info::fcn_info_rep::find_user_function");
+-
+-
+-        std::string file_name = lp.find_fcn (name, dir_name, package_name);
+-
+-        if (! file_name.empty ())
+-          {
+-            octave_value ov_fcn
+-              = load_fcn_from_file (file_name, dir_name, "",
+-                                            package_name);
+-
+-            if (ov_fcn.is_defined ())
+-              function_on_path = ov_fcn;
+-          }
+-      }
+-
+-    return function_on_path;
+-  }
+-
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::find_package (void)
+-  {
+-    // FIXME: implement correct way to check out of date package
+-    //if (package.is_defined ())
+-    //  out_of_date_check (package);
+-
+-    if (package.is_undefined ())
+-      {
+-        cdef_manager& cdm
+-          = __get_cdef_manager__ ("symbol_table::fcn_info::fcn_info_rep::find_package");
+-
+-        octave_function *fcn = cdm.find_package_symbol (full_name ());
+-
+-        if (fcn)
+-          package = octave_value (fcn);
+-      }
+-
+-    return package;
+   }
+ 
+   // Insert INF_CLASS in the set of class names that are considered
+   // inferior to SUP_CLASS.  Return FALSE if INF_CLASS is currently
+   // marked as superior to SUP_CLASS.
+ 
+   bool
+   symbol_table::set_class_relationship (const std::string& sup_class,
+@@ -1283,91 +356,68 @@ namespace octave
+     if (p == m_class_precedence_table.end ())
+       return false;
+ 
+     const std::set<std::string>& inferior_classes = p->second;
+     std::set<std::string>::const_iterator q = inferior_classes.find (b);
+     return (q != inferior_classes.end ());
+   }
+ 
+-  void
+-  symbol_table::fcn_info::fcn_info_rep::install_built_in_dispatch (const std::string& klass)
+-  {
+-    if (built_in_function.is_defined ())
+-      {
+-        octave_function *fcn = built_in_function.function_value ();
+-
+-        if (fcn)
+-          {
+-            if (fcn->handles_dispatch_class (klass))
+-              warning ("install_built_in_dispatch: '%s' already defined for class '%s'",
+-                       name.c_str (), klass.c_str ());
+-            else
+-              fcn->push_dispatch_class (klass);
+-          }
+-      }
+-    else
+-      error ("install_built_in_dispatch: '%s' is not a built-in function",
+-             name.c_str ());
+-  }
+-}
+-
+-static octave_value
+-dump_function_map (const std::map<std::string, octave_value>& fcn_map)
+-{
+-  if (fcn_map.empty ())
+-    return octave_value (Matrix ());
+-
+-  std::map<std::string, octave_value> info_map;
+-
+-  for (const auto& nm_fcn : fcn_map)
+-    {
+-      std::string nm = nm_fcn.first;
+-      const octave_value& fcn = nm_fcn.second;
+-      info_map[nm] = fcn.dump ();
+-    }
+-
+-  return octave_value (info_map);
+-}
+-
+-namespace octave
+-{
+-  octave_value
+-  symbol_table::fcn_info::fcn_info_rep::dump (void) const
+-  {
+-    std::map<std::string, octave_value> m
+-      = {{ "name", full_name () },
+-         { "refcount", count.value () },
+-         { "package", package.dump () },
+-         { "local_functions", dump_function_map (local_functions) },
+-         { "private_functions", dump_function_map (private_functions) },
+-         { "class_methods", dump_function_map (class_methods) },
+-         { "class_constructors", dump_function_map (class_constructors) },
+-         { "cmdline_function", cmdline_function.dump () },
+-         { "autoload_function", autoload_function.dump () },
+-         { "function_on_path", function_on_path.dump () },
+-         { "built_in_function", built_in_function.dump () }};
+-
+-    return octave_value (m);
+-  }
+-
+   octave_value
+   symbol_table::find (const std::string& name, const octave_value_list& args,
+                       bool skip_variables, bool local_funcs)
+   {
+     return (m_current_scope
+             ? m_current_scope->find (name, args, skip_variables, local_funcs)
+             : octave_value ());
+   }
+ 
+   octave_value
+   symbol_table::builtin_find (const std::string& name)
+   {
+-    return (m_current_scope
+-            ? m_current_scope->builtin_find (name) : octave_value ());
++    fcn_table_iterator p = m_fcn_table.find (name);
++
++    if (p != m_fcn_table.end ())
++      return p->second.builtin_find ();
++    else
++      {
++        fcn_info finfo (name);
++
++        octave_value fcn = finfo.builtin_find ();
++
++        if (fcn.is_defined ())
++          m_fcn_table[name] = finfo;
++
++        return fcn;
++      }
++
++    return octave_value ();
++  }
++
++  octave_value
++  symbol_table::fcn_table_find (const std::string& name,
++                               const octave_value_list& args, bool local_funcs)
++  {
++    fcn_table_iterator p = m_fcn_table.find (name);
++
++    if (p != m_fcn_table.end ())
++      return p->second.find (args, local_funcs);
++    else
++      {
++        fcn_info finfo (name);
++
++        octave_value fcn = finfo.find (args, local_funcs);
++
++        if (fcn.is_defined ())
++          m_fcn_table[name] = finfo;
++
++        return fcn;
++      }
++
++    return octave_value ();
+   }
+ 
+   octave_value
+   symbol_table::find_function (const std::string& name,
+                                const octave_value_list& args, bool local_funcs)
+   {
+     octave_value retval;
+ 
+@@ -1513,403 +563,16 @@ namespace octave
+       {
+         std::string nm = nm_finfo.first;
+         const fcn_info& finfo = nm_finfo.second;
+         info_map[nm] = finfo.dump ();
+       }
+ 
+     return octave_value (info_map);
+   }
+-
+-  octave_value
+-  symbol_table::scope::find (const std::string& name,
+-                             const octave_value_list& args,
+-                             bool skip_variables, bool local_funcs)
+-  {
+-    octave_value retval;
+-
+-    // Variable.
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::scope::find");
+-
+-    if (! skip_variables)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p != m_symbols.end ())
+-          {
+-            symbol_record sr = p->second;
+-
+-            if (sr.is_global ())
+-              return symtab.global_varval (name);
+-            else
+-              {
+-                octave_value val = sr.varval ();
+-
+-                if (val.is_defined ())
+-                  return val;
+-              }
+-          }
+-      }
+-
+-    if (local_funcs)
+-      {
+-        // Subfunction.  I think it only makes sense to check for
+-        // subfunctions if we are currently executing a function defined
+-        // from a .m file.
+-
+-        octave_value fcn = find_subfunction (name);
+-
+-        if (fcn.is_defined ())
+-          return fcn;
+-      }
+-
+-    fcn_table_iterator p = symtab.m_fcn_table.find (name);
+-
+-    if (p != symtab.m_fcn_table.end ())
+-      return p->second.find (args, local_funcs);
+-    else
+-      {
+-        fcn_info finfo (name);
+-
+-        octave_value fcn = finfo.find (args, local_funcs);
+-
+-        if (fcn.is_defined ())
+-          symtab.m_fcn_table[name] = finfo;
+-
+-        return fcn;
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_value
+-  symbol_table::scope::builtin_find (const std::string& name)
+-  {
+-    octave_value retval;
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::scope::find");
+-
+-    fcn_table_iterator p = symtab.m_fcn_table.find (name);
+-
+-    if (p != symtab.m_fcn_table.end ())
+-      return p->second.builtin_find ();
+-    else
+-      {
+-        fcn_info finfo (name);
+-
+-        octave_value fcn = finfo.builtin_find ();
+-
+-        if (fcn.is_defined ())
+-          symtab.m_fcn_table[name] = finfo;
+-
+-        return fcn;
+-      }
+-
+-    return retval;
+-  }
+-
+-  symbol_table::symbol_record&
+-  symbol_table::scope::insert (const std::string& name, bool force_add)
+-  {
+-    table_iterator p = m_symbols.find (name);
+-
+-    if (p == m_symbols.end ())
+-      {
+-        symbol_table::symbol_record ret (this, name);
+-
+-        if (m_is_nested && m_parent && m_parent->look_nonlocal (name, ret))
+-          return m_symbols[name] = ret;
+-        else
+-          {
+-            if (m_is_static && ! force_add)
+-              ret.mark_added_static ();
+-
+-            return m_symbols[name] = ret;
+-          }
+-      }
+-    else
+-      return p->second;
+-  }
+-
+-  void
+-  symbol_table::scope::clear_global (const std::string& name)
+-  {
+-    table_iterator p = m_symbols.find (name);
+-
+-    if (p != m_symbols.end ())
+-      {
+-        symbol_table::symbol_record& sr = p->second;
+-
+-        if (sr.is_global ())
+-          sr.unmark_global ();
+-      }
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::scope::clear_global");
+-
+-    global_symbols_iterator q = symtab.m_global_symbols.find (name);
+-
+-    if (q != symtab.m_global_symbols.end ())
+-      symtab.m_global_symbols.erase (q);
+-
+-  }
+-
+-  void
+-  symbol_table::scope::clear_global_pattern (const std::string& pat)
+-  {
+-    glob_match pattern (pat);
+-
+-    for (auto& nm_sr : m_symbols)
+-      {
+-        symbol_table::symbol_record& sr = nm_sr.second;
+-
+-        if (sr.is_global () && pattern.match (sr.name ()))
+-          sr.unmark_global ();
+-      }
+-
+-    symbol_table& symtab
+-      = __get_symbol_table__ ("symbol_table::scope::clear_global_pattern");
+-
+-    global_symbols_iterator q = symtab.m_global_symbols.begin ();
+-
+-    while (q != symtab.m_global_symbols.end ())
+-      {
+-        if (pattern.match (q->first))
+-          symtab.m_global_symbols.erase (q++);
+-        else
+-          q++;
+-      }
+-  }
+-
+-  std::list<workspace_element>
+-  symbol_table::scope::workspace_info (void) const
+-  {
+-    std::list<workspace_element> retval;
+-
+-    for (const auto& nm_sr : m_symbols)
+-      {
+-        std::string nm = nm_sr.first;
+-        symbol_record sr = nm_sr.second;
+-
+-        if (! sr.is_hidden ())
+-          {
+-            octave_value val = sr.varval ();
+-
+-            if (val.is_defined ())
+-              {
+-                // FIXME: fix size for objects, see kluge in variables.cc
+-                //dim_vector dv = val.dims ();
+-                octave_value tmp = val;
+-                Matrix sz = tmp.size ();
+-                dim_vector dv = dim_vector::alloc (sz.numel ());
+-                for (octave_idx_type i = 0; i < dv.ndims (); i++)
+-                  dv(i) = sz(i);
+-
+-                char storage = ' ';
+-                if (sr.is_global ())
+-                  storage = 'g';
+-                else if (sr.is_persistent ())
+-                  storage = 'p';
+-                else if (sr.is_automatic ())
+-                  storage = 'a';
+-                else if (sr.is_formal ())
+-                  storage = 'f';
+-                else if (sr.is_hidden ())
+-                  storage = 'h';
+-                else if (sr.is_inherited ())
+-                  storage = 'i';
+-
+-                std::ostringstream buf;
+-                val.short_disp (buf);
+-                std::string short_disp_str = buf.str ();
+-
+-                workspace_element elt (storage, nm, val.class_name (),
+-                                       short_disp_str, dv.str (),
+-                                       val.iscomplex ());
+-
+-                retval.push_back (elt);
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_value
+-  symbol_table::scope::dump (void) const
+-  {
+-    std::map<std::string, octave_value> m
+-      = {{ "name", m_name },
+-         { "symbols", dump_symbols_map () },
+-         { "persistent_variables", m_persistent_symbols },
+-         { "subfunctions", dump_function_map (m_subfunctions) }};
+-
+-    return octave_value (m);
+-  }
+-
+-  octave_value
+-  symbol_table::scope::dump_symbols_map (void) const
+-  {
+-    std::map<std::string, octave_value> info_map;
+-
+-    for (const auto& nm_sr : m_symbols)
+-      {
+-        std::string nm = nm_sr.first;
+-        const symbol_table::symbol_record& sr = nm_sr.second;
+-        info_map[nm] = sr.dump ();
+-      }
+-
+-    return octave_value (info_map);
+-  }
+-
+-  void
+-  symbol_table::scope::install_subfunction (const std::string& name,
+-                                            const octave_value& fval,
+-                                            bool is_nested)
+-  {
+-    m_subfunctions[name] = fval;
+-
+-    // This can be simpler once the scope object is stored in the function
+-    // object...
+-    octave_user_function *fcn = fval.user_function_value ();
+-
+-    scope *fcn_scope = fcn->scope ();
+-
+-    fcn_scope->set_parent (this);
+-
+-    if (is_nested)
+-      {
+-        m_children.push_back (fcn_scope);
+-
+-        fcn->mark_as_nested_function ();
+-
+-        fcn_scope->m_is_nested = true;
+-      }
+-
+-  }
+-
+-  octave_value
+-  symbol_table::scope::find_subfunction (const std::string& name) const
+-  {
+-    subfunctions_const_iterator p = m_subfunctions.find (name);
+-
+-    if (p != m_subfunctions.end ())
+-      return p->second;
+-
+-    if (m_parent)
+-      return m_parent->find_subfunction (name);
+-
+-    return octave_value ();
+-  }
+-
+-  void
+-  symbol_table::scope::mark_subfunctions_in_scope_as_private (const std::string& class_name)
+-  {
+-    for (auto& nm_sf : m_subfunctions)
+-      {
+-        octave_function *fcn = nm_sf.second.function_value ();
+-
+-        if (fcn)
+-          fcn->mark_as_private_function (class_name);
+-      }
+-  }
+-
+-  void
+-  symbol_table::scope::set_parent (scope *p)
+-  {
+-    m_parent = p;
+-
+-    if (m_parent)
+-      {
+-        // If m_parent is the top-level scope, there will be no parent
+-        // function.
+-
+-        octave_function *current_fcn = function ();
+-
+-        if (current_fcn && current_fcn->is_anonymous_function ())
+-          {
+-            octave_function *parent_fcn = m_parent->function ();
+-
+-            if (parent_fcn)
+-              m_parent_fcn = octave_value (parent_fcn, true);
+-          }
+-      }
+-  }
+-
+-  void
+-  symbol_table::scope::update_nest (void)
+-  {
+-    if (m_parent)
+-      {
+-        // fix bad symbol_records
+-        for (auto& nm_sr : m_symbols)
+-          {
+-            symbol_record& ours = nm_sr.second;
+-
+-            if (! ours.is_formal ()
+-                && m_is_nested && m_parent->look_nonlocal (nm_sr.first, ours))
+-              {
+-                if (ours.is_global () || ours.is_persistent ())
+-                  error ("global and persistent may only be used in the topmost level in which a nested variable is used");
+-              }
+-            else
+-              ours.set_curr_fcn (m_fcn);
+-          }
+-
+-        // The scopes of nested functions are static.
+-        m_is_static = true;
+-      }
+-    else if (m_children.size ())
+-      {
+-        // Parents of nested functions have static scopes.
+-        m_is_static = true;
+-
+-        for (auto& nm_sr : m_symbols)
+-          nm_sr.second.set_curr_fcn (m_fcn);
+-      }
+-
+-    for (auto& symtab_p : m_children)
+-      symtab_p->update_nest ();
+-  }
+-
+-  bool
+-  symbol_table::scope::look_nonlocal (const std::string& name,
+-                                      symbol_table::symbol_record& result)
+-  {
+-    table_iterator p = m_symbols.find (name);
+-    if (p == m_symbols.end ())
+-      {
+-        if (m_is_nested && m_parent)
+-          return m_parent->look_nonlocal (name, result);
+-      }
+-    else if (! p->second.is_automatic ())
+-      {
+-        result.bind_fwd_rep (p->second);
+-        return true;
+-      }
+-
+-    return false;
+-  }
+-
+-  void
+-  symbol_table::scope::bind_script_symbols (scope *curr_scope)
+-  {
+-    for (auto& nm_sr : m_symbols)
+-      nm_sr.second.bind_fwd_rep (curr_scope->find_symbol (nm_sr.first));
+-  }
+-
+-  void
+-  symbol_table::scope::unbind_script_symbols (void)
+-  {
+-    for (auto& nm_sr : m_symbols)
+-      nm_sr.second.unbind_fwd_rep ();
+-  }
+ }
+ 
+ DEFUN (ignore_function_time_stamp, args, nargout,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{val} =} ignore_function_time_stamp ()
+ @deftypefnx {} {@var{old_val} =} ignore_function_time_stamp (@var{new_val})
+ Query or set the internal variable that controls whether Octave checks
+ the time stamp on files each time it looks up functions defined in
+@@ -1990,17 +653,17 @@ DEFMETHOD (__current_scope__, interp, , 
+            doc: /* -*- texinfo -*-
+ @deftypefn {} {[@var{scope}, @var{context}]} __current_scope__ ()
+ Return the current scope and context as integers.
+ @seealso{__dump_symtab_info__}
+ @end deftypefn */)
+ {
+   octave::symbol_table& symtab = interp.get_symbol_table ();
+ 
+-  octave::symbol_table::scope *scope = symtab.current_scope ();
++  octave::scope *scope = symtab.current_scope ();
+ 
+   std::string nm = scope ? scope->name () : "<unknown>";
+ 
+   return ovl (nm, symtab.current_context ());
+ }
+ 
+ DEFMETHOD (__dump_symtab_info__, interp, args, ,
+            doc: /* -*- texinfo -*-
+@@ -2018,17 +681,17 @@ Undocumented internal function.
+   octave::symbol_table& symtab = interp.get_symbol_table ();
+ 
+   if (nargin == 0)
+     return symtab.dump ();
+   else
+     {
+       std::string fname = args(0).xstring_value ("__dump_symtab_info__: argument must be a function name");
+ 
+-      octave::symbol_table::fcn_info *finfo = symtab.get_fcn_info (fname);
++      octave::fcn_info *finfo = symtab.get_fcn_info (fname);
+ 
+       if (finfo)
+         return finfo->dump ();
+     }
+ 
+   return ovl ();
+ }
+ 
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -35,1084 +35,34 @@ along with Octave; see the file COPYING.
+ 
+ #include "glob-match.h"
+ #include "lo-regexp.h"
+ #include "oct-refcount.h"
+ 
+ class tree_argument_list;
+ class octave_user_function;
+ 
++#include "fcn-info.h"
+ #include "ov.h"
+ #include "ovl.h"
++#include "scope.h"
++#include "symrec.h"
+ #include "workspace-element.h"
+ 
+ namespace octave
+ {
+   class OCTINTERP_API symbol_table
+   {
+   public:
+ 
+-    static octave_value dummy_octave_value;
+-
+-    typedef size_t context_id;
+-
+-    class scope;
+-
+-    class fcn_info;
+-
+-    class symbol_record
+-    {
+-    public:
+-
+-      // generic variable
+-      static const unsigned int local = 1;
+-
+-      // varargin, argn, .nargin., .nargout.
+-      // (FIXME: is this really used now?)
+-      static const unsigned int automatic = 2;
+-
+-      // formal parameter
+-      static const unsigned int formal = 4;
+-
+-      // not listed or cleared (.nargin., .nargout.)
+-      static const unsigned int hidden = 8;
+-
+-      // inherited from parent scope; not cleared at function exit
+-      static const unsigned int inherited = 16;
+-
+-      // global (redirects to global scope)
+-      static const unsigned int global = 32;
+-
+-      // not cleared at function exit
+-      static const unsigned int persistent = 64;
+-
+-      // this symbol may NOT become a variable.
+-      // (symbol added to a static workspace)
+-      static const unsigned int added_static = 128;
+-
+-    private:
+-
+-      class symbol_record_rep
+-      {
+-      public:
+-
+-        symbol_record_rep (scope *s, const std::string& nm,
+-                           const octave_value& v, unsigned int sc)
+-          : m_decl_scope (s), curr_fcn (nullptr), name (nm),
+-            m_fwd_rep (nullptr), value_stack (),
+-            storage_class (sc), /* finfo (), */ valid (true), count (1)
+-        {
+-          value_stack.push_back (v);
+-        }
+-
+-        // No copying!
+-
+-        symbol_record_rep (const symbol_record_rep& ov) = delete;
+-
+-        symbol_record_rep& operator = (const symbol_record_rep&) = delete;
+-
+-        ~symbol_record_rep (void) = default;
+-
+-        void assign (const octave_value& value)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->assign (value);
+-              return;
+-            }
+-
+-          varref () = value;
+-        }
+-
+-        void assign (octave_value::assign_op op,
+-                     const std::string& type,
+-                     const std::list<octave_value_list>& idx,
+-                     const octave_value& value)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->assign (op, type, idx, value);
+-              return;
+-            }
+-
+-          varref().assign (op, type, idx, value);
+-        }
+-
+-        void assign (octave_value::assign_op op, const octave_value& value)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->assign (op, value);
+-              return;
+-            }
+-
+-          varref().assign (op, value);
+-        }
+-
+-        void do_non_const_unary_op (octave_value::unary_op op)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->do_non_const_unary_op (op);
+-              return;
+-            }
+-
+-          varref().do_non_const_unary_op (op);
+-        }
+-
+-        void do_non_const_unary_op (octave_value::unary_op op,
+-                                    const std::string& type,
+-                                    const std::list<octave_value_list>& idx)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->do_non_const_unary_op (op, type, idx);
+-              return;
+-            }
+-
+-          varref().do_non_const_unary_op (op, type, idx);
+-        }
+-
+-        octave_value& varref (void)
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->varref ();
+-
+-          context_id context
+-            = m_decl_scope ? m_decl_scope->current_context () : 0;
+-
+-          if (is_global ())
+-            return xglobal_varref ();
+-          else if (is_persistent ())
+-            return xpersistent_varref ();
+-          else
+-            {
+-              context_id n = value_stack.size ();
+-              while (n++ <= context)
+-                value_stack.push_back (octave_value ());
+-
+-              return value_stack[context];
+-            }
+-        }
+-
+-        octave_value varval (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->varval ();
+-
+-          context_id context
+-            = m_decl_scope ? m_decl_scope->current_context () : 0;
+-
+-          if (is_global ())
+-            return xglobal_varval ();
+-          else if (is_persistent ())
+-            return xpersistent_varval ();
+-          else
+-            {
+-              if (context < value_stack.size ())
+-                return value_stack[context];
+-              else
+-                return octave_value ();
+-            }
+-        }
+-
+-        void push_context (scope *sid)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->push_context (sid);
+-              return;
+-            }
+-
+-          if (! (is_persistent () || is_global ())
+-              && sid == decl_scope ())
+-            value_stack.push_back (octave_value ());
+-        }
+-
+-        // If pop_context returns 0, we are out of values and this element
+-        // of the symbol table should be deleted.  This can happen for
+-        // functions like
+-        //
+-        //   function foo (n)
+-        //     if (n > 0)
+-        //       foo (n-1);
+-        //     else
+-        //       eval ("x = 1");
+-        //     endif
+-        //   endfunction
+-        //
+-        // Here, X should only exist in the final stack frame.
+-
+-        size_t pop_context (scope *sid)
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->pop_context (sid);
+-
+-          size_t retval = 1;
+-
+-          if (! (is_persistent () || is_global ())
+-              && sid == decl_scope ())
+-            {
+-              value_stack.pop_back ();
+-              retval = value_stack.size ();
+-            }
+-
+-          return retval;
+-        }
+-
+-        void clear (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->clear ();
+-              return;
+-            }
+-
+-          clear (decl_scope ());
+-        }
+-
+-        void clear (scope *sid);
+-
+-        bool is_defined (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_defined ();
+-
+-          return varval ().is_defined ();
+-        }
+-
+-        bool is_valid (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_valid ();
+-
+-          return valid;
+-        }
+-
+-        bool is_variable (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_variable ();
+-
+-          return (! is_local () || is_defined ());
+-        }
+-
+-        bool is_local (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_local ();
+-
+-          return storage_class & local;
+-        }
+-
+-        bool is_automatic (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_automatic ();
+-
+-          return storage_class & automatic;
+-        }
+-
+-        bool is_formal (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_formal ();
+-
+-          return storage_class & formal;
+-        }
+-
+-        bool is_hidden (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_hidden ();
+-
+-          return storage_class & hidden;
+-        }
+-
+-        bool is_inherited (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_inherited ();
+-
+-          return storage_class & inherited;
+-        }
+-
+-        bool is_global (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_global ();
+-
+-          return storage_class & global;
+-        }
+-
+-        bool is_persistent (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_persistent ();
+-
+-          return storage_class & persistent;
+-        }
+-
+-        bool is_added_static (void) const
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->is_added_static ();
+-
+-          return storage_class & added_static;
+-        }
+-
+-        void mark_local (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_local ();
+-              return;
+-            }
+-
+-          storage_class |= local;
+-        }
+-
+-        void mark_automatic (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_automatic ();
+-              return;
+-            }
+-
+-          storage_class |= automatic;
+-        }
+-
+-        void mark_formal (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_formal ();
+-              return;
+-            }
+-
+-          storage_class |= formal;
+-        }
+-
+-        void mark_hidden (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_hidden ();
+-              return;
+-            }
+-
+-          storage_class |= hidden;
+-        }
+-
+-        void mark_inherited (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_inherited ();
+-              return;
+-            }
+-
+-          storage_class |= inherited;
+-        }
+-
+-        void mark_global (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_global ();
+-              return;
+-            }
+-
+-          if (is_persistent ())
+-            error ("can't make persistent variable %s global", name.c_str ());
+-
+-          storage_class |= global;
+-        }
+-
+-        void mark_persistent (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_persistent ();
+-              return;
+-            }
+-
+-          if (is_global ())
+-            error ("can't make global variable %s persistent", name.c_str ());
+-
+-          storage_class |= persistent;
+-        }
+-
+-        void mark_added_static (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->mark_added_static ();
+-              return;
+-            }
+-
+-          storage_class |= added_static;
+-        }
+-
+-        void unmark_local (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_local ();
+-              return;
+-            }
+-
+-          storage_class &= ~local;
+-        }
+-
+-        void unmark_automatic (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_automatic ();
+-              return;
+-            }
+-
+-          storage_class &= ~automatic;
+-        }
+-
+-        void unmark_formal (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_formal ();
+-              return;
+-            }
+-
+-          storage_class &= ~formal;
+-        }
+-
+-        void unmark_hidden (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_hidden ();
+-              return;
+-            }
+-
+-          storage_class &= ~hidden;
+-        }
+-
+-        void unmark_inherited (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_inherited ();
+-              return;
+-            }
+-
+-          storage_class &= ~inherited;
+-        }
+-
+-        void unmark_global (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_global ();
+-              return;
+-            }
+-
+-          storage_class &= ~global;
+-        }
+-
+-        void unmark_persistent (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_persistent ();
+-              return;
+-            }
+-
+-          storage_class &= ~persistent;
+-        }
+-
+-        void unmark_added_static (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->unmark_added_static ();
+-              return;
+-            }
+-
+-          storage_class &= ~added_static;
+-        }
+-
+-        void init_persistent (void);
+-
+-        void invalidate (void)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->invalidate ();
+-              return;
+-            }
+-
+-          valid = false;
+-        }
+-
+-        void erase_persistent (void);
+-
+-        scope *decl_scope (void)
+-        {
+-          if (m_fwd_rep)
+-            return m_fwd_rep->decl_scope ();
+-
+-          return m_decl_scope;
+-        }
+-
+-        void set_curr_fcn (octave_user_function *fcn)
+-        {
+-          if (m_fwd_rep)
+-            {
+-              m_fwd_rep->set_curr_fcn (fcn);
+-              return;
+-            }
+-
+-          curr_fcn = fcn;
+-        }
+-
+-        // We don't forward more than once, so no need to forward the
+-        // next two.
++    typedef octave::symbol_record symbol_record;
++    typedef octave::scope scope;
++    typedef octave::fcn_info fcn_info;
+ 
+-        void bind_fwd_rep (symbol_record_rep *fwd_rep) { m_fwd_rep = fwd_rep; }
+-
+-        void unbind_fwd_rep (void) { m_fwd_rep = nullptr; }
+-
+-        symbol_record_rep * dup (scope *new_scope) const;
+-
+-        octave_value dump (void) const;
+-
+-        scope *m_decl_scope;
+-
+-        octave_user_function *curr_fcn;
+-
+-        std::string name;
+-
+-        symbol_record_rep *m_fwd_rep;
+-
+-        std::deque<octave_value> value_stack;
+-
+-        unsigned int storage_class;
+-
+-        //      fcn_info *finfo;
+-
+-        bool valid;
+-
+-        refcount<size_t> count;
+-
+-      private:
+-
+-        octave_value& xglobal_varref (void);
+-
+-        octave_value& xpersistent_varref (void);
+-
+-        octave_value xglobal_varval (void) const;
+-
+-        octave_value xpersistent_varval (void) const;
+-      };
+-
+-    public:
+-
+-      symbol_record (void);
+-
+-      symbol_record (scope *s, const std::string& nm = "",
+-                     const octave_value& v = octave_value (),
+-                     unsigned int sc = local)
+-        : rep (new symbol_record_rep (s, nm, v, sc)) { }
+-
+-      symbol_record (const symbol_record& sr)
+-        : rep (sr.rep)
+-      {
+-        rep->count++;
+-      }
+-
+-      symbol_record& operator = (const symbol_record& sr)
+-      {
+-        if (this != &sr)
+-          {
+-            if (--rep->count == 0)
+-              delete rep;
+-
+-            rep = sr.rep;
+-            rep->count++;
+-          }
+-
+-        return *this;
+-      }
+-
+-      ~symbol_record (void)
+-      {
+-        if (--rep->count == 0)
+-          delete rep;
+-      }
+-
+-      symbol_record dup (scope *sid) const
+-      {
+-        return symbol_record (rep->dup (sid));
+-      }
+-
+-      const std::string& name (void) const { return rep->name; }
+-
+-      void rename (const std::string& new_name) { rep->name = new_name; }
+-
+-      octave_value
+-      find (const octave_value_list& args = octave_value_list ()) const;
+-
+-      void assign (const octave_value& value)
+-      {
+-        rep->assign (value);
+-      }
+-
+-      void assign (octave_value::assign_op op,
+-                   const std::string& type,
+-                   const std::list<octave_value_list>& idx,
+-                   const octave_value& value)
+-      {
+-        rep->assign (op, type, idx, value);
+-      }
+-
+-      void assign (octave_value::assign_op op, const octave_value& value)
+-      {
+-        rep->assign (op, value);
+-      }
+-
+-      void do_non_const_unary_op (octave_value::unary_op op)
+-      {
+-        rep->do_non_const_unary_op (op);
+-      }
+-
+-      void do_non_const_unary_op (octave_value::unary_op op,
+-                                  const std::string& type,
+-                                  const std::list<octave_value_list>& idx)
+-      {
+-        rep->do_non_const_unary_op (op, type, idx);
+-      }
+-
+-      // Delete when deprecated varref functions are removed.
+-      octave_value& varref (void)
+-      {
+-        return rep->varref ();
+-      }
+-
+-      octave_value varval (void) const
+-      {
+-        return rep->varval ();
+-      }
+-
+-      void push_context (scope *sid) { rep->push_context (sid); }
+-
+-      size_t pop_context (scope *sid) { return rep->pop_context (sid); }
+-
+-      void clear (void) { rep->clear (); }
+-
+-      void clear (scope *sid) { rep->clear (sid); }
+-
+-      bool is_defined (void) const
+-      {
+-        return rep->is_defined ();
+-      }
+-
+-      bool is_undefined (void) const
+-      {
+-        return ! rep->is_defined ();
+-      }
+-
+-      bool is_valid (void) const
+-      {
+-        return rep->is_valid ();
+-      }
+-
+-      bool is_variable (void) const
+-      {
+-        return rep->is_variable ();
+-      }
+-
+-      bool is_local (void) const { return rep->is_local (); }
+-      bool is_automatic (void) const { return rep->is_automatic (); }
+-      bool is_formal (void) const { return rep->is_formal (); }
+-      bool is_global (void) const { return rep->is_global (); }
+-      bool is_hidden (void) const { return rep->is_hidden (); }
+-      bool is_inherited (void) const { return rep->is_inherited (); }
+-      bool is_persistent (void) const { return rep->is_persistent (); }
+-      bool is_added_static (void) const { return rep->is_added_static (); }
+-
+-      void mark_local (void) { rep->mark_local (); }
+-      void mark_automatic (void) { rep->mark_automatic (); }
+-      void mark_formal (void) { rep->mark_formal (); }
+-      void mark_hidden (void) { rep->mark_hidden (); }
+-      void mark_inherited (void) { rep->mark_inherited (); }
+-      void mark_global (void) { rep->mark_global (); }
+-      void mark_persistent (void) { rep->mark_persistent (); }
+-      void mark_added_static (void) { rep->mark_added_static (); }
+-
+-      void unmark_local (void) { rep->unmark_local (); }
+-      void unmark_automatic (void) { rep->unmark_automatic (); }
+-      void unmark_formal (void) { rep->unmark_formal (); }
+-      void unmark_hidden (void) { rep->unmark_hidden (); }
+-      void unmark_inherited (void) { rep->unmark_inherited (); }
+-      void unmark_global (void) { rep->unmark_global (); }
+-      void unmark_persistent (void) { rep->unmark_persistent (); }
+-      void unmark_added_static (void) { rep->unmark_added_static (); }
+-
+-      void init_persistent (void) { rep->init_persistent (); }
+-
+-      void erase_persistent (void) { rep->erase_persistent (); }
+-
+-      void invalidate (void) { rep->invalidate (); }
+-
+-      scope *decl_scope (void) { return rep->decl_scope (); }
+-
+-      unsigned int xstorage_class (void) const { return rep->storage_class; }
+-
+-      void set_curr_fcn (octave_user_function *fcn)
+-      {
+-        rep->set_curr_fcn (fcn);
+-      }
+-
+-      void bind_fwd_rep (const symbol_record& sr)
+-      {
+-        rep->bind_fwd_rep (sr.rep);
+-      }
+-
+-      void unbind_fwd_rep (void) { rep->unbind_fwd_rep (); }
+-
+-      octave_value dump (void) const { return rep->dump (); }
+-
+-      const symbol_record_rep *xrep (void) const { return rep; }
+-
+-    private:
+-
+-      symbol_record_rep *rep;
+-
+-      symbol_record (symbol_record_rep *new_rep) : rep (new_rep) { }
+-    };
+-
+-    class fcn_info
+-    {
+-    public:
+-
+-      typedef std::map<std::string, octave_value>::const_iterator
+-      str_val_const_iterator;
+-      typedef std::map<std::string, octave_value>::iterator str_val_iterator;
+-
+-    private:
+-
+-      class fcn_info_rep
+-      {
+-      public:
+-
+-        fcn_info_rep (const std::string& nm)
+-          : name (nm), package_name (), local_functions (),
+-            private_functions (), class_constructors (), class_methods (),
+-            cmdline_function (), autoload_function (), function_on_path (),
+-            built_in_function (), count (1)
+-        {
+-          size_t pos = name.rfind ('.');
+-
+-          if (pos != std::string::npos)
+-            {
+-              package_name = name.substr (0, pos);
+-              name = name.substr (pos+1);
+-            }
+-        }
+-
+-        // No copying!
+-
+-        fcn_info_rep (const fcn_info_rep&) = delete;
+-
+-        fcn_info_rep& operator = (const fcn_info_rep&) = delete;
+-
+-        ~fcn_info_rep (void) = default;
+-
+-        octave_value install_local_function (const std::string& file_name);
+-
+-        octave_value load_private_function (const std::string& dir_name);
+-
+-        octave_value load_class_constructor (void);
+-
+-        octave_value load_class_method (const std::string& dispatch_type);
+-
+-        octave_value find (const octave_value_list& args, bool local_funcs);
+-
+-        octave_value builtin_find (void);
+-
+-        octave_value find_method (const std::string& dispatch_type);
+-
+-        octave_value find_autoload (void);
+-
+-        octave_value find_package (void);
+-
+-        octave_value find_user_function (void);
+-
+-        bool is_user_function_defined (void) const
+-        {
+-          return function_on_path.is_defined ();
+-        }
+-
+-        octave_value find_function (const octave_value_list& args,
+-                                    bool local_funcs)
+-        {
+-          return find (args, local_funcs);
+-        }
+-
+-        void install_cmdline_function (const octave_value& f)
+-        {
+-          cmdline_function = f;
+-        }
+-
+-        void install_local_function (const octave_value& f,
+-                                     const std::string& file_name)
+-        {
+-          local_functions[file_name] = f;
+-        }
+-
+-        void install_user_function (const octave_value& f)
+-        {
+-          function_on_path = f;
+-        }
+-
+-        void install_built_in_function (const octave_value& f)
+-        {
+-          built_in_function = f;
+-        }
+-
+-        void install_built_in_dispatch (const std::string& klass);
+-
+-        template <typename T>
+-        void
+-        clear_map (std::map<T, octave_value>& map, bool force = false)
+-        {
+-          typename std::map<T, octave_value>::iterator p = map.begin ();
+-
+-          while (p != map.end ())
+-            {
+-              if (force || ! p->second.islocked ())
+-                map.erase (p++);
+-              else
+-                p++;
+-            }
+-        }
+-
+-        void clear_autoload_function (bool force = false)
+-        {
+-          if (force || ! autoload_function.islocked ())
+-            autoload_function = octave_value ();
+-        }
+-
+-        // We also clear command line functions here, as these are both
+-        // "user defined"
+-        void clear_user_function (bool force = false)
+-        {
+-          clear_autoload_function (force);
+-
+-          if (force || ! function_on_path.islocked ())
+-            function_on_path = octave_value ();
+-
+-          if (force || ! cmdline_function.islocked ())
+-            cmdline_function = octave_value ();
+-        }
+-
+-        void clear_mex_function (void)
+-        {
+-          if (function_on_path.is_mex_function ())
+-            clear_user_function ();
+-        }
+-
+-        void clear_package (void)
+-        {
+-          package = octave_value ();
+-        }
+-
+-        void clear (bool force = false)
+-        {
+-          clear_map (local_functions, force);
+-          clear_map (private_functions, force);
+-          clear_map (class_constructors, force);
+-          clear_map (class_methods, force);
+-
+-          clear_autoload_function (force);
+-          clear_user_function (force);
+-          clear_package ();
+-        }
+-
+-        octave_value dump (void) const;
+-
+-        std::string full_name (void) const
+-        {
+-          if (package_name.empty ())
+-            return name;
+-          else
+-            return package_name + '.' + name;
+-        }
+-
+-        std::string name;
+-
+-        std::string package_name;
+-
+-        // File name to function object.
+-        std::map<std::string, octave_value> local_functions;
+-
+-        // Directory name to function object.
+-        std::map<std::string, octave_value> private_functions;
+-
+-        // Class name to function object.
+-        std::map<std::string, octave_value> class_constructors;
+-
+-        // Dispatch type to function object.
+-        std::map<std::string, octave_value> class_methods;
+-
+-        octave_value cmdline_function;
+-
+-        octave_value autoload_function;
+-
+-        octave_value function_on_path;
+-
+-        octave_value package;
+-
+-        octave_value built_in_function;
+-
+-        refcount<size_t> count;
+-
+-      private:
+-
+-        octave_value xfind (const octave_value_list& args, bool local_funcs);
+-
+-        octave_value x_builtin_find (void);
+-      };
+-
+-    public:
+-
+-      fcn_info (const std::string& nm = "")
+-        : rep (new fcn_info_rep (nm)) { }
+-
+-      fcn_info (const fcn_info& fi) : rep (fi.rep)
+-      {
+-        rep->count++;
+-      }
+-
+-      fcn_info& operator = (const fcn_info& fi)
+-      {
+-        if (this != &fi)
+-          {
+-            if (--rep->count == 0)
+-              delete rep;
+-
+-            rep = fi.rep;
+-            rep->count++;
+-          }
+-
+-        return *this;
+-      }
+-
+-      ~fcn_info (void)
+-      {
+-        if (--rep->count == 0)
+-          delete rep;
+-      }
+-
+-      octave_value find (const octave_value_list& args = octave_value_list (),
+-                         bool local_funcs = true)
+-      {
+-        return rep->find (args, local_funcs);
+-      }
+-
+-      octave_value builtin_find (void)
+-      {
+-        return rep->builtin_find ();
+-      }
+-
+-      octave_value find_method (const std::string& dispatch_type) const
+-      {
+-        return rep->find_method (dispatch_type);
+-      }
+-
+-      octave_value find_built_in_function (void) const
+-      {
+-        return rep->built_in_function;
+-      }
+-
+-      octave_value find_cmdline_function (void) const
+-      {
+-        return rep->cmdline_function;
+-      }
+-
+-      octave_value find_autoload (void)
+-      {
+-        return rep->find_autoload ();
+-      }
+-
+-      octave_value find_user_function (void)
+-      {
+-        return rep->find_user_function ();
+-      }
+-
+-      bool is_user_function_defined (void) const
+-      {
+-        return rep->is_user_function_defined ();
+-      }
+-
+-      octave_value find_function (const octave_value_list& args
+-                                  = octave_value_list (),
+-                                  bool local_funcs = true)
+-      {
+-        return rep->find_function (args, local_funcs);
+-      }
+-
+-      void install_cmdline_function (const octave_value& f)
+-      {
+-        rep->install_cmdline_function (f);
+-      }
+-
+-      void install_local_function (const octave_value& f,
+-                                   const std::string& file_name)
+-      {
+-        rep->install_local_function (f, file_name);
+-      }
+-
+-      void install_user_function (const octave_value& f)
+-      {
+-        rep->install_user_function (f);
+-      }
+-
+-      void install_built_in_function (const octave_value& f)
+-      {
+-        rep->install_built_in_function (f);
+-      }
+-
+-      void install_built_in_dispatch (const std::string& klass)
+-      {
+-        rep->install_built_in_dispatch (klass);
+-      }
+-
+-      void clear (bool force = false) { rep->clear (force); }
+-
+-      void clear_user_function (bool force = false)
+-      {
+-        rep->clear_user_function (force);
+-      }
+-
+-      void clear_autoload_function (bool force = false)
+-      {
+-        rep->clear_autoload_function (force);
+-      }
+-
+-      void clear_mex_function (void) { rep->clear_mex_function (); }
+-
+-      octave_value dump (void) const { return rep->dump (); }
+-
+-    private:
+-
+-      fcn_info_rep *rep;
+-    };
++    typedef scope::context_id context_id;
+ 
+     symbol_table (void)
+       : m_global_symbols (), m_fcn_table (), m_class_precedence_table (),
+       m_parent_map (), m_global_scope (new scope ("global scope")),
+       m_top_scope (new scope ("top scope")),
+       m_current_scope (m_top_scope)
+       { }
+ 
+@@ -1187,18 +137,16 @@ namespace octave
+ 
+     // Find a value corresponding to the given name in the table.
+     octave_value
+       find (const std::string& name,
+             const octave_value_list& args = octave_value_list (),
+             bool skip_variables = false,
+             bool local_funcs = true);
+ 
+-    octave_value builtin_find (const std::string& name);
+-
+     void assign (const std::string& name, const octave_value& value, bool force_add)
+     {
+       if (m_current_scope)
+         m_current_scope->assign (name, value, force_add);
+     }
+ 
+     void assign (const std::string& name,
+                  const octave_value& value = octave_value ())
+@@ -1220,16 +168,24 @@ namespace octave
+       global_symbols_iterator p = m_global_symbols.find (name);
+ 
+       if (p == m_global_symbols.end ())
+         m_global_symbols[name] = value;
+       else
+         p->second = value;
+     }
+ 
++    octave_value& global_varref (const std::string& name)
++    {
++      global_symbols_iterator p = m_global_symbols.find (name);
++
++      return (p == m_global_symbols.end ()
++              ? m_global_symbols[name] : p->second);
++    }
++
+     octave_value global_varval (const std::string& name) const
+     {
+       global_symbols_const_iterator p = m_global_symbols.find (name);
+ 
+       return (p != m_global_symbols.end ()) ? p->second : octave_value ();
+     }
+ 
+     void
+@@ -1298,16 +254,23 @@ namespace octave
+       find_autoload (const std::string& name)
+     {
+       fcn_table_iterator p = m_fcn_table.find (name);
+ 
+       return (p != m_fcn_table.end ()
+               ? p->second.find_autoload () : octave_value ());
+     }
+ 
++    octave_value builtin_find (const std::string& name);
++
++    octave_value
++    fcn_table_find (const std::string& name,
++                    const octave_value_list& args = octave_value_list (),
++                    bool local_funcs = true);
++
+     octave_value
+       find_function (const std::string& name,
+                      const octave_value_list& args = octave_value_list (),
+                      bool local_funcs = true);
+ 
+     octave_value find_user_function (const std::string& name)
+     {
+       fcn_table_iterator p = m_fcn_table.find (name);
+@@ -1507,16 +470,20 @@ namespace octave
+     void clear_mex_functions (void)
+     {
+       fcn_table_iterator p = m_fcn_table.begin ();
+ 
+       while (p != m_fcn_table.end ())
+         (p++)->second.clear_mex_function ();
+     }
+ 
++    void erase_global (const std::string& name);
++
++    void erase_global_pattern (const glob_match& pattern);
++
+     bool set_class_relationship (const std::string& sup_class,
+                                  const std::string& inf_class);
+ 
+     bool is_superiorto (const std::string& a, const std::string& b);
+ 
+     void alias_built_in_function (const std::string& alias,
+                                   const std::string& name)
+     {
+@@ -1778,552 +745,16 @@ namespace octave
+     void cleanup (void);
+ 
+     fcn_info * get_fcn_info (const std::string& name)
+     {
+       fcn_table_iterator p = m_fcn_table.find (name);
+       return p != m_fcn_table.end () ? &p->second : nullptr;
+     }
+ 
+-    class scope
+-    {
+-    public:
+-
+-      typedef std::map<std::string, symbol_table::symbol_record>::const_iterator
+-      table_const_iterator;
+-      typedef std::map<std::string, symbol_table::symbol_record>::iterator
+-      table_iterator;
+-
+-      typedef std::map<std::string, octave_value>::const_iterator
+-      m_persistent_symbols_const_iterator;
+-      typedef std::map<std::string, octave_value>::iterator
+-      m_persistent_symbols_iterator;
+-
+-      typedef std::map<std::string, octave_value>::const_iterator
+-      subfunctions_const_iterator;
+-      typedef std::map<std::string, octave_value>::iterator subfunctions_iterator;
+-
+-      scope (const std::string& name = "")
+-        : m_name (name), m_symbols (), m_persistent_symbols (), m_subfunctions (),
+-          m_fcn (nullptr), m_parent (nullptr), m_parent_fcn (), m_children (), m_is_nested (false),
+-          m_is_static (false), m_context (0)
+-      { }
+-
+-      // No copying!
+-
+-      scope (const scope&) = delete;
+-
+-      scope& operator = (const scope&) = delete;
+-
+-      ~scope (void) = default;
+-
+-      void insert_symbol_record (const symbol_table::symbol_record& sr)
+-      {
+-        m_symbols[sr.name ()] = sr;
+-      }
+-
+-      bool is_nested (void) const { return m_is_nested; }
+-
+-      void mark_nested (void) { m_is_nested = true; }
+-
+-      bool is_static (void) const { return m_is_static; }
+-
+-      void mark_static (void) { m_is_static = true; }
+-
+-      scope * parent_scope (void) const { return m_parent; }
+-      octave_value parent_fcn (void) const { return m_parent_fcn; }
+-
+-      scope * dup (void) const
+-      {
+-        scope *new_sid = new scope ();
+-
+-        for (const auto& nm_sr : m_symbols)
+-          new_sid->insert_symbol_record (nm_sr.second.dup (new_sid));
+-
+-        new_sid->m_parent = m_parent;
+-        new_sid->m_parent_fcn = m_parent_fcn;
+-
+-        return new_sid;
+-      }
+-
+-      void set_context (context_id context) { m_context = context; }
+-
+-      context_id current_context (void) const { return m_context; }
+-
+-      symbol_table::symbol_record find_symbol (const std::string& name)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p == m_symbols.end ())
+-          return insert (name);
+-        else
+-          return p->second;
+-      }
+-
+-      void inherit_internal (scope& donor_scope)
+-      {
+-        for (auto& nm_sr : m_symbols)
+-          {
+-            symbol_table::symbol_record& sr = nm_sr.second;
+-
+-            if (! (sr.is_automatic () || sr.is_formal ()))
+-              {
+-                std::string nm = sr.name ();
+-
+-                if (nm != "__retval__")
+-                  {
+-                    octave_value val = donor_scope.varval (nm);
+-
+-                    if (val.is_defined ())
+-                      {
+-                        sr.assign (val);
+-
+-                        sr.mark_inherited ();
+-                      }
+-                  }
+-              }
+-          }
+-      }
+-
+-      void inherit (scope *donor_scope)
+-      {
+-        while (donor_scope)
+-          {
+-            inherit_internal (*donor_scope);
+-
+-            if (donor_scope->is_nested ())
+-              donor_scope = donor_scope->parent_scope ();
+-            else
+-              break;
+-          }
+-      }
+-
+-
+-      octave_value
+-      find (const std::string& name, const octave_value_list& args,
+-            bool skip_variables, bool local_funcs);
+-
+-      octave_value builtin_find (const std::string& name);
+-
+-      symbol_table::symbol_record&
+-      insert (const std::string& name, bool force_add = false);
+-
+-      void rename (const std::string& old_name, const std::string& new_name)
+-      {
+-        table_iterator p = m_symbols.find (old_name);
+-
+-        if (p != m_symbols.end ())
+-          {
+-            symbol_table::symbol_record sr = p->second;
+-
+-            sr.rename (new_name);
+-
+-            m_symbols.erase (p);
+-
+-            m_symbols[new_name] = sr;
+-          }
+-      }
+-
+-      void assign (const std::string& name, const octave_value& value,
+-                   bool force_add)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p == m_symbols.end ())
+-          {
+-            symbol_table::symbol_record& sr = insert (name, force_add);
+-
+-            sr.assign (value);
+-          }
+-        else
+-          p->second.assign (value);
+-      }
+-
+-      void assign (const std::string& name,
+-                   const octave_value& value = octave_value ())
+-      {
+-        assign (name, value, false);
+-      }
+-
+-      void force_assign (const std::string& name, const octave_value& value)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p == m_symbols.end ())
+-          {
+-            symbol_table::symbol_record& sr = insert (name, true);
+-
+-            sr.assign (value);
+-          }
+-        else
+-          p->second.assign (value);
+-      }
+-
+-      // Use assign (name, value, force_add) instead.
+-      // Delete when deprecated varref functions are removed.
+-      octave_value& varref (const std::string& name, bool force_add)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p == m_symbols.end ())
+-          {
+-            symbol_table::symbol_record& sr = insert (name, force_add);
+-
+-            return sr.varref ();
+-          }
+-        else
+-          return p->second.varref ();
+-      }
+-
+-      octave_value varval (const std::string& name) const
+-      {
+-        table_const_iterator p = m_symbols.find (name);
+-
+-        return (p != m_symbols.end ()
+-                ? p->second.varval () : octave_value ());
+-      }
+-
+-      void persistent_assign (const std::string& name, const octave_value& value)
+-      {
+-        m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+-
+-        if (p == m_persistent_symbols.end ())
+-          m_persistent_symbols[name] = value;
+-        else
+-          p->second = value;
+-      }
+-
+-      // Use persistent_assign (name, value) instead.
+-      // Delete when deprecated varref functions are removed.
+-      octave_value& persistent_varref (const std::string& name)
+-      {
+-        m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+-
+-        return (p == m_persistent_symbols.end ()
+-                ? m_persistent_symbols[name] : p->second);
+-      }
+-
+-      octave_value persistent_varval (const std::string& name) const
+-      {
+-        m_persistent_symbols_const_iterator p = m_persistent_symbols.find (name);
+-
+-        return (p != m_persistent_symbols.end ()) ? p->second : octave_value ();
+-      }
+-
+-      void erase_persistent (const std::string& name)
+-      {
+-        m_persistent_symbols_iterator p = m_persistent_symbols.find (name);
+-
+-        if (p != m_persistent_symbols.end ())
+-          m_persistent_symbols.erase (p);
+-      }
+-
+-      bool is_variable (const std::string& name) const
+-      {
+-        bool retval = false;
+-
+-        table_const_iterator p = m_symbols.find (name);
+-
+-        if (p != m_symbols.end ())
+-          {
+-            const symbol_table::symbol_record& sr = p->second;
+-
+-            retval = sr.is_variable ();
+-          }
+-
+-        return retval;
+-      }
+-
+-      void push_context (void)
+-      {
+-        for (auto& nm_sr : m_symbols)
+-          nm_sr.second.push_context (this);
+-      }
+-
+-      void pop_context (void)
+-      {
+-        table_iterator tbl_it = m_symbols.begin ();
+-
+-        while (tbl_it != m_symbols.end ())
+-          {
+-            if (tbl_it->second.pop_context (this) == 0)
+-              m_symbols.erase (tbl_it++);
+-            else
+-              tbl_it++;
+-          }
+-      }
+-
+-      void clear_variables (void)
+-      {
+-        for (auto& nm_sr : m_symbols)
+-          nm_sr.second.clear (this);
+-      }
+-
+-      void clear_objects (void)
+-      {
+-        for (auto& nm_sr : m_symbols)
+-          {
+-            symbol_table::symbol_record& sr = nm_sr.second;
+-            octave_value val = sr.varval ();
+-            if (val.isobject ())
+-              nm_sr.second.clear (this);
+-          }
+-      }
+-
+-      void clear_global (const std::string& name);
+-
+-      void clear_variable (const std::string& name)
+-      {
+-        table_iterator p = m_symbols.find (name);
+-
+-        if (p != m_symbols.end ())
+-          p->second.clear (this);
+-      }
+-
+-      void clear_global_pattern (const std::string& pat);
+-
+-      void clear_variable_pattern (const std::string& pat)
+-      {
+-        glob_match pattern (pat);
+-
+-        for (auto& nm_sr : m_symbols)
+-          {
+-            symbol_table::symbol_record& sr = nm_sr.second;
+-
+-            if (sr.is_defined () || sr.is_global ())
+-              {
+-                if (pattern.match (sr.name ()))
+-                  sr.clear (this);
+-              }
+-          }
+-      }
+-
+-      void clear_variable_regexp (const std::string& pat)
+-      {
+-        octave::regexp pattern (pat);
+-
+-        for (auto& nm_sr : m_symbols)
+-          {
+-            symbol_table::symbol_record& sr = nm_sr.second;
+-
+-            if (sr.is_defined () || sr.is_global ())
+-              {
+-                if (pattern.is_match (sr.name ()))
+-                  sr.clear (this);
+-              }
+-          }
+-      }
+-
+-      void mark_automatic (const std::string& name)
+-      {
+-        insert (name).mark_automatic ();
+-      }
+-
+-      void mark_hidden (const std::string& name)
+-      {
+-        insert (name).mark_hidden ();
+-      }
+-
+-      void mark_global (const std::string& name)
+-      {
+-        insert (name).mark_global ();
+-      }
+-
+-      std::list<symbol_table::symbol_record>
+-      all_variables (bool defined_only = true,
+-                     unsigned int exclude = symbol_table::symbol_record::hidden) const
+-      {
+-        std::list<symbol_table::symbol_record> retval;
+-
+-        for (const auto& nm_sr : m_symbols)
+-          {
+-            const symbol_table::symbol_record& sr = nm_sr.second;
+-
+-            if ((defined_only && ! sr.is_defined ())
+-                || (sr.xstorage_class () & exclude))
+-              continue;
+-
+-            retval.push_back (sr);
+-          }
+-
+-        return retval;
+-      }
+-
+-      std::list<symbol_table::symbol_record>
+-      glob (const std::string& pattern, bool vars_only = false) const
+-      {
+-        std::list<symbol_table::symbol_record> retval;
+-
+-        glob_match pat (pattern);
+-
+-        for (const auto& nm_sr : m_symbols)
+-          {
+-            if (pat.match (nm_sr.first))
+-              {
+-                const symbol_table::symbol_record& sr = nm_sr.second;
+-
+-                if (vars_only && ! sr.is_variable ())
+-                  continue;
+-
+-                retval.push_back (sr);
+-              }
+-          }
+-
+-        return retval;
+-      }
+-
+-      std::list<symbol_table::symbol_record>
+-      regexp (const std::string& pattern, bool vars_only = false) const
+-      {
+-        std::list<symbol_table::symbol_record> retval;
+-
+-        octave::regexp pat (pattern);
+-
+-        for (const auto& nm_sr : m_symbols)
+-          {
+-            if (pat.is_match (nm_sr.first))
+-              {
+-                const symbol_table::symbol_record& sr = nm_sr.second;
+-
+-                if (vars_only && ! sr.is_variable ())
+-                  continue;
+-
+-                retval.push_back (sr);
+-              }
+-          }
+-
+-        return retval;
+-      }
+-
+-      std::list<std::string> variable_names (void)
+-      {
+-        std::list<std::string> retval;
+-
+-        for (const auto& nm_sr : m_symbols)
+-          {
+-            if (nm_sr.second.is_variable ())
+-              retval.push_back (nm_sr.first);
+-          }
+-
+-        retval.sort ();
+-
+-        return retval;
+-      }
+-
+-      bool is_local_variable (const std::string& name) const
+-      {
+-        table_const_iterator p = m_symbols.find (name);
+-
+-        return (p != m_symbols.end ()
+-                && ! p->second.is_global ()
+-                && p->second.is_defined ());
+-      }
+-
+-      bool is_global (const std::string& name) const
+-      {
+-        table_const_iterator p = m_symbols.find (name);
+-
+-        return p != m_symbols.end () && p->second.is_global ();
+-      }
+-
+-      void install_subfunction (const std::string& name,
+-                                const octave_value& fval,
+-                                bool is_nested = false);
+-
+-      void install_nestfunction (const std::string& name,
+-                                 const octave_value& fval)
+-      {
+-        install_subfunction (name, fval, true);
+-      }
+-
+-      octave_value find_subfunction (const std::string& name) const;
+-
+-      void lock_subfunctions (void)
+-      {
+-        for (auto& nm_sf : m_subfunctions)
+-          nm_sf.second.lock ();
+-      }
+-
+-      void unlock_subfunctions (void)
+-      {
+-        for (auto& nm_sf : m_subfunctions)
+-          nm_sf.second.unlock ();
+-      }
+-
+-      std::map<std::string, octave_value> subfunctions (void)
+-      {
+-        return m_subfunctions;
+-      }
+-
+-      void erase_subfunctions (void)
+-      {
+-        m_subfunctions.clear ();
+-      }
+-
+-      void mark_subfunctions_in_scope_as_private (const std::string& class_name);
+-
+-      std::list<workspace_element> workspace_info (void) const;
+-
+-      octave_value dump (void) const;
+-
+-      std::string name (void) const { return m_name; }
+-
+-      void cache_name (const std::string& name) { m_name = name; }
+-
+-      octave_user_function *function (void) { return m_fcn; }
+-
+-      void set_function (octave_user_function *fcn) { m_fcn = fcn; }
+-
+-      void set_parent (scope *p);
+-
+-      void update_nest (void);
+-
+-      bool look_nonlocal (const std::string& name,
+-                          symbol_table::symbol_record& result);
+-
+-      void bind_script_symbols (scope *curr_scope);
+-
+-      void unbind_script_symbols (void);
+-
+-    private:
+-
+-      // Name for this scope (usually the corresponding filename of the
+-      // function corresponding to the scope).
+-      std::string m_name;
+-
+-      // Map from symbol names to symbol info.
+-      std::map<std::string, symbol_table::symbol_record> m_symbols;
+-
+-      // Map from names of persistent variables to values.
+-      std::map<std::string, octave_value> m_persistent_symbols;
+-
+-      // Map from symbol names to subfunctions.
+-      std::map<std::string, octave_value> m_subfunctions;
+-
+-      // The associated user code (may be null).
+-      octave_user_function *m_fcn;
+-
+-      // Parent of nested function (may be null).
+-      scope *m_parent;
+-      octave_value m_parent_fcn;
+-
+-      // Child nested functions.
+-      std::vector<scope*> m_children;
+-
+-      // If true, then this scope belongs to a nested function.
+-      bool m_is_nested;
+-
+-      // If true then no variables can be added.
+-      bool m_is_static;
+-
+-      context_id m_context;
+-
+-      octave_value dump_symbols_map (void) const;
+-    };
+-
+   private:
+ 
+     typedef std::map<std::string, octave_value>::const_iterator
+       global_symbols_const_iterator;
+     typedef std::map<std::string, octave_value>::iterator
+       global_symbols_iterator;
+ 
+     typedef std::map<std::string, fcn_info>::const_iterator

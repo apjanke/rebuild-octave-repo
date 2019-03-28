@@ -1,0 +1,1264 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1339091000 18000
+#      Thu Jun 07 12:43:20 2012 -0500
+# Node ID bab44e3ee2912d9d083f69c8832f5ceb1184b57f
+# Parent  78e1457c5bf55393f9b80f8d335f8e1a0f7fc33c
+Adding basic error support to JIT
+
+diff --git a/src/pt-jit.cc b/src/pt-jit.cc
+--- a/src/pt-jit.cc
++++ b/src/pt-jit.cc
+@@ -296,16 +296,22 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   range = new_type ("range", any, range_t);
+   string = new_type ("string", any, string_t);
+   boolean = new_type ("bool", any, bool_t);
+   index = new_type ("index", any, index_t);
+ 
+   casts.resize (next_id + 1);
+   identities.resize (next_id + 1, 0);
+ 
++  // bind global variables
++  lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
++                                           llvm::GlobalValue::ExternalLinkage,
++                                           0, "error_state");
++  engine->addGlobalMapping (lerror_state, reinterpret_cast<void *> (&error_state));
++
+   // any with anything is an any op
+   llvm::Function *fn;
+   llvm::Type *binary_op_type
+     = llvm::Type::getIntNTy (context, sizeof (octave_value::binary_op));
+   llvm::Function *any_binary = create_function ("octave_jit_binary_any_any",
+                                                 any->to_llvm (), binary_op_type,
+                                                 any->to_llvm (), any->to_llvm ());
+   engine->addGlobalMapping (any_binary,
+@@ -329,20 +335,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+       llvm::APInt op_int(sizeof (octave_value::binary_op), op,
+                          std::numeric_limits<octave_value::binary_op>::is_signed);
+       llvm::Value *op_as_llvm = llvm::ConstantInt::get (binary_op_type, op_int);
+       llvm::Value *ret = builder.CreateCall3 (any_binary,
+                                                  op_as_llvm,
+                                                  fn->arg_begin (),
+                                                  ++fn->arg_begin ());
+       builder.CreateRet (ret);
+-
+-      jit_function::overload overload (fn, true, any, any, any);
+-      for (octave_idx_type i = 0; i < next_id; ++i)
+-        binary_ops[op].add_overload (overload);
++      binary_ops[op].add_overload (fn, true, true, any, any, any);
+     }
+ 
+   llvm::Type *void_t = llvm::Type::getVoidTy (context);
+ 
+   // grab any
+   fn = create_function ("octave_jit_grab_any", any, any);
+                         
+   engine->addGlobalMapping (fn, reinterpret_cast<void*>(&octave_jit_grab_any));
+@@ -630,16 +633,22 @@ jit_typeinfo::create_identity (jit_type 
+       builder.CreateRet (fn->arg_begin ());
+       llvm::verifyFunction (*fn);
+       identities[id] = fn;
+     }
+ 
+   return identities[id];
+ }
+ 
++llvm::Value *
++jit_typeinfo::do_insert_error_check (void)
++{
++  return builder.CreateLoad (lerror_state);
++}
++
+ jit_type *
+ jit_typeinfo::do_type_of (const octave_value &ov) const
+ {
+   if (ov.is_function ())
+     return 0;
+ 
+   if (ov.is_double_type () && ov.is_real_scalar ())
+     return get_scalar ();
+@@ -674,20 +683,17 @@ jit_value::~jit_value (void)
+ 
+ void
+ jit_value::replace_with (jit_value *value)
+ {
+   while (use_head)
+     {
+       jit_instruction *user = use_head->user ();
+       size_t idx = use_head->index ();
+-      if (idx < user->argument_count ())
+-        user->stash_argument (idx, value);
+-      else
+-        user->stash_tag (0);
++      user->stash_argument (idx, value);
+     }
+ }
+ 
+ #define JIT_METH(clname)                                \
+   void                                                  \
+   jit_ ## clname::accept (jit_ir_walker& walker)        \
+   {                                                     \
+     walker.visit (*this);                               \
+@@ -705,59 +711,28 @@ operator<< (std::ostream& os, const jit_
+ // -------------------- jit_instruction --------------------
+ void
+ jit_instruction::remove (void)
+ {
+   if (mparent)
+     mparent->remove (mlocation);
+ }
+ 
+-void
+-jit_instruction::push_variable (void)
+-{
+-  if (tag ())
+-    tag ()->push (this);
+-}
+-
+-void
+-jit_instruction::pop_variable (void)
+-{
+-  if (tag ())
+-    tag ()->pop ();
+-}
+-
+ llvm::BasicBlock *
+ jit_instruction::parent_llvm (void) const
+ {
+   return mparent->to_llvm ();
+ }
+ 
+ std::ostream&
+ jit_instruction::short_print (std::ostream& os) const
+ {
+   if (type ())
+     jit_print (os, type ()) << ": ";
+-
+-  if (tag ())
+-    os << tag ()->name () << "." << id;
+-  else
+-    os << "#" << id;
+-  return os;
+-}
+-
+-jit_variable *
+-jit_instruction::tag (void) const
+-{
+-  return reinterpret_cast<jit_variable *> (mtag.value ());
+-}
+-
+-void
+-jit_instruction::stash_tag (jit_variable *atag)
+-{
+-  mtag.stash_value (atag, this);
++  return os << "#" << mid;
+ }
+ 
+ // -------------------- jit_block --------------------
+ jit_instruction *
+ jit_block::prepend (jit_instruction *instr)
+ {
+   instructions.push_front (instr);
+   instr->stash_parent (this, instructions.begin ());
+@@ -962,23 +937,35 @@ jit_block::update_idom (size_t visit_cou
+ 
+   if (! pred_count ())
+     return false;
+ 
+   bool changed = false;
+   for (size_t i = 0; i < pred_count (); ++i)
+     changed = pred (i)->update_idom (visit_count) || changed;
+ 
++  if (! idom)
++    {
++      // one of our predecessors may have an idom of us, so if idom_intersect
++      // is called we need to have an idom. Assign idom to the pred with the
++      // lowest rpo id, as this prevents an infinite loop in idom_intersect
++      // FIXME: Textbook algorithm doesn't do this, ensure this is correct
++      size_t lowest_rpo = 0;
++      for (size_t i = 1; i < pred_count (); ++i)
++        if (pred (i)->id () < pred (lowest_rpo)->id ())
++          lowest_rpo = i;
++      idom = pred (lowest_rpo);
++      changed = true;
++    }
++
+   jit_block *new_idom = pred (0);
+   for (size_t i = 1; i < pred_count (); ++i)
+     {
+       jit_block *pidom = pred (i)->idom;
+-      if (! new_idom)
+-        new_idom = pidom;
+-      else if (pidom)
++      if (pidom)
+         new_idom = pidom->idom_intersect (new_idom);
+     }
+ 
+   if (idom != new_idom)
+     {
+       idom = new_idom;
+       return true;
+     }
+@@ -1072,38 +1059,39 @@ jit_call::infer (void)
+ 
+ // -------------------- jit_convert --------------------
+ jit_convert::jit_convert (llvm::Module *module, tree &tee)
+   : iterator_count (0), breaking (false)
+ {
+   jit_instruction::reset_ids ();
+ 
+   entry_block = create<jit_block> ("body");
++  final_block = create<jit_block> ("final");
+   blocks.push_back (entry_block);
+   block = entry_block;
+   visit (tee);
+ 
+   // FIXME: Remove if we no longer only compile loops
+   assert (! breaking);
+   assert (breaks.empty ());
+   assert (continues.empty ());
+ 
+-  jit_block *final_block = block;
++  block->append (create<jit_break> (final_block));
++  blocks.push_back (final_block);
++  
+   for (vmap_t::iterator iter = vmap.begin (); iter != vmap.end (); ++iter)
+        
+     {
+       jit_variable *var = iter->second;
+       const std::string& name = var->name ();
+       if (name.size () && name[0] != '#')
+         final_block->append (create<jit_store_argument> (var));
+     }
+ 
+-  print_blocks ("octave jit ir");
+-
+-  construct_ssa (final_block);
++  construct_ssa ();
+ 
+   // initialize the worklist to instructions derived from constants
+   for (std::list<jit_value *>::iterator iter = constants.begin ();
+        iter != constants.end (); ++iter)
+     append_users (*iter);
+ 
+   // FIXME: Describe algorithm here
+   while (worklist.size ())
+@@ -1171,16 +1159,21 @@ jit_convert::visit_binary_expression (tr
+   tree_expression *lhs = be.lhs ();
+   jit_value *lhsv = visit (lhs);
+ 
+   tree_expression *rhs = be.rhs ();
+   jit_value *rhsv = visit (rhs);
+ 
+   const jit_function& fn = jit_typeinfo::binary_op (be.op_type ());
+   result = block->append (create<jit_call> (fn, lhsv, rhsv));
++
++  jit_block *normal = create<jit_block> (block->name () + "a");
++  block->append (create<jit_check_error> (normal, final_block));
++  blocks.push_back (normal);
++  block = normal;
+ }
+ 
+ void
+ jit_convert::visit_break_command (tree_break_command&)
+ {
+   breaks.push_back (block);
+   breaking = true;
+ }
+@@ -1236,20 +1229,19 @@ void
+ jit_convert::visit_decl_init_list (tree_decl_init_list&)
+ {
+   fail ();
+ }
+ 
+ void
+ jit_convert::visit_simple_for_command (tree_simple_for_command& cmd)
+ {
+-  // how a for statement is compiled. Note we do an initial check
+-  // to see if the loop will run atleast once. This allows us to get
+-  // better type inference bounds on variables defined and used only
+-  // inside the for loop (e.g. the index variable)
++  // Note we do an initial check to see if the loop will run atleast once.
++  // This allows us to get better type inference bounds on variables defined
++  // and used only inside the for loop (e.g. the index variable)
+ 
+   // If we are a nested for loop we need to store the previous breaks
+   assert (! breaking);
+   unwind_protect prot;
+   prot.protect_var (breaks);
+   prot.protect_var (continues);
+   prot.protect_var (breaking);
+   breaks.clear ();
+@@ -1270,18 +1262,18 @@ jit_convert::visit_simple_for_command (t
+   jit_block *body = create<jit_block> ("for_body");
+   blocks.push_back (body);
+ 
+   jit_block *tail = create<jit_block> ("for_tail");
+ 
+   // do control expression, iter init, and condition check in prev_block (block)
+   jit_value *control = visit (cmd.control_expr ());
+   jit_call *init_iter = create<jit_call> (jit_typeinfo::for_init, control);
+-  init_iter->stash_tag (iterator);
+   block->append (init_iter);
++  block->append (create<jit_assign> (iterator, init_iter));
+   
+   jit_value *check = block->append (create<jit_call> (jit_typeinfo::for_check,
+                                                       control, iterator));
+   block->append (create<jit_cond_break> (check, body, tail));
+   block = body;
+ 
+   // compute the syntactical iterator
+   jit_call *idx_rhs = create<jit_call> (jit_typeinfo::for_index, control, iterator);
+@@ -1311,18 +1303,18 @@ jit_convert::visit_simple_for_command (t
+   finish_breaks (check_block, continues);
+ 
+   block = check_block;
+   const jit_function& add_fn = jit_typeinfo::binary_op (octave_value::op_add);
+   jit_instruction *one = create<jit_const_index> (1);
+   block->append (one);
+ 
+   jit_call *iter_inc = create<jit_call> (add_fn, iterator, one);
+-  iter_inc->stash_tag (iterator);
+   block->append (iter_inc);
++  block->append (create<jit_assign> (iterator, iter_inc));
+   check = block->append (create<jit_call> (jit_typeinfo::for_check, control,
+                                            iterator));
+   block->append (create<jit_cond_break> (check, body, tail));
+ 
+   // breaks will go to our tail
+   blocks.push_back (tail);
+   finish_breaks (tail, breaks);
+   block = tail;
+@@ -1384,51 +1376,16 @@ jit_convert::visit_if_command (tree_if_c
+   tree_if_command_list *lst = cmd.cmd_list ();
+   assert (lst); // jwe: Can this be null?
+   lst->accept (*this);
+ }
+ 
+ void
+ jit_convert::visit_if_command_list (tree_if_command_list& lst)
+ {
+-  // Example code:
+-  // if a == 1
+-  //  c = c + 1;
+-  // elseif b == 1
+-  //  c = c + 2;
+-  // else
+-  //  c = c + 3;
+-  // endif
+-
+-  // ********************
+-  // FIXME: Documentation no longer reflects current version
+-  // ********************
+-
+-  // Generates:
+-  // prev_block0: % pred - ?
+-  //   #temp.0 = call binary== (a.0, 1)
+-  //   cond_break #temp.0, if_body1, ifelse_cond2
+-  // if_body1:
+-  //   c.1 = call binary+ (c.0, 1)
+-  //   break if_tail5
+-  // ifelse_cond2:
+-  //   #temp.1 = call binary== (b.0, 1)
+-  //   cond_break #temp.1, ifelse_body3, else4
+-  // ifelse_body3:
+-  //   c.2 = call binary+ (c.0, 2)
+-  //   break if_tail5
+-  // else4:
+-  //   c.3 = call binary+ (c.0, 3)
+-  //   break if_tail5
+-  // if_tail5:
+-  //   c.4 = phi | if_body1 -> c.1
+-  //             | ifelse_body3 -> c.2
+-  //             | else4 -> c.3
+-
+-
+   tree_if_clause *last = lst.back ();
+   size_t last_else = static_cast<size_t> (last->is_else_clause ());
+ 
+   // entry_blocks represents the block you need to enter in order to execute
+   // the condition check for the ith clause. For the else, it is simple the
+   // else body. If there is no else body, then it is padded with the tail
+   std::vector<jit_block *> entry_blocks (lst.size () + 1 - last_else);
+   std::vector<jit_block *> branch_blocks (lst.size (), 0); // final blocks
+@@ -1713,17 +1670,17 @@ jit_convert::get_variable (const std::st
+   return vmap[vname] = var;
+ }
+ 
+ jit_instruction *
+ jit_convert::do_assign (const std::string& lhs, jit_instruction *rhs,
+                         bool print)
+ {
+   jit_variable *var = get_variable (lhs);
+-  rhs->stash_tag (var);
++  block->append (create<jit_assign> (var, rhs));
+ 
+   if (print)
+     {
+       const jit_function& print_fn = jit_typeinfo::print_value ();
+       jit_const_string *name = create<jit_const_string> (lhs);
+       block->append (create<jit_call> (print_fn, name, var));
+     }
+ 
+@@ -1737,17 +1694,17 @@ jit_convert::visit (tree& tee)
+   tee.accept (*this);
+ 
+   jit_instruction *ret = result;
+   result = 0;
+   return ret;
+ }
+ 
+ void
+-jit_convert::construct_ssa (jit_block *final_block)
++jit_convert::construct_ssa (void)
+ {
+   final_block->label ();
+   entry_block->compute_idom (final_block);
+   entry_block->compute_df ();
+   entry_block->create_dom_tree ();
+ 
+   // insert phi nodes where needed, this is done on a per variable basis
+   for (vmap_t::iterator iter = vmap.begin (); iter != vmap.end (); ++iter)
+@@ -1779,28 +1736,30 @@ jit_convert::construct_ssa (jit_block *f
+                   ssa_worklist.push_back (dblock);
+                   visited.insert (dblock);
+                 }
+             }
+         }
+     }
+ 
+   entry_block->visit_dom (&jit_convert::do_construct_ssa, &jit_block::pop_all);
++  print_dom ();
+ }
+ 
+ void
+ jit_convert::do_construct_ssa (jit_block& block)
+ {
+   // replace variables with their current SSA value
+   for (jit_block::iterator iter = block.begin (); iter != block.end (); ++iter)
+     {
+       jit_instruction *instr = *iter;
+       if (! isa<jit_phi> (instr))
+         {
+-          for (size_t i = 0; i < instr->argument_count (); ++i)
++          for (size_t i = isa<jit_assign> (instr); i < instr->argument_count ();
++               ++i)
+             {
+               jit_value *arg = instr->argument (i);
+               jit_variable *var = dynamic_cast<jit_variable *> (arg);
+               if (var)
+                 instr->stash_argument (i, var->top ());
+             }
+         }
+ 
+@@ -1809,29 +1768,40 @@ jit_convert::do_construct_ssa (jit_block
+ 
+   // finish phi nodes of sucessors
+   for (size_t i = 0; i < block.succ_count (); ++i)
+     {
+       jit_block *finish = block.succ (i);
+       size_t pred_idx = finish->pred_index (&block);
+ 
+       for (jit_block::iterator iter = finish->begin (); iter != finish->end ()
+-             && isa<jit_phi> (*iter); ++iter)
++             && isa<jit_phi> (*iter);)
+         {
+-          jit_instruction *phi = *iter;
+-          jit_variable *var = phi->tag ();
+-          phi->stash_argument (pred_idx, var->top ());
++          jit_phi *phi = dynamic_cast<jit_phi *> (*iter);
++          jit_variable *var = phi->dest ();
++          if (var->has_top ())
++            {
++              phi->stash_argument (pred_idx, var->top ());
++              ++iter;
++            }
++          else
++            {
++              // temporaries may have extranious phi nodes which can be removed
++              assert (! phi->use_count ());
++              assert (var->name ().size () && var->name ()[0] == '#');
++              iter = finish->remove (iter);
++            }
+         }
+     }
+ }
+ 
+ void
+ jit_convert::place_releases (void)
+ {
+-  jit_convert::release_placer placer (*this);
++  release_placer placer (*this);
+   entry_block->visit_dom (placer, &jit_block::pop_all);
+ }
+ 
+ void
+ jit_convert::finish_breaks (jit_block *dest, const block_list& lst)
+ {
+   for (block_list::const_iterator iter = lst.begin (); iter != lst.end ();
+        ++iter)
+@@ -1843,34 +1813,32 @@ jit_convert::finish_breaks (jit_block *d
+ 
+ // -------------------- jit_convert::release_placer --------------------
+ void
+ jit_convert::release_placer::operator() (jit_block& block)
+ {
+   for (jit_block::iterator iter = block.begin (); iter != block.end (); ++iter)
+     {
+       jit_instruction *instr = *iter;
++      instr->stash_last_use (instr);
++
+       for (size_t i = 0; i < instr->argument_count (); ++i)
+         {
+-          jit_value *varg = instr->argument (i);
+-          jit_instruction *arg = dynamic_cast<jit_instruction *> (varg);
+-          if (arg && arg->tag ())
+-            {
+-              jit_variable *tag = arg->tag ();
+-              tag->stash_last_use (instr);
+-            }
++          jit_value *arg = instr->argument (i);
++          assert (arg);
++          arg->stash_last_use (instr);
+         }
+ 
+-      jit_variable *tag = instr->tag ();
+-      if (tag && ! (isa<jit_phi> (instr) || isa<jit_store_argument> (instr))
+-          && tag->has_top ())
++      jit_assign *assign = dynamic_cast<jit_assign *> (instr);
++      if (assign && assign->dest ()->has_top ())
+         {
+-          jit_instruction *last_use = tag->last_use ();
++          jit_variable *var = assign->dest ();
++          jit_instruction *last_use = var->last_use ();
+           jit_call *release = convert.create<jit_call> (jit_typeinfo::release,
+-                                                        tag->top ());
++                                                        var->top ());
+           release->infer ();
+           if (last_use && last_use->parent () == &block
+               && ! isa<jit_phi> (last_use))
+             block.insert_after (last_use->location (), release);
+           else
+             block.prepend_after_phi (release);
+         }
+ 
+@@ -1948,17 +1916,17 @@ jit_convert::convert_llvm::convert (llvm
+ }
+ 
+ void
+ jit_convert::convert_llvm::finish_phi (jit_instruction *phi)
+ {
+   jit_block *pblock = phi->parent ();
+   llvm::PHINode *llvm_phi = llvm::cast<llvm::PHINode> (phi->to_llvm ());
+ 
+-  bool can_remove = llvm_phi->use_empty ();
++  bool can_remove = ! phi->use_count ();
+   if (! can_remove && llvm_phi->hasOneUse () && phi->use_count () == 1)
+     {
+       jit_instruction *user = phi->first_use ()->user ();
+       can_remove = isa<jit_call> (user); // must be a remove
+     }
+ 
+   if (can_remove)
+     {
+@@ -1995,19 +1963,17 @@ jit_convert::convert_llvm::finish_phi (j
+         }
+     }
+   else
+     {
+       for (size_t i = 0; i < phi->argument_count (); ++i)
+         {
+           llvm::BasicBlock *pred = pblock->pred_llvm (i);
+           if (phi->argument_type (i) == phi->type ())
+-            {
+-              llvm_phi->addIncoming (phi->argument_llvm (i), pred);
+-            }
++            llvm_phi->addIncoming (phi->argument_llvm (i), pred);
+           else
+             {
+               // add cast right before pred terminator
+               builder.SetInsertPoint (--pred->end ());
+ 
+               const jit_function::overload& ol
+                 = jit_typeinfo::cast (phi->type (),
+                                       phi->argument_type (i));
+@@ -2147,16 +2113,29 @@ jit_convert::convert_llvm::visit (jit_ph
+ }
+ 
+ void
+ jit_convert::convert_llvm::visit (jit_variable&)
+ {
+   fail ("ERROR: SSA construction should remove all variables");
+ }
+ 
++void
++jit_convert::convert_llvm::visit (jit_check_error& check)
++{
++  llvm::Value *cond = jit_typeinfo::insert_error_check ();
++  llvm::Value *br = builder.CreateCondBr (cond, check.sucessor_llvm (1),
++                                          check.sucessor_llvm (0));
++  check.stash_llvm (br);
++}
++
++void
++jit_convert::convert_llvm::visit (jit_assign&)
++{}
++
+ // -------------------- tree_jit --------------------
+ 
+ tree_jit::tree_jit (void) : module (0), engine (0)
+ {
+ }
+ 
+ tree_jit::~tree_jit (void)
+ {}
+diff --git a/src/pt-jit.h b/src/pt-jit.h
+--- a/src/pt-jit.h
++++ b/src/pt-jit.h
+@@ -79,16 +79,17 @@ namespace llvm
+   class FunctionPassManager;
+   class PassManager;
+   class ExecutionEngine;
+   class Function;
+   class BasicBlock;
+   class LLVMContext;
+   class Type;
+   class Twine;
++  class GlobalVariable;
+ }
+ 
+ class octave_base_value;
+ class octave_value;
+ class tree;
+ 
+ // Use like: isa<jit_phi> (value)
+ // basically just a short cut type typing dyanmic_cast.
+@@ -351,16 +352,21 @@ public:
+   {
+     return instance->do_cast (result);
+   }
+ 
+   static const jit_function::overload& cast (jit_type *to, jit_type *from)
+   {
+     return instance->do_cast (to, from);
+   }
++
++  static llvm::Value *insert_error_check (void)
++  {
++    return instance->do_insert_error_check ();
++  }
+ private:
+   jit_typeinfo (llvm::Module *m, llvm::ExecutionEngine *e);
+ 
+   // FIXME: Do these methods really need to be in jit_typeinfo?
+   jit_type *do_join (jit_type *lhs, jit_type *rhs)
+   {
+     // empty case
+     if (! lhs)
+@@ -482,23 +488,26 @@ private:
+                             arg1->to_llvm (), arg2->to_llvm ());
+   }
+ 
+   llvm::Function *create_function (const llvm::Twine& name, llvm::Type *ret,
+                                    const std::vector<llvm::Type *>& args);
+ 
+   llvm::Function *create_identity (jit_type *type);
+ 
++  llvm::Value *do_insert_error_check (void);
++
+   static jit_typeinfo *instance;
+ 
+   llvm::Module *module;
+   llvm::ExecutionEngine *engine;
+   int next_id;
+ 
+   llvm::Type *ov_t;
++  llvm::GlobalVariable *lerror_state;
+ 
+   std::vector<jit_type*> id_to_type;
+   jit_type *any;
+   jit_type *scalar;
+   jit_type *range;
+   jit_type *string;
+   jit_type *boolean;
+   jit_type *index;
+@@ -520,29 +529,31 @@ private:
+   std::vector<llvm::Function *> identities;
+ };
+ 
+ // The low level octave jit ir
+ // this ir is close to llvm, but contains information for doing type inference.
+ // We convert the octave parse tree to this IR directly.
+ 
+ #define JIT_VISIT_IR_NOTEMPLATE                 \
+-  JIT_METH(block)                               \
+-  JIT_METH(break)                               \
+-  JIT_METH(cond_break)                          \
+-  JIT_METH(call)                                \
+-  JIT_METH(extract_argument)                    \
+-  JIT_METH(store_argument)                      \
+-  JIT_METH(phi)                                 \
+-  JIT_METH(variable)
++  JIT_METH(block);                              \
++  JIT_METH(break);                              \
++  JIT_METH(cond_break);                         \
++  JIT_METH(call);                               \
++  JIT_METH(extract_argument);                   \
++  JIT_METH(store_argument);                     \
++  JIT_METH(phi);                                \
++  JIT_METH(variable);                           \
++  JIT_METH(check_error);                        \
++  JIT_METH(assign)
+ 
+ #define JIT_VISIT_IR_CONST                      \
+-  JIT_METH(const_scalar)                        \
+-  JIT_METH(const_index)                         \
+-  JIT_METH(const_string)                        \
++  JIT_METH(const_scalar);                       \
++  JIT_METH(const_index);                        \
++  JIT_METH(const_string);                       \
+   JIT_METH(const_range)
+ 
+ #define JIT_VISIT_IR_CLASSES                    \
+   JIT_VISIT_IR_NOTEMPLATE                       \
+   JIT_VISIT_IR_CONST
+ 
+ // forward declare all ir classes
+ #define JIT_METH(cname)                         \
+@@ -571,17 +582,18 @@ jit_const_range;
+ class jit_ir_walker;
+ class jit_use;
+ 
+ class
+ jit_value
+ {
+   friend class jit_use;
+ public:
+-  jit_value (void) : llvm_value (0), ty (0), use_head (0), myuse_count (0) {}
++  jit_value (void) : llvm_value (0), ty (0), use_head (0), myuse_count (0),
++                     mlast_use (0) {}
+ 
+   virtual ~jit_value (void);
+ 
+   // replace all uses with
+   void replace_with (jit_value *value);
+ 
+   jit_type *type (void) const { return ty; }
+ 
+@@ -603,16 +615,23 @@ public:
+ 
+   std::string print_string (void)
+   {
+     std::stringstream ss;
+     print (ss);
+     return ss.str ();
+   }
+ 
++  jit_instruction *last_use (void) const { return mlast_use; }
++
++  void stash_last_use (jit_instruction *alast_use)
++  {
++    mlast_use = alast_use;
++  }
++
+   virtual std::ostream& print (std::ostream& os, size_t indent = 0) const = 0;
+ 
+   virtual std::ostream& short_print (std::ostream& os) const
+   { return print (os); }
+ 
+   virtual void accept (jit_ir_walker& walker) = 0;
+ 
+   bool has_llvm (void) const
+@@ -639,16 +658,17 @@ protected:
+     return os;
+   }
+ 
+   llvm::Value *llvm_value;
+ private:
+   jit_type *ty;
+   jit_use *use_head;
+   size_t myuse_count;
++  jit_instruction *mlast_use;
+ };
+ 
+ std::ostream& operator<< (std::ostream& os, const jit_value& value);
+ 
+ class
+ jit_use
+ {
+ public:
+@@ -732,56 +752,56 @@ private:
+   size_t mindex;
+ };
+ 
+ class
+ jit_instruction : public jit_value
+ {
+ public:
+   // FIXME: this code could be so much pretier with varadic templates...
+-  jit_instruction (void) : id (next_id ()), mparent (0)
++  jit_instruction (void) : mid (next_id ()), mparent (0)
+   {}
+ 
+   jit_instruction (size_t nargs, jit_value *adefault = 0)
+   : already_infered (nargs, reinterpret_cast<jit_type *>(0)), arguments (nargs),
+-    id (next_id ()), mparent (0)
++    mid (next_id ()), mparent (0)
+   {
+     if (adefault)
+       for (size_t i = 0; i < nargs; ++i)
+         stash_argument (i, adefault);
+   }
+ 
+   jit_instruction (jit_value *arg0)
+     : already_infered (1, reinterpret_cast<jit_type *>(0)), arguments (1), 
+-      id (next_id ()), mparent (0)
++      mid (next_id ()), mparent (0)
+   {
+     stash_argument (0, arg0);
+   }
+ 
+   jit_instruction (jit_value *arg0, jit_value *arg1)
+     : already_infered (2, reinterpret_cast<jit_type *>(0)), arguments (2), 
+-      id (next_id ()), mparent (0)
++      mid (next_id ()), mparent (0)
+   {
+     stash_argument (0, arg0);
+     stash_argument (1, arg1);
+   }
+ 
+   jit_instruction (jit_value *arg0, jit_value *arg1, jit_value *arg2)
+     : already_infered (3, reinterpret_cast<jit_type *>(0)), arguments (3), 
+-      id (next_id ()), mparent (0)
++      mid (next_id ()), mparent (0)
+   {
+     stash_argument (0, arg0);
+     stash_argument (1, arg1);
+     stash_argument (2, arg2);
+   }
+ 
+   jit_instruction (jit_value *arg0, jit_value *arg1, jit_value *arg2,
+                    jit_value *arg3)
+     : already_infered (3, reinterpret_cast<jit_type *>(0)), arguments (4), 
+-      id (next_id ()), mparent (0)
++      mid (next_id ()), mparent (0)
+   {
+     stash_argument (0, arg0);
+     stash_argument (1, arg1);
+     stash_argument (2, arg2);
+     stash_argument (3, arg3);
+   }
+ 
+   static void reset_ids (void)
+@@ -842,24 +862,24 @@ public:
+   // argument types which have been infered already
+   const std::vector<jit_type *>& argument_types (void) const
+   { return already_infered; }
+ 
+   virtual bool dead (void) const { return false; }
+ 
+   virtual bool almost_dead (void) const { return false; }
+ 
++  virtual void push_variable (void) {}
++
++  virtual void pop_variable (void) {}
++
+   virtual bool infer (void) { return false; }
+ 
+   void remove (void);
+ 
+-  void push_variable (void);
+-
+-  void pop_variable (void);
+-
+   virtual std::ostream& short_print (std::ostream& os) const;
+ 
+   jit_block *parent (void) const { return mparent; }
+ 
+   std::list<jit_instruction *>::iterator location (void) const
+   {
+     return mlocation;
+   }
+@@ -868,36 +888,32 @@ public:
+ 
+   void stash_parent (jit_block *aparent,
+                      std::list<jit_instruction *>::iterator alocation)
+   {
+     mparent = aparent;
+     mlocation = alocation;
+   }
+ 
+-  jit_variable *tag (void) const;
+-
+-  void stash_tag (jit_variable *atag);
++  size_t id (void) const { return mid; }
+ protected:
+   std::vector<jit_type *> already_infered;
+ private:
+   static size_t next_id (bool reset = false)
+   {
+     static size_t ret = 0;
+     if (reset)
+       return ret = 0;
+ 
+     return ret++;
+   }
+ 
+   std::vector<jit_use> arguments;
+ 
+-  jit_use mtag;
+-
+-  size_t id;
++  size_t mid;
+   jit_block *mparent;
+   std::list<jit_instruction *>::iterator mlocation;
+ };
+ 
+ // defnie accept methods for subclasses
+ #define JIT_VALUE_ACCEPT(clname)                \
+   virtual void accept (jit_ir_walker& walker);
+ 
+@@ -955,21 +971,22 @@ public:
+   jit_instruction *prepend_after_phi (jit_instruction *instr);
+ 
+   jit_instruction *append (jit_instruction *instr);
+ 
+   jit_instruction *insert_before (iterator loc, jit_instruction *instr);
+ 
+   jit_instruction *insert_after (iterator loc, jit_instruction *instr);
+ 
+-  void remove (jit_block::iterator iter)
++  iterator remove (iterator iter)
+   {
+     jit_instruction *instr = *iter;
+-    instructions.erase (iter);
++    iter = instructions.erase (iter);
+     instr->stash_parent (0, instructions.end ());
++    return iter;
+   }
+ 
+   jit_terminator *terminator (void) const;
+ 
+   jit_block *pred (size_t idx) const;
+ 
+   jit_terminator *pred_terminator (size_t idx) const
+   {
+@@ -1041,18 +1058,17 @@ public:
+   {
+     if (mvisit_count > visit_count)
+       return;
+     ++mvisit_count;
+ 
+     for (size_t i = 0; i < pred_count (); ++i)
+       pred (i)->label (visit_count, number);
+ 
+-    mid = number;
+-    ++number;
++    mid = number++;
+   }
+ 
+   // See for idom computation algorithm
+   // Cooper, Keith D.; Harvey, Timothy J; and Kennedy, Ken (2001).
+   // "A Simple, Fast Dominance Algorithm"
+   void compute_idom (jit_block *final)
+   {
+     bool changed;
+@@ -1249,25 +1265,76 @@ public:
+   JIT_VALUE_ACCEPT (variable)
+ private:
+   std::string mname;
+   std::stack<jit_value *> value_stack;
+   jit_instruction *mlast_use;
+ };
+ 
+ class
+-jit_phi : public jit_instruction
++jit_assign_base : public jit_instruction
++{
++public:
++  jit_assign_base (jit_variable *adest) : jit_instruction (), mdest (adest) {}
++
++  jit_assign_base (jit_variable *adest, size_t npred) : jit_instruction (npred),
++                                                        mdest (adest) {}
++
++  jit_assign_base (jit_variable *adest, jit_value *arg0, jit_value *arg1)
++    : jit_instruction (arg0, arg1), mdest (adest) {}
++
++  jit_variable *dest (void) const { return mdest; }
++
++  virtual void push_variable (void)
++  {
++    mdest->push (this);
++  }
++
++  virtual void pop_variable (void)
++  {
++    mdest->pop ();
++  }
++private:
++  jit_variable *mdest;
++};
++
++class
++jit_assign : public jit_assign_base
+ {
+ public:
+-  jit_phi (jit_variable *avariable, size_t npred)
+-    : jit_instruction (npred)
++  jit_assign (jit_variable *adest, jit_instruction *asrc)
++    : jit_assign_base (adest, adest, asrc) {}
++
++  jit_instruction *src (void) const
++  {
++    return static_cast<jit_instruction *> (argument (1));
++  }
++
++  virtual void push_variable (void)
++  {
++    dest ()->push (src ());
++  }
++
++  virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
+   {
+-    stash_tag (avariable);
++    return print_indent (os, indent) << *dest () << " = " << *src ();
+   }
+ 
++  JIT_VALUE_ACCEPT (assign);
++private:
++  jit_variable *mdest;
++};
++
++class
++jit_phi : public jit_assign_base
++{
++public:
++  jit_phi (jit_variable *adest, size_t npred) : jit_assign_base (adest, npred)
++  {}
++
+   virtual bool dead (void) const
+   {
+     return use_count () == 0;
+   }
+ 
+   virtual bool almost_dead (void) const
+   {
+     return use_count () <= 1;
+@@ -1309,25 +1376,37 @@ public:
+ 
+         if (i + 1 < argument_count ())
+           os << std::endl;
+       }
+ 
+     return os;
+   }
+ 
++  virtual std::ostream& short_print (std::ostream& os) const
++  {
++    if (type ())
++      jit_print (os, type ()) << ": ";
++
++    dest ()->short_print (os);
++    return os << "#" << id ();
++  }
++
+   JIT_VALUE_ACCEPT (phi);
+ };
+ 
+ class
+ jit_terminator : public jit_instruction
+ {
+ public:
+   jit_terminator (jit_value *arg0) : jit_instruction (arg0) {}
+ 
++  jit_terminator (jit_value *arg0, jit_value *arg1)
++    : jit_instruction (arg0, arg1) {}
++
+   jit_terminator (jit_value *arg0, jit_value *arg1, jit_value *arg2)
+     : jit_instruction (arg0, arg1, arg2) {}
+ 
+   virtual jit_block *sucessor (size_t idx = 0) const = 0;
+ 
+   // return either our sucessors block directly, or the phi merge block
+   // between us and our sucessor
+   llvm::BasicBlock *sucessor_llvm (size_t idx = 0) const
+@@ -1446,17 +1525,17 @@ public:
+   {
+     return mfunction.get_overload (argument_types ());
+   }
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent) const
+   {
+     print_indent (os, indent);
+ 
+-    if (use_count () || tag ())
++    if (use_count ())
+       short_print (os) << " = ";
+     os << "call " << mfunction.name () << " (";
+ 
+     for (size_t i = 0; i < argument_count (); ++i)
+       {
+         print_argument (os, i);
+         if (i + 1 < argument_count ())
+           os << ", ";
+@@ -1470,30 +1549,56 @@ public:
+ 
+   virtual bool infer (void);
+ 
+   JIT_VALUE_ACCEPT (call)
+ private:
+   const jit_function& mfunction;
+ };
+ 
++// FIXME: This is just ugly...
++// checks error_state, if error_state is false then goto the normal branche,
++// otherwise goto the error branch
+ class
+-jit_extract_argument : public jit_instruction
++jit_check_error : public jit_terminator
+ {
+ public:
+-  jit_extract_argument (jit_type *atype, jit_variable *var)
+-    : jit_instruction ()
++  jit_check_error (jit_block *normal, jit_block *error)
++    : jit_terminator (normal, error) {}
++
++  jit_block *sucessor (size_t idx) const
++  {
++    return static_cast<jit_block *> (argument (idx));
++  }
++
++  size_t sucessor_count (void) const { return 2; }
++
++  virtual std::ostream& print (std::ostream& os, size_t indent = 0) const
++  {
++    print_indent (os, indent) << "check_error: normal: ";
++    print_sucessor (os, 0) << " error: ";
++    return print_sucessor (os, 1);
++  }
++
++  JIT_VALUE_ACCEPT (jit_check_error)
++};
++
++class
++jit_extract_argument : public jit_assign_base
++{
++public:
++  jit_extract_argument (jit_type *atype, jit_variable *adest)
++    : jit_assign_base (adest)
+   {
+     stash_type (atype);
+-    stash_tag (var);
+   }
+ 
+   const std::string& name (void) const
+   {
+-    return tag ()->name ();
++    return dest ()->name ();
+   }
+ 
+   const jit_function::overload& overload (void) const
+   {
+     return jit_typeinfo::cast (type (), jit_typeinfo::get_any ());
+   }
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent) const
+@@ -1507,24 +1612,22 @@ public:
+   JIT_VALUE_ACCEPT (extract_argument)
+ };
+ 
+ class
+ jit_store_argument : public jit_instruction
+ {
+ public:
+   jit_store_argument (jit_variable *var)
+-    : jit_instruction (var)
+-  {
+-    stash_tag (var);
+-  }
++  : jit_instruction (var), dest (var)
++  {}
+ 
+   const std::string& name (void) const
+   {
+-    return tag ()->name ();
++    return dest->name ();
+   }
+ 
+   const jit_function::overload& overload (void) const
+   {
+     return jit_typeinfo::cast (jit_typeinfo::get_any (), result_type ());
+   }
+ 
+   jit_value *result (void) const
+@@ -1541,21 +1644,30 @@ public:
+   {
+     return result ()->to_llvm ();
+   }
+ 
+   virtual std::ostream& print (std::ostream& os, size_t indent) const
+   {
+     jit_value *res = result ();
+     print_indent (os, indent) << "store ";
+-    short_print (os) << " = ";
+-    return res->short_print (os);
++    dest->short_print (os);
++
++    if (! isa<jit_variable> (res))
++      {
++        os << " = ";
++        res->short_print (os);
++      }
++
++    return os;
+   }
+ 
+   JIT_VALUE_ACCEPT (store_argument)
++private:
++  jit_variable *dest;
+ };
+ 
+ class
+ jit_ir_walker
+ {
+ public:
+   virtual ~jit_ir_walker () {}
+ 
+@@ -1730,16 +1842,18 @@ private:
+   std::vector<std::pair<std::string, bool> > arguments;
+   type_bound_vector bounds;
+ 
+   // used instead of return values from visit_* functions
+   jit_instruction *result;
+ 
+   jit_block *entry_block;
+ 
++  jit_block *final_block;
++
+   jit_block *block;
+ 
+   llvm::Function *function;
+ 
+   std::list<jit_block *> blocks;
+ 
+   std::list<jit_instruction *> worklist;
+ 
+@@ -1769,17 +1883,17 @@ private:
+ 
+   void track_value (jit_value *value)
+   {
+     if (value->type ())
+       constants.push_back (value);
+     all_values.push_back (value);
+   }
+ 
+-  void construct_ssa (jit_block *final_block);
++  void construct_ssa (void);
+ 
+   static void do_construct_ssa (jit_block& block);
+ 
+   void place_releases (void);
+ 
+   void print_blocks (const std::string& header)
+   {
+     std::cout << "-------------------- " << header << " --------------------\n";

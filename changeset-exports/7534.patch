@@ -1,0 +1,192 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1204065457 18000
+#      Tue Feb 26 17:37:37 2008 -0500
+# Node ID ef755c763b624bac71838d03cd65677efe627418
+# Parent  ff52243af934e339f4bef0d04e68779731be66d2
+avoid more "comparison is always false due to limited range of data type" warnings from GCC
+
+diff --git a/liboctave/oct-inttypes.h b/liboctave/oct-inttypes.h
+--- a/liboctave/oct-inttypes.h
++++ b/liboctave/oct-inttypes.h
+@@ -194,18 +194,19 @@ OCTAVE_S_US_FTR_FCNS (long long)
+ #define OCTAVE_INT_MAX_VAL2(T1, T2) \
+   std::numeric_limits<typename octave_int_binop_traits<T1, T2>::TR>::max ()
+ 
+ #define OCTAVE_INT_FIT_TO_RANGE2(r, T1, T2) \
+   octave_int_fit_to_range (r, \
+                            OCTAVE_INT_MIN_VAL2 (T1, T2), \
+                            OCTAVE_INT_MAX_VAL2 (T1, T2))
+ 
+-// By using these classes/functions we avoid warnings from GCC about
+-// comparisons always being false due to limited range of data type.
++// We have all the machinery below (octave_int_helper) to avoid a few
++// warnings from GCC about comparisons always false due to limited
++// range of data types.  Ugh.  The cure may be worse than the disease.
+ 
+ // FIXME -- it would be nice to nest the helper class inside the
+ // octave_int class, but I don't see the magic for that at the moment.
+ 
+ template <class T> class octave_int;
+ 
+ template <class T, bool is_signed>
+ class octave_int_helper
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,15 @@
+ 2008-02-26  John W. Eaton  <jwe@octave.org>
+ 
++	* ov-base-int.cc (octave_base_int_helper,
++	octave_base_int_helper_traits): New templates and specializations.
++	(octave_base_int_matrix<T>::convert_to_str_internal,
++	octave_base_int_matrix<T>::convert_to_str_internal): Use them.
++
+ 	* DLD-FUNCTIONS/rand.cc (do_rand): Pass name of calling function
+ 	to octave_rand::state.
+ 
+ 	* variables.cc (bind_ans): Handle cs-lists recursively.
+ 
+ 	* ov-cs-list.h, ov-cs-list.cc (octave_cs_list::print,
+ 	octave_cs_list::print_raw): Delete.
+ 
+diff --git a/src/ov-base-int.cc b/src/ov-base-int.cc
+--- a/src/ov-base-int.cc
++++ b/src/ov-base-int.cc
+@@ -50,16 +50,77 @@ along with Octave; see the file COPYING.
+ #include "pr-output.h"
+ #include "variables.h"
+ 
+ #include "byte-swap.h"
+ #include "ls-oct-ascii.h"
+ #include "ls-utils.h"
+ #include "ls-hdf5.h"
+ 
++// We have all the machinery below (octave_base_int_helper and
++// octave_base_int_helper_traits) to avoid a few warnings from GCC
++// about comparisons always false due to limited range of data types.
++// Ugh.  The cure may be worse than the disease.
++
++template <class T, bool is_signed = true, bool can_be_too_big = true>
++struct octave_base_int_helper
++{
++  static bool
++  char_value_out_of_range (T val) { return val < 0 || val > UCHAR_MAX; }
++};
++
++template <class T>
++struct octave_base_int_helper<T, false, false>
++{
++  static bool char_value_out_of_range (T) { return true; }
++};
++
++template <class T>
++struct octave_base_int_helper<T, false, true>
++{
++  static bool char_value_out_of_range (T val) { return val > UCHAR_MAX; }
++};
++
++template <class T>
++struct octave_base_int_helper<T, true, false>
++{
++  static bool char_value_out_of_range (T val) { return val < 0; }
++};
++
++// For all types other than char, signed char, and unsigned char, we
++// assume that the upper limit for the range of allowable values is
++// larger than the range for unsigned char.  If that's not true, we
++// are still OK, but will see the warnings again for any other types
++// that do not meet this assumption.
++
++template <class T>
++struct octave_base_int_helper_traits
++{
++  static const bool can_be_larger_than_uchar_max = true;
++};
++
++template <>
++struct octave_base_int_helper_traits<char>
++{
++  static const bool can_be_larger_than_uchar_max = false;
++};
++
++template <>
++struct octave_base_int_helper_traits<signed char>
++{
++  static const bool can_be_larger_than_uchar_max = false;
++};
++
++template <>
++struct octave_base_int_helper_traits<unsigned char>
++{
++  static const bool can_be_larger_than_uchar_max = false;
++};
++
++
+ template <class T>
+ octave_base_value *
+ octave_base_int_matrix<T>::try_narrowing_conversion (void)
+ {
+   octave_base_value *retval = 0;
+ 
+   if (this->matrix.nelem () == 1)
+     retval = new typename octave_value_int_traits<T>::scalar_type (this->matrix (0));
+@@ -80,20 +141,26 @@ octave_base_int_matrix<T>::convert_to_st
+   bool warned = false;
+ 
+   for (octave_idx_type i = 0; i < nel; i++)
+     {
+       OCTAVE_QUIT;
+ 
+       typename T::elt_type tmp = this->matrix(i);
+ 
+-      typename T::elt_type::val_type ival = tmp.value ();
++      typedef typename T::elt_type::val_type val_type;
++
++      val_type ival = tmp.value ();
+ 
+-      
+-      if (ival < 0 || ival > UCHAR_MAX)
++      static const bool is_signed = std::numeric_limits<val_type>::is_signed;
++      static const bool can_be_larger_than_uchar_max
++	= octave_base_int_helper_traits<val_type>::can_be_larger_than_uchar_max;
++
++      if (octave_base_int_helper<val_type, is_signed,
++	  can_be_larger_than_uchar_max>::char_value_out_of_range (ival))
+ 	{
+ 	  // FIXME -- is there something better we could do?
+ 
+ 	  ival = 0;
+ 
+ 	  if (! warned)
+ 	    {
+ 	      ::warning ("range error for conversion to character value");
+@@ -373,19 +440,26 @@ octave_base_int_matrix<T>::print_raw (st
+ template <class T>
+ octave_value
+ octave_base_int_scalar<T>::convert_to_str_internal (bool, bool, char type) const
+ {
+   octave_value retval;
+ 
+   T tmp = this->scalar;
+ 
+-  typename T::val_type ival = tmp.value ();
++  typedef typename T::val_type val_type;
++
++  val_type ival = tmp.value ();
+ 
+-  if (ival < 0 || ival > UCHAR_MAX)
++  static const bool is_signed = std::numeric_limits<val_type>::is_signed;
++  static const bool can_be_larger_than_uchar_max
++    = octave_base_int_helper_traits<val_type>::can_be_larger_than_uchar_max;
++
++  if (octave_base_int_helper<val_type, is_signed,
++      can_be_larger_than_uchar_max>::char_value_out_of_range (ival))
+     {
+       // FIXME -- is there something better we could do?
+ 
+       ival = 0;
+ 
+       ::warning ("range error for conversion to character value");
+     }
+   else

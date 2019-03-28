@@ -1,0 +1,363 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1526410421 14400
+#      Tue May 15 14:53:41 2018 -0400
+# Branch stable
+# Node ID 61ba501d8f0401028c37ddb065ab6ef9cdbdb5c0
+# Parent  8e30ef611002fa1f610cf8460ff82f7ff38898f2
+back out changes attempting to automatically call handle class destructor
+
+These changes proved to cause too much trouble for stable.  Making
+Octave call destructors for handle class objects will have to be done
+on the default branch.
+
+The following changesets on the stable branch were backed out:
+
+  changeset:   b328ff3ce0f7
+  user:        Piotr Held <pjheld@gmail.com>
+  date:        Thu Nov 02 10:27:11 2017 -0700
+  summary:     call delete method for handle class objects (bug #46497)
+
+  changeset:   2205c0ca02e7
+  parent:      0548e32e6b27
+  user:        John W. Eaton <jwe@octave.org>
+  date:        Fri May 11 16:46:27 2018 -0400
+  summary:     improve test for handle class destructor
+
+  changeset:   97f1d513aaf6
+  parent:      2205c0ca02e7
+  user:        John W. Eaton <jwe@octave.org>
+  date:        Mon May 14 14:47:19 2018 -0400
+  summary:     defer deletion of temporaries in argument lists (bug #53844)
+
+  changeset:   2f3a66d7cf8a
+  parent:      c8f49ee7a687
+  user:        John W. Eaton <jwe@octave.org>
+  date:        Mon May 14 20:41:59 2018 -0400
+  summary:     also preserve temporaries in indexing expressions (bug #53844)
+
+diff --git a/libinterp/parse-tree/pt-arg-list.cc b/libinterp/parse-tree/pt-arg-list.cc
+--- a/libinterp/parse-tree/pt-arg-list.cc
++++ b/libinterp/parse-tree/pt-arg-list.cc
+@@ -242,39 +242,22 @@ namespace octave
+             index_position = k;
+             num_indices = len;
+           }
+ 
+         tree_expression *elt = *p++;
+ 
+         if (elt)
+           {
+-            bool is_assignment = elt->is_assignment_expression ();
+-
+             octave_value tmp = tw->evaluate (elt);
+ 
+             if (tmp.is_cs_list ())
+               args.push_back (tmp.list_value ());
+             else if (tmp.is_defined ())
+-              {
+-                args.push_back (tmp);
+-
+-                // Defer deletion of any temporary values until the end
+-                // of the containing statement.  That way destructors
+-                // for temporary classdef handle objects will be called
+-                // when it is safe to do so.
+-                //
+-                // FIXME: We could further limit this action to classdef
+-                // handle objects, but we don't currently have an
+-                // octave_value predicate for that so should add it on
+-                // the default branch, not stable.
+-
+-                if (! is_assignment)
+-                  tw->defer_deletion (tmp);
+-              }
++              args.push_back (tmp);
+           }
+         else
+           {
+             args.push_back (octave_value ());
+             break;
+           }
+       }
+ 
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -76,17 +76,16 @@ namespace octave
+   // Normal evaluator.
+ 
+   void
+   tree_evaluator::reset (void)
+   {
+     m_result_type = RT_UNDEFINED;
+     m_expr_result_value = octave_value ();
+     m_expr_result_value_list = octave_value_list ();
+-    m_deferred_delete_stack.clear ();
+     m_lvalue_list_stack.clear ();
+     m_nargout_stack.clear ();
+   }
+ 
+   void
+   tree_evaluator::visit_anon_fcn_handle (tree_anon_fcn_handle& anon_fh)
+   {
+     // FIXME: should CMD_LIST be limited to a single expression?
+@@ -1365,26 +1364,16 @@ namespace octave
+                   }
+               }
+           }
+       }
+ 
+     if (base_expr_val.is_undefined ())
+       base_expr_val = evaluate (expr);
+ 
+-    // Defer deletion of any temporary values until the end of the
+-    // containing statement.  That way destructors for temporary
+-    // classdef handle objects will be called when it is safe to do so.
+-    //
+-    // FIXME: We could further limit this action to classdef handle
+-    // objects, but we don't currently have an octave_value predicate for
+-    // that so should add it on the default branch, not stable.
+-
+-    defer_deletion (base_expr_val);
+-
+     // If we are indexing an object or looking at something like
+     //
+     //   classname.static_function (args, ...);
+     //
+     // then we'll just build a complete index list for one big subsref
+     // call.  If the expression we are indexing is a classname then
+     // base_expr_val will be an octave_classdef_meta object.  If we have
+     // files in a +packagename folder, they will also be an
+@@ -2276,23 +2265,16 @@ namespace octave
+           }
+ 
+         try
+           {
+             if (cmd)
+               cmd->accept (*this);
+             else
+               {
+-                unwind_protect frame;
+-
+-                frame.add_method (m_deferred_delete_stack,
+-                                  &deferred_delete_stack::pop_frame);
+-
+-                m_deferred_delete_stack.mark ();
+-
+                 if (m_echo_state)
+                   {
+                     size_t line = stmt.line ();
+                     echo_code (line);
+                     m_echo_file_pos = line + 1;
+                   }
+ 
+                 if (debug_mode)
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -62,64 +62,16 @@ namespace octave
+     enum echo_state
+     {
+       ECHO_OFF = 0,
+       ECHO_SCRIPTS = 1,
+       ECHO_FUNCTIONS = 2,
+       ECHO_ALL = 4
+     };
+ 
+-    class deferred_delete_stack
+-    {
+-    public:
+-
+-      deferred_delete_stack (void) = default;
+-
+-      deferred_delete_stack (const deferred_delete_stack&) = default;
+-
+-      deferred_delete_stack& operator = (const deferred_delete_stack&) = default;
+-
+-      ~deferred_delete_stack (void) = default;
+-
+-      // An undefined value on the stack marks the boundary of the
+-      // current frame.
+-
+-      void mark (void) { push (octave_value ()); }
+-
+-      void push (const octave_value& val) { m_stack.push (val); }
+-
+-      void pop_frame (void)
+-      {
+-        while (! m_stack.empty ())
+-          {
+-            octave_value val = val_pop ();
+-
+-            if (val.is_undefined ())
+-              break;
+-          }
+-      }
+-
+-      void clear (void)
+-      {
+-        while (! m_stack.empty ())
+-          m_stack.pop ();
+-      }
+-
+-    private:
+-
+-      std::stack<octave_value> m_stack;
+-
+-      octave_value val_pop (void)
+-      {
+-        octave_value retval = m_stack.top ();
+-        m_stack.pop ();
+-        return retval;
+-      }
+-    };
+-
+     template <typename T>
+     class value_stack
+     {
+     public:
+ 
+       value_stack (void) = default;
+ 
+       value_stack (const value_stack&) = default;
+@@ -168,18 +120,18 @@ namespace octave
+       std::stack<T> m_stack;
+     };
+ 
+     typedef void (*decl_elt_init_fcn) (tree_decl_elt&);
+ 
+     tree_evaluator (interpreter& interp)
+       : m_interpreter (interp), m_result_type (RT_UNDEFINED),
+         m_expr_result_value (), m_expr_result_value_list (),
+-        m_deferred_delete_stack (), m_lvalue_list_stack (),
+-        m_nargout_stack (), m_call_stack (interp), m_profiler (),
++        m_lvalue_list_stack (), m_nargout_stack (),
++        m_call_stack (interp), m_profiler (),
+         m_max_recursion_depth (256), m_silent_functions (false),
+         m_string_fill_char (' '), m_PS4 ("+ "), m_echo (ECHO_OFF),
+         m_echo_state (false), m_echo_file_name (), m_echo_file_pos (1),
+         m_echo_files ()
+     { }
+ 
+     // No copying!
+ 
+@@ -310,21 +262,16 @@ namespace octave
+     };
+ 
+     // The context for the current evaluation.
+     static stmt_list_type statement_context;
+ 
+     // TRUE means we are evaluating some kind of looping construct.
+     static bool in_loop_command;
+ 
+-    void defer_deletion (const octave_value& val)
+-    {
+-      m_deferred_delete_stack.push (val);
+-    }
+-
+     Matrix ignored_fcn_outputs (void) const;
+ 
+     bool isargout (int nargout, int iout) const;
+ 
+     void isargout (int nargout, int nout, bool *isargout) const;
+ 
+     const std::list<octave_lvalue> * lvalue_list (void) const
+     {
+@@ -535,18 +482,16 @@ namespace octave
+     void echo_code (size_t line);
+ 
+     interpreter& m_interpreter;
+ 
+     result_type m_result_type;
+     octave_value m_expr_result_value;
+     octave_value_list m_expr_result_value_list;
+ 
+-    deferred_delete_stack m_deferred_delete_stack;
+-
+     value_stack<const std::list<octave_lvalue>*> m_lvalue_list_stack;
+ 
+     value_stack<int> m_nargout_stack;
+ 
+     call_stack m_call_stack;
+ 
+     profiler m_profiler;
+ 
+diff --git a/test/bug-46497/bug-46497.tst b/test/bug-46497/bug-46497.tst
+deleted file mode 100644
+--- a/test/bug-46497/bug-46497.tst
++++ /dev/null
+@@ -1,24 +0,0 @@
+-## Copyright (C) 2017 Piotr Held
+-##
+-## This file is part of Octave.
+-##
+-## Octave is free software; you can redistribute it and/or modify it
+-## under the terms of the GNU General Public License as published by
+-## the Free Software Foundation; either version 3 of the License, or
+-## (at your option) any later version.
+-##
+-## Octave is distributed in the hope that it will be useful, but
+-## WITHOUT ANY WARRANTY; without even the implied warranty of
+-## MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+-## GNU General Public License for more details.
+-##
+-## You should have received a copy of the GNU General Public License
+-## along with Octave; see the file COPYING.  If not, see
+-## <http://www.gnu.org/licenses/>.
+-
+-%!test
+-%! global __bug46497_global__
+-%! __bug46497_global__ = "test_bug46497";
+-%! a = class_bug46497 (13);
+-%! a = [];
+-%! assert(__bug46497_global__, struct ("myprop", 13, "status", "deleted"));
+diff --git a/test/bug-46497/class_bug46497.m b/test/bug-46497/class_bug46497.m
+deleted file mode 100644
+--- a/test/bug-46497/class_bug46497.m
++++ /dev/null
+@@ -1,14 +0,0 @@
+-classdef class_bug46497 < handle
+-  properties
+-    myprop;
+-  endproperties
+-  methods
+-    function obj = class_bug46497 (x)
+-      obj.myprop = x;
+-    endfunction
+-    function delete (self)
+-      global __bug46497_global__
+-      __bug46497_global__ = struct ("myprop", self.myprop, "status", "deleted");
+-    endfunction
+-  endmethods
+-endclassdef
+diff --git a/test/bug-46497/module.mk b/test/bug-46497/module.mk
+deleted file mode 100644
+--- a/test/bug-46497/module.mk
++++ /dev/null
+@@ -1,5 +0,0 @@
+-bug_46497_TEST_FILES = \
+-  %reldir%/bug-46497.tst \
+-  %reldir%/class_bug46497.m
+-
+-TEST_FILES += $(bug_46497_TEST_FILES)
+diff --git a/test/module.mk b/test/module.mk
+--- a/test/module.mk
++++ b/test/module.mk
+@@ -51,17 +51,16 @@ DIRSTAMP_FILES += %reldir%/$(octave_dirs
+ 
+ include %reldir%/bug-35448/module.mk
+ include %reldir%/bug-35881/module.mk
+ include %reldir%/bug-36025/module.mk
+ include %reldir%/bug-38236/module.mk
+ include %reldir%/bug-38691/module.mk
+ include %reldir%/bug-41723/module.mk
+ include %reldir%/bug-44940/module.mk
+-include %reldir%/bug-46497/module.mk
+ include %reldir%/bug-46660/module.mk
+ include %reldir%/bug-49379/module.mk
+ include %reldir%/bug-50014/module.mk
+ include %reldir%/bug-50035/module.mk
+ include %reldir%/bug-50716/module.mk
+ include %reldir%/bug-51192/module.mk
+ include %reldir%/bug-51532/module.mk
+ include %reldir%/bug-51534/module.mk

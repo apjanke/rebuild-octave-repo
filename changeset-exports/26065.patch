@@ -1,0 +1,556 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1542094012 18000
+#      Tue Nov 13 02:26:52 2018 -0500
+# Node ID 2eb71b83d3e20f58f302ba487006494dbfed85d6
+# Parent  673b1af421434d64f0564367974d3c59af234e18
+partially refactor function lookup in symbol table
+
+* symtab.h, symtab.cc (symbol_table::find): delete.
+(symbol_table::find_function): Simplify.  Don't decode
+@class/method>sub names.  Assume name is a single function name.
+(symbol_table::find_method): Simplify.  Don't call find_submethod.
+(symbol_table::find_submethod): Delete.
+
+* ov-usr-fcn.h, ov-usr-fcn.cc (octave_user_code::find_subfunction):
+New virtual function.
+(octave_user_function::find_subfunction): New function.
+
+* pt-eval.cc (tree_evaluator::get_user_code):
+Decode function name here instead of in symbol_table::find_function.
+
+* ov-classdef.cc (cdef_package::cdef_package_rep::find): Use
+symbol_scope::find instead of symbol_table::find.
+(cdef_manager::find_class): Likewise.
+* file-editor-tab.cc (file_editor_tab::exit_debug_and_clear): Likewise.
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -1998,17 +1998,20 @@ namespace octave
+   {
+     symbol_table& symtab
+       = __get_symbol_table__ ("file_editor_tab::exit_debug_and_clear");
+ 
+     std::string base_name = base_name_q.toStdString ();
+     octave_value sym;
+     try
+       {
+-        sym = symtab.find (base_name);
++        symbol_scope curr_scope
++          = __get_current_scope__ ("file_editor_tab::exit_debug_and_clear");
++
++        sym = curr_scope.find (base_name, octave_value_list (), false, true);
+       }
+     catch (const execution_exception& e)
+       {
+         // Ignore syntax error.
+         // It was in the old file on disk; the user may have fixed it already.
+       }
+ 
+     // Return early if this file is not loaded in the symbol table
+diff --git a/libinterp/corefcn/symtab.cc b/libinterp/corefcn/symtab.cc
+--- a/libinterp/corefcn/symtab.cc
++++ b/libinterp/corefcn/symtab.cc
+@@ -352,25 +352,16 @@ namespace octave
+       return false;
+ 
+     const std::set<std::string>& inferior_classes = p->second;
+     std::set<std::string>::const_iterator q = inferior_classes.find (b);
+     return (q != inferior_classes.end ());
+   }
+ 
+   octave_value
+-  symbol_table::find (const std::string& name, const octave_value_list& args,
+-                      bool skip_variables, bool local_funcs)
+-  {
+-    return (m_current_scope
+-            ? m_current_scope.find (name, args, skip_variables, local_funcs)
+-            : octave_value ());
+-  }
+-
+-  octave_value
+   symbol_table::builtin_find (const std::string& name)
+   {
+     fcn_table_iterator p = m_fcn_table.find (name);
+ 
+     if (p != m_fcn_table.end ())
+       return p->second.builtin_find ();
+     else
+       {
+@@ -384,17 +375,18 @@ namespace octave
+         return fcn;
+       }
+ 
+     return octave_value ();
+   }
+ 
+   octave_value
+   symbol_table::fcn_table_find (const std::string& name,
+-                                const octave_value_list& args, bool local_funcs)
++                                const octave_value_list& args,
++                                bool local_funcs)
+   {
+     fcn_table_iterator p = m_fcn_table.find (name);
+ 
+     if (p != m_fcn_table.end ())
+       return p->second.find (args, local_funcs);
+     else
+       {
+         fcn_info finfo (name);
+@@ -407,103 +399,54 @@ namespace octave
+         return fcn;
+       }
+ 
+     return octave_value ();
+   }
+ 
+   octave_value
+   symbol_table::find_function (const std::string& name,
+-                               const octave_value_list& args, bool local_funcs)
+-  {
+-    octave_value retval;
+-
+-    if (! name.empty () && name[0] == '@')
+-      {
+-        // Look for a class specific function.
+-        std::string dispatch_type =
+-          name.substr (1, name.find_first_of (sys::file_ops::dir_sep_str ()) - 1);
+-
+-        std::string method;
+-        size_t pos = name.find_last_of (sys::file_ops::dir_sep_str ());
+-        if (pos != std::string::npos)
+-          method = name.substr (pos + 1);
+-
+-        retval = find_method (method, dispatch_type);
+-      }
+-    else
+-      {
+-        size_t pos = name.find_first_of ('>');
+-
+-        if (pos == std::string::npos)
+-          retval = find (name, args, true, local_funcs);
+-        else
+-          {
+-            std::string fcn_scope = name.substr (0, pos);
+-            symbol_scope stored_scope = m_current_scope;
+-            m_current_scope = m_top_scope;
+-            octave_value parent = find_function (name.substr (0, pos),
+-                                                 octave_value_list (), false);
+-
+-            if (parent.is_defined ())
+-              {
+-                octave_function *parent_fcn = parent.function_value ();
+-
+-                if (parent_fcn)
+-                  {
+-                    m_current_scope = parent_fcn->scope ();
+-
+-                    if (m_current_scope && m_current_scope != m_top_scope)
+-                      retval = find_function (name.substr (pos + 1), args);
+-                  }
+-              }
+-
+-            m_current_scope = stored_scope;
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+-  // look for @class/method>subfunction
+-  octave_value
+-  symbol_table::find_submethod (const std::string& name,
+-                                const std::string& dispatch_type)
++                               const octave_value_list& args,
++                               bool local_funcs)
+   {
+     octave_value fcn;
+ 
+-    std::string full_name = '@' + dispatch_type +
+-      sys::file_ops::dir_sep_str () + name;
+-    size_t pos = full_name.find_first_of ('>');
+-
+-    if (pos != std::string::npos)
++    if (m_current_scope)
+       {
+-        std::string fcn_scope = full_name.substr (0, pos);
+-        symbol_scope stored_scope = m_current_scope;
+-        m_current_scope = m_top_scope;
+-        octave_value parent = find_function (full_name.substr (0, pos),
+-                                             octave_value_list (), false);
+-        if (parent.is_defined ())
+-          {
+-            octave_function *parent_fcn = parent.function_value ();
++        fcn = m_current_scope.find_subfunction (name);
+ 
+-            if (parent_fcn)
+-              {
+-                m_current_scope = parent_fcn->scope ();
+-
+-                if (m_current_scope && m_current_scope != m_top_scope)
+-                  fcn = find_function (full_name.substr (pos + 1),
+-                                       octave_value_list ());
+-              }
+-          }
+-
+-        m_current_scope = stored_scope;
++        if (fcn.is_defined ())
++          return fcn;
+       }
+ 
+-    return fcn;
++    return fcn_table_find (name, args, local_funcs);
++  }
++
++  // FIXME: this function only finds legacy class methods, not
++  // classdef methods.
++
++  octave_value
++  symbol_table::find_method (const std::string& name,
++                             const std::string& dispatch_type)
++  {
++    fcn_table_const_iterator p = m_fcn_table.find (name);
++
++    if (p != m_fcn_table.end ())
++      return p->second.find_method (dispatch_type);
++    else
++      {
++        fcn_info finfo (name);
++
++        octave_value fcn = finfo.find_method (dispatch_type);
++
++        if (fcn.is_defined ())
++          m_fcn_table[name] = finfo;
++
++        return fcn;
++      }
+   }
+ 
+   template <template <typename, typename...> class C, typename V,
+             typename... A>
+   static octave_value
+   dump_container_map (const std::map<std::string, C<V, A...>>& container_map)
+   {
+     if (container_map.empty ())
+diff --git a/libinterp/corefcn/symtab.h b/libinterp/corefcn/symtab.h
+--- a/libinterp/corefcn/symtab.h
++++ b/libinterp/corefcn/symtab.h
+@@ -133,23 +133,16 @@ namespace octave
+ 
+     void inherit (symbol_scope& recipient_scope)
+     {
+       inherit (recipient_scope, m_current_scope);
+     }
+ 
+     bool at_top_level (void) { return m_current_scope == m_top_scope; }
+ 
+-    // Find a value corresponding to the given name in the table.
+-    octave_value
+-    find (const std::string& name,
+-          const octave_value_list& args = octave_value_list (),
+-          bool skip_variables = false,
+-          bool local_funcs = true);
+-
+     void assign (const std::string& name, const octave_value& value, bool force_add)
+     {
+       if (m_current_scope)
+         m_current_scope.assign (name, value, force_add);
+     }
+ 
+     void assign (const std::string& name,
+                  const octave_value& value = octave_value ())
+@@ -190,48 +183,20 @@ namespace octave
+     bool
+     is_built_in_function_name (const std::string& name)
+     {
+       octave_value val = find_built_in_function (name);
+ 
+       return val.is_defined ();
+     }
+ 
++    // FIXME: this function only finds legacy class methods, not
++    // classdef methods.
+     octave_value
+-    find_method (const std::string& name, const std::string& dispatch_type)
+-    {
+-      fcn_table_const_iterator p = m_fcn_table.find (name);
+-
+-      if (p != m_fcn_table.end ())
+-        {
+-          octave_value fcn = p->second.find_method (dispatch_type);
+-
+-          if (! fcn.is_defined ())
+-            fcn = find_submethod (name, dispatch_type);
+-
+-          return fcn;
+-        }
+-      else
+-        {
+-          fcn_info finfo (name);
+-
+-          octave_value fcn = finfo.find_method (dispatch_type);
+-
+-          if (! fcn.is_defined ())
+-            fcn = find_submethod (name, dispatch_type);
+-
+-          if (fcn.is_defined ())
+-            m_fcn_table[name] = finfo;
+-
+-          return fcn;
+-        }
+-    }
+-
+-    octave_value
+-    find_submethod (const std::string& name, const std::string& dispatch_type);
++    find_method (const std::string& name, const std::string& dispatch_type);
+ 
+     octave_value
+     find_built_in_function (const std::string& name)
+     {
+       fcn_table_const_iterator p = m_fcn_table.find (name);
+ 
+       return (p != m_fcn_table.end ()
+               ? p->second.find_built_in_function () : octave_value ());
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -3373,20 +3373,20 @@ Cell
+ cdef_package::cdef_package_rep::get_packages (void) const
+ { return map2Cell (package_map); }
+ 
+ octave_value
+ cdef_package::cdef_package_rep::find (const std::string& nm)
+ {
+   std::string symbol_name = get_name () + '.' + nm;
+ 
+-  octave::symbol_table& symtab
+-    = octave::__get_symbol_table__ ("cdef_package::cdef_package_rep::find");
+-
+-  return symtab.find (symbol_name, octave_value_list (), true, false);
++  octave::symbol_scope curr_scope
++    = octave::__get_current_scope__ ("cdef_package::cdef_package_rep::find");
++
++  return curr_scope.find (symbol_name, octave_value_list (), false);
+ }
+ 
+ octave_value_list
+ cdef_package::cdef_package_rep::meta_subsref
+   (const std::string& type, const std::list<octave_value_list>& idx,
+    int nargout)
+ {
+   octave_value_list retval;
+@@ -3785,19 +3785,21 @@ cdef_manager::find_class (const std::str
+       if (load_if_not_found)
+         {
+           octave_value ov_cls;
+ 
+           size_t pos = name.rfind ('.');
+ 
+           if (pos == std::string::npos)
+             {
+-              octave::symbol_table& symtab = m_interpreter.get_symbol_table ();
+-
+-              ov_cls = symtab.find (name);
++              octave::symbol_scope curr_scope
++                = m_interpreter.get_current_scope ();
++
++              ov_cls = curr_scope.find (name, octave_value_list (),
++                                        false, true);
+             }
+           else
+             {
+               std::string pack_name = name.substr (0, pos);
+ 
+               cdef_package pack = find_package (pack_name, false, true);
+ 
+               if (pack.ok ())
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -381,16 +381,47 @@ octave_user_function::unlock_subfunction
+ }
+ 
+ std::map<std::string, octave_value>
+ octave_user_function::subfunctions (void) const
+ {
+   return m_scope.subfunctions ();
+ }
+ 
++// Find definition of final subfunction in list of subfuns:
++//
++//  sub1>sub2>...>subN
++
++octave_value
++octave_user_function::find_subfunction (const std::string& subfuns_arg) const
++{
++  std::string subfuns = subfuns_arg;
++
++  std::string first_fun = subfuns;
++
++  size_t pos = subfuns.find ('>');
++
++  if (pos == std::string::npos)
++    subfuns = "";
++  else
++    {
++      first_fun = subfuns.substr (0, pos-1);
++      subfuns = subfuns.substr (pos+1);
++    }
++
++  octave_value ov_fcn = m_scope.find_subfunction (first_fun);
++
++  if (subfuns.empty ())
++    return ov_fcn;
++
++  octave_user_function *fcn = ov_fcn.user_function_value ();
++
++  return fcn->find_subfunction (subfuns);
++}
++
+ bool
+ octave_user_function::has_subfunctions (void) const
+ {
+   return m_scope.has_subfunctions ();
+ }
+ 
+ void
+ octave_user_function::stash_subfunction_names (const std::list<std::string>& names)
+diff --git a/libinterp/octave-value/ov-usr-fcn.h b/libinterp/octave-value/ov-usr-fcn.h
+--- a/libinterp/octave-value/ov-usr-fcn.h
++++ b/libinterp/octave-value/ov-usr-fcn.h
+@@ -103,16 +103,21 @@ public:
+   }
+ 
+   std::string fcn_file_name (void) const { return file_name; }
+ 
+   octave::sys::time time_parsed (void) const { return t_parsed; }
+ 
+   octave::sys::time time_checked (void) const { return t_checked; }
+ 
++  virtual octave_value find_subfunction (const std::string&) const
++  {
++    return octave_value ();
++  }
++
+   // XXX FIXME
+   int call_depth (void) const { return m_call_depth; }
+ 
+   void set_call_depth (int val) { m_call_depth = val; }
+ 
+   void increment_call_depth (void) { ++m_call_depth; }
+ 
+   virtual std::map<std::string, octave_value> subfunctions (void) const;
+@@ -288,16 +293,18 @@ public:
+   void mark_as_private_function (const std::string& cname = "");
+ 
+   void lock_subfunctions (void);
+ 
+   void unlock_subfunctions (void);
+ 
+   std::map<std::string, octave_value> subfunctions (void) const;
+ 
++  octave_value find_subfunction (const std::string& subfuns) const;
++
+   bool has_subfunctions (void) const;
+ 
+   void stash_subfunction_names (const std::list<std::string>& names);
+ 
+   std::list<std::string> subfunction_names (void) const;
+ 
+   octave_value_list all_va_args (const octave_value_list& args);
+ 
+diff --git a/libinterp/parse-tree/oct-parse.yy b/libinterp/parse-tree/oct-parse.yy
+--- a/libinterp/parse-tree/oct-parse.yy
++++ b/libinterp/parse-tree/oct-parse.yy
+@@ -5001,18 +5001,18 @@ namespace octave
+     size_t extension = file_name.find_last_of ('.');
+     if (extension == std::string::npos)
+       extension = file_name.length ();
+ 
+     std::string symbol = file_name.substr (dir_end, extension - dir_end);
+     std::string full_name = sys::canonicalize_file_name (file_name);
+ 
+     // Check if this file is already loaded (or in the path)
+-    symbol_table& symtab = __get_symbol_table__ ("source_file");
+-    octave_value ov_code = symtab.find (symbol);
++    symbol_scope curr_scope = __get_current_scope__ ("source_file");
++    octave_value ov_code = curr_scope.find (symbol, ovl (), false, true);
+ 
+     // For compatibility with Matlab, accept both scripts and
+     // functions.
+ 
+     if (ov_code.is_user_code ())
+       {
+         octave_user_code *code = ov_code.user_code_value ();
+ 
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -976,22 +976,62 @@ namespace octave
+             std::replace (beg, end, '/', sys::file_ops::dir_sep_char ());
+           }
+ 
+         size_t name_len = name.length ();
+ 
+         if (name_len > 2 && name.substr (name_len-2) == ".m")
+           name = name.substr (0, name_len-2);
+ 
++        if (name.empty ())
++          return nullptr;
++
+         symbol_table& symtab = m_interpreter.get_symbol_table ();
+ 
+-        octave_value fcn = symtab.find_function (name);
+-
+-        if (fcn.is_defined () && fcn.is_user_code ())
+-          user_code = fcn.user_code_value ();
++        octave_value fcn;
++        size_t p2;
++
++        if (name[0] == '@')
++          {
++            size_t p1 = name.find (sys::file_ops::dir_sep_char (), 1);
++
++            if (p1 == std::string::npos)
++              return nullptr;
++
++            std::string dispatch_type = name.substr (1, p1-1);
++
++            p2 = name.find ('>', p1);
++
++            std::string method = name.substr (p1+1, p2-1);
++
++            fcn = symtab.find_method (method, dispatch_type);
++          }
++        else
++          {
++            p2 = name.find ('>');
++
++            std::string main_fcn = name.substr (0, p2);
++
++            fcn = symtab.find_function (main_fcn);
++          }
++
++        // List of function names sub1>sub2>...
++        std::string subfuns;
++
++        if (p2 != std::string::npos)
++          subfuns = name.substr (p2+1);
++
++        user_code = fcn.user_code_value ();
++
++        if (! user_code || subfuns.empty ())
++          return user_code;
++
++        fcn = user_code->find_subfunction (subfuns);
++
++        user_code = fcn.user_code_value ();
+       }
+ 
+     return user_code;
+   }
+ 
+   void
+   tree_evaluator::visit_decl_command (tree_decl_command& cmd)
+   {

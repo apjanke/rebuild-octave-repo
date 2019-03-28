@@ -1,0 +1,406 @@
+# HG changeset patch
+# User Michael C. Grant <mcg@cvxr.com>
+# Date 1389027724 18000
+#      Mon Jan 06 12:02:04 2014 -0500
+# Branch gui-release
+# Node ID 615fdd2238c1837c23b52684054cb64f0c3a5672
+# Parent  4d90e104bf357f9e8310cbb0242db8c94dab4a6f
+improve compatibility of command syntax parsing (bug #41032)
+
+* lex.h, lex.ll (lexical_feedback::command_arg_paren_count):
+New data member.
+(lexical_feedback::lexical_feedback): Initialize it.
+(lexical_feedback::reset): Reset it.
+(COMMAND_ARG_FINISH): New macro.
+Rewrite COMMAND_START patterns to improve Matlab compatibility of
+command syntax parsing.
+(<DQ_STRING_START>\", <SQ_STRING_START>\'): Don't return token if
+start state is COMMAND_START.
+* close.m: Fix test.
+
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -263,19 +263,19 @@ public:
+       looking_at_indirect_ref (false), parsing_class_method (false),
+       maybe_classdef_get_set_method (false), parsing_classdef (false),
+       quote_is_transpose (false), force_script (false),
+       reading_fcn_file (false), reading_script_file (false),
+       reading_classdef_file (false),
+       input_line_number (1), current_input_column (1),
+       bracketflag (0), braceflag (0),
+       looping (0), defining_func (0), looking_at_function_handle (0),
+-      block_comment_nesting_level (0), token_count (0),
+-      current_input_line (), comment_text (), help_text (),
+-      string_text (), string_line (0), string_column (0),
++      block_comment_nesting_level (0), command_arg_paren_count (0),
++      token_count (0), current_input_line (), comment_text (),
++      help_text (), string_text (), string_line (0), string_column (0),
+       fcn_file_name (), fcn_file_full_name (), looking_at_object_index (),
+       parsed_function_name (), pending_local_variables (),
+       symtab_context (), nesting_level (), tokens ()
+   {
+     init ();
+   }
+ 
+   ~lexical_feedback (void);
+@@ -384,16 +384,19 @@ public:
+   int defining_func;
+ 
+   // nonzero means we are parsing a function handle.
+   int looking_at_function_handle;
+ 
+   // nestng level for blcok comments.
+   int block_comment_nesting_level;
+ 
++  // Parenthesis count for command argument parsing.
++  int command_arg_paren_count;
++
+   // Count of tokens recognized by this lexer since initialized or
+   // since the last reset.
+   size_t token_count;
+ 
+   // The current line of input.
+   std::string current_input_line;
+ 
+   // The current comment text.
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -227,16 +227,37 @@ object) relevant global values before an
+             return -1; \
+  \
+           if (curr_lexer->at_end_of_file ()) \
+             return curr_lexer->handle_end_of_input (); \
+         } \
+     } \
+   while (0)
+ 
++// When a command argument boundary is detected, push out the
++// current argument being built.  This one seems like a good
++// candidate for a function call.
++
++#define COMMAND_ARG_FINISH \
++  do \
++    { \
++      if (curr_lexer->string_text.empty ()) \
++        break; \
++ \
++      int retval = curr_lexer->handle_token (curr_lexer->string_text, \
++                                             SQ_STRING); \
++ \
++      curr_lexer->string_text = ""; \
++      curr_lexer->command_arg_paren_count = 0; \
++ \
++      yyless (0); \
++ \
++      return retval; \
++    } \
++  while (0)
+ 
+ static bool Vdisplay_tokens = false;
+ 
+ static unsigned int Vtoken_count = 0;
+ 
+ // Internal variable for lexer debugging state.
+ static bool lexer_debug_flag = false;
+ 
+@@ -278,64 +299,139 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+     return curr_lexer->show_token (INPUT_FILE);
+   }
+ 
+ %{
+ // Help and other command-style functions.
+ %}
+ 
+-<COMMAND_START>{NL} {
+-    curr_lexer->lexer_debug ("<COMMAND_START>{NL}");
++%{
++// Commands can be continued on a second line using the ellipsis.
++// If an argument is in construction, it is completed.
++%}
++
++<COMMAND_START>(\.\.\.)[^\r\n]*{NL} {
++    curr_lexer->lexer_debug ("<COMMAND_START>(\\.\\.\\.)[^\\r\\n]*{NL}");
++
++    COMMAND_ARG_FINISH;
++
++    curr_lexer->input_line_number++;
++    curr_lexer->current_input_column = 1;
++
++    HANDLE_STRING_CONTINUATION;
++  }
++
++%{
++// Commands normally end at the end of a line or a semicolon.
++%}
++
++<COMMAND_START>({CCHAR}[^\r\n]*)?{NL} {
++    curr_lexer->lexer_debug ("<COMMAND_START>({CCHAR}[^\\r\\n]*)?{NL}");
++
++    COMMAND_ARG_FINISH;
+ 
+     curr_lexer->input_line_number++;
+     curr_lexer->current_input_column = 1;
+-
+     curr_lexer->looking_for_object_index = false;
+     curr_lexer->at_beginning_of_statement = true;
+-
+     curr_lexer->pop_start_state ();
+ 
+-    return curr_lexer->count_token ('\n');
++    return curr_lexer->handle_token ('\n');
++  }
++
++<COMMAND_START>[\,\;] {
++    curr_lexer->lexer_debug( "<COMMAND_START>[\\,\\;]" );
++
++    if (yytext[0] != ',' || curr_lexer->command_arg_paren_count == 0)
++      {
++        COMMAND_ARG_FINISH;
++        curr_lexer->looking_for_object_index = false;
++        curr_lexer->at_beginning_of_statement = true;
++        curr_lexer->pop_start_state ();
++        return curr_lexer->handle_token (yytext[0]);
++      }
++    else
++      curr_lexer->string_text += yytext;
++
++    curr_lexer->current_input_column += yyleng;
+   }
+ 
+-<COMMAND_START>[\;\,] {
+-    curr_lexer->lexer_debug ("<COMMAND_START>[\\;\\,]");
+-
+-    curr_lexer->looking_for_object_index = false;
+-    curr_lexer->at_beginning_of_statement = true;
+-
+-    curr_lexer->pop_start_state ();
+-
+-    if (strcmp (yytext, ",") == 0)
+-      return curr_lexer->handle_token (',');
+-    else
+-      return curr_lexer->handle_token (';');
++%{
++// Unbalanced parentheses serve as pseudo-quotes: they are included in
++// the final argument string, but they cause parentheses and quotes to
++// be slurped into that argument as well.
++%}
++
++<COMMAND_START>[\(\[\{]+ {
++    curr_lexer->lexer_debug ("<COMMAND_START>[\\(\\[\\{]+");
++
++    curr_lexer->command_arg_paren_count += yyleng;
++    curr_lexer->string_text += yytext;
++    curr_lexer->current_input_column += yyleng;
+   }
+ 
++<COMMAND_START>[\)\]\}]+ {
++   curr_lexer->lexer_debug ("<COMMAND_START>[\\)\\]\\}]+");
++
++   curr_lexer->command_arg_paren_count -= yyleng;
++   curr_lexer->string_text += yytext;
++   curr_lexer->current_input_column += yyleng;
++}
++
++%{
++// Handle quoted strings.  Quoted strings that are not separated by
++// whitespace from other argument text are combined with that previous
++// text.  For instance,
++//
++//   command 'text1'"text2"
++//
++// has a single argument text1text2, not two separate arguments.
++// That's why we must test to see if we are in command argument mode
++// when processing the end of a string.
++%}
++
+ <COMMAND_START>[\"\'] {
+     curr_lexer->lexer_debug ("<COMMAND_START>[\\\"\\']");
+ 
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    curr_lexer->current_input_column++;
+-
+-    curr_lexer->begin_string (yytext[0] == '"'
+-                              ? DQ_STRING_START : SQ_STRING_START);
++    if (curr_lexer->command_arg_paren_count == 0)
++      curr_lexer->begin_string (yytext[0] == '"'
++                                ? DQ_STRING_START : SQ_STRING_START);
++    else
++      curr_lexer->string_text += yytext;
++
++    curr_lexer->current_input_column += yyleng;
+   }
+ 
+-<COMMAND_START>[^#% \t\r\n\;\,\"\'][^ \t\r\n\;\,]*{S}* {
+-    curr_lexer->lexer_debug ("<COMMAND_START>[^#% \\t\\r\\n\\;\\,\\\"\\'][^ \\t\\r\\n\\;\\,]*{S}*");
+-
+-    std::string tok = strip_trailing_whitespace (yytext);
+-
+-    curr_lexer->looking_for_object_index = false;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    return curr_lexer->handle_token (tok, SQ_STRING);
++%{
++// In standard command argument processing, whitespace separates
++// arguments.  In the presence of unbalanced parentheses, it is
++// incorporated into the argument.
++%}
++
++<COMMAND_START>{S}+ {
++    curr_lexer->lexer_debug ("<COMMAND_START>{S}+");
++
++    if (curr_lexer->command_arg_paren_count == 0)
++      COMMAND_ARG_FINISH;
++    else
++      curr_lexer->string_text += yytext;
++
++    curr_lexer->current_input_column += yyleng;
++  }
++
++%{
++// Everything else is slurped into the command arguments.
++%}
++
++<COMMAND_START>([\.]|[^#% \t\r\n\,\;\"\'\(\[\{\}\]\)]+) {
++    curr_lexer->lexer_debug ("<COMMAND_START>[^#% \\t\\r\\n\\.\\,\\;\\\"\\'\\(\\[\\{\\}\\]\\)]+");
++
++    curr_lexer->string_text += yytext;
++    curr_lexer->current_input_column += yyleng;
+   }
+ 
+ <MATRIX_START>{S}* {
+     curr_lexer->lexer_debug ("<MATRIX_START>{S}*");
+ 
+     curr_lexer->mark_previous_token_trailing_space ();
+   }
+ 
+@@ -673,27 +769,30 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+ <DQ_STRING_START>\" {
+     curr_lexer->lexer_debug ("<DQ_STRING_START>\\\"");
+ 
+     curr_lexer->current_input_column++;
+ 
+     curr_lexer->pop_start_state ();
+ 
+-    curr_lexer->looking_for_object_index = true;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    curr_lexer->push_token (new token (DQ_STRING,
+-                                       curr_lexer->string_text,
+-                                       curr_lexer->string_line,
+-                                       curr_lexer->string_column));
+-
+-    curr_lexer->string_text = "";
+-
+-    return curr_lexer->count_token_internal (DQ_STRING);
++    if (curr_lexer->start_state() != COMMAND_START)
++      {
++        curr_lexer->looking_for_object_index = true;
++        curr_lexer->at_beginning_of_statement = false;
++
++        curr_lexer->push_token (new token (DQ_STRING,
++                                           curr_lexer->string_text,
++                                           curr_lexer->string_line,
++                                           curr_lexer->string_column));
++
++        curr_lexer->string_text = "";
++
++        return curr_lexer->count_token_internal (DQ_STRING);
++      }
+   }
+ 
+ <DQ_STRING_START>\\[0-7]{1,3} {
+     curr_lexer->lexer_debug ("<DQ_STRING_START>\\\\[0-7]{1,3}");
+ 
+     curr_lexer->current_input_column += yyleng;
+ 
+     int result;
+@@ -856,27 +955,30 @@ ANY_INCLUDING_NL (.|{NL})
+ 
+ <SQ_STRING_START>\' {
+     curr_lexer->lexer_debug ("<SQ_STRING_START>\\'");
+ 
+     curr_lexer->current_input_column++;
+ 
+     curr_lexer->pop_start_state ();
+ 
+-    curr_lexer->looking_for_object_index = true;
+-    curr_lexer->at_beginning_of_statement = false;
+-
+-    curr_lexer->push_token (new token (SQ_STRING,
+-                                       curr_lexer->string_text,
+-                                       curr_lexer->string_line,
+-                                       curr_lexer->string_column));
+-
+-    curr_lexer->string_text = "";
+-
+-    return curr_lexer->count_token_internal (SQ_STRING);
++    if (curr_lexer->start_state() != COMMAND_START)
++      {
++        curr_lexer->looking_for_object_index = true;
++        curr_lexer->at_beginning_of_statement = false;
++
++        curr_lexer->push_token (new token (SQ_STRING,
++                                           curr_lexer->string_text,
++                                           curr_lexer->string_line,
++                                           curr_lexer->string_column));
++
++        curr_lexer->string_text = "";
++
++        return curr_lexer->count_token_internal (SQ_STRING);
++      }
+   }
+ 
+ <SQ_STRING_START>[^\'\n\r]+ {
+     curr_lexer->lexer_debug ("<SQ_STRING_START>[^\\'\\n\\r]+");
+ 
+     curr_lexer->current_input_column += yyleng;
+     curr_lexer->string_text += yytext;
+   }
+@@ -1844,16 +1946,17 @@ lexical_feedback::reset (void)
+   help_text = "";
+   string_text = "";
+   string_line = 0;
+   string_column = 0;
+   fcn_file_name = "";
+   fcn_file_full_name = "";
+   looking_at_object_index.clear ();
+   looking_at_object_index.push_front (false);
++  command_arg_paren_count = 0;
+ 
+   while (! parsed_function_name.empty ())
+     parsed_function_name.pop ();
+ 
+   nesting_level.reset ();
+ 
+   tokens.clear ();
+ }
+@@ -3260,8 +3363,9 @@ octave_push_lexer::fill_flex_buffer (cha
+       status = YY_NULL;
+ 
+       if (! input_buf.at_eof ())
+         fatal_error ("octave_base_lexer::fill_flex_buffer failed");
+     }
+ 
+   return status;
+ }
++
+diff --git a/scripts/plot/util/close.m b/scripts/plot/util/close.m
+--- a/scripts/plot/util/close.m
++++ b/scripts/plot/util/close.m
+@@ -100,10 +100,9 @@ endfunction
+ %!     close (hf);
+ %!   endif
+ %! end_unwind_protect
+ 
+ %!error close (1,2,3)
+ %!error <first argument must be "all" or a figure> close ({"all"})
+ %!error <first argument must be "all" or a figure> close ("all_and_more")
+ %!error <first argument must be "all" or a figure> close (-1)
+-%!error <expecting argument to be "all hidden"> close "all" hid"
+-
++%!error <expecting argument to be "all hidden"> close all hid

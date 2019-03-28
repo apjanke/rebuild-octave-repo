@@ -1,0 +1,324 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1526070123 14400
+#      Fri May 11 16:22:03 2018 -0400
+# Branch stable
+# Node ID 0548e32e6b275d54fdd2d96fa79a1ac0d96f91e8
+# Parent  bbc47fb89973dfd986e7f63a5e8d4aa2f9816643
+call delete method correctly for handle class objects (bug #53844)
+
+* ov-classdef.h, ov-classdef.cc (cdef_object_rep::release):
+Accept reference to the to-be-deleted cdef_object.  Change all callers.
+Call cdef_class::delete_object here.  Pass referent to object to
+delete_object.
+(handle_cdef_object::~handle_cdef_object): Don't call delete_object.
+(cdef_class::cdef_class_rep::delete_object): Pass argument by const
+reference, not value.  Simplify calling of delete method.  Don't call
+delete_object on "handle" superclass object.
+(cdef_class_rep::delete_object): Pass argument by const reference.
+
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -630,17 +630,17 @@ property_get_defaultvalue (const octave_
+   return retval;
+ }
+ 
+ static octave_value_list
+ handle_delete (const octave_value_list& /* args */, int /* nargout */)
+ {
+   octave_value_list retval;
+ 
+-  // FIXME: implement this
++  // FIXME: implement this.  Wait, what is this supposed to do?
+ 
+   return retval;
+ }
+ 
+ cdef_class
+ cdef_manager::make_class (const std::string& name,
+                           const std::list<cdef_class>& super_list)
+ {
+@@ -1209,16 +1209,82 @@ private:
+   }
+ 
+ private:
+   octave_value_list args;
+ };
+ 
+ //----------------------------------------------------------------------------
+ 
++void
++cdef_object_rep::release (const cdef_object& obj)
++{
++  // We need to be careful to keep a reference to the object if we are
++  // calling the delete method.  The object is passed to the delete
++  // method as an argument and if the count is already zero when we
++  // do that, then we will increment the count while creating the
++  // argument list for the delete method and then it will be decremented
++  // back to zero and we'll find ourselves in an infinite loop.
++
++  if (refcount - 1 > static_count ())
++    {
++      --refcount;
++      return;
++    }
++
++  if (is_handle_object () && ! is_meta_object ())
++    {
++      octave::unwind_protect frame;
++
++      // Clear interrupts.
++      frame.protect_var (octave_interrupt_state);
++      octave_interrupt_state = 0;
++
++      // Disallow quit().
++      frame.protect_var (quit_allowed);
++      quit_allowed = false;
++
++      interpreter_try (frame);
++
++      try
++        {
++          // Call classdef "delete()" method on object
++          get_class ().delete_object (obj);
++        }
++      catch (const octave::interrupt_exception&)
++        {
++          octave::interpreter::recover_from_exception ();
++
++          warning ("interrupt occurred in handle class delete method");
++        }
++      catch (const octave::execution_exception&)
++        {
++          std::string msg = last_error_message ();
++          warning ("error caught while executing handle class delete method:\n%s\n",
++                   msg.c_str ());
++
++        }
++      catch (const octave::exit_exception&)
++        {
++          // This shouldn't happen since we disabled quit above.
++          warning ("exit disabled while executing handle class delete method");
++        }
++      catch (...) // Yes, the black hole.  We're in a d-tor.
++        {
++          // This shouldn't happen, in theory.
++          warning ("internal error: unhandled exception in handle class delete method");
++        }
++    }
++
++  // Now it is safe to set the count to zero.
++  refcount--;
++
++  destroy ();
++}
++
+ octave_map
+ cdef_object::map_value (void) const
+ {
+   octave_map retval;
+ 
+   warning_with_id ("Octave:classdef-to-struct",
+                    "struct: converting a classdef object into a struct "
+                    "overrides the access restrictions defined for properties. "
+@@ -1783,57 +1849,16 @@ cdef_object_scalar::is_partially_constru
+ inline void
+ cdef_object_scalar::mark_as_constructed (const cdef_class& cls)
+ {
+   ctor_list.erase (cls);
+ }
+ 
+ handle_cdef_object::~handle_cdef_object (void)
+ {
+-  octave::unwind_protect frame;
+-
+-  // Clear interrupts.
+-  frame.protect_var (octave_interrupt_state);
+-  octave_interrupt_state = 0;
+-
+-  // Disallow quit().
+-  frame.protect_var (quit_allowed);
+-  quit_allowed = false;
+-
+-  interpreter_try (frame);
+-
+-  try
+-    {
+-      // Call classdef "delete()" method on object
+-      get_class ().delete_object (get_class ());
+-    }
+-  catch (const octave::interrupt_exception&)
+-    {
+-      octave::interpreter::recover_from_exception ();
+-
+-      warning ("interrupt occurred in handle class delete method");
+-    }
+-  catch (const octave::execution_exception&)
+-    {
+-      std::string msg = last_error_message ();
+-      warning ("error caught while executing handle class delete method:\n%s\n",
+-               msg.c_str ());
+-
+-    }
+-  catch (const octave::exit_exception&)
+-    {
+-      // This shouldn't happen since we disabled quit above.
+-      warning ("exit disabled while executing handle class delete method");
+-    }
+-  catch (...) // Yes, the black hole.  We're in a d-tor.
+-    {
+-      // This shouldn't happen, in theory.
+-      warning ("internal error: unhandled exception in handle class delete method");
+-    }
+-
+ #if DEBUG_TRACE
+   std::cerr << "deleting " << get_class ().get_name ()
+             << " object (handle)" << std::endl;
+ #endif
+ }
+ 
+ value_cdef_object::~value_cdef_object (void)
+ {
+@@ -2284,42 +2309,35 @@ cdef_class::cdef_class_rep::get_names (v
+   find_names (names, false);
+ 
+   string_vector v (names);
+ 
+   return v.sort (true);
+ }
+ 
+ void
+-cdef_class::cdef_class_rep::delete_object (cdef_object obj)
++cdef_class::cdef_class_rep::delete_object (const cdef_object& obj)
+ {
+-  method_iterator it = method_map.find ("delete");
+-
+-  if (it != method_map.end ())
+-    {
+-      cdef_class cls = obj.get_class ();
+-
+-      obj.set_class (wrap ());
+-
+-      it->second.execute (obj, octave_value_list (), 0, false);
+-
+-      obj.set_class (cls);
+-    }
++  cdef_method dtor = find_method ("delete");
++
++  if (dtor.ok ())
++    dtor.execute (obj, octave_value_list (), 0, true, "destructor");
+ 
+   // FIXME: should we destroy corresponding properties here?
+ 
+   // Call "delete" in super classes
+ 
+   Cell super_classes = get ("SuperClasses").cell_value ();
+ 
+   for (int i = 0; i < super_classes.numel (); i++)
+     {
+       cdef_class cls = lookup_class (super_classes(i));
+ 
+-      cls.delete_object (obj);
++      if (cls.get_name () != "handle")
++        cls.delete_object (obj);
+     }
+ }
+ 
+ octave_value_list
+ cdef_class::cdef_class_rep::meta_subsref (const std::string& type,
+                                           const std::list<octave_value_list>& idx,
+                                           int nargout)
+ {
+diff --git a/libinterp/octave-value/ov-classdef.h b/libinterp/octave-value/ov-classdef.h
+--- a/libinterp/octave-value/ov-classdef.h
++++ b/libinterp/octave-value/ov-classdef.h
+@@ -172,21 +172,17 @@ public:
+   {
+     err_invalid_object ("is_constructed");
+   }
+ 
+   virtual octave_idx_type static_count (void) const { return 0; }
+ 
+   virtual void destroy (void) { delete this; }
+ 
+-  void release (void)
+-  {
+-    if (--refcount == static_count ())
+-      destroy ();
+-  }
++  void release (const cdef_object& obj);
+ 
+   virtual dim_vector dims (void) const { return dim_vector (); }
+ 
+ protected:
+ 
+   // Reference count
+   octave::refcount<octave_idx_type> refcount;
+ 
+@@ -214,23 +210,25 @@ public:
+ 
+   cdef_object (const cdef_object& obj)
+     : rep (obj.rep) { rep->refcount++; }
+ 
+   cdef_object (cdef_object_rep *r)
+     : rep (r) { }
+ 
+   virtual ~cdef_object (void)
+-  { rep->release (); }
++  {
++    rep->release (*this);
++  }
+ 
+   cdef_object& operator = (const cdef_object& obj)
+   {
+     if (rep != obj.rep)
+       {
+-        rep->release ();
++        rep->release (*this);
+ 
+         rep = obj.rep;
+         rep->refcount++;
+       }
+ 
+     return *this;
+   }
+ 
+@@ -706,17 +704,17 @@ private:
+     std::map<std::string, cdef_property> get_property_map (int mode);
+ 
+     string_vector get_names (void);
+ 
+     void set_directory (const std::string& dir) { directory = dir; }
+ 
+     std::string get_directory (void) const { return directory; }
+ 
+-    void delete_object (cdef_object obj);
++    void delete_object (const cdef_object& obj);
+ 
+     octave_value_list
+     meta_subsref (const std::string& type,
+                   const std::list<octave_value_list>& idx, int nargout);
+ 
+     void meta_release (void);
+ 
+     bool meta_accepts_postfix_index (char type) const
+@@ -879,17 +877,17 @@ public:
+   { return get_rep ()->get_directory (); }
+ 
+   std::string get_name (void) const
+   { return get_rep ()->get_name (); }
+ 
+   bool is_builtin (void) const
+   { return get_directory ().empty (); }
+ 
+-  void delete_object (cdef_object obj)
++  void delete_object (const cdef_object& obj)
+   { get_rep ()->delete_object (obj); }
+ 
+   //! Analyze the tree_classdef tree and transform it to a cdef_class
+   //!
+   //! <b>All attribute validation should occur here.</b>
+   //!
+   //! Classdef attribute values can be given in the form of
+   //! expressions.  These expressions must be evaluated before

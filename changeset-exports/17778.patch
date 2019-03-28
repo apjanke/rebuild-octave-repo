@@ -1,0 +1,1285 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1382914042 14400
+#      Sun Oct 27 18:47:22 2013 -0400
+# Node ID b5d58667d32dc61079dd98a2fe1d33bc659945ab
+# Parent  ae8905fbf1f83499acb1e02fe06e833a407f2003
+new main program wrapper to handle giving up controlling tty
+
+* octave-gui.cc (octave_cli_thread): New class, from QtHandles.
+(dissociate_terminal): Delete.
+(octave_start_gui): Third arg is now START_GUI instead of FORK.
+Don't call dissociate_terminal.  If start_gui is false, use
+octave_cli_thread to start Octave within a QApplication context.
+* sighandlers.cc (gui_driver_sig_handler): Move to src/main.in.cc.
+(install_gui_driver_signal_handlers): Move to src/main.in.cc and rename
+to octave_set_signal_handler.
+* octave.cc (no_fork_option): Delete.
+(process_command_line): Don't handle NO_FORK_OPTION.
+(octave_fork_gui): Move to src/main.in.cc and rename to
+have_controlling_terminal.
+* options-usage.h (usage_string, octave_print_verbose_usage_and_exit):
+Delete --no-fork from text.
+(long_opts): Delete no-fork from list.
+(NO_FORK_OPTION): Delete.
+* run-octave.in: Set OCTAVE_BINDIR in environment before exec-ing
+Octave binary.
+* src/Makefile.am: Build octave-gui, octave-cli, and octave instead of
+octave-cli and octave.
+* main-gui.cc: Rename from main.cc.  Call octave_start_gui and pass
+START_GUI as parameter.
+* main.in.cc: New file.
+
+diff --git a/libgui/src/octave-gui.cc b/libgui/src/octave-gui.cc
+--- a/libgui/src/octave-gui.cc
++++ b/libgui/src/octave-gui.cc
+@@ -19,41 +19,74 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #ifdef HAVE_CONFIG_H
+ #include <config.h>
+ #endif
+ 
+-#include <QtGui/QApplication>
++#include <QApplication>
+ #include <QTextCodec>
++#include <QThread>
+ #include <QTranslator>
+ 
+ #include <iostream>
+ 
+ #include <unistd.h>
+ #include <fcntl.h>
+ 
+ #if defined (HAVE_SYS_IOCTL_H)
+ #include <sys/ioctl.h>
+ #endif
+ 
+ #include "lo-utils.h"
+ #include "oct-env.h"
+ #include "oct-syscalls.h"
+ #include "syswait.h"
+ 
++#include "octave.h"
+ #include "sighandlers.h"
+ 
+ #include "welcome-wizard.h"
+ #include "resource-manager.h"
+ #include "main-window.h"
+ #include "octave-gui.h"
+ 
++// Allow the Octave interpreter to start as in CLI mode with a
++// QApplication context so that it can use Qt for things like plotting
++// and UI widgets.
++
++class octave_cli_thread : public QThread
++{
++public:
++
++  octave_cli_thread (int argc, char **argv)
++    : m_argc (argc), m_argv (argv), m_result (0) { }
++
++  int result (void) const { return m_result; }
++
++protected:
++
++  void run (void)
++  {
++    octave_initialize_interpreter (m_argc, m_argv, 0);
++
++    m_result = octave_execute_interpreter ();
++
++    QApplication::exit (m_result);
++  }
++
++private:
++
++  int m_argc;
++  char** m_argv;
++  int m_result;
++};
++
+ 
+ // Custom message handler for filtering some messages from Qt.
+ 
+ void message_handler (QtMsgType type, const char *msg)
+  {
+    switch (type)
+      {
+      case QtDebugMsg:
+@@ -73,109 +106,80 @@ void message_handler (QtMsgType type, co
+        std::cerr << "Fatal: " << msg << std::endl;
+        abort ();
+ 
+      default:
+        break;
+      }
+  }
+ 
+-
+-// Dissociate from the controlling terminal, if any.
++// If START_GUI is false, we still set up the QApplication so that we
++// can use Qt widgets for plot windows.
+ 
+-static void
+-dissociate_terminal (void)
++int
++octave_start_gui (int argc, char *argv[], bool start_gui)
+ {
+-#if ! (defined (__WIN32__) || defined (__APPLE__)) || defined (__CYGWIN__)
+- 
+-  pid_t pid = fork ();
++  qInstallMsgHandler (message_handler);
+ 
+-  if (pid < 0)
++  QApplication application (argc, argv);
++
++  if (start_gui)
+     {
+-      std::cerr << "fork failed!" << std::endl;;
+-      exit (1);
+-    }
+-  else if (pid == 0)
+-    {
+-      // Child.
++      // Set the codec for all strings
++      QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
++
++      // install translators for the gui and qt text
++      QTranslator gui_tr, qt_tr, qsci_tr;
++      resource_manager::config_translators (&qt_tr,&qsci_tr,&gui_tr);
++      application.installTranslator (&qt_tr);
++      application.installTranslator (&qsci_tr);
++      application.installTranslator (&gui_tr);
++
++      while (true)
++        {
++          if (resource_manager::is_first_run ())
++            {
++              welcome_wizard welcomeWizard;
++              welcomeWizard.exec ();
++              resource_manager::reload_settings ();
++            }
++          else
++            {
++              // update network-settings
++              resource_manager::update_network_settings ();
+ 
+-      if (setsid () < 0)
+-        {
+-          std::cerr << "setsid error" << std::endl;
+-          exit (1);
++#if ! defined (__WIN32__) || defined (__CYGWIN__)
++              // If we were started from a launcher, TERM might not be
++              // defined, but we provide a terminal with xterm
++              // capabilities.
++
++              std::string term = octave_env::getenv ("TERM");
++
++              if (term.empty ())
++                octave_env::putenv ("TERM", "xterm");
++#else
++              std::string term = octave_env::getenv ("TERM");
++
++              if (term.empty ())
++                octave_env::putenv ("TERM", "cygwin");
++#endif
++
++              // create main window, read settings, and show window
++              main_window w;
++              w.read_settings ();  // get widget settings and window layout
++              w.focus_command_window ();
++              w.connect_visibility_changed (); // connect signals for changes in
++              // visibility not before w is shown
++              return application.exec ();
++            }
+         }
+     }
+   else
+     {
+-      // Parent
+-
+-      install_gui_driver_signal_handlers (pid);
+-
+-      int status;
+-
+-      waitpid (pid, &status, 0);
+-
+-      exit (octave_wait::ifexited (status)
+-            ? octave_wait::exitstatus (status) : 127);
+-    }
+-
+-#endif
+-}
++      octave_cli_thread main_thread (argc, argv);
+ 
+-int
+-octave_start_gui (int argc, char *argv[], bool fork)
+-{
+-  if (fork)
+-    dissociate_terminal ();
+-
+-  qInstallMsgHandler (message_handler);
+-
+-  QApplication application (argc, argv);
+-
+-  // Set the codec for all strings
+-  QTextCodec::setCodecForCStrings(QTextCodec::codecForName("UTF-8"));
+-
+-  // install translators for the gui and qt text
+-  QTranslator gui_tr, qt_tr, qsci_tr;
+-  resource_manager::config_translators (&qt_tr,&qsci_tr,&gui_tr);
+-  application.installTranslator (&qt_tr);
+-  application.installTranslator (&qsci_tr);
+-  application.installTranslator (&gui_tr);
++      application.setQuitOnLastWindowClosed (false);
+ 
+-  while (true)
+-    {
+-      if (resource_manager::is_first_run ())
+-        {
+-          welcome_wizard welcomeWizard;
+-          welcomeWizard.exec ();
+-          resource_manager::reload_settings ();
+-        }
+-      else
+-        {
+-          // update network-settings
+-          resource_manager::update_network_settings ();
+-
+-#if ! defined (__WIN32__) || defined (__CYGWIN__)
+-          // If we were started from a launcher, TERM might not be
+-          // defined, but we provide a terminal with xterm
+-          // capabilities.
++      main_thread.start ();
+ 
+-          std::string term = octave_env::getenv ("TERM");
+-
+-          if (term.empty ())
+-            octave_env::putenv ("TERM", "xterm");
+-#else
+-          std::string term = octave_env::getenv ("TERM");
+-
+-          if (term.empty ())
+-            octave_env::putenv ("TERM", "cygwin");
+-#endif
+-
+-          // create main window, read settings, and show window
+-          main_window w;
+-          w.read_settings ();  // get widget settings and window layout
+-          w.focus_command_window ();
+-          w.connect_visibility_changed (); // connect signals for changes in
+-                                           // visibility not before w is shown
+-          return application.exec ();
+-        }
++      return application.exec ();
+     }
+ }
+diff --git a/libgui/src/octave-gui.h b/libgui/src/octave-gui.h
+--- a/libgui/src/octave-gui.h
++++ b/libgui/src/octave-gui.h
+@@ -19,11 +19,11 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if !defined (octave_octave_gui_h)
+ #define octave_octave_gui_h 1
+ 
+ extern OCTGUI_API int octave_start_gui (int argc, char **argv,
+-                                        bool fork = true);
++                                        bool start_gui = true);
+ 
+ #endif
+diff --git a/libinterp/corefcn/sighandlers.cc b/libinterp/corefcn/sighandlers.cc
+--- a/libinterp/corefcn/sighandlers.cc
++++ b/libinterp/corefcn/sighandlers.cc
+@@ -572,147 +572,16 @@ install_signal_handlers (void)
+ #endif
+ 
+ #ifdef SIGXFSZ
+   octave_set_signal_handler (SIGXFSZ, generic_sig_handler);
+ #endif
+ 
+ }
+ 
+-static pid_t gui_pid = 0;
+-
+-static void
+-gui_driver_sig_handler (int sig)
+-{
+-  if (gui_pid > 0)
+-    octave_syscalls::kill (gui_pid, sig);
+-}
+-
+-void
+-install_gui_driver_signal_handlers (pid_t pid)
+-{
+-  gui_pid = pid;
+-
+-#ifdef SIGINT
+-  octave_set_signal_handler (SIGINT, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGBREAK
+-  octave_set_signal_handler (SIGBREAK, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGABRT
+-  octave_set_signal_handler (SIGABRT, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGALRM
+-  octave_set_signal_handler (SIGALRM, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGBUS
+-  octave_set_signal_handler (SIGBUS, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGCHLD
+-  // SIGCLD
+-  // SIGCONT
+-
+-#ifdef SIGEMT
+-  octave_set_signal_handler (SIGEMT, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGFPE
+-  octave_set_signal_handler (SIGFPE, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGHUP
+-  octave_set_signal_handler (SIGHUP, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGILL
+-  octave_set_signal_handler (SIGILL, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGINFO
+-  // SIGINT
+-
+-#ifdef SIGIOT
+-  octave_set_signal_handler (SIGIOT, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGLOST
+-  octave_set_signal_handler (SIGLOST, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGPIPE
+-  octave_set_signal_handler (SIGPIPE, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGPOLL
+-  octave_set_signal_handler (SIGPOLL, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGPROF
+-  // SIGPWR
+-
+-#ifdef SIGQUIT
+-  octave_set_signal_handler (SIGQUIT, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGSEGV
+-  octave_set_signal_handler (SIGSEGV, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGSTOP
+-
+-#ifdef SIGSYS
+-  octave_set_signal_handler (SIGSYS, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGTERM
+-  octave_set_signal_handler (SIGTERM, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGTRAP
+-  octave_set_signal_handler (SIGTRAP, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGTSTP
+-  // SIGTTIN
+-  // SIGTTOU
+-  // SIGURG
+-
+-#ifdef SIGUSR1
+-  octave_set_signal_handler (SIGUSR1, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGUSR2
+-  octave_set_signal_handler (SIGUSR2, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGVTALRM
+-  octave_set_signal_handler (SIGVTALRM, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGIO
+-  octave_set_signal_handler (SIGIO, gui_driver_sig_handler);
+-#endif
+-
+-  // SIGWINCH
+-
+-#ifdef SIGXCPU
+-  octave_set_signal_handler (SIGXCPU, gui_driver_sig_handler);
+-#endif
+-
+-#ifdef SIGXFSZ
+-  octave_set_signal_handler (SIGXFSZ, gui_driver_sig_handler);
+-#endif
+-
+-}
+-
+ static octave_scalar_map
+ make_sig_struct (void)
+ {
+   octave_scalar_map m;
+ 
+ #ifdef SIGABRT
+   m.assign ("ABRT", SIGABRT);
+ #endif
+diff --git a/libinterp/corefcn/sighandlers.h b/libinterp/corefcn/sighandlers.h
+--- a/libinterp/corefcn/sighandlers.h
++++ b/libinterp/corefcn/sighandlers.h
+@@ -66,18 +66,16 @@ extern int pipe_handler_error_count;
+ // TRUE means we can be interrupted.
+ extern OCTINTERP_API bool can_interrupt;
+ 
+ extern OCTINTERP_API sig_handler *octave_set_signal_handler (int, sig_handler *,
+                                                bool restart_syscalls = true);
+ 
+ extern OCTINTERP_API void install_signal_handlers (void);
+ 
+-extern OCTINTERP_API void install_gui_driver_signal_handlers (pid_t pid);
+-
+ extern OCTINTERP_API void octave_signal_handler (void);
+ 
+ extern OCTINTERP_API octave_interrupt_handler octave_catch_interrupts (void);
+ 
+ extern OCTINTERP_API octave_interrupt_handler octave_ignore_interrupts (void);
+ 
+ extern OCTINTERP_API octave_interrupt_handler
+ octave_set_interrupt_handler (const volatile octave_interrupt_handler&,
+diff --git a/libinterp/octave.cc b/libinterp/octave.cc
+--- a/libinterp/octave.cc
++++ b/libinterp/octave.cc
+@@ -123,20 +123,16 @@ static bool inhibit_startup_message = fa
+ // If TRUE, print verbose info in some cases.
+ // (--verbose; -V)
+ static bool verbose_flag = false;
+ 
+ // If TRUE, force the GUI to start.
+ // (--force-gui)
+ static bool force_gui_option = false;
+ 
+-// If TRUE don't fork when starting the GUI.
+-// (--no-fork)
+-static bool no_fork_option = false;
+-
+ // If TRUE don't start the GUI.
+ // (--no-gui)
+ static bool no_gui_option = false;
+ 
+ // If TRUE, force readline command line editing.
+ // (--line-editing)
+ static bool forced_line_editing = false;
+ 
+@@ -642,20 +638,16 @@ octave_process_command_line (int argc, c
+         case DEBUG_JIT_OPTION:
+           Fdebug_jit (octave_value (true));
+           break;
+ 
+         case LINE_EDITING_OPTION:
+           forced_line_editing = true;
+           break;
+ 
+-        case NO_FORK_OPTION:
+-          no_fork_option = true;
+-          break;
+-
+         case NO_GUI_OPTION:
+           no_gui_option = true;
+           break;
+ 
+         case NO_INIT_FILE_OPTION:
+           read_init_files = false;
+           break;
+ 
+@@ -933,36 +925,16 @@ check_starting_gui (void)
+ 
+ int
+ octave_starting_gui (void)
+ {
+   start_gui = check_starting_gui ();
+   return start_gui;
+ }
+ 
+-int
+-octave_fork_gui (void)
+-{
+-  bool have_ctty = false;
+-
+-#if ! (defined (__WIN32__) || defined (__APPLE__)) || defined (__CYGWIN__)
+-
+-#if defined (HAVE_CTERMID)
+-  const char *ctty = ctermid (0);
+-#else
+-  const char *ctty = "/dev/tty";
+-#endif
+-
+-  have_ctty = gnulib::open (ctty, O_RDWR, 0) > 0;
+-
+-#endif
+-
+-  return (have_ctty && ! no_fork_option);
+-}
+-
+ DEFUN (isguirunning, args, ,
+   "-*- texinfo -*-\n\
+ @deftypefn {Built-in Function} {} isguirunning ()\n\
+ Return true if Octave is running in GUI mode and false otherwise.\n\
+ @end deftypefn")
+ {
+   octave_value retval;
+ 
+diff --git a/libinterp/options-usage.h b/libinterp/options-usage.h
+--- a/libinterp/options-usage.h
++++ b/libinterp/options-usage.h
+@@ -28,21 +28,21 @@ along with Octave; see the file COPYING.
+ #include "version.h"
+ 
+ // Usage message
+ static const char *usage_string =
+   "octave [-HVWdfhiqvx] [--debug] [--debug-jit] [--doc-cache-file file]\n\
+        [--echo-commands] [--eval CODE] [--exec-path path]\n\
+        [--force-gui] [--help] [--image-path path]\n\
+        [--info-file file] [--info-program prog] [--interactive]\n\
+-       [--line-editing] [--no-fork] [--no-gui] [--no-history]\n\
+-       [--no-init-file] [--no-init-path] [--no-jit-compiler]\n\
+-       [--no-line-editing] [--no-site-file] [--no-window-system]\n\
+-       [--norc] [-p path] [--path path] [--persist] [--silent]\n\
+-       [--traditional] [--verbose] [--version] [file]";
++       [--line-editing] [--no-gui] [--no-history] [--no-init-file]\n\
++       [--no-init-path] [--no-jit-compiler] [--no-line-editing]\n\
++       [--no-site-file] [--no-window-system] [--norc] [-p path]\n\
++       [--path path] [--persist] [--silent] [--traditional]\n\
++       [--verbose] [--version] [file]";
+ 
+ // This is here so that it's more likely that the usage message and
+ // the real set of options will agree.  Note: the '+' must come first
+ // to prevent getopt from permuting arguments!
+ static const char *short_opts = "+HWVdfhip:qvx";
+ 
+ // Long options.  See the comments in getopt.h for the meanings of the
+ // fields in this structure.
+@@ -51,43 +51,41 @@ static const char *short_opts = "+HWVdfh
+ #define EVAL_OPTION 3
+ #define EXEC_PATH_OPTION 4
+ #define FORCE_GUI_OPTION 5
+ #define IMAGE_PATH_OPTION 6
+ #define INFO_FILE_OPTION 7
+ #define INFO_PROG_OPTION 8
+ #define DEBUG_JIT_OPTION 9
+ #define LINE_EDITING_OPTION 10
+-#define NO_FORK_OPTION 11
+-#define NO_GUI_OPTION 12
+-#define NO_INIT_FILE_OPTION 13
+-#define NO_INIT_PATH_OPTION 14
+-#define NO_JIT_COMPILER_OPTION 15
+-#define NO_LINE_EDITING_OPTION 16
+-#define NO_SITE_FILE_OPTION 17
+-#define PERSIST_OPTION 18
+-#define TEXI_MACROS_FILE_OPTION 19
+-#define TRADITIONAL_OPTION 20
++#define NO_GUI_OPTION 11
++#define NO_INIT_FILE_OPTION 12
++#define NO_INIT_PATH_OPTION 13
++#define NO_JIT_COMPILER_OPTION 14
++#define NO_LINE_EDITING_OPTION 15
++#define NO_SITE_FILE_OPTION 16
++#define PERSIST_OPTION 17
++#define TEXI_MACROS_FILE_OPTION 18
++#define TRADITIONAL_OPTION 19
+ struct option long_opts[] = {
+   { "braindead",                no_argument,       0, TRADITIONAL_OPTION },
+   { "built-in-docstrings-file", required_argument, 0, BUILT_IN_DOCSTRINGS_FILE_OPTION },
+   { "debug",                    no_argument,       0, 'd' },
+   { "debug-jit",                no_argument,       0, DEBUG_JIT_OPTION },
+   { "doc-cache-file",           required_argument, 0, DOC_CACHE_FILE_OPTION },
+   { "echo-commands",            no_argument,       0, 'x' },
+   { "eval",                     required_argument, 0, EVAL_OPTION },
+   { "exec-path",                required_argument, 0, EXEC_PATH_OPTION },
+   { "force-gui",                no_argument,       0, FORCE_GUI_OPTION },
+   { "help",                     no_argument,       0, 'h' },
+   { "image-path",               required_argument, 0, IMAGE_PATH_OPTION },
+   { "info-file",                required_argument, 0, INFO_FILE_OPTION },
+   { "info-program",             required_argument, 0, INFO_PROG_OPTION },
+   { "interactive",              no_argument,       0, 'i' },
+   { "line-editing",             no_argument,       0, LINE_EDITING_OPTION },
+-  { "no-fork",                  no_argument,       0, NO_FORK_OPTION },
+   { "no-gui",                   no_argument,       0, NO_GUI_OPTION },
+   { "no-history",               no_argument,       0, 'H' },
+   { "no-init-file",             no_argument,       0, NO_INIT_FILE_OPTION },
+   { "no-init-path",             no_argument,       0, NO_INIT_PATH_OPTION },
+   { "no-jit-compiler",          no_argument,       0, NO_JIT_COMPILER_OPTION },
+   { "no-line-editing",          no_argument,       0, NO_LINE_EDITING_OPTION },
+   { "no-site-file",             no_argument,       0, NO_SITE_FILE_OPTION },
+   { "no-window-system",         no_argument,       0, 'W' },
+@@ -124,17 +122,16 @@ Options:\n\
+   --exec-path PATH        Set path for executing subprograms.\n\
+   --force-gui             Force graphical user interface to start.\n\
+   --help, -h,             Print short help message and exit.\n\
+   --image-path PATH       Add PATH to head of image search path.\n\
+   --info-file FILE        Use top-level info file FILE.\n\
+   --info-program PROGRAM  Use PROGRAM for reading info files.\n\
+   --interactive, -i       Force interactive behavior.\n\
+   --line-editing          Force readline use for command-line editing.\n\
+-  --no-fork               Don't fork when starting the graphical user interface.\n\
+   --no-gui                Disable the graphical user interface.\n\
+   --no-history, -H        Don't save commands to the history list\n\
+   --no-init-file          Don't read the ~/.octaverc or .octaverc files.\n\
+   --no-init-path          Don't initialize function search path.\n\
+   --no-jit-compiler       Disable the JIT compiler.\n\
+   --no-line-editing       Don't use readline for command-line editing.\n\
+   --no-site-file          Don't read the site-wide octaverc file.\n\
+   --no-window-system, -W  Disable window system, including graphics.\n\
+diff --git a/run-octave.in b/run-octave.in
+--- a/run-octave.in
++++ b/run-octave.in
+@@ -73,16 +73,17 @@ if [ $# -gt 0 ]; then
+     driver="strace -o octave.trace"
+     shift
+   elif [ "x$1" = "x-cli" ]; then
+     octave_executable="$builddir/src/octave-cli"
+     shift
+   fi
+ fi
+ 
++OCTAVE_BINDIR="$builddir/src" \
+ OCTAVE_SITE_INITFILE="$top_srcdir/scripts/startup/main-rcfile" \
+ OCTAVE_DEFAULT_QT_SETTINGS="$builddir/libgui/default-qt-settings" \
+ OCTAVE_LOCALE_DIR="$builddir/libgui/languages" \
+ OCTAVE_JAVA_DIR="$builddir/scripts/java" \
+   exec $builddir/libtool --mode=execute $driver \
+     "$octave_executable" --no-init-path --path="$LOADPATH" \
+     --image-path="$IMAGEPATH" --doc-cache-file="$DOCFILE" \
+     --built-in-docstrings-file="$BUILT_IN_DOCSTRINGS_FILE" \
+diff --git a/src/Makefile.am b/src/Makefile.am
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -31,63 +31,75 @@ AM_CPPFLAGS = \
+   -I$(top_builddir)/libinterp/corefcn -I$(top_srcdir)/libinterp/corefcn \
+   -I$(top_builddir)/libgnu -I$(top_srcdir)/libgnu
+ 
+ AM_CFLAGS += $(WARN_CFLAGS)
+ 
+ AM_CXXFLAGS += $(WARN_CXXFLAGS)
+ 
+ EXTRA_DIST = \
++  main.in.cc \
+   mkoctfile.in.cc \
+   mkoctfile.in.sh \
+   octave-config.in.cc \
+   octave-config.in.sh
+ 
+-DISTCLEANFILES =
++DISTCLEANFILES = \
++  main.cc
+ 
+ OCTAVE_BINARIES = \
+   octave \
+   octave-cli
+ 
++if AMCOND_BUILD_GUI
++  OCTAVE_BINARIES += octave-gui
++endif
++
+ OCTAVE_CORE_LIBS = \
+   $(top_builddir)/libinterp/liboctinterp.la \
+   $(top_builddir)/liboctave/liboctave.la
+ 
+ include ../libgui/link-deps.mk
+ 
++nodist_octave_SOURCES = main.cc
++
++octave_LDADD = \
++  $(top_builddir)/libgnu/libgnu.la \
++  $(GNULIB_LINK_DEPS)
++
++octave_LDFLAGS = \
++  $(NO_UNDEFINED_LDFLAG) \
++  $(OCTAVE_LINK_OPTS)
++
+ octave_cli_SOURCES = main-cli.cc
+ 
+ octave_cli_LDADD = \
+   $(OCTAVE_CORE_LIBS)
+   $(OCTAVE_LINK_DEPS)
+ 
+ octave_cli_LDFLAGS = \
+   $(NO_UNDEFINED_LDFLAG) \
+   $(OCTAVE_LINK_OPTS)
+ 
+ if AMCOND_BUILD_GUI
+-  octave_SOURCES = main.cc
++  octave_gui_SOURCES = main-gui.cc
+   OCTAVE_GUI_LIBS = $(top_builddir)/libgui/liboctgui.la
+   OCTAVE_GUI_CPPFLAGS = -I$(top_srcdir)/libgui/src
+-else
+-  octave_SOURCES = main-cli.cc
+-  OCTAVE_GUI_LIBS =
+-  OCTAVE_GUI_CPPFLAGS =
+ endif
+ 
+-octave_CPPFLAGS = \
++octave_gui_CPPFLAGS = \
+   $(AM_CPPFLAGS) \
+   $(OCTAVE_GUI_CPPFLAGS)
+ 
+-octave_LDADD = \
++octave_gui_LDADD = \
+   $(OCTAVE_GUI_LIBS) \
+   $(OCTAVE_CORE_LIBS) \
+   $(OCTAVE_GUI_LINK_DEPS)
+ 
+-octave_LDFLAGS = \
++octave_gui_LDFLAGS = \
+   $(NO_UNDEFINED_LDFLAG) \
+   $(OCTAVE_GUI_LINK_OPTS)
+ 
+ if AMCOND_BUILD_COMPILED_AUX_PROGRAMS
+ bin_PROGRAMS = \
+   $(OCTAVE_BINARIES) \
+   mkoctfile \
+   octave-config
+@@ -126,16 +138,22 @@ octave-config: octave-config.in.sh Makef
+ 	@$(do_subst_default_vals)
+ 	chmod a+rx $@
+ 
+ mkoctfile: mkoctfile.in.sh Makefile
+ 	@$(do_subst_config_vals)
+ 	chmod a+rx $@
+ endif
+ 
++## main.cc must depend on Makefile.  Calling configure may change
++## default/config values.  However, calling configure will also 
++## regenerate the Makefiles from Makefile.am and trigger the rules below.
++main.cc: main.in.cc Makefile
++	@$(do_subst_default_vals)
++
+ install-exec-hook: make-version-links
+ 
+ uninstall-local: remove-version-links
+ 
+ make-version-links:
+ 	cd $(DESTDIR)$(bindir) && \
+ 	for f in $(basename $(bin_PROGRAMS)); do \
+ 	  mv $$f$(EXEEXT) $$f-$(version)$(EXEEXT) && \
+diff --git a/src/main.cc b/src/main-gui.cc
+rename from src/main.cc
+rename to src/main-gui.cc
+--- a/src/main.cc
++++ b/src/main-gui.cc
+@@ -27,46 +27,18 @@ along with Octave; see the file COPYING.
+ #include "defaults.h"
+ #include "octave.h"
+ #include "octave-gui.h"
+ #include "sysdep.h"
+ 
+ int
+ main (int argc, char **argv)
+ {
+-  int retval = 0;
+-
+   octave_process_command_line (argc, argv);
+ 
+   sysdep_init ();
+ 
+   install_defaults ();
+ 
+-  if (octave_starting_gui ())
+-    retval = octave_start_gui (argc, argv, octave_fork_gui ());
+-  else
+-    {
+-      octave_initialize_interpreter (argc, argv, 0);
+-
+-      retval = octave_execute_interpreter ();
+-    }
+-
+-  return retval;
+-}
+-
++  bool start_gui = octave_starting_gui ();
+ 
+-/*!
+-@mainpage Source code documentation for GNU Octave
+-
+-GNU Octave is a high-level language, primarily intended for numerical
+-computations.  It provides a convenient interactive command line
+-interface for solving linear and nonlinear problems numerically, and
+-for performing other numerical experiments.  It may also be used as a
+-batch-oriented language for data processing.
+-
+-GNU Octave is free software. You may redistribute it and/or modify it
+-under the terms of the <a href="http://www.gnu.org/licenses/">GNU
+-General Public License</a> as published by the Free Software Foundation.
+-
+-This is the developer documentation for Octave's own source code. It is
+-intended to help for hacking Octave. It may also be useful for
+-understanding the Octave API when writing your own .oct files.
+-*/
++  return octave_start_gui (argc, argv, start_gui);
++}
+diff --git a/src/main.in.cc b/src/main.in.cc
+new file mode 100644
+--- /dev/null
++++ b/src/main.in.cc
+@@ -0,0 +1,442 @@
++// %NO_EDIT_WARNING%
++/*
++
++Copyright (C) 2012-2013 John W. Eaton
++
++This file is part of Octave.
++
++Octave is free software; you can redistribute it and/or modify it
++under the terms of the GNU General Public License as published by the
++Free Software Foundation; either version 3 of the License, or (at your
++option) any later version.
++
++Octave is distributed in the hope that it will be useful, but WITHOUT
++ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
++for more details.
++
++You should have received a copy of the GNU General Public License
++along with Octave; see the file COPYING.  If not, see
++<http://www.gnu.org/licenses/>.
++
++*/
++
++// NOTE: This program is supposed to be a small wrapper that exists
++// primarily to give up the controlling TTY and then exec Octave with
++// its GUI.  It may also execute Octave without the GUI or the command
++// line version of Octave that is not linked with GUI libraries.  So
++// that it remains small, it should NOT depend on or be linked with
++// liboctave or libinterp.
++
++#ifdef HAVE_CONFIG_H
++#include <config.h>
++#endif
++
++#include <cstdlib>
++#include <cstring>
++
++#include <algorithm>
++#include <iostream>
++#include <string>
++
++#include <sys/wait.h>
++#include <sys/types.h>
++#include <sys/signal.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#ifndef OCTAVE_BINDIR
++#define OCTAVE_BINDIR %OCTAVE_BINDIR%
++#endif
++
++#ifndef OCTAVE_PREFIX
++#define OCTAVE_PREFIX %OCTAVE_PREFIX%
++#endif
++
++typedef void sig_handler (int);
++
++// Forward signals to the GUI process.
++
++static pid_t gui_pid = 0;
++
++static void
++gui_driver_sig_handler (int sig)
++{
++  if (gui_pid > 0)
++    kill (gui_pid, sig);
++}
++
++static sig_handler *
++octave_set_signal_handler (int sig, sig_handler *handler)
++{
++  struct sigaction act, oact;
++
++  act.sa_handler = handler;
++  act.sa_flags = 0;
++
++  gnulib::sigemptyset (&act.sa_mask);
++  gnulib::sigemptyset (&oact.sa_mask);
++
++  gnulib::sigaction (sig, &act, &oact);
++
++  return oact.sa_handler;
++}
++
++static void
++install_signal_handlers (void)
++{
++
++#ifdef SIGINT
++  octave_set_signal_handler (SIGINT, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGBREAK
++  octave_set_signal_handler (SIGBREAK, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGABRT
++  octave_set_signal_handler (SIGABRT, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGALRM
++  octave_set_signal_handler (SIGALRM, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGBUS
++  octave_set_signal_handler (SIGBUS, gui_driver_sig_handler);
++#endif
++
++  // SIGCHLD
++  // SIGCLD
++  // SIGCONT
++
++#ifdef SIGEMT
++  octave_set_signal_handler (SIGEMT, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGFPE
++  octave_set_signal_handler (SIGFPE, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGHUP
++  octave_set_signal_handler (SIGHUP, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGILL
++  octave_set_signal_handler (SIGILL, gui_driver_sig_handler);
++#endif
++
++  // SIGINFO
++  // SIGINT
++
++#ifdef SIGIOT
++  octave_set_signal_handler (SIGIOT, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGLOST
++  octave_set_signal_handler (SIGLOST, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGPIPE
++  octave_set_signal_handler (SIGPIPE, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGPOLL
++  octave_set_signal_handler (SIGPOLL, gui_driver_sig_handler);
++#endif
++
++  // SIGPROF
++  // SIGPWR
++
++#ifdef SIGQUIT
++  octave_set_signal_handler (SIGQUIT, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGSEGV
++  octave_set_signal_handler (SIGSEGV, gui_driver_sig_handler);
++#endif
++
++  // SIGSTOP
++
++#ifdef SIGSYS
++  octave_set_signal_handler (SIGSYS, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGTERM
++  octave_set_signal_handler (SIGTERM, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGTRAP
++  octave_set_signal_handler (SIGTRAP, gui_driver_sig_handler);
++#endif
++
++  // SIGTSTP
++  // SIGTTIN
++  // SIGTTOU
++  // SIGURG
++
++#ifdef SIGUSR1
++  octave_set_signal_handler (SIGUSR1, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGUSR2
++  octave_set_signal_handler (SIGUSR2, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGVTALRM
++  octave_set_signal_handler (SIGVTALRM, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGIO
++  octave_set_signal_handler (SIGIO, gui_driver_sig_handler);
++#endif
++
++  // SIGWINCH
++
++#ifdef SIGXCPU
++  octave_set_signal_handler (SIGXCPU, gui_driver_sig_handler);
++#endif
++
++#ifdef SIGXFSZ
++  octave_set_signal_handler (SIGXFSZ, gui_driver_sig_handler);
++#endif
++
++}
++
++static int
++have_controlling_terminal (void)
++{
++  int retval = 0;
++
++#if ! (defined (__WIN32__) || defined (__APPLE__)) || defined (__CYGWIN__)
++
++#if defined (HAVE_CTERMID)
++  const char *ctty = ctermid (0);
++#else
++  const char *ctty = "/dev/tty";
++#endif
++
++  int fd = gnulib::open (ctty, O_RDWR, 0);
++
++  if (fd >= 0)
++    {
++      gnulib::close (fd);
++
++      retval = 1;
++    }
++
++#endif
++
++  return retval;
++}
++
++// Find the directory where the octave binary is supposed to be
++// installed.
++
++#if (defined (OCTAVE_HAVE_WINDOWS_FILESYSTEM) \
++     && ! defined (OCTAVE_HAVE_POSIX_FILESYSTEM))
++static const char dir_sep_char = '\\';
++#else
++static const char dir_sep_char = '/';
++#endif
++
++static std::string
++octave_getenv (const std::string& name)
++{
++  char *value = ::getenv (name.c_str ());
++
++  return value ? value : "";
++}
++
++static std::string
++get_octave_home (void)
++{
++  std::string oh = octave_getenv ("OCTAVE_HOME");
++
++  return oh.empty () ? std::string (OCTAVE_PREFIX) : oh;
++}
++
++static std::string
++subst_octave_home (const std::string& s)
++{
++  std::string retval;
++
++  std::string octave_home = get_octave_home ();
++
++  std::string prefix = OCTAVE_PREFIX;
++
++  retval = s;
++
++  if (octave_home != prefix)
++    {
++      octave_idx_type len = prefix.length ();
++
++      if (s.substr (0, len) == prefix)
++        retval.replace (0, len, octave_home);
++    }
++
++  if (dir_sep_char != '/')
++    std::replace (retval.begin (), retval.end (), '/', dir_sep_char);
++
++  return retval;
++}
++
++static std::string
++get_octave_bindir (void)
++{
++  // Accept value from the environment literally, but substitute
++  // OCTAVE_HOME in the configuration value OCTAVE_BINDIR in case Octave
++  // has been relocated to some installation directory other than the
++  // one originally configured.
++
++  std::string obd = octave_getenv ("OCTAVE_BINDIR");
++
++  return obd.empty () ? subst_octave_home (std::string (OCTAVE_BINDIR)) : obd;
++}
++
++static int
++octave_exec (const std::string& file, char **argv)
++{
++  execv (file.c_str (), argv);
++
++  std::cerr << "octave: failed to exec '" << file << "'" << std::endl;
++
++  return 1;
++}
++
++static char *
++strsave (const char *s)
++{
++  if (! s)
++    return 0;
++
++  int len = strlen (s);
++  char *tmp = new char [len+1];
++  tmp = strcpy (tmp, s);
++  return tmp;
++}
++
++int
++main (int argc, char **argv)
++{
++  int retval = 0;
++
++  bool start_gui = true;
++  bool cli_only = false;
++
++#if defined (__WIN32__) || defined (__CYGWIN__)
++  bool no_fork_required = true;
++#else
++  bool no_fork_required = false;
++#endif
++
++  std::string octave_bindir = get_octave_bindir ();
++
++  std::string file = octave_bindir + dir_sep_char + "octave-gui";
++
++  char **new_argv = new char * [argc + 1];
++
++  int k = 0;
++  new_argv[k++] = strsave ("octave");
++
++  for (int i = 1; i < argc; i++)
++    {
++      if (! strcmp (argv[i], "--no-gui-libs"))
++        {
++          // Run the version of Octave that is not linked with any GUI
++          // libraries.  It may not be possible to do plotting or any
++          // ui* calls, but it will be a little faster to start and
++          // require less memory.  Don't pass the --no-gui-libs option
++          // on as that option is not recognized by Octave.
++
++          cli_only = true;
++          file = octave_bindir + dir_sep_char + "octave-cli";
++        }
++      else if (! strcmp (argv[i], "--no-gui"))
++        {
++          // If we see this option, then we can just exec octave; we
++          // don't have to create a child process and wait for it to
++          // exit.  But do exec "octave", not "octave-cli", because even
++          // if the --no-gui option is given, we may be asked to do some
++          // plotting or ui* calls.
++
++          start_gui = false;
++          new_argv[k++] = argv[i];
++        }
++      else
++        new_argv[k++] = argv[i];
++    }
++
++  new_argv[k] = 0;
++
++  if (cli_only || no_fork_required
++      || (! start_gui && ! have_controlling_terminal ()))
++    {
++      retval = octave_exec (file, new_argv);
++    }
++  else
++    {
++      install_signal_handlers ();
++
++      gui_pid = fork ();
++
++      if (gui_pid < 0)
++        {
++          std::cerr << "octave: fork failed!" << std::endl;
++
++          retval = 1;
++        }
++      else if (gui_pid == 0)
++        {
++          // Child.
++
++          if (setsid () < 0)
++            {
++              std::cerr << "octave: error calling setsid!" << std::endl;
++
++              retval = 1;
++            }
++
++          retval = octave_exec (file, new_argv);
++        }
++      else
++        {
++          // Parent.  Forward signals to the child while waiting for it
++          // to exit.
++
++          int status;
++
++          while (1)
++            {
++              waitpid (gui_pid, &status, 0);
++
++              if (WIFEXITED (status))
++                {
++                  retval = WIFEXITED (status) ? WEXITSTATUS (status) : 127;
++
++                  break;
++                }
++            }
++        }
++    }
++
++  return retval;
++}
++
++/*!
++@mainpage Source code documentation for GNU Octave
++
++GNU Octave is a high-level language, primarily intended for numerical
++computations.  It provides a convenient interactive command line
++interface for solving linear and nonlinear problems numerically, and
++for performing other numerical experiments.  It may also be used as a
++batch-oriented language for data processing.
++
++GNU Octave is free software. You may redistribute it and/or modify it
++under the terms of the <a href="http://www.gnu.org/licenses/">GNU
++General Public License</a> as published by the Free Software Foundation.
++
++This is the developer documentation for Octave's own source code. It is
++intended to help for hacking Octave. It may also be useful for
++understanding the Octave API when writing your own .oct files.
++*/

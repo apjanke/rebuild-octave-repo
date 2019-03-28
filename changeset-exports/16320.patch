@@ -1,0 +1,570 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1363413763 14400
+#      Sat Mar 16 02:02:43 2013 -0400
+# Node ID 09f0cb9cac7de0f3dbf662c2ff1951adad9fec28
+# Parent  54c4b4b58a2430c449c57ade713eb916cc141213
+don't modify symbol table scope in the parser
+
+* symtab.h (symbol_table::insert): Accept scope as argument.
+* lex.h (symbol_table_context): New class.
+(octave_lexer::symtab_context: New data member.
+* parse-private.h: Delete.
+* parse.h, oct-parse.in.yy (parser_symtab_context): Delete global
+variable and all uses.
+* lex.ll (octave_lexer::reset): Clear symtab_context.
+(octave_base_lexer::handle_superclass_identifier,
+octave_base_lexer::handle_meta_identifier,
+octave_base_lexer::handle_identifier): Get current symbol table scope
+for parsing from symtab_context.  Use it to insert new variables in
+the symbol table.
+* oct-parse.in.yy (ABORT_PARSE): Don't pop symtab_context.
+(push_fcn_symtab, param_list_beg): Push newly allocated scope on the
+symtab_context stack.  Don't modify symbol table scope.
+(make_anon_fcn_handle): Get function scope from symtab_context instead
+of the symbol table.  Pop symtab_context.
+(start_function):  Get function scope from symtab_context instead
+of the symbol table.
+(octave_base_parser::recover_from_parsing_function):
+Pop symtab_context.
+
+diff --git a/libinterp/interpfcn/symtab.h b/libinterp/interpfcn/symtab.h
+--- a/libinterp/interpfcn/symtab.h
++++ b/libinterp/interpfcn/symtab.h
+@@ -1166,21 +1166,22 @@ public:
+   find (const std::string& name,
+         const octave_value_list& args = octave_value_list (),
+         bool skip_variables = false,
+         bool local_funcs = true);
+ 
+   static octave_value builtin_find (const std::string& name);
+ 
+   // Insert a new name in the table.
+-  static symbol_record& insert (const std::string& name)
++  static symbol_record& insert (const std::string& name,
++                                scope_id scope = xcurrent_scope)
+   {
+     static symbol_record foobar;
+ 
+-    symbol_table *inst = get_instance (xcurrent_scope);
++    symbol_table *inst = get_instance (scope);
+ 
+     return inst ? inst->do_insert (name) : foobar;
+   }
+ 
+   static octave_value& varref (const std::string& name,
+                                scope_id scope = xcurrent_scope,
+                                context_id context = xdefault_context,
+                                bool force_add = false)
+diff --git a/libinterp/parse-tree/lex.h b/libinterp/parse-tree/lex.h
+--- a/libinterp/parse-tree/lex.h
++++ b/libinterp/parse-tree/lex.h
+@@ -38,16 +38,65 @@ extern bool is_keyword (const std::strin
+ 
+ // For communication between the lexer and parser.
+ 
+ class
+ lexical_feedback
+ {
+ public:
+ 
++  // Track symbol table information when parsing functions.
++
++  class symbol_table_context
++  {
++  public:
++
++    symbol_table_context (void)
++      : frame_stack (), init_scope (symbol_table::current_scope ())
++    {
++      push (init_scope);
++    }
++
++    void clear (void)
++    {
++      while (! frame_stack.empty ())
++        frame_stack.pop ();
++
++      push (init_scope);
++    }
++
++    bool empty (void) const { return frame_stack.empty (); }
++
++    void pop (void)
++    {
++      frame_stack.pop ();
++    }
++
++    void push (symbol_table::scope_id scope)
++    {
++      frame_stack.push (scope);
++    }
++
++    void push (void)
++    {
++      push (symbol_table::current_scope ());
++    }
++
++    symbol_table::scope_id curr_scope (void) const
++    {
++      return frame_stack.top ();
++    }
++
++  private:
++
++    std::stack<symbol_table::scope_id> frame_stack;
++
++    symbol_table::scope_id init_scope;
++  };
++
+   // Track nesting of square brackets, curly braces, and parentheses.
+ 
+   class bbp_nesting_level
+   {
+   private:
+ 
+     enum bracket_type
+       {
+@@ -228,17 +277,17 @@ public:
+       reading_classdef_file (false),
+       input_line_number (1), current_input_column (1),
+       bracketflag (0), braceflag (0),
+       looping (0), defining_func (0), looking_at_function_handle (0),
+       block_comment_nesting_level (0), token_count (0),
+       current_input_line (), comment_text (), help_text (),
+       fcn_file_name (), fcn_file_full_name (), looking_at_object_index (),
+       parsed_function_name (), pending_local_variables (),
+-      nesting_level (), tokens ()
++      symtab_context (), nesting_level (), tokens ()
+   {
+     init ();
+   }
+ 
+   ~lexical_feedback (void);
+ 
+   void init (void);
+ 
+@@ -370,16 +419,19 @@ public:
+   // if the top of the stack is true, then we've already seen the name
+   // of the current function.  should only matter if
+   // current_function_level > 0
+   std::stack<bool> parsed_function_name;
+ 
+   // set of identifiers that might be local variable names.
+   std::set<std::string> pending_local_variables;
+ 
++  // Track current symbol table scope and context.
++  symbol_table_context symtab_context;
++
+   // is the closest nesting level a square bracket, squiggly brace,
+   // a paren, or an anonymous function body?
+   bbp_nesting_level nesting_level;
+ 
+   // Tokens generated by the lexer.
+   token_cache tokens;
+ 
+ private:
+diff --git a/libinterp/parse-tree/lex.ll b/libinterp/parse-tree/lex.ll
+--- a/libinterp/parse-tree/lex.ll
++++ b/libinterp/parse-tree/lex.ll
+@@ -79,17 +79,16 @@ object) relevant global values before an
+ #include "comment-list.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "input.h"
+ #include "lex.h"
+ #include "ov.h"
+ #include "parse.h"
+-#include "parse-private.h"
+ #include "pt-all.h"
+ #include "symtab.h"
+ #include "token.h"
+ #include "toplev.h"
+ #include "utils.h"
+ #include "variables.h"
+ #include <oct-parse.h>
+ #include <oct-gperf.h>
+@@ -1617,17 +1616,17 @@ octave_base_lexer::init (void)
+   struct yyguts_t *yyg = static_cast<struct yyguts_t*> (scanner)
+ 
+ void
+ octave_base_lexer::reset (void)
+ {
+   // Start off on the right foot.
+   clear_start_state ();
+ 
+-  parser_symtab_context.clear ();
++  symtab_context.clear ();
+ 
+   // We do want a prompt by default.
+   promptflag (1);
+ 
+   // Only ask for input from stdin if we are expecting interactive
+   // input.
+ 
+   if (! quitting_gracefully
+@@ -2398,21 +2397,24 @@ octave_base_lexer::handle_superclass_ide
+   int kw_token = (is_keyword_token (meth) || is_keyword_token (cls)
+                   || is_keyword_token (pkg));
+   if (kw_token)
+     {
+       error ("method, class and package names may not be keywords");
+       return LEXICAL_ERROR;
+     }
+ 
+-  push_token (new token (SUPERCLASSREF,
+-                         meth.empty () ? 0 : &(symbol_table::insert (meth)),
+-                         cls.empty () ? 0 : &(symbol_table::insert (cls)),
+-                         pkg.empty () ? 0 : &(symbol_table::insert (pkg)),
+-                         input_line_number, current_input_column));
++  symbol_table::scope_id sid = symtab_context.curr_scope ();
++
++  push_token (new token
++              (SUPERCLASSREF,
++               meth.empty () ? 0 : &(symbol_table::insert (meth, sid)),
++               cls.empty () ? 0 : &(symbol_table::insert (cls, sid)),
++               pkg.empty () ? 0 : &(symbol_table::insert (pkg, sid)),
++               input_line_number, current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+ 
+   return SUPERCLASSREF;
+ }
+ 
+ int
+ octave_base_lexer::handle_meta_identifier (void)
+@@ -2430,20 +2432,23 @@ octave_base_lexer::handle_meta_identifie
+ 
+   int kw_token = is_keyword_token (cls) || is_keyword_token (pkg);
+   if (kw_token)
+     {
+        error ("class and package names may not be keywords");
+       return LEXICAL_ERROR;
+     }
+ 
+-  push_token (new token (METAQUERY,
+-                         cls.empty () ? 0 : &(symbol_table::insert (cls)),
+-                         pkg.empty () ? 0 : &(symbol_table::insert (pkg)),
+-                         input_line_number, current_input_column));
++  symbol_table::scope_id sid = symtab_context.curr_scope ();
++
++  push_token (new token
++              (METAQUERY,
++               cls.empty () ? 0 : &(symbol_table::insert (cls, sid)),
++               pkg.empty () ? 0 : &(symbol_table::insert (pkg, sid)),
++               input_line_number, current_input_column));
+ 
+   current_input_column += flex_yyleng ();
+ 
+   return METAQUERY;
+ }
+ 
+ // Figure out exactly what kind of token to return when we have seen
+ // an identifier.  Handles keywords.  Return -1 if the identifier
+@@ -2522,17 +2527,19 @@ octave_base_lexer::handle_identifier (vo
+     }
+ 
+   // Find the token in the symbol table.  Beware the magic
+   // transformation of the end keyword...
+ 
+   if (tok == "end")
+     tok = "__end__";
+ 
+-  token *tok_val = new token (NAME, &(symbol_table::insert (tok)),
++  symbol_table::scope_id sid = symtab_context.curr_scope ();
++
++  token *tok_val = new token (NAME, &(symbol_table::insert (tok, sid)),
+                               input_line_number, current_input_column);
+ 
+   if (at_beginning_of_statement
+       && (! (tok == "e"
+              || tok == "I" || tok == "i"
+              || tok == "J" || tok == "j"
+              || tok == "Inf" || tok == "inf"
+              || tok == "NaN" || tok == "nan")))
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -63,17 +63,16 @@ along with Octave; see the file COPYING.
+ #include "oct-hist.h"
+ #include "oct-map.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ #include "ov-null-mat.h"
+ #include "toplev.h"
+ #include "pager.h"
+ #include "parse.h"
+-#include "parse-private.h"
+ #include "pt-all.h"
+ #include "pt-eval.h"
+ #include "symtab.h"
+ #include "token.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ 
+@@ -93,19 +92,16 @@ octave_base_lexer *LEXER = 0;
+ #define fclose GNULIB_NAMESPACE::fclose
+ #define fprintf GNULIB_NAMESPACE::fprintf
+ #define malloc GNULIB_NAMESPACE::malloc
+ #endif
+ 
+ // TRUE means we printed messages about reading startup files.
+ bool reading_startup_message_printed = false;
+ 
+-// Keep track of symbol table information when parsing functions.
+-symtab_context parser_symtab_context;
+-
+ // List of autoloads (function -> file mapping).
+ static std::map<std::string, std::string> autoload_map;
+ 
+ // Forward declarations for some functions defined at the bottom of
+ // the file.
+ 
+ static void yyerror (octave_base_parser& parser, const char *s);
+ 
+@@ -118,19 +114,17 @@ make_statement (T *arg)
+ 
+   return new tree_statement (arg, comment);
+ }
+ 
+ #define ABORT_PARSE \
+   do \
+     { \
+       yyerrok; \
+-      if (! parser_symtab_context.empty ()) \
+-        parser_symtab_context.pop (); \
+-      if ((interactive || forced_interactive)   \
++      if ((interactive || forced_interactive) \
+           && ! lexer.input_from_eval_string ()) \
+         YYACCEPT; \
+       else \
+         YYABORT; \
+     } \
+   while (0)
+ 
+ #define lexer parser.lexer
+@@ -995,26 +989,26 @@ except_command  : UNWIND stash_comment o
+ 
+ push_fcn_symtab : // empty
+                   {
+                     parser.curr_fcn_depth++;
+ 
+                     if (parser.max_fcn_depth < parser.curr_fcn_depth)
+                       parser.max_fcn_depth = parser.curr_fcn_depth;
+ 
+-                    parser_symtab_context.push ();
+-
+-                    symbol_table::set_scope (symbol_table::alloc_scope ());
+-
+-                    parser.function_scopes.push_back (symbol_table::current_scope ());
++                    lexer.symtab_context.push (symbol_table::alloc_scope ());
++
++                    parser.function_scopes.push_back
++                     (lexer.symtab_context.curr_scope ());
+ 
+                     if (! lexer.reading_script_file
+                         && parser.curr_fcn_depth == 1
+                         && ! parser.parsing_subfunctions)
+-                      parser.primary_fcn_scope = symbol_table::current_scope ();
++                      parser.primary_fcn_scope
++                        = lexer.symtab_context.curr_scope ();
+ 
+                     if (lexer.reading_script_file
+                         && parser.curr_fcn_depth > 1)
+                       parser.bison_error ("nested functions not implemented in this context");
+                   }
+                 ;
+ 
+ // ===========================
+@@ -1022,18 +1016,17 @@ push_fcn_symtab : // empty
+ // ===========================
+ 
+ param_list_beg  : '('
+                   {
+                     lexer.looking_at_parameter_list = true;
+ 
+                     if (lexer.looking_at_function_handle)
+                       {
+-                        parser_symtab_context.push ();
+-                        symbol_table::set_scope (symbol_table::alloc_scope ());
++                        lexer.symtab_context.push (symbol_table::alloc_scope ());
+                         lexer.looking_at_function_handle--;
+                         lexer.looking_at_anon_fcn_args = true;
+                       }
+                   }
+                 ;
+ 
+ param_list_end  : ')'
+                   {
+@@ -1887,22 +1880,22 @@ octave_base_parser::make_anon_fcn_handle
+                                           tree_statement *stmt)
+ {
+   // FIXME -- need to get these from the location of the @ symbol.
+   int l = lexer.input_line_number;
+   int c = lexer.current_input_column;
+ 
+   tree_parameter_list *ret_list = 0;
+ 
+-  symbol_table::scope_id fcn_scope = symbol_table::current_scope ();
+-
+-  if (parser_symtab_context.empty ())
++  symbol_table::scope_id fcn_scope = lexer.symtab_context.curr_scope ();
++
++  if (lexer.symtab_context.empty ())
+     panic_impossible ();
+ 
+-  parser_symtab_context.pop ();
++  lexer.symtab_context.pop ();
+ 
+   stmt->set_print_flag (false);
+ 
+   tree_statement_list *body = new tree_statement_list (stmt);
+ 
+   body->mark_as_anon_function_body ();
+ 
+   tree_anon_fcn_handle *retval
+@@ -2574,17 +2567,17 @@ octave_base_parser::start_function (tree
+   // We'll fill in the return list later.
+ 
+   if (! body)
+     body = new tree_statement_list ();
+ 
+   body->append (end_fcn_stmt);
+ 
+   octave_user_function *fcn
+-    = new octave_user_function (symbol_table::current_scope (),
++    = new octave_user_function (lexer.symtab_context.curr_scope (),
+                                 param_list, 0, body);
+ 
+   if (fcn)
+     {
+       octave_comment_list *tc = octave_comment_buffer::get_comment ();
+ 
+       fcn->stash_trailing_comment (tc);
+     }
+@@ -2765,20 +2758,20 @@ octave_base_parser::finish_function (tre
+     }
+ 
+   return retval;
+ }
+ 
+ void
+ octave_base_parser::recover_from_parsing_function (void)
+ {
+-  if (parser_symtab_context.empty ())
++  if (lexer.symtab_context.empty ())
+     panic_impossible ();
+ 
+-  parser_symtab_context.pop ();
++  lexer.symtab_context.pop ();
+ 
+   if (lexer.reading_fcn_file && curr_fcn_depth == 1
+       && ! parsing_subfunctions)
+     parsing_subfunctions = true;
+ 
+   curr_fcn_depth--;
+   function_scopes.pop_back ();
+ 
+diff --git a/libinterp/parse-tree/parse-private.h b/libinterp/parse-tree/parse-private.h
+deleted file mode 100644
+--- a/libinterp/parse-tree/parse-private.h
++++ /dev/null
+@@ -1,96 +0,0 @@
+-/*
+-
+-Copyright (C) 2012 John W. Eaton
+-
+-This file is part of Octave.
+-
+-Octave is free software; you can redistribute it and/or modify it
+-under the terms of the GNU General Public License as published by the
+-Free Software Foundation; either version 3 of the License, or (at your
+-option) any later version.
+-
+-Octave is distributed in the hope that it will be useful, but WITHOUT
+-ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+-FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+-for more details.
+-
+-You should have received a copy of the GNU General Public License
+-along with Octave; see the file COPYING.  If not, see
+-<http://www.gnu.org/licenses/>.
+-
+-*/
+-
+-#if !defined (octave_parse_private_h)
+-#define octave_parse_private_h 1
+-
+-#include <stack>
+-
+-#include "symtab.h"
+-
+-// Keep track of symbol table information when parsing functions.
+-class symtab_context
+-{
+-private:
+-
+-  class frame
+-  {
+-  public:
+-    frame (symbol_table::scope_id s, symbol_table::scope_id c)
+-      : m_scope (s), m_context (c) { }
+-
+-    frame (const frame& f) : m_scope (f.m_scope), m_context (f.m_context) { }
+-
+-    frame& operator = (const frame& f)
+-    {
+-      if (&f != this)
+-        {
+-          m_scope = f.m_scope;
+-          m_context = f.m_context;
+-        }
+-
+-      return *this;
+-    }
+-
+-    ~frame (void) { }
+-
+-    symbol_table::scope_id scope (void) const { return m_scope; }
+-    symbol_table::scope_id context (void) const { return m_context; }
+-
+-  private:
+-
+-    symbol_table::scope_id m_scope;
+-    symbol_table::scope_id m_context;
+-  };
+-
+-  std::stack<frame> frame_stack;
+-
+-public:
+-  symtab_context (void) : frame_stack () { }
+-
+-  void clear (void)
+-  {
+-    while (! frame_stack.empty ())
+-      frame_stack.pop ();
+-  }
+-
+-  bool empty (void) const { return frame_stack.empty (); }
+-
+-  void pop (void)
+-  {
+-    frame tmp = frame_stack.top ();
+-
+-    symbol_table::set_scope_and_context (tmp.scope (), tmp.context ());
+-
+-    frame_stack.pop ();
+-  }
+-
+-  void push (void)
+-  {
+-    frame_stack.push (frame (symbol_table::current_scope (),
+-                             symbol_table::current_context ()));
+-  }
+-};
+-
+-extern symtab_context parser_symtab_context;
+-
+-#endif

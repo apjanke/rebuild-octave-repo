@@ -1,0 +1,3759 @@
+# HG changeset patch
+# User John W. Eaton <jwe@octave.org>
+# Date 1496815985 14400
+#      Wed Jun 07 02:13:05 2017 -0400
+# Node ID 14723784b9f25ebf1ad2ea9bc6bbca2bcc0a4ff2
+# Parent  654661539e2068c5f985b1587196207386edc091
+don't use singleton for call_stack
+
+* call-stack.h, call-stack.cc (class call_stack):
+Don't use singleton pattern.  Store reference to parent intepreter
+object in call stack.
+
+* pt-eval.h, pt-eval.cc (tree_evaluator::m_call_stack): New data
+member.
+(tree_evaluator::get_call_stack): New function.
+
+* interpreter-private.h, interpreter-private.cc (__get_call_stack__):
+New function.
+
+* interpreter.h, interpreter.cc (interpreter::get_call_stack):
+New function.
+
+Change all uses of call_stack to access call_stack object from the
+interpreter.
+
+diff --git a/libgui/src/m-editor/file-editor-tab.cc b/libgui/src/m-editor/file-editor-tab.cc
+--- a/libgui/src/m-editor/file-editor-tab.cc
++++ b/libgui/src/m-editor/file-editor-tab.cc
+@@ -66,25 +66,26 @@ along with Octave; see the file COPYING.
+ #include "file-editor.h"
+ #include "octave-txt-lexer.h"
+ #include "marker.h"
+ 
+ #include "file-ops.h"
+ 
+ #include "bp-table.h"
+ #include "call-stack.h"
++#include "defaults.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "oct-map.h"
+ #include "octave-qt-link.h"
+-#include "version.h"
+-#include "utils.h"
+-#include "defaults.h"
+ #include "ov-usr-fcn.h"
+ #include "symtab.h"
+-#include "interpreter.h"
+ #include "unwind-prot.h"
+-#include <oct-map.h>
++#include "utils.h"
++#include "version.h"
+ 
+ bool file_editor_tab::_cancelled = false;
+ 
+ /**
+  A file_editor_tab object consists of a text area and three left margins.
+  The first holds breakpoints, bookmarks, and the debug program counter.
+  The second holds line numbers.
+  The third holds "fold" marks, to hide sections of text.
+@@ -1798,17 +1799,19 @@ file_editor_tab::exit_debug_and_clear (c
+   if (octave::sys::canonicalize_file_name (full_name.c_str ())
+       != octave::sys::canonicalize_file_name (fcn->fcn_file_name ().c_str ()))
+     return true;
+ 
+   // If this file is loaded, check that we aren't currently running it
+   bool retval = true;
+   octave_idx_type curr_frame = -1;
+   size_t nskip = 0;
+-  octave_map stk = octave::call_stack::backtrace (nskip, curr_frame, false);
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("file_editor_tab::exit_debug_and_clear");
++  octave_map stk = cs.backtrace (nskip, curr_frame, false);
+   Cell names = stk.contents ("name");
+   for (octave_idx_type i = names.numel () - 1; i >= 0; i--)
+     {
+       if (names(i).string_value () == base_name)
+         {
+           int ans = QMessageBox::question (0, tr ("Debug or Save"),
+              tr ("This file is currently being executed.\n"
+                           "Quit debugging and save?"),
+@@ -1816,17 +1819,17 @@ file_editor_tab::exit_debug_and_clear (c
+ 
+           if (ans == QMessageBox::Save)
+             {
+               emit execute_command_in_terminal_signal ("dbquit");
+               // Wait until dbquit has actually occurred
+               while (names.numel () > i)
+                 {
+                   octave_sleep (0.01);
+-                  stk = octave::call_stack::backtrace (nskip, curr_frame, false);
++                  stk = cs.backtrace (nskip, curr_frame, false);
+                   names = stk.contents ("name");
+                 }
+             }
+           else
+             retval = false;
+           break;
+         }
+     }
+diff --git a/libinterp/corefcn/call-stack.cc b/libinterp/corefcn/call-stack.cc
+--- a/libinterp/corefcn/call-stack.cc
++++ b/libinterp/corefcn/call-stack.cc
+@@ -19,35 +19,32 @@ along with Octave; see the file COPYING.
+ <http://www.gnu.org/licenses/>.
+ 
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+-#include "singleton-cleanup.h"
+-
+ #include "call-stack.h"
++#include "interpreter.h"
+ #include "oct-map.h"
+ #include "ov.h"
+ #include "ov-fcn.h"
+ #include "ov-fcn-handle.h"
+ #include "ov-usr-fcn.h"
+ 
+ // Use static fields for the best efficiency.
+ // NOTE: C++0x will allow these two to be merged into one.
+ static const char *bt_fieldnames[] =
+   { "file", "name", "line", "column", "scope", "context", 0 };
+ static const octave_fields bt_fields (bt_fieldnames);
+ 
+ namespace octave
+ {
+-  call_stack *call_stack::instance = nullptr;
+-
+   std::string
+   call_stack::stack_frame::fcn_file_name (void) const
+   {
+     return m_fcn ? m_fcn->fcn_file_name () : "";
+   }
+ 
+   std::string
+   call_stack::stack_frame::fcn_name (bool print_subfn) const
+@@ -82,60 +79,52 @@ namespace octave
+     else if (this->fcn_file_name () != rhs.fcn_file_name ())
+       return false;
+     else if (this->fcn_name () != rhs.fcn_name ())
+       return false;
+     else
+       return true;
+   }
+ 
+-  void
+-  call_stack::create_instance (void)
++  call_stack::call_stack (interpreter& interp)
++    : cs (), curr_frame (0), m_interpreter (interp)
+   {
+-    instance = new call_stack ();
+-
+-    if (instance)
+-      {
+-        instance->do_push (0, symbol_table::top_scope (), 0);
+-
+-        singleton_cleanup_list::add (cleanup_instance);
+-      }
++    push (0, symbol_table::top_scope (), 0);
+   }
+ 
+   int
+-  call_stack::do_current_line (void) const
++  call_stack::current_line (void) const
+   {
+     int retval = -1;
+ 
+     if (! cs.empty ())
+       {
+         const stack_frame& elt = cs[curr_frame];
+         retval = elt.m_line;
+       }
+ 
+     return retval;
+   }
+ 
+   int
+-  call_stack::do_current_column (void) const
++  call_stack::current_column (void) const
+   {
+     int retval = -1;
+ 
+     if (! cs.empty ())
+       {
+         const stack_frame& elt = cs[curr_frame];
+         retval = elt.m_column;
+       }
+ 
+     return retval;
+   }
+ 
+   size_t
+-  call_stack::do_num_user_code_frames
+-  (octave_idx_type& curr_user_frame) const
++  call_stack::num_user_code_frames (octave_idx_type& curr_user_frame) const
+   {
+     size_t retval = 0;
+ 
+     curr_user_frame = 0;
+ 
+     // Look for the caller of dbstack.
+     size_t xframe = cs[curr_frame].m_prev;
+ 
+@@ -162,17 +151,17 @@ namespace octave
+     // We counted how many user frames were not the one, in reverse.
+     // Now set curr_user_frame to be the index in the other direction.
+     curr_user_frame = retval - curr_user_frame - 1;
+ 
+     return retval;
+   }
+ 
+   octave_user_code *
+-  call_stack::do_caller_user_code (size_t nskip) const
++  call_stack::caller_user_code (size_t nskip) const
+   {
+     octave_user_code *retval = nullptr;
+ 
+     const_iterator p = cs.end ();
+ 
+     while (p != cs.begin ())
+       {
+         const stack_frame& elt = *(--p);
+@@ -190,17 +179,17 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   int
+-  call_stack::do_caller_user_code_line (void) const
++  call_stack::caller_user_code_line (void) const
+   {
+     int retval = -1;
+ 
+     const_iterator p = cs.end ();
+ 
+     while (p != cs.begin ())
+       {
+         const stack_frame& elt = *(--p);
+@@ -216,17 +205,17 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   int
+-  call_stack::do_caller_user_code_column (void) const
++  call_stack::caller_user_code_column (void) const
+   {
+     int retval = -1;
+ 
+     const_iterator p = cs.end ();
+ 
+     while (p != cs.begin ())
+       {
+         const stack_frame& elt = *(--p);
+@@ -242,17 +231,17 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   octave_user_code *
+-  call_stack::do_debug_user_code (void) const
++  call_stack::debug_user_code (void) const
+   {
+     octave_user_code *retval = nullptr;
+ 
+     // This should never happen...
+     if (curr_frame == 0)
+       return retval;
+ 
+     // Start looking with the caller of the calling debug function.
+@@ -270,17 +259,17 @@ namespace octave
+             break;
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   int
+-  call_stack::do_debug_user_code_line (void) const
++  call_stack::debug_user_code_line (void) const
+   {
+     int retval = -1;
+ 
+     // This should never happen...
+     if (curr_frame == 0)
+       return retval;
+ 
+     // Start looking with the caller of the calling debug function.
+@@ -301,17 +290,17 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   int
+-  call_stack::do_debug_user_code_column (void) const
++  call_stack::debug_user_code_column (void) const
+   {
+     int retval = -1;
+ 
+     // This should never happen...
+     if (curr_frame == 0)
+       return retval;
+ 
+     // Start looking with the caller of the calling debug function.
+@@ -332,17 +321,17 @@ namespace octave
+               }
+           }
+       }
+ 
+     return retval;
+   }
+ 
+   bool
+-  call_stack::do_all_scripts (void) const
++  call_stack::all_scripts (void) const
+   {
+     bool retval = true;
+ 
+     const_iterator p = cs.end ();
+ 
+     while (p != cs.begin ())
+       {
+         const stack_frame& elt = *(--p);
+@@ -354,94 +343,18 @@ namespace octave
+             retval = false;
+             break;
+           }
+       }
+ 
+     return retval;
+   }
+ 
+-  octave_map
+-  call_stack::empty_backtrace (void)
+-  {
+-    return octave_map (dim_vector (0, 1), bt_fields);
+-  }
+-
+-  std::list<call_stack::stack_frame>
+-  call_stack::do_backtrace_frames (size_t nskip,
+-                                   octave_idx_type& curr_user_frame) const
+-  {
+-    std::list<call_stack::stack_frame> retval;
+-
+-    size_t user_code_frames = do_num_user_code_frames (curr_user_frame);
+-
+-    size_t nframes = (nskip <= user_code_frames ? user_code_frames - nskip : 0);
+-
+-    // Our list is reversed.
+-    curr_user_frame = nframes - curr_user_frame - 1;
+-
+-    if (nframes > 0)
+-      {
+-        for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
+-          {
+-            const stack_frame& elt = *p;
+-
+-            octave_function *f = elt.m_fcn;
+-
+-            if (f && f->is_user_code ())
+-              {
+-                if (nskip > 0)
+-                  nskip--;
+-                else
+-                  retval.push_back (elt);
+-              }
+-          }
+-      }
+-
+-    return retval;
+-  }
+-
+-  octave_map
+-  call_stack::do_backtrace (size_t nskip,
+-                            octave_idx_type& curr_user_frame,
+-                            bool print_subfn) const
+-  {
+-    std::list<call_stack::stack_frame> frames
+-      = do_backtrace_frames (nskip, curr_user_frame);
+-
+-    size_t nframes = frames.size ();
+-
+-    octave_map retval (dim_vector (nframes, 1), bt_fields);
+-
+-    Cell& file = retval.contents (0);
+-    Cell& name = retval.contents (1);
+-    Cell& line = retval.contents (2);
+-    Cell& column = retval.contents (3);
+-    Cell& scope = retval.contents (4);
+-    Cell& context = retval.contents (5);
+-
+-    octave_idx_type k = 0;
+-
+-    for (const auto& frm : frames)
+-      {
+-        scope(k)   = frm.m_scope;
+-        context(k) = frm.m_context;
+-        file(k)    = frm.fcn_file_name ();
+-        name(k)    = frm.fcn_name (print_subfn);
+-        line(k)    = frm.m_line;
+-        column(k)  = frm.m_column;
+-
+-        k++;
+-      }
+-
+-    return retval;
+-  }
+-
+   bool
+-  call_stack::do_goto_frame (size_t n, bool verbose)
++  call_stack::goto_frame (size_t n, bool verbose)
+   {
+     bool retval = false;
+ 
+     if (n < cs.size ())
+       {
+         retval = true;
+ 
+         curr_frame = n;
+@@ -459,17 +372,17 @@ namespace octave
+                         << "[context = " << elt.m_context << "])"
+                         << std::endl;
+       }
+ 
+     return retval;
+   }
+ 
+   bool
+-  call_stack::do_goto_frame_relative (int nskip, bool verbose)
++  call_stack::goto_frame_relative (int nskip, bool verbose)
+   {
+     bool retval = false;
+ 
+     int incr = 0;
+ 
+     if (nskip < 0)
+       incr = -1;
+     else if (nskip > 0)
+@@ -529,17 +442,17 @@ namespace octave
+         // happen when the dbup/dbdown/keyboard frame is popped and we
+         // jump to the new "prev" frame set above.
+       }
+ 
+     return retval;
+   }
+ 
+   void
+-  call_stack::do_goto_caller_frame (void)
++  call_stack::goto_caller_frame (void)
+   {
+     size_t xframe = curr_frame;
+ 
+     bool skipped = false;
+ 
+     while (xframe != 0)
+       {
+         xframe = cs[xframe].m_prev;
+@@ -567,20 +480,95 @@ namespace octave
+ 
+                 break;
+               }
+           }
+       }
+   }
+ 
+   void
+-  call_stack::do_goto_base_frame (void)
++  call_stack::goto_base_frame (void)
+   {
+     stack_frame tmp (cs[0]);
+     tmp.m_prev = curr_frame;
+ 
+     curr_frame = cs.size ();
+ 
+     cs.push_back (tmp);
+ 
+     symbol_table::set_scope_and_context (tmp.m_scope, tmp.m_context);
+   }
++
++  std::list<call_stack::stack_frame>
++  call_stack::backtrace_frames (size_t nskip,
++                                octave_idx_type& curr_user_frame) const
++  {
++    std::list<call_stack::stack_frame> retval;
++
++    size_t user_code_frames = num_user_code_frames (curr_user_frame);
++
++    size_t nframes = (nskip <= user_code_frames ? user_code_frames - nskip : 0);
++
++    // Our list is reversed.
++    curr_user_frame = nframes - curr_user_frame - 1;
++
++    if (nframes > 0)
++      {
++        for (const_reverse_iterator p = cs.rbegin (); p != cs.rend (); p++)
++          {
++            const stack_frame& elt = *p;
++
++            octave_function *f = elt.m_fcn;
++
++            if (f && f->is_user_code ())
++              {
++                if (nskip > 0)
++                  nskip--;
++                else
++                  retval.push_back (elt);
++              }
++          }
++      }
++
++    return retval;
++  }
++
++  octave_map
++  call_stack::backtrace (size_t nskip, octave_idx_type& curr_user_frame,
++                         bool print_subfn) const
++  {
++    std::list<call_stack::stack_frame> frames
++      = backtrace_frames (nskip, curr_user_frame);
++
++    size_t nframes = frames.size ();
++
++    octave_map retval (dim_vector (nframes, 1), bt_fields);
++
++    Cell& file = retval.contents (0);
++    Cell& name = retval.contents (1);
++    Cell& line = retval.contents (2);
++    Cell& column = retval.contents (3);
++    Cell& scope = retval.contents (4);
++    Cell& context = retval.contents (5);
++
++    octave_idx_type k = 0;
++
++    for (const auto& frm : frames)
++      {
++        scope(k)   = frm.m_scope;
++        context(k) = frm.m_context;
++        file(k)    = frm.fcn_file_name ();
++        name(k)    = frm.fcn_name (print_subfn);
++        line(k)    = frm.m_line;
++        column(k)  = frm.m_column;
++
++        k++;
++      }
++
++    return retval;
++  }
++
++  octave_map
++  call_stack::empty_backtrace (void) const
++  {
++    return octave_map (dim_vector (0, 1), bt_fields);
++  }
+ }
+diff --git a/libinterp/corefcn/call-stack.h b/libinterp/corefcn/call-stack.h
+--- a/libinterp/corefcn/call-stack.h
++++ b/libinterp/corefcn/call-stack.h
+@@ -33,24 +33,22 @@ class octave_user_code;
+ class octave_user_script;
+ 
+ #include "input.h"
+ #include "oct-map.h"
+ #include "symtab.h"
+ 
+ namespace octave
+ {
++  class interpreter;
++
+   class
+   OCTINTERP_API
+   call_stack
+   {
+-  protected:
+-
+-    call_stack (void) : cs (), curr_frame (0) { }
+-
+   public:
+ 
+     class stack_frame
+     {
+     public:
+ 
+       friend class call_stack;
+ 
+@@ -86,401 +84,213 @@ namespace octave
+     };
+ 
+     typedef std::deque<stack_frame>::iterator iterator;
+     typedef std::deque<stack_frame>::const_iterator const_iterator;
+ 
+     typedef std::deque<stack_frame>::reverse_iterator reverse_iterator;
+     typedef std::deque<stack_frame>::const_reverse_iterator const_reverse_iterator;
+ 
+-    static void create_instance (void);
+-
+-    static bool instance_ok (void)
+-    {
+-      bool retval = true;
++    call_stack (interpreter& interp);
+ 
+-      if (! instance)
+-        create_instance ();
++    // Current function (top of stack).
++    octave_function * current (void) const
++    {
++      octave_function *retval = nullptr;
+ 
+-      if (! instance)
+-        error ("unable to create call stack object!");
++      if (! cs.empty ())
++        {
++          const stack_frame& elt = cs[curr_frame];
++          retval = elt.m_fcn;
++        }
+ 
+       return retval;
+     }
+ 
+-    // Current function (top of stack).
+-    static octave_function * current (void)
+-    {
+-      return instance_ok () ? instance->do_current () : 0;
+-    }
+-
+     // Current line in current function.
+-    static int current_line (void)
+-    {
+-      return instance_ok () ? instance->do_current_line () : -1;
+-    }
++    int current_line (void) const;
+ 
+     // Current column in current function.
+-    static int current_column (void)
+-    {
+-      return instance_ok () ? instance->do_current_column () : -1;
+-    }
++    int current_column (void) const;
+ 
+     // Caller function, may be built-in.
+-    static octave_function * caller (void)
+-    {
+-      return instance_ok () ? instance->do_caller () : 0;
+-    }
+-
+-    static size_t current_frame (void)
+-    {
+-      return instance_ok () ? instance->do_current_frame () : 0;
+-    }
+-
+-    static size_t size (void)
+-    {
+-      return instance_ok () ? instance->do_size () : 0;
+-    }
+-
+-    static size_t num_user_code_frames (octave_idx_type& curr_user_frame)
+-    {
+-      return instance_ok ()
+-        ? instance->do_num_user_code_frames (curr_user_frame) : 0;
+-    }
+-
+-    static symbol_table::scope_id current_scope (void)
+-    {
+-      return instance_ok () ? instance->do_current_scope () : 0;
+-    }
+-
+-    static symbol_table::context_id current_context (void)
+-    {
+-      return instance_ok () ? instance->do_current_context () : 0;
+-    }
+-
+-#if 0
+-    static stack_frame frame (size_t idx)
+-    {
+-      return instance_ok () ? instance->do_frame (idx) : stack_frame ();
+-    }
+-#endif
+-
+-    // Function at location N on the call stack (N == 0 is current), may
+-    // be built-in.
+-    static octave_function * element (size_t n)
+-    {
+-      return instance_ok () ? instance->do_element (n) : 0;
+-    }
+-
+-    // User code caller.
+-    static octave_user_code * caller_user_code (size_t nskip = 0)
+-    {
+-      return instance_ok () ? instance->do_caller_user_code (nskip) : 0;
+-    }
+-
+-    // Line in user code caller.
+-    static int caller_user_code_line (void)
+-    {
+-      return instance_ok () ? instance->do_caller_user_code_line () : -1;
+-    }
+-
+-    // Column in user code caller.
+-    static int caller_user_code_column (void)
+-    {
+-      return instance_ok () ? instance->do_caller_user_code_column () : -1;
+-    }
+-
+-    // Current function that we are debugging.
+-    static octave_user_code * debug_user_code (void)
+-    {
+-      return instance_ok () ? instance->do_debug_user_code () : 0;
+-    }
+-
+-    // Line number in current function that we are debugging.
+-    static int debug_user_code_line (void)
+-    {
+-      return instance_ok () ? instance->do_debug_user_code_line () : 0;
+-    }
+-
+-    // Column number in current function that we are debugging.
+-    static int debug_user_code_column (void)
+-    {
+-      return instance_ok () ? instance->do_debug_user_code_column () : 0;
+-    }
+-
+-    // Return TRUE if all elements on the call stack are scripts.
+-    static bool all_scripts (void)
+-    {
+-      return instance_ok () ? instance->do_all_scripts () : false;
+-    }
+-
+-    static void
+-    push (octave_function *f,
+-          symbol_table::scope_id scope = symbol_table::current_scope (),
+-          symbol_table::context_id context = symbol_table::current_context ())
+-    {
+-      if (instance_ok ())
+-        instance->do_push (f, scope, context);
+-    }
+-
+-    static void
+-    push (symbol_table::scope_id scope = symbol_table::current_scope (),
+-          symbol_table::context_id context = symbol_table::current_context ())
+-    {
+-      if (instance_ok ())
+-        instance->do_push (0, scope, context);
+-    }
+-
+-    static void set_location (int l, int c)
+-    {
+-      if (instance_ok ())
+-        instance->do_set_location (l, c);
+-    }
+-
+-    static void set_line (int l)
+-    {
+-      if (instance_ok ())
+-        instance->do_set_line (l);
+-    }
+-
+-    static void set_column (int c)
+-    {
+-      if (instance_ok ())
+-        instance->do_set_column (c);
+-    }
+-
+-    static bool goto_frame (size_t n = 0, bool verbose = false)
+-    {
+-      return instance_ok () ? instance->do_goto_frame (n, verbose) : false;
+-    }
+-
+-    static void restore_frame (size_t n)
+-    {
+-      goto_frame (n);
+-    }
+-
+-    static bool goto_frame_relative (int n, bool verbose = false)
+-    {
+-      return instance_ok ()
+-        ? instance->do_goto_frame_relative (n, verbose) : false;
+-    }
+-
+-    static void goto_caller_frame (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_goto_caller_frame ();
+-    }
+-
+-    static void goto_base_frame (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_goto_base_frame ();
+-    }
+-
+-    static octave_map backtrace (size_t nskip = 0)
+-    {
+-      octave_idx_type curr_user_frame = -1;
+-
+-      return instance_ok ()
+-        ? instance->do_backtrace (nskip, curr_user_frame, true)
+-        : octave_map ();
+-    }
+-
+-    static octave_map backtrace (size_t nskip, octave_idx_type& curr_user_frame,
+-                                 bool print_subfn = true)
+-    {
+-      return instance_ok ()
+-        ? instance->do_backtrace (nskip, curr_user_frame, print_subfn)
+-        : octave_map ();
+-    }
+-
+-    static std::list<call_stack::stack_frame>
+-    backtrace_frames (size_t nskip = 0)
+-    {
+-      octave_idx_type curr_user_frame = -1;
+-
+-      return instance_ok ()
+-        ? instance->do_backtrace_frames (nskip, curr_user_frame)
+-        : std::list<call_stack::stack_frame> ();
+-    }
+-
+-    static std::list<call_stack::stack_frame>
+-    backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame)
+-    {
+-      return instance_ok ()
+-        ? instance->do_backtrace_frames (nskip, curr_user_frame)
+-        : std::list<call_stack::stack_frame> ();
+-    }
+-
+-    static octave_map empty_backtrace (void);
+-
+-    static void pop (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_pop ();
+-    }
+-
+-    static void clear (void)
+-    {
+-      if (instance_ok ())
+-        instance->do_clear ();
+-    }
+-
+-  private:
+-
+-    // The current call stack.
+-    std::deque<stack_frame> cs;
+-
+-    size_t curr_frame;
+-
+-    static call_stack *instance;
+-
+-    static void cleanup_instance (void) { delete instance; instance = 0; }
+-
+-    int do_current_line (void) const;
+-
+-    int do_current_column (void) const;
+-
+-    octave_function * do_caller (void) const
++    octave_function * caller (void) const
+     {
+       return curr_frame > 1 ? cs[curr_frame-1].m_fcn : cs[0].m_fcn;
+     }
+ 
+-    size_t do_current_frame (void) { return curr_frame; }
++    size_t current_frame (void) const { return curr_frame; }
+ 
+-    size_t do_size (void) { return cs.size (); }
++    size_t size (void) const { return cs.size (); }
+ 
+-    size_t do_num_user_code_frames (octave_idx_type& curr_user_frame) const;
++    size_t num_user_code_frames (octave_idx_type& curr_user_frame) const;
+ 
+-    symbol_table::scope_id do_current_scope (void) const
++    symbol_table::scope_id current_scope (void) const
+     {
+-      return curr_frame > 0 && curr_frame < cs.size ()
+-                                            ? cs[curr_frame].m_scope : 0;
++      return (curr_frame > 0 && curr_frame < cs.size ()
++              ? cs[curr_frame].m_scope : 0);
+     }
+ 
+-    symbol_table::context_id do_current_context (void) const
++    symbol_table::context_id current_context (void) const
+     {
+-      return curr_frame > 0 && curr_frame < cs.size ()
+-                                            ? cs[curr_frame].m_context : 0;
++      return (curr_frame > 0 && curr_frame < cs.size ()
++              ? cs[curr_frame].m_context : 0);
+     }
+ 
+-#if 0
+-    const stack_frame& do_frame (size_t idx)
+-    {
+-      static stack_frame foobar;
+-
+-      return idx < cs.size () ? cs[idx] : foobar;
+-    }
+-#endif
+-
+-    octave_function * do_element (size_t n)
++    // Function at location N on the call stack (N == 0 is current), may
++    // be built-in.
++    octave_function * element (size_t n)
+     {
+       octave_function *retval = nullptr;
+ 
+       if (cs.size () > n)
+         {
+           stack_frame& elt = cs[n];
+           retval = elt.m_fcn;
+         }
+ 
+       return retval;
+     }
+ 
+-    octave_user_code * do_caller_user_code (size_t nskip) const;
+-    int do_caller_user_code_line (void) const;
+-    int do_caller_user_code_column (void) const;
++    // User code caller.
++    octave_user_code * caller_user_code (size_t nskip = 0) const;
++
++    // Line in user code caller.
++    int caller_user_code_line (void) const;
++
++    // Column in user code caller.
++    int caller_user_code_column (void) const;
++
++    // Current function that we are debugging.
++    octave_user_code * debug_user_code (void) const;
++
++    // Line number in current function that we are debugging.
++    int debug_user_code_line (void) const;
+ 
+-    octave_user_code * do_debug_user_code (void) const;
+-    int do_debug_user_code_line (void) const;
+-    int do_debug_user_code_column (void) const;
++    // Column number in current function that we are debugging.
++    int debug_user_code_column (void) const;
++
++    // Return TRUE if all elements on the call stack are scripts.
++    bool all_scripts (void) const;
+ 
+-    bool do_all_scripts (void) const;
++    void push (octave_function *fcn)
++    {
++      push (fcn, symbol_table::current_scope (),
++            symbol_table::current_context ());
++    }
+ 
+-    void do_push (octave_function *fcn, symbol_table::scope_id scope,
+-                  symbol_table::context_id context)
++    void push (octave_function *fcn, symbol_table::scope_id scope,
++               symbol_table::context_id context)
+     {
+       size_t prev_frame = curr_frame;
+       curr_frame = cs.size ();
+       cs.push_back (stack_frame (fcn, scope, context, prev_frame));
+       symbol_table::set_scope_and_context (scope, context);
+     }
+ 
+-    octave_function * do_current (void) const
++    void push (void)
+     {
+-      octave_function *retval = nullptr;
+-
+-      if (! cs.empty ())
+-        {
+-          const stack_frame& elt = cs[curr_frame];
+-          retval = elt.m_fcn;
+-        }
+-
+-      return retval;
++      push (nullptr);
+     }
+ 
+-    void do_set_location (int l, int c)
++    void push (symbol_table::scope_id scope, symbol_table::context_id context)
++    {
++      push (nullptr, scope, context);
++    }
++
++    void set_location (int l, int c)
+     {
+       if (! cs.empty ())
+         {
+           stack_frame& elt = cs.back ();
+ 
+           elt.m_line = l;
+           elt.m_column = c;
+         }
+     }
+ 
+-    void do_set_line (int l)
++    void set_line (int l)
+     {
+       if (! cs.empty ())
+         {
+           stack_frame& elt = cs.back ();
+ 
+           elt.m_line = l;
+         }
+     }
+ 
+-    void do_set_column (int c)
++    void set_column (int c)
+     {
+       if (! cs.empty ())
+         {
+           stack_frame& elt = cs.back ();
+ 
+           elt.m_column = c;
+         }
+     }
+ 
+-    std::list<call_stack::stack_frame>
+-    do_backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame) const;
++    bool goto_frame (size_t n = 0, bool verbose = false);
++
++    void restore_frame (size_t n)
++    {
++      goto_frame (n);
++    }
+ 
+-    octave_map do_backtrace (size_t nskip,
+-                             octave_idx_type& curr_user_frame,
+-                             bool print_subfn) const;
++    bool goto_frame_relative (int n, bool verbose = false);
++
++    void goto_caller_frame (void);
++
++    void goto_base_frame (void);
++
++    std::list<call_stack::stack_frame>
++    backtrace_frames (size_t nskip, octave_idx_type& curr_user_frame) const;
+ 
+-    bool do_goto_frame (size_t n, bool verbose);
++    std::list<call_stack::stack_frame>
++    backtrace_frames (size_t nskip = 0) const
++    {
++      octave_idx_type curr_user_frame = -1;
+ 
+-    bool do_goto_frame_relative (int n, bool verbose);
++      return backtrace_frames (nskip, curr_user_frame);
++    }
++
++    octave_map backtrace (size_t nskip, octave_idx_type& curr_user_frame,
++                          bool print_subfn = true) const;
+ 
+-    void do_goto_caller_frame (void);
++    octave_map backtrace (size_t nskip = 0)
++    {
++      octave_idx_type curr_user_frame = -1;
+ 
+-    void do_goto_base_frame (void);
++      return backtrace (nskip, curr_user_frame, true);
++    }
+ 
+-    void do_pop (void)
++    octave_map empty_backtrace (void) const;
++
++    void pop (void)
+     {
+       if (cs.size () > 1)
+         {
+           const stack_frame& elt = cs.back ();
+           curr_frame = elt.m_prev;
+           cs.pop_back ();
+           const stack_frame& new_elt = cs[curr_frame];
+           symbol_table::set_scope_and_context (new_elt.m_scope,
+                                                new_elt.m_context);
+         }
+     }
+ 
+-    void do_clear (void) { cs.clear (); }
++    void clear (void) { cs.clear (); }
++
++  private:
++
++    // The current call stack.
++    std::deque<stack_frame> cs;
++
++    size_t curr_frame;
++
++    interpreter& m_interpreter;
+   };
+ }
+ 
+ #if defined (OCTAVE_USE_DEPRECATED_FUNCTIONS)
+ 
+ OCTAVE_DEPRECATED ("use 'octave::call_stack' instead")
+ typedef octave::call_stack octave_call_stack;
+ 
+diff --git a/libinterp/corefcn/debug.cc b/libinterp/corefcn/debug.cc
+--- a/libinterp/corefcn/debug.cc
++++ b/libinterp/corefcn/debug.cc
+@@ -38,16 +38,18 @@ along with Octave; see the file COPYING.
+ #include "bp-table.h"
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
+ #include "file-ops.h"
+ #include "help.h"
+ #include "input.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
+ #include "octave-preserve-stream-state.h"
+ #include "ov-usr-fcn.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pt-eval.h"
+ #include "unwind-prot.h"
+@@ -514,35 +516,37 @@ The @qcode{"warn"} field is set similarl
+ %! dbclear all;
+ %! assert (s(1).name, "@audioplayer/set>setproperty");
+ %! assert (s(2).name, "@ftp/dir");
+ %! assert (s(3).name, "ls");
+ %! assert (s(4).name, "quantile>__quantile__");
+ %! assert (s(2).file(end-10:end), [filesep "@ftp" filesep "dir.m"]);
+ */
+ 
+-DEFUN (dbwhere, , ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbwhere, interp, , ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} dbwhere
+ In debugging mode, report the current file and line number where execution
+ is stopped.
+ @seealso{dbstack, dblist, dbstatus, dbcont, dbstep, dbup, dbdown}
+ @end deftypefn */)
+ {
+   octave_user_code *dbg_fcn = get_user_code ();
+ 
+   if (! dbg_fcn)
+     {
+       octave_stdout << "stopped at top level" << std::endl;
+       return ovl ();
+     }
+ 
+   octave_stdout << "stopped in " << dbg_fcn->name () << " at ";
+ 
+-  int l = octave::call_stack::debug_user_code_line ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  int l = cs.debug_user_code_line ();
+ 
+   if (l > 0)
+     {
+       octave_stdout << "line " << l;
+ 
+       std::string file_name = dbg_fcn->fcn_file_name ();
+ 
+       if (! file_name.empty ())
+@@ -736,18 +740,18 @@ numbers.
+ 
+     default:
+       error ("dbtype: expecting zero, one, or two arguments\n");
+     }
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (dblist, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dblist, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dblist
+ @deftypefnx {} {} dblist @var{n}
+ In debugging mode, list @var{n} lines of the function being debugged
+ centered around the current line to be executed.
+ 
+ If unspecified @var{n} defaults to 10 (+/- 5 lines)
+ @seealso{dbwhere, dbtype, dbstack}
+ @end deftypefn */)
+@@ -781,17 +785,19 @@ If unspecified @var{n} defaults to 10 (+
+   std::string name = dbg_fcn->fcn_file_name ();
+ 
+   if (name.empty ())
+     {
+       have_file = false;
+       name = dbg_fcn->name ();
+     }
+ 
+-  int l = octave::call_stack::debug_user_code_line ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  int l = cs.debug_user_code_line ();
+ 
+   if (l > 0)
+     {
+       if (have_file)
+         {
+           int l_min = std::max (l - n/2, 0);
+           int l_max = l + n/2;
+           do_dbtype (octave_stdout, name, l_min, l-1);
+@@ -808,17 +814,18 @@ If unspecified @var{n} defaults to 10 (+
+       octave_stdout << "dblist: unable to determine source code line"
+                     << std::endl;
+     }
+ 
+   return ovl ();
+ }
+ 
+ static octave_value_list
+-do_dbstack (const octave_value_list& args, int nargout, std::ostream& os)
++do_dbstack (octave::interpreter& interp, const octave_value_list& args,
++            int nargout, std::ostream& os)
+ {
+   int nargin = args.length ();
+ 
+   if (nargin > 2)
+     print_usage ();
+ 
+   octave_value_list retval;
+ 
+@@ -852,19 +859,21 @@ do_dbstack (const octave_value_list& arg
+           if (n <= 0)
+             error ("dbstack: N must be a non-negative integer");
+         }
+ 
+       if (n > 0)
+         nskip = n;
+     }
+ 
++  octave::call_stack& cs = interp.get_call_stack ();
++
+   if (nargout == 0)
+     {
+-      octave_map stk = octave::call_stack::backtrace (nskip, curr_frame);
++      octave_map stk = cs.backtrace (nskip, curr_frame);
+       octave_idx_type nframes_to_display = stk.numel ();
+ 
+       if (nframes_to_display > 0)
+         {
+           octave_preserve_stream_state stream_state (os);
+ 
+           os << "stopped in:\n\n";
+ 
+@@ -900,37 +909,38 @@ do_dbstack (const octave_value_list& arg
+             }
+ 
+           if (show_top_level)
+             os << "  --> top level" << std::endl;
+         }
+     }
+   else
+     {
+-      octave_map stk = octave::call_stack::backtrace (nskip, curr_frame, false);
++      octave_map stk = cs.backtrace (nskip, curr_frame, false);
+ 
+       retval = ovl (stk, curr_frame < 0 ? 1 : curr_frame + 1);
+     }
+ 
+   return retval;
+ }
+ 
+ // A function that can be easily called from a debugger print the Octave stack.
+ // This can be useful for finding what line of code the interpreter is
+ // currently executing when the debugger is stopped in some C++ function,
+ // for example.
+ 
+ void
+ show_octave_dbstack (void)
+ {
+-  do_dbstack (octave_value_list (), 0, std::cerr);
++  do_dbstack (octave::__get_interpreter__ ("show_octave_dbstack"),
++              octave_value_list (), 0, std::cerr);
+ }
+ 
+-DEFUN (dbstack, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbstack, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbstack
+ @deftypefnx {} {} dbstack @var{n}
+ @deftypefnx {} {} dbstack @var{-completenames}
+ @deftypefnx {} {[@var{stack}, @var{idx}] =} dbstack (@dots{})
+ Display or return current debugging function stack information.
+ 
+ With optional argument @var{n}, omit the @var{n} innermost stack frames.
+ 
+@@ -963,21 +973,22 @@ Undocumented.
+ Undocumented.
+ @end table
+ 
+ The return argument @var{idx} specifies which element of the @var{stack}
+ struct array is currently active.
+ @seealso{dbup, dbdown, dbwhere, dblist, dbstatus}
+ @end deftypefn */)
+ {
+-  return do_dbstack (args, nargout, octave_stdout);
++  return do_dbstack (interp, args, nargout, octave_stdout);
+ }
+ 
+ static void
+-do_dbupdown (const octave_value_list& args, const std::string& who)
++do_dbupdown (octave::interpreter& interp, const octave_value_list& args,
++             const std::string& who)
+ {
+   int n = 1;
+ 
+   if (args.length () == 1)
+     {
+       octave_value arg = args(0);
+ 
+       if (arg.is_string ())
+@@ -988,46 +999,48 @@ do_dbupdown (const octave_value_list& ar
+         }
+       else
+         n = args(0).int_value ();
+     }
+ 
+   if (who == "dbup")
+     n = -n;
+ 
+-  if (! octave::call_stack::goto_frame_relative (n, true))
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  if (! cs.goto_frame_relative (n, true))
+     error ("%s: invalid stack frame", who.c_str ());
+ }
+ 
+-DEFUN (dbup, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbup, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbup
+ @deftypefnx {} {} dbup @var{n}
+ In debugging mode, move up the execution stack @var{n} frames.
+ 
+ If @var{n} is omitted, move up one frame.
+ @seealso{dbstack, dbdown}
+ @end deftypefn */)
+ {
+-  do_dbupdown (args, "dbup");
++  do_dbupdown (interp, args, "dbup");
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (dbdown, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (dbdown, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbdown
+ @deftypefnx {} {} dbdown @var{n}
+ In debugging mode, move down the execution stack @var{n} frames.
+ 
+ If @var{n} is omitted, move down one frame.
+ @seealso{dbstack, dbup}
+ @end deftypefn */)
+ {
+-  do_dbupdown (args, "dbdown");
++  do_dbupdown (interp, args, "dbdown");
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (dbstep, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {} dbstep
+ @deftypefnx {} {} dbstep @var{n}
+diff --git a/libinterp/corefcn/defun.cc b/libinterp/corefcn/defun.cc
+--- a/libinterp/corefcn/defun.cc
++++ b/libinterp/corefcn/defun.cc
+@@ -48,17 +48,20 @@ along with Octave; see the file COPYING.
+ #include "symtab.h"
+ #include "variables.h"
+ #include "parse.h"
+ 
+ // Print the usage part of the doc string of FCN (user-defined or DEFUN).
+ void
+ print_usage (void)
+ {
+-  const octave_function *cur = octave::call_stack::current ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("print_usage");
++
++  const octave_function *cur = cs.current ();
++
+   if (cur)
+     print_usage (cur->name ());
+   else
+     error ("print_usage: invalid function");
+ }
+ 
+ void
+ print_usage (const std::string& name)
+@@ -157,17 +160,20 @@ install_builtin_dispatch (const std::str
+   symbol_table::install_built_in_dispatch (name, klass);
+ }
+ 
+ octave::dynamic_library
+ get_current_shlib (void)
+ {
+   octave::dynamic_library retval;
+ 
+-  octave_function *curr_fcn = octave::call_stack::current ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("get_current_shlib");
++
++  octave_function *curr_fcn = cs.current ();
++
+   if (curr_fcn)
+     {
+       if (curr_fcn->is_dld_function ())
+         {
+           octave_dld_function *dld
+             = dynamic_cast<octave_dld_function *> (curr_fcn);
+           retval = dld->get_shlib ();
+         }
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -34,26 +34,27 @@ along with Octave; see the file COPYING.
+ #include <string>
+ 
+ #include "bp-table.h"
+ #include "builtin-defun-decls.h"
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "input.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
++#include "oct-map.h"
+ #include "octave.h"
++#include "ov-usr-fcn.h"
++#include "ov.h"
++#include "ovl.h"
+ #include "pager.h"
+-#include "ovl.h"
+-#include "oct-map.h"
++#include "pt-eval.h"
++#include "unwind-prot.h"
+ #include "utils.h"
+-#include "ov.h"
+-#include "ov-usr-fcn.h"
+-#include "pt-eval.h"
+-#include "interpreter.h"
+-#include "unwind-prot.h"
+ #include "variables.h"
+ 
+ // TRUE means that Octave will try to beep obnoxiously before printing
+ // error messages.
+ static bool Vbeep_on_error = false;
+ 
+ // TRUE means that Octave will try to enter the debugger when an error
+ // is encountered.  This will also inhibit printing of the normal
+@@ -137,17 +138,20 @@ initialize_warning_options (const std::s
+   initw.setfield ("state", state);
+ 
+   warning_options = initw;
+ }
+ 
+ static octave_map
+ initialize_last_error_stack (void)
+ {
+-  return octave::call_stack::empty_backtrace ();
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("initialize_last_error_stack");
++
++  return cs.empty_backtrace ();
+ }
+ 
+ static void
+ verror (bool save_last_error, std::ostream& os,
+         const char *name, const char *id, const char *fmt, va_list args,
+         bool with_cfn = false)
+ {
+   if (discard_error_messages && ! Vdebug_on_caught)
+@@ -176,23 +180,25 @@ verror (bool save_last_error, std::ostre
+   if (name)
+     {
+       if (in_try_catch && ! strcmp (name, "error"))
+         msg_string += "caught error: ";
+       else
+         msg_string += std::string (name) + ": ";
+     }
+ 
++  octave::call_stack& cs = octave::__get_call_stack__ ("verror");
++
+   // If with_fcn is specified, we'll attempt to prefix the message with the name
+   // of the current executing function.  But we'll do so only if:
+   // 1. the name is not empty (anonymous function)
+   // 2. it is not already there (including the following colon)
+   if (with_cfn)
+     {
+-      octave_function *curfcn = octave::call_stack::current ();
++      octave_function *curfcn = cs.current ();
+       if (curfcn)
+         {
+           std::string cfn = curfcn->name ();
+           if (! cfn.empty ())
+             {
+               cfn += ':';
+               if (cfn.length () > base_msg.length ()
+                   || base_msg.compare (0, cfn.length (), cfn) != 0)
+@@ -207,23 +213,23 @@ verror (bool save_last_error, std::ostre
+ 
+   if (save_last_error)
+     {
+       // This is the first error in a possible series.
+ 
+       Vlast_error_id = id;
+       Vlast_error_message = base_msg;
+ 
+-      octave_user_code *fcn = octave::call_stack::caller_user_code ();
++      octave_user_code *fcn = cs.caller_user_code ();
+ 
+       if (fcn)
+         {
+           octave_idx_type curr_frame = -1;
+ 
+-          Vlast_error_stack = octave::call_stack::backtrace (0, curr_frame);
++          Vlast_error_stack = cs.backtrace (0, curr_frame);
+         }
+       else
+         Vlast_error_stack = initialize_last_error_stack ();
+     }
+ 
+   if (! buffer_error_messages || Vdebug_on_caught)
+     {
+       octave_diary << msg_string;
+@@ -302,18 +308,20 @@ pr_where (std::ostream& os, const char *
+       else
+         pr_where_1 (os, "    %s\n", fcn_name.c_str ());
+     }
+ }
+ 
+ static void
+ pr_where (std::ostream& os, const char *who)
+ {
++  octave::call_stack& cs = octave::__get_call_stack__ ("pr_where");
++
+   std::list<octave::call_stack::stack_frame> call_stack_frames
+-    = octave::call_stack::backtrace_frames ();
++    = cs.backtrace_frames ();
+ 
+   // Print the error message only if it is different from the previous one;
+   // Makes the output more concise and readable.
+   call_stack_frames.unique ();
+ 
+   std::list<error_stack_frame> frames;
+   for (const auto& frm : call_stack_frames)
+     {
+@@ -342,29 +350,31 @@ make_execution_exception (const char *wh
+ 
+   return retval;
+ }
+ 
+ static void
+ maybe_enter_debugger (octave::execution_exception& e,
+                       bool show_stack_trace = false)
+ {
++  octave::call_stack& cs = octave::__get_call_stack__ ("maybe_enter_debugger");
++
+   if ((octave::application::interactive ()
+        || octave::application::forced_interactive ())
+       && ((Vdebug_on_error && bp_table::debug_on_err (last_error_id ()))
+           || (Vdebug_on_caught && bp_table::debug_on_caught (last_error_id ())))
+-      && octave::call_stack::caller_user_code ())
++      && cs.caller_user_code ())
+     {
+       octave::unwind_protect frame;
+       frame.protect_var (Vdebug_on_error);
+       Vdebug_on_error = false;
+ 
+       octave::tree_evaluator::debug_mode = true;
+ 
+-      octave::tree_evaluator::current_frame = octave::call_stack::current_frame ();
++      octave::tree_evaluator::current_frame = cs.current_frame ();
+ 
+       if (show_stack_trace)
+         {
+           std::string stack_trace = e.info ();
+ 
+           if (! stack_trace.empty ())
+             {
+               std::cerr << stack_trace;
+@@ -523,17 +533,20 @@ error_1 (octave::execution_exception& e,
+ 
+                   // If format ends with newline, suppress stack trace.
+                   e.set_stack_trace ();
+                 }
+               else
+                 {
+                   verror (true, os, name, id, fmt, args, with_cfn);
+ 
+-                  bool in_user_code = octave::call_stack::caller_user_code () != 0;
++                  octave::call_stack& cs
++                    = octave::__get_call_stack__ ("error_1");
++
++                  bool in_user_code = cs.caller_user_code () != 0;
+ 
+                   if (in_user_code && ! discard_error_messages)
+                     show_stack_trace = true;
+                 }
+             }
+         }
+     }
+   else
+@@ -743,34 +756,36 @@ warning_1 (const char *id, const char *f
+         {
+           // Strip newline before issuing warning
+           std::string tmp_fmt (fmt, fmt_len - 1);
+           vwarning ("warning", id, tmp_fmt.c_str (), args);
+         }
+       else
+         vwarning ("warning", id, fmt, args);
+ 
+-      bool in_user_code = octave::call_stack::caller_user_code () != 0;
++      octave::call_stack& cs = octave::__get_call_stack__ ("warning_1");
++
++      bool in_user_code = cs.caller_user_code () != 0;
+ 
+       if (! fmt_suppresses_backtrace && in_user_code
+           && Vbacktrace_on_warning
+           && ! discard_warning_messages)
+         pr_where (std::cerr, "warning");
+ 
+       if ((octave::application::interactive ()
+            || octave::application::forced_interactive ())
+           && Vdebug_on_warning && in_user_code && bp_table::debug_on_warn (id))
+         {
+           octave::unwind_protect frame;
+           frame.protect_var (Vdebug_on_warning);
+           Vdebug_on_warning = false;
+ 
+           octave::tree_evaluator::debug_mode = true;
+ 
+-          octave::tree_evaluator::current_frame = octave::call_stack::current_frame ();
++          octave::tree_evaluator::current_frame = cs.current_frame ();
+ 
+           do_keyboard (octave_value_list ());
+         }
+     }
+ }
+ 
+ void
+ vwarning (const char *fmt, va_list args)
+@@ -1403,18 +1418,18 @@ set_warning_option (const std::string& s
+   tst(nel) = state;
+ 
+   warning_options.clear ();
+ 
+   warning_options.assign ("identifier", tid);
+   warning_options.assign ("state", tst);
+ }
+ 
+-DEFUN (warning, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (warning, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} warning (@var{template}, @dots{})
+ @deftypefnx {} {} warning (@var{id}, @var{template}, @dots{})
+ @deftypefnx {} {} warning ("on", @var{id})
+ @deftypefnx {} {} warning ("off", @var{id})
+ @deftypefnx {} {} warning ("query", @var{id})
+ @deftypefnx {} {} warning ("error", @var{id})
+ @deftypefnx {} {} warning (@var{state}, "backtrace")
+ @deftypefnx {} {} warning (@var{state}, @var{id}, "local")
+@@ -1484,28 +1499,27 @@ disable escape sequence expansion use a 
+       string_vector argv = args.make_argv ("warning");
+ 
+       std::string arg1 = argv[1];
+       std::string arg2 = "all";
+ 
+       if (nargin >= 2)
+         arg2 = argv[2];
+ 
++      octave::call_stack& cs = interp.get_call_stack ();
++
+       if (arg1 == "on" || arg1 == "off" || arg1 == "error")
+         {
+           octave_map old_warning_options = warning_options;
+ 
+           if (nargin == 3 && argv[3] == "local"
+               && ! symbol_table::at_top_level ())
+             {
+-              symbol_table::scope_id scope
+-                = octave::call_stack::current_scope ();
+-
+-              symbol_table::context_id context
+-                = octave::call_stack::current_context ();
++              symbol_table::scope_id scope = cs.current_scope ();
++              symbol_table::context_id context = cs.current_context ();
+ 
+               octave_scalar_map val = warning_query (arg2);
+ 
+               octave_value curr_state = val.contents ("state");
+ 
+               // FIXME: this might be better with a dictionary object.
+ 
+               octave_value curr_warning_states
+@@ -1745,23 +1759,29 @@ disable escape sequence expansion use a 
+ octave_value_list
+ set_warning_state (const std::string& id, const std::string& state)
+ {
+   octave_value_list args;
+ 
+   args(1) = id;
+   args(0) = state;
+ 
+-  return Fwarning (args, 1);
++  octave::interpreter& interp
++    = octave::__get_interpreter__ ("set_warning_state");
++
++  return Fwarning (interp, args, 1);
+ }
+ 
+ octave_value_list
+ set_warning_state (const octave_value_list& args)
+ {
+-  return Fwarning (args, 1);
++  octave::interpreter& interp
++    = octave::__get_interpreter__ ("set_warning_state");
++
++  return Fwarning (interp, args, 1);
+ }
+ 
+ void
+ disable_warning (const std::string& id)
+ {
+   set_warning_option ("off", id);
+ }
+ 
+@@ -1782,18 +1802,18 @@ initialize_default_warning_state (void)
+   disable_warning ("Octave:resize-on-range-error");
+   disable_warning ("Octave:separator-insert");
+   disable_warning ("Octave:single-quote-string");
+   disable_warning ("Octave:str-to-num");
+   disable_warning ("Octave:mixed-string-concat");
+   disable_warning ("Octave:variable-switch-label");
+ }
+ 
+-DEFUN (lasterror, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (lasterror, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{lasterr} =} lasterror ()
+ @deftypefnx {} {} lasterror (@var{err})
+ @deftypefnx {} {} lasterror ("reset")
+ Query or set the last error message structure.
+ 
+ When called without arguments, return a structure containing the last error
+ message and other information related to this error.  The elements of the
+ structure are:
+@@ -1936,18 +1956,19 @@ fields are set to their default values.
+               new_err_stack.setfield ("column", new_error_column);
+               Vlast_error_stack = new_err_stack;
+             }
+           else
+             {
+               // No stack field.  Fill it in with backtrace info.
+               octave_idx_type curr_frame = -1;
+ 
+-              Vlast_error_stack
+-                = octave::call_stack::backtrace (0, curr_frame);
++              octave::call_stack& cs = interp.get_call_stack ();
++
++              Vlast_error_stack = cs.backtrace (0, curr_frame);
+             }
+         }
+       else
+         error ("lasterror: argument must be a structure or a string");
+     }
+ 
+   return ovl (err);
+ }
+diff --git a/libinterp/corefcn/help.cc b/libinterp/corefcn/help.cc
+--- a/libinterp/corefcn/help.cc
++++ b/libinterp/corefcn/help.cc
+@@ -148,17 +148,19 @@ const static string_vector operator_name
+ 
+ // Return a vector of all functions from this file,
+ // for use in command line auto-completion.
+ static string_vector
+ local_functions (void)
+ {
+   string_vector retval;
+ 
+-  octave_user_code *curr_fcn = octave::call_stack::caller_user_code ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("local_functions");
++
++  octave_user_code *curr_fcn = cs.caller_user_code ();
+ 
+   if (! curr_fcn)
+     return retval;
+ 
+   // All subfunctions are listed in the top-level function of this file.
+   while (curr_fcn->is_subfunction ())
+     curr_fcn = symbol_table::get_curr_fcn (curr_fcn->parent_fcn_scope ());
+ 
+@@ -623,18 +625,18 @@ DEFUN (__builtins__, , ,
+ Undocumented internal function.
+ @end deftypefn */)
+ {
+   const string_vector bif = symbol_table::built_in_function_names ();
+ 
+   return ovl (Cell (bif));
+ }
+ 
+-DEFUN (localfunctions, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (localfunctions, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} localfunctions ()
+ Return a list of all local functions, i.e., subfunctions, within the current
+ file.
+ 
+ The return value is a column cell array of function handles to all local
+ functions accessible from the function from which @code{localfunctions} is
+ called.  Nested functions are @emph{not} included in the list.
+ 
+@@ -645,17 +647,18 @@ the return value is an empty cell array.
+ @end deftypefn */)
+ {
+   if (args.length () != 0)
+     print_usage ();
+ 
+   Cell retval;
+ 
+   // Find the main function we are in.
+-  octave_user_code *parent_fcn = octave::call_stack::debug_user_code ();
++  octave::call_stack& cs = interp.get_call_stack ();
++  octave_user_code *parent_fcn = cs.debug_user_code ();
+ 
+   if (! parent_fcn)
+     return ovl (retval);
+ 
+   // Find the subfunctions of this function.
+   // 1) subfunction_names contains only valid subfunctions
+   // 2) subfunctions contains both nested functions and subfunctions
+   const std::list<std::string> names = parent_fcn->subfunction_names ();
+diff --git a/libinterp/corefcn/input.cc b/libinterp/corefcn/input.cc
+--- a/libinterp/corefcn/input.cc
++++ b/libinterp/corefcn/input.cc
+@@ -593,35 +593,37 @@ execute_in_debugger_handler (const std::
+ static void
+ get_debug_input (const std::string& prompt)
+ {
+   octave::unwind_protect frame;
+ 
+   bool silent = octave::tree_evaluator::quiet_breakpoint_flag;
+   octave::tree_evaluator::quiet_breakpoint_flag = false;
+ 
+-  octave_user_code *caller = octave::call_stack::caller_user_code ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("get_debug_input");
++
++  octave_user_code *caller = cs.caller_user_code ();
+   std::string nm;
+   int curr_debug_line;
+ 
+   bool have_file = false;
+ 
+   if (caller)
+     {
+       nm = caller->fcn_file_name ();
+ 
+       if (nm.empty ())
+         nm = caller->name ();
+       else
+         have_file = true;
+ 
+-      curr_debug_line = octave::call_stack::caller_user_code_line ();
++      curr_debug_line = cs.caller_user_code_line ();
+     }
+   else
+-    curr_debug_line = octave::call_stack::current_line ();
++    curr_debug_line = cs.current_line ();
+ 
+   std::ostringstream buf;
+ 
+   if (! nm.empty ())
+     {
+       if (Vgud_mode)
+         {
+           static char ctrl_z = 'Z' & 0x1f;
+@@ -954,18 +956,20 @@ do_keyboard (const octave_value_list& ar
+ 
+   frame.add_fcn (octave::command_history::ignore_entries,
+                  octave::command_history::ignoring_entries ());
+ 
+   octave::command_history::ignore_entries (false);
+ 
+   frame.protect_var (Vdebugging);
+ 
+-  frame.add_fcn (octave::call_stack::restore_frame,
+-                 octave::call_stack::current_frame ());
++  octave::call_stack& cs = octave::__get_call_stack__ ("do_keyboard");
++
++  frame.add_method (cs, &octave::call_stack::restore_frame,
++                    cs.current_frame ());
+ 
+   // FIXME: probably we just want to print one line, not the
+   // entire statement, which might span many lines...
+   //
+   // tree_print_code tpc (octave_stdout);
+   // stmt.accept (tpc);
+ 
+   Vdebugging = true;
+@@ -975,18 +979,18 @@ do_keyboard (const octave_value_list& ar
+   if (nargin > 0)
+     prompt = args(0).string_value ();
+ 
+   get_debug_input (prompt);
+ 
+   return retval;
+ }
+ 
+-DEFUN (keyboard, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (keyboard, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} keyboard ()
+ @deftypefnx {} {} keyboard ("@var{prompt}")
+ Stop m-file execution and enter debug mode.
+ 
+ When the @code{keyboard} function is executed, Octave prints a prompt and
+ waits for user input.  The input strings are then evaluated and the results
+ are printed.  This makes it possible to examine the values of variables
+ within a function, and to assign new values if necessary.  To leave the
+@@ -998,26 +1002,28 @@ If @code{keyboard} is invoked without ar
+ @seealso{dbstop, dbcont, dbquit}
+ @end deftypefn */)
+ {
+   if (args.length () > 1)
+     print_usage ();
+ 
+   octave::unwind_protect frame;
+ 
+-  frame.add_fcn (octave::call_stack::restore_frame,
+-                 octave::call_stack::current_frame ());
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  frame.add_method (cs, &octave::call_stack::restore_frame,
++                    cs.current_frame ());
+ 
+   // Skip the frame assigned to the keyboard function.
+-  octave::call_stack::goto_frame_relative (0);
++  cs.goto_frame_relative (0);
+ 
+   octave::tree_evaluator::debug_mode = true;
+   octave::tree_evaluator::quiet_breakpoint_flag = false;
+ 
+-  octave::tree_evaluator::current_frame = octave::call_stack::current_frame ();
++  octave::tree_evaluator::current_frame = cs.current_frame ();
+ 
+   do_keyboard (args);
+ 
+   return ovl ();
+ }
+ 
+ DEFUN (echo, args, ,
+        doc: /* -*- texinfo -*-
+diff --git a/libinterp/corefcn/interpreter-private.cc b/libinterp/corefcn/interpreter-private.cc
+--- a/libinterp/corefcn/interpreter-private.cc
++++ b/libinterp/corefcn/interpreter-private.cc
+@@ -21,16 +21,17 @@ along with Octave; see the file COPYING.
+ */
+ 
+ #if defined (HAVE_CONFIG_H)
+ #  include "config.h"
+ #endif
+ 
+ #include <string>
+ 
++#include "call-stack.h"
+ #include "error.h"
+ #include "load-path.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ 
+ namespace octave
+ {
+   interpreter& __get_interpreter__ (const std::string& who)
+@@ -51,9 +52,16 @@ namespace octave
+   }
+ 
+   tree_evaluator& __get_evaluator__ (const std::string& who)
+   {
+     interpreter& interp = __get_interpreter__ (who);
+ 
+     return interp.get_evaluator ();
+   }
++
++  call_stack& __get_call_stack__ (const std::string& who)
++  {
++    interpreter& interp = __get_interpreter__ (who);
++
++    return interp.get_call_stack ();
++  }
+ }
+diff --git a/libinterp/corefcn/interpreter-private.h b/libinterp/corefcn/interpreter-private.h
+--- a/libinterp/corefcn/interpreter-private.h
++++ b/libinterp/corefcn/interpreter-private.h
+@@ -24,20 +24,23 @@ along with Octave; see the file COPYING.
+ #define octave_interpreter_private_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <string>
+ 
+ namespace octave
+ {
++  class call_stack;
+   class interpreter;
+   class load_path;
+   class tree_evaluator;
+ 
+   extern interpreter& __get_interpreter__ (const std::string& who);
+ 
+   extern load_path& __get_load_path__ (const std::string& who);
+ 
+   extern tree_evaluator& __get_evaluator__ (const std::string& who);
++
++  extern call_stack& __get_call_stack__ (const std::string& who);
+ }
+ 
+ #endif
+diff --git a/libinterp/corefcn/interpreter.cc b/libinterp/corefcn/interpreter.cc
+--- a/libinterp/corefcn/interpreter.cc
++++ b/libinterp/corefcn/interpreter.cc
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ #include "oct-env.h"
+ #include "str-vec.h"
+ #include "signal-wrappers.h"
+ #include "unistd-wrappers.h"
+ 
+ #include "builtins.h"
+ #include "defaults.h"
+ #include "Cell.h"
++#include "call-stack.h"
+ #include "defun.h"
+ #include "display.h"
+ #include "error.h"
+ #include "file-io.h"
+ #include "graphics.h"
+ #include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "load-path.h"
+@@ -367,20 +368,21 @@ execute_pkg_add (const std::string& dir)
+ namespace octave
+ {
+   // Create an interpreter object and perform initialization up to the
+   // point of setting reading command history and setting the load
+   // path.
+ 
+   interpreter::interpreter (application *app_context)
+     : m_app_context (app_context), m_evaluator (new tree_evaluator (*this)),
+-      m_load_path (), m_interactive (false), m_read_site_files (true),
+-      m_read_init_files (m_app_context != 0), m_verbose (false),
+-      m_inhibit_startup_message (false), m_load_path_initialized (false),
+-      m_history_initialized (false), m_initialized (false)
++      m_load_path (), m_interactive (false),
++      m_read_site_files (true), m_read_init_files (m_app_context != 0),
++      m_verbose (false), m_inhibit_startup_message (false),
++      m_load_path_initialized (false), m_history_initialized (false),
++      m_initialized (false)
+   {
+     if (instance)
+       throw std::runtime_error
+         ("only one Octave interpreter object may be active");
+ 
+     instance = this;
+ 
+     // Matlab uses "C" locale for LC_NUMERIC class regardless of local setting
+@@ -1107,18 +1109,16 @@ namespace octave
+     OCTAVE_SAFE_CALL (gtk_manager::unload_all_toolkits, ());
+ 
+     OCTAVE_SAFE_CALL (close_files, ());
+ 
+     OCTAVE_SAFE_CALL (cleanup_tmp_files, ());
+ 
+     OCTAVE_SAFE_CALL (symbol_table::cleanup, ());
+ 
+-    symbol_table::cleanup_instance ();
+-
+     OCTAVE_SAFE_CALL (sysdep_cleanup, ());
+ 
+     OCTAVE_SAFE_CALL (octave_finalize_hdf5, ());
+ 
+     OCTAVE_SAFE_CALL (octave::flush_stdout, ());
+ 
+     // Don't call singleton_cleanup_list::cleanup until we have the
+     // problems with registering/unregistering types worked out.  For
+@@ -1135,16 +1135,21 @@ namespace octave
+     OCTAVE_SAFE_CALL (octave::chunk_buffer::clear, ());
+   }
+ 
+   tree_evaluator& interpreter::get_evaluator (void)
+   {
+     return *m_evaluator;
+   }
+ 
++  call_stack& interpreter::get_call_stack (void)
++  {
++    return m_evaluator->get_call_stack ();
++  }
++
+   void interpreter::recover_from_exception (void)
+   {
+     octave::can_interrupt = true;
+     octave_interrupt_immediately = 0;
+     octave_interrupt_state = 0;
+     octave_signal_caught = 0;
+     octave_exception_state = octave_no_exception;
+     octave_restore_signal_mask ();
+diff --git a/libinterp/corefcn/interpreter.h b/libinterp/corefcn/interpreter.h
+--- a/libinterp/corefcn/interpreter.h
++++ b/libinterp/corefcn/interpreter.h
+@@ -38,16 +38,17 @@ extern OCTINTERP_API bool quit_allowed;
+ // is ready for interactive use.
+ extern OCTINTERP_API bool octave_interpreter_ready;
+ 
+ // TRUE means we've processed all the init code and we are good to go.
+ extern OCTINTERP_API bool octave_initialized;
+ 
+ namespace octave
+ {
++  class call_stack;
+   class tree_evaluator;
+ 
+   // The application object contains a pointer to the current
+   // interpreter and the interpreter contains a pointer back to the
+   // application context so we need a forward declaration for one (or
+   // both) of them...
+ 
+   class application;
+@@ -130,16 +131,18 @@ namespace octave
+       return m_initialized;
+     }
+ 
+     load_path& get_load_path (void)
+     {
+       return m_load_path;
+     }
+ 
++    call_stack& get_call_stack (void);
++
+     tree_evaluator& get_evaluator (void);
+ 
+     static void recover_from_exception (void);
+ 
+     static void add_atexit_function (const std::string& fname);
+ 
+     static bool remove_atexit_function (const std::string& fname);
+ 
+diff --git a/libinterp/corefcn/ls-mat5.cc b/libinterp/corefcn/ls-mat5.cc
+--- a/libinterp/corefcn/ls-mat5.cc
++++ b/libinterp/corefcn/ls-mat5.cc
+@@ -980,18 +980,20 @@ read_mat5_binary_element (std::istream& 
+             // Set up temporary scope to use for evaluating the text
+             // that defines the anonymous function.
+ 
+             symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
+             frame.add_fcn (symbol_table::erase_scope, local_scope);
+ 
+             symbol_table::set_scope (local_scope);
+ 
+-            octave::call_stack::push (local_scope, 0);
+-            frame.add_fcn (octave::call_stack::pop);
++            octave::call_stack& cs
++              = octave::__get_call_stack__ ("read_mat5_binary_element");
++            cs.push (local_scope, 0);
++            frame.add_method (cs, &octave::call_stack::pop);
+ 
+             if (m2.nfields () > 0)
+               {
+                 octave_value tmp;
+ 
+                 for (octave_map::iterator p0 = m2.begin () ;
+                      p0 != m2.end (); p0++)
+                   {
+diff --git a/libinterp/corefcn/mex.cc b/libinterp/corefcn/mex.cc
+--- a/libinterp/corefcn/mex.cc
++++ b/libinterp/corefcn/mex.cc
+@@ -37,16 +37,17 @@ along with Octave; see the file COPYING.
+ #include "f77-fcn.h"
+ #include "lo-ieee.h"
+ #include "oct-locbuf.h"
+ #include "quit.h"
+ 
+ #include "Cell.h"
+ #include "call-stack.h"
+ #include "error.h"
++#include "interpreter-private.h"
+ #include "interpreter.h"
+ // mxArray must be declared as a class before including mexproto.h.
+ #include "mxarray.h"
+ #include "mexproto.h"
+ #include "oct-map.h"
+ #include "ovl.h"
+ #include "ov.h"
+ #include "ov-mex-fcn.h"
+@@ -2112,17 +2113,20 @@ public:
+ 
+     mxFree (fname);
+   }
+ 
+   const char * function_name (void) const
+   {
+     if (! fname)
+       {
+-        octave_function *fcn = octave::call_stack::current ();
++        octave::call_stack& cs
++          = octave::__get_call_stack__ ("mex::function_name");
++
++        octave_function *fcn = cs.current ();
+ 
+         if (fcn)
+           {
+             std::string nm = fcn->name ();
+             fname = mxArray::strsave (nm.c_str ());
+           }
+         else
+           fname = mxArray::strsave ("unknown");
+@@ -3408,19 +3412,22 @@ mexGetVariable (const char *space, const
+ 
+       if (caller || base)
+         {
+           // MEX files don't create a separate frame in the call stack,
+           // so we are already in the "caller" frame.
+ 
+           if (base)
+             {
+-              octave::call_stack::goto_base_frame ();
+-
+-              frame.add_fcn (octave::call_stack::pop);
++              octave::call_stack& cs
++                = octave::__get_call_stack__ ("mexGetVariable");
++
++              cs.goto_base_frame ();
++
++              frame.add_method (cs, &octave::call_stack::pop);
+             }
+ 
+           val = symbol_table::varval (name);
+         }
+       else
+         mexErrMsgTxt ("mexGetVariable: symbol table does not exist");
+     }
+ 
+@@ -3468,19 +3475,22 @@ mexPutVariable (const char *space, const
+ 
+       if (caller || base)
+         {
+           // MEX files don't create a separate frame in the call stack,
+           // so we are already in the "caller" frame.
+ 
+           if (base)
+             {
+-              octave::call_stack::goto_base_frame ();
+-
+-              frame.add_fcn (octave::call_stack::pop);
++              octave::call_stack& cs
++                = octave::__get_call_stack__ ("mexPutVariable");
++
++              cs.goto_base_frame ();
++
++              frame.add_method (cs, &octave::call_stack::pop);
+             }
+ 
+           symbol_table::assign (name, mxArray::as_octave_value (ptr));
+         }
+       else
+         mexErrMsgTxt ("mexPutVariable: symbol table does not exist");
+     }
+ 
+diff --git a/libinterp/corefcn/variables.cc b/libinterp/corefcn/variables.cc
+--- a/libinterp/corefcn/variables.cc
++++ b/libinterp/corefcn/variables.cc
+@@ -735,17 +735,19 @@ wants_local_change (const octave_value_l
+     }
+ 
+   return retval;
+ }
+ 
+ template <typename T>
+ bool try_local_protect (T& var)
+ {
+-  octave_user_code *curr_usr_code = octave::call_stack::caller_user_code ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("try_local_protect");
++
++  octave_user_code *curr_usr_code = cs.caller_user_code ();
+   octave_user_function *curr_usr_fcn = nullptr;
+   if (curr_usr_code && curr_usr_code->is_user_function ())
+     curr_usr_fcn = dynamic_cast<octave_user_function *> (curr_usr_code);
+ 
+   if (curr_usr_fcn && curr_usr_fcn->local_protect (var))
+     return true;
+   else
+     return false;
+@@ -1628,21 +1630,23 @@ public:
+   }
+ 
+ private:
+   std::list<symbol_info> lst;
+ 
+ };
+ 
+ static octave_value
+-do_who (int argc, const string_vector& argv, bool return_list,
+-        bool verbose = false, std::string msg = "")
++do_who (octave::interpreter& interp, int argc, const string_vector& argv,
++        bool return_list, bool verbose = false, std::string msg = "")
+ {
+   octave_value retval;
+ 
++  octave::call_stack& cs = interp.get_call_stack ();
++
+   std::string my_name = argv[0];
+ 
+   bool global_only = false;
+   bool have_regexp = false;
+ 
+   int i;
+   for (i = 1; i < argc; i++)
+     {
+@@ -1663,27 +1667,27 @@ do_who (int argc, const string_vector& a
+ 
+           // Set up temporary scope.
+ 
+           symbol_table::scope_id tmp_scope = symbol_table::alloc_scope ();
+           frame.add_fcn (symbol_table::erase_scope, tmp_scope);
+ 
+           symbol_table::set_scope (tmp_scope);
+ 
+-          octave::call_stack::push (tmp_scope, 0);
+-          frame.add_fcn (octave::call_stack::pop);
++          cs.push (tmp_scope, 0);
++          frame.add_method (cs, &octave::call_stack::pop);
+ 
+           frame.add_fcn (symbol_table::clear_variables);
+ 
+           octave::feval ("load", octave_value (nm), 0);
+ 
+           std::string newmsg = std::string ("Variables in the file ")
+                                + nm + ":\n\n";
+ 
+-          retval = do_who (i, argv, return_list, verbose, newmsg);
++          retval = do_who (interp, i, argv, return_list, verbose, newmsg);
+ 
+           return retval;
+         }
+       else if (argv[i] == "-regexp")
+         have_regexp = true;
+       else if (argv[i] == "global")
+         global_only = true;
+       else if (argv[i][0] == '-')
+@@ -1785,17 +1789,17 @@ do_who (int argc, const string_vector& a
+         }
+     }
+ 
+   if (return_list)
+     {
+       if (verbose)
+         {
+           std::string caller_function_name;
+-          octave_function *caller = octave::call_stack::caller ();
++          octave_function *caller = cs.caller ();
+           if (caller)
+             caller_function_name = caller->name ();
+ 
+           retval = symbol_stats.map_value (caller_function_name, 1);
+         }
+       else
+         retval = Cell (string_vector (symbol_names));
+     }
+@@ -1819,18 +1823,18 @@ do_who (int argc, const string_vector& a
+         }
+ 
+       octave_stdout << "\n";
+     }
+ 
+   return retval;
+ }
+ 
+-DEFUN (who, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (who, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} who
+ @deftypefnx {} {} who pattern @dots{}
+ @deftypefnx {} {} who option pattern @dots{}
+ @deftypefnx {} {C =} who ("pattern", @dots{})
+ List currently defined variables matching the given patterns.
+ 
+ Valid pattern syntax is the same as described for the @code{clear} command.
+ If no patterns are supplied, all variables are listed.
+@@ -1858,21 +1862,21 @@ If called as a function, return a cell a
+ matching the given patterns.
+ @seealso{whos, isglobal, isvarname, exist, regexp}
+ @end deftypefn */)
+ {
+   int argc = args.length () + 1;
+ 
+   string_vector argv = args.make_argv ("who");
+ 
+-  return do_who (argc, argv, nargout == 1);
++  return do_who (interp, argc, argv, nargout == 1);
+ }
+ 
+-DEFUN (whos, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (whos, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} whos
+ @deftypefnx {} {} whos pattern @dots{}
+ @deftypefnx {} {} whos option pattern @dots{}
+ @deftypefnx {} {S =} whos ("pattern", @dots{})
+ Provide detailed information on currently defined variables matching the
+ given patterns.
+ 
+ Options and pattern syntax are the same as for the @code{who} command.
+@@ -1929,17 +1933,17 @@ describing each variable are: name, size
+ complex, nesting, persistent.
+ @seealso{who, whos_line_format}
+ @end deftypefn */)
+ {
+   int argc = args.length () + 1;
+ 
+   string_vector argv = args.make_argv ("whos");
+ 
+-  return do_who (argc, argv, nargout == 1, true);
++  return do_who (interp, argc, argv, nargout == 1, true);
+ }
+ 
+ // Defining variables.
+ 
+ void
+ bind_ans (const octave_value& val, bool print)
+ {
+   static std::string ans = "ans";
+@@ -1975,17 +1979,19 @@ bind_internal_variable (const std::strin
+   args(0) = val;
+ 
+   octave::feval (fname, args, 0);
+ }
+ 
+ void
+ mlock (void)
+ {
+-  octave_function *fcn = octave::call_stack::current ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("mlock");
++
++  octave_function *fcn = cs.current ();
+ 
+   if (! fcn)
+     error ("mlock: invalid use outside a function");
+ 
+   fcn->lock ();
+ }
+ 
+ void
+@@ -2015,38 +2021,40 @@ mislocked (const std::string& nm)
+ 
+       if (fcn)
+         retval = fcn->islocked ();
+     }
+ 
+   return retval;
+ }
+ 
+-DEFUN (mlock, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (mlock, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} mlock ()
+ Lock the current function into memory so that it can't be cleared.
+ @seealso{munlock, mislocked, persistent}
+ @end deftypefn */)
+ {
+   if (args.length () != 0)
+     print_usage ();
+ 
+-  octave_function *fcn = octave::call_stack::caller ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  octave_function *fcn = cs.caller ();
+ 
+   if (! fcn)
+     error ("mlock: invalid use outside a function");
+ 
+   fcn->lock ();
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (munlock, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (munlock, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} munlock ()
+ @deftypefnx {} {} munlock (@var{fcn})
+ Unlock the named function @var{fcn}.
+ 
+ If no function is named then unlock the current function.
+ @seealso{mlock, mislocked, persistent}
+ @end deftypefn */)
+ {
+@@ -2058,29 +2066,31 @@ If no function is named then unlock the 
+   if (nargin == 1)
+     {
+       std::string name = args(0).xstring_value ("munlock: FCN must be a string");
+ 
+       munlock (name);
+     }
+   else
+     {
+-      octave_function *fcn = octave::call_stack::caller ();
++      octave::call_stack& cs = interp.get_call_stack ();
++
++      octave_function *fcn = cs.caller ();
+ 
+       if (! fcn)
+         error ("munlock: invalid use outside a function");
+ 
+       fcn->unlock ();
+     }
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (mislocked, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (mislocked, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} mislocked ()
+ @deftypefnx {} {} mislocked (@var{fcn})
+ Return true if the named function @var{fcn} is locked.
+ 
+ If no function is named then return true if the current function is locked.
+ @seealso{mlock, munlock, persistent}
+ @end deftypefn */)
+ {
+@@ -2094,17 +2104,19 @@ If no function is named then return true
+   if (nargin == 1)
+     {
+       std::string name = args(0).xstring_value ("mislocked: FCN must be a string");
+ 
+       retval = mislocked (name);
+     }
+   else
+     {
+-      octave_function *fcn = octave::call_stack::caller ();
++      octave::call_stack& cs = interp.get_call_stack ();
++
++      octave_function *fcn = cs.caller ();
+ 
+       if (! fcn)
+         error ("mislocked: invalid use outside a function");
+ 
+       retval = fcn->islocked ();
+     }
+ 
+   return retval;
+diff --git a/libinterp/octave-value/ov-base.cc b/libinterp/octave-value/ov-base.cc
+--- a/libinterp/octave-value/ov-base.cc
++++ b/libinterp/octave-value/ov-base.cc
+@@ -29,37 +29,38 @@ along with Octave; see the file COPYING.
+ #include <limits>
+ 
+ #include "lo-ieee.h"
+ #include "lo-mappers.h"
+ 
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "errwarn.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
+ #include "mxarray.h"
+-#include "oct-map.h"
+-#include "ovl.h"
+ #include "oct-hdf5.h"
+ #include "oct-lvalue.h"
++#include "oct-map.h"
+ #include "oct-stream.h"
+ #include "ops.h"
+ #include "ov-base.h"
+ #include "ov-cell.h"
+ #include "ov-ch-mat.h"
+ #include "ov-complex.h"
+ #include "ov-cx-mat.h"
++#include "ov-fcn-handle.h"
+ #include "ov-range.h"
+ #include "ov-re-mat.h"
+ #include "ov-scalar.h"
+ #include "ov-str-mat.h"
+-#include "ov-fcn-handle.h"
++#include "ovl.h"
+ #include "parse.h"
+ #include "pr-output.h"
+ #include "utils.h"
+-#include "interpreter.h"
+ #include "variables.h"
+ 
+ builtin_type_t btyp_mixed_numeric (builtin_type_t x, builtin_type_t y)
+ {
+   builtin_type_t retval = btyp_unknown;
+ 
+   if (x == btyp_bool)
+     x = btyp_double;
+@@ -1486,17 +1487,19 @@ make_idx_args (const std::string& type,
+   m.assign ("subs", subs_field);
+ 
+   return m;
+ }
+ 
+ bool
+ called_from_builtin (void)
+ {
+-  octave_function *fcn = octave::call_stack::caller ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("called_from_builtin");
++
++  octave_function *fcn = cs.caller ();
+ 
+   // FIXME: we probably need a better check here, or some other
+   // mechanism to avoid overloaded functions when builtin is used.
+   // For example, what if someone overloads the builtin function?
+   // Also, are there other places where using builtin is not properly
+   // avoiding dispatch?
+ 
+   return (fcn && fcn->name () == "builtin");
+diff --git a/libinterp/octave-value/ov-builtin.cc b/libinterp/octave-value/ov-builtin.cc
+--- a/libinterp/octave-value/ov-builtin.cc
++++ b/libinterp/octave-value/ov-builtin.cc
+@@ -46,19 +46,21 @@ octave_builtin::call (octave::tree_evalu
+ {
+   octave_value_list retval;
+ 
+   if (args.has_magic_colon ())
+     error ("invalid use of colon in function argument list");
+ 
+   octave::unwind_protect frame;
+ 
+-  octave::call_stack::push (this);
++  octave::call_stack& cs = octave::__get_call_stack__ ("octave_builtin::call");
+ 
+-  frame.add_fcn (octave::call_stack::pop);
++  cs.push (this);
++
++  frame.add_method (cs, &octave::call_stack::pop);
+ 
+   profile_data_accumulator::enter<octave_builtin> block (profiler, *this);
+ 
+   if (f)
+     retval = (*f) (args, nargout);
+   else
+     {
+       octave::interpreter& interp
+diff --git a/libinterp/octave-value/ov-class.cc b/libinterp/octave-value/ov-class.cc
+--- a/libinterp/octave-value/ov-class.cc
++++ b/libinterp/octave-value/ov-class.cc
+@@ -221,17 +221,20 @@ octave_class::unique_clone (void)
+ 
+ std::string
+ octave_class::get_current_method_class (void)
+ {
+   std::string retval = class_name ();
+ 
+   if (nparents () > 0)
+     {
+-      octave_function *fcn = octave::call_stack::current ();
++      octave::call_stack& cs
++        = octave::__get_call_stack__ ("octave_class::get_current_method_class");
++
++      octave_function *fcn = cs.current ();
+ 
+       // Here we are just looking to see if FCN is a method or constructor
+       // for any class, not specifically this one.
+       if (fcn && (fcn->is_class_method () || fcn->is_class_constructor ()))
+         retval = fcn->dispatch_class ();
+     }
+ 
+   return retval;
+@@ -1619,17 +1622,20 @@ mxArray *
+ octave_class::as_mxArray (void) const
+ {
+   err_wrong_type_arg ("octave_class::as_mxArray ()", type_name ());
+ }
+ 
+ bool
+ octave_class::in_class_method (void)
+ {
+-  octave_function *fcn = octave::call_stack::current ();
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("octave_class::in_class_method");
++
++  octave_function *fcn = cs.current ();
+ 
+   return (fcn
+           && (fcn->is_class_method ()
+               || fcn->is_class_constructor ()
+               || fcn->is_anonymous_function_of_class ()
+               || fcn->is_private_function_of_class (class_name ()))
+           && find_parent_class (fcn->dispatch_class ()));
+ }
+@@ -1683,18 +1689,18 @@ octave_class::exemplar_info::compare (co
+     {
+       if (*p++ != *q++)
+         error ("mismatch in parent classes");
+     }
+ 
+   return true;
+ }
+ 
+-DEFUN (class, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (class, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{classname} =} class (@var{obj})
+ @deftypefnx {} {} class (@var{s}, @var{id})
+ @deftypefnx {} {} class (@var{s}, @var{id}, @var{p}, @dots{})
+ Return the class of the object @var{obj}, or create a class with
+ fields from structure @var{s} and name (string) @var{id}.
+ 
+ Additional arguments name a list of parent classes from which the new class
+ is derived.
+@@ -1711,17 +1717,19 @@ is derived.
+   if (nargin == 1)
+     // Called for class of object
+     retval = args(0).class_name ();
+   else
+     {
+       // Called as class constructor
+       std::string id = args(1).xstring_value ("class: ID (class name) must be a string");
+ 
+-      octave_function *fcn = octave::call_stack::caller ();
++      octave::call_stack& cs = interp.get_call_stack ();
++
++      octave_function *fcn = cs.caller ();
+ 
+       if (! fcn)
+         error ("class: invalid call from outside class constructor or method");
+ 
+       if (! fcn->is_class_constructor (id) && ! fcn->is_class_method (id))
+         error ("class: '%s' is invalid as a class name in this context",
+                id.c_str ());
+ 
+@@ -1983,28 +1991,31 @@ is_built_in_class (const std::string& cn
+       built_in_class_names.insert ("uint32");
+       built_in_class_names.insert ("int64");
+       built_in_class_names.insert ("uint64");
+     }
+ 
+   return built_in_class_names.find (cn) != built_in_class_names.end ();
+ }
+ 
+-DEFUN (superiorto, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (superiorto, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} superiorto (@var{class_name}, @dots{})
+ When called from a class constructor, mark the object currently constructed
+ as having a higher precedence than @var{class_name}.
+ 
+ More that one such class can be specified in a single call.  This function
+ may @emph{only} be called from a class constructor.
+ @seealso{inferiorto}
+ @end deftypefn */)
+ {
+-  octave_function *fcn = octave::call_stack::caller ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  octave_function *fcn = cs.caller ();
++
+   if (! fcn || ! fcn->is_class_constructor ())
+     error ("superiorto: invalid call from outside class constructor");
+ 
+   for (int i = 0; i < args.length (); i++)
+     {
+       std::string inf_class = args(i).xstring_value ("superiorto: CLASS_NAME must be a string");
+ 
+       // User defined classes always have higher precedence
+@@ -2016,28 +2027,31 @@ may @emph{only} be called from a class c
+       if (! symbol_table::set_class_relationship (sup_class, inf_class))
+         error ("superiorto: opposite precedence already set for %s and %s",
+                sup_class.c_str (), inf_class.c_str ());
+     }
+ 
+   return ovl ();
+ }
+ 
+-DEFUN (inferiorto, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (inferiorto, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} inferiorto (@var{class_name}, @dots{})
+ When called from a class constructor, mark the object currently constructed
+ as having a lower precedence than @var{class_name}.
+ 
+ More that one such class can be specified in a single call.  This function
+ may @emph{only} be called from a class constructor.
+ @seealso{superiorto}
+ @end deftypefn */)
+ {
+-  octave_function *fcn = octave::call_stack::caller ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  octave_function *fcn = cs.caller ();
++
+   if (! fcn || ! fcn->is_class_constructor ())
+     error ("inferiorto: invalid call from outside class constructor");
+ 
+   for (int i = 0; i < args.length (); i++)
+     {
+       std::string sup_class = args(i).xstring_value ("inferiorto: CLASS_NAME must be a string");
+ 
+       if (is_built_in_class (sup_class))
+diff --git a/libinterp/octave-value/ov-classdef.cc b/libinterp/octave-value/ov-classdef.cc
+--- a/libinterp/octave-value/ov-classdef.cc
++++ b/libinterp/octave-value/ov-classdef.cc
+@@ -253,17 +253,19 @@ class_get_properties (const octave_value
+   return retval;
+ }
+ 
+ static cdef_class
+ get_class_context (std::string& name, bool& in_constructor)
+ {
+   cdef_class cls;
+ 
+-  octave_function *fcn = octave::call_stack::current ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("get_class_context");
++
++  octave_function *fcn = cs.current ();
+ 
+   in_constructor = false;
+ 
+   if (fcn && (fcn->is_class_method ()
+               || fcn->is_classdef_constructor ()
+               || fcn->is_anonymous_function_of_class ()
+               || (fcn->is_private_function ()
+                   && ! fcn->dispatch_class ().empty ())))
+@@ -413,17 +415,19 @@ is_dummy_method (const octave_value& fcn
+ }
+ 
+ static bool
+ is_method_executing (const octave_value& ov, const cdef_object& obj)
+ {
+   octave::tree_evaluator& tw
+     = octave::__get_evaluator__ ("is_method_executing");
+ 
+-  octave_function *stack_fcn = octave::call_stack::current ();
++  octave::call_stack& cs = octave::__get_call_stack__ ("is_method_executing");
++
++  octave_function *stack_fcn = cs.current ();
+ 
+   octave_function *method_fcn = ov.function_value (true);
+ 
+   // Does the top of the call stack match our target function?
+ 
+   if (stack_fcn && stack_fcn == method_fcn)
+     {
+       octave_user_function *uf = method_fcn->user_function_value (true);
+@@ -1129,17 +1133,20 @@ public:
+       }
+ 
+     return retval;
+   }
+ 
+ private:
+   bool is_constructed_object (const std::string nm)
+   {
+-    octave_function *of = octave::call_stack::current ();
++    octave::call_stack& cs
++      = octave::__get_call_stack__ ("octave_classdef_superclass_ref::is_constructed_object");
++
++    octave_function *of = cs.current ();
+ 
+     if (of->is_classdef_constructor ())
+       {
+         octave_user_function *uf = of->user_function_value (true);
+ 
+         if (uf)
+           {
+             octave::tree_parameter_list *ret_list = uf->return_list ();
+diff --git a/libinterp/octave-value/ov-fcn-handle.cc b/libinterp/octave-value/ov-fcn-handle.cc
+--- a/libinterp/octave-value/ov-fcn-handle.cc
++++ b/libinterp/octave-value/ov-fcn-handle.cc
+@@ -418,18 +418,21 @@ octave_fcn_handle::load_ascii (std::istr
+       // Set up temporary scope to use for evaluating the text that
+       // defines the anonymous function.
+ 
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
+       frame.add_fcn (symbol_table::erase_scope, local_scope);
+ 
+       symbol_table::set_scope (local_scope);
+ 
+-      octave::call_stack::push (local_scope, 0);
+-      frame.add_fcn (octave::call_stack::pop);
++      octave::call_stack& cs
++        = octave::__get_call_stack__ ("octave_fcn_handle::load_ascii");
++
++      cs.push (local_scope, 0);
++      frame.add_method (cs, &octave::call_stack::pop);
+ 
+       octave_idx_type len = 0;
+ 
+       if (extract_keyword (is, "length", len, true) && len >= 0)
+         {
+           if (len > 0)
+             {
+               for (octave_idx_type i = 0; i < len; i++)
+@@ -601,18 +604,21 @@ octave_fcn_handle::load_binary (std::ist
+       // Set up temporary scope to use for evaluating the text that
+       // defines the anonymous function.
+ 
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
+       frame.add_fcn (symbol_table::erase_scope, local_scope);
+ 
+       symbol_table::set_scope (local_scope);
+ 
+-      octave::call_stack::push (local_scope, 0);
+-      frame.add_fcn (octave::call_stack::pop);
++      octave::call_stack& cs
++        = octave::__get_call_stack__ ("octave_fcn_handle::load_binary");
++
++      cs.push (local_scope, 0);
++      frame.add_method (cs, &octave::call_stack::pop);
+ 
+       if (len > 0)
+         {
+           for (octave_idx_type i = 0; i < len; i++)
+             {
+               octave_value t2;
+               bool dummy;
+               std::string doc;
+@@ -1117,18 +1123,21 @@ octave_fcn_handle::load_hdf5 (octave_hdf
+       // Set up temporary scope to use for evaluating the text that
+       // defines the anonymous function.
+ 
+       symbol_table::scope_id local_scope = symbol_table::alloc_scope ();
+       frame.add_fcn (symbol_table::erase_scope, local_scope);
+ 
+       symbol_table::set_scope (local_scope);
+ 
+-      octave::call_stack::push (local_scope, 0);
+-      frame.add_fcn (octave::call_stack::pop);
++      octave::call_stack& cs
++        = octave::__get_call_stack__ ("octave_fcn_handle::load_hdf5");
++
++      cs.push (local_scope, 0);
++      frame.add_method (cs, &octave::call_stack::pop);
+ 
+       if (len > 0 && success)
+         {
+           hsize_t num_obj = 0;
+ #if defined (HAVE_HDF5_18)
+           data_hid = H5Gopen (group_hid, "symbol table", octave_H5P_DEFAULT);
+ #else
+           data_hid = H5Gopen (group_hid, "symbol table");
+diff --git a/libinterp/octave-value/ov-fcn-inline.cc b/libinterp/octave-value/ov-fcn-inline.cc
+--- a/libinterp/octave-value/ov-fcn-inline.cc
++++ b/libinterp/octave-value/ov-fcn-inline.cc
+@@ -34,25 +34,26 @@ Open Source Initiative (www.opensource.o
+ #include <vector>
+ 
+ #include "oct-locbuf.h"
+ 
+ #include "call-stack.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "errwarn.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
+ #include "oct-hdf5.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-fcn-inline.h"
+ #include "ov-usr-fcn.h"
++#include "parse.h"
+ #include "pr-output.h"
+ #include "variables.h"
+-#include "parse.h"
+-#include "interpreter.h"
+ 
+ #include "byte-swap.h"
+ #include "ls-ascii-helper.h"
+ #include "ls-oct-text.h"
+ #include "ls-hdf5.h"
+ #include "ls-utils.h"
+ 
+ 
+@@ -91,17 +92,20 @@ octave_fcn_inline::octave_fcn_inline (co
+       if (fh)
+         {
+           fcn = fh->fcn_val ();
+ 
+           octave_user_function *uf = fcn.user_function_value ();
+ 
+           if (uf)
+             {
+-              octave_function *curr_fcn = octave::call_stack::current ();
++              octave::call_stack& cs
++                = octave::__get_call_stack__ ("octave_fcn_inline");
++
++              octave_function *curr_fcn = cs.current ();
+ 
+               if (curr_fcn)
+                 {
+                   symbol_table::scope_id parent_scope
+                     = curr_fcn->parent_fcn_scope ();
+ 
+                   if (parent_scope < 0)
+                     parent_scope = curr_fcn->scope ();
+diff --git a/libinterp/octave-value/ov-mex-fcn.cc b/libinterp/octave-value/ov-mex-fcn.cc
+--- a/libinterp/octave-value/ov-mex-fcn.cc
++++ b/libinterp/octave-value/ov-mex-fcn.cc
+@@ -26,21 +26,22 @@ along with Octave; see the file COPYING.
+ 
+ #include "oct-shlib.h"
+ 
+ #include "call-stack.h"
+ #include "defaults.h"
+ #include "dynamic-ld.h"
+ #include "error.h"
+ #include "errwarn.h"
+-#include "ovl.h"
++#include "interpreter-private.h"
++#include "interpreter.h"
+ #include "ov-mex-fcn.h"
+ #include "ov.h"
++#include "ovl.h"
+ #include "profiler.h"
+-#include "interpreter.h"
+ #include "unwind-prot.h"
+ 
+ 
+ DEFINE_OV_TYPEID_FUNCTIONS_AND_DATA (octave_mex_function,
+                                      "mex function", "mex function");
+ 
+ octave_mex_function::octave_mex_function
+   (void *fptr, bool fmex, const octave::dynamic_library& shl,
+@@ -88,18 +89,21 @@ octave_mex_function::call (octave::tree_
+ {
+   octave_value_list retval;
+ 
+   if (args.has_magic_colon ())
+     error ("invalid use of colon in function argument list");
+ 
+   octave::unwind_protect frame;
+ 
+-  octave::call_stack::push (this);
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("octave_mex_function::call");
+ 
+-  frame.add_fcn (octave::call_stack::pop);
++  cs.push (this);
++
++  frame.add_method (cs, &octave::call_stack::pop);
+ 
+   profile_data_accumulator::enter<octave_mex_function> block (profiler, *this);
+ 
+   retval = call_mex (*this, args, nargout);
+ 
+   return retval;
+ }
+diff --git a/libinterp/octave-value/ov-usr-fcn.cc b/libinterp/octave-value/ov-usr-fcn.cc
+--- a/libinterp/octave-value/ov-usr-fcn.cc
++++ b/libinterp/octave-value/ov-usr-fcn.cc
+@@ -43,16 +43,17 @@ along with Octave; see the file COPYING.
+ #include "pt-eval.h"
+ #include "pt-jit.h"
+ #include "pt-jump.h"
+ #include "pt-misc.h"
+ #include "pt-pr-code.h"
+ #include "pt-stmt.h"
+ #include "pt-walk.h"
+ #include "symtab.h"
++#include "interpreter-private.h"
+ #include "interpreter.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "parse.h"
+ #include "profiler.h"
+ #include "variables.h"
+ #include "ov-fcn-handle.h"
+ 
+@@ -125,19 +126,22 @@ octave_user_script::call (octave::tree_e
+   if (cmd_list)
+     {
+       frame.protect_var (call_depth);
+       call_depth++;
+ 
+       if (call_depth >= Vmax_recursion_depth)
+         error ("max_recursion_depth exceeded");
+ 
+-      octave::call_stack::push (this);
++      octave::call_stack& cs
++        = octave::__get_call_stack__ ("octave_user_script::call");
+ 
+-      frame.add_fcn (octave::call_stack::pop);
++      cs.push (this);
++
++      frame.add_method (cs, &octave::call_stack::pop);
+ 
+       // Update line number even if debugging.
+       frame.protect_var (Vtrack_line_num);
+       Vtrack_line_num = true;
+ 
+       frame.protect_var (octave::tree_evaluator::statement_context);
+       octave::tree_evaluator::statement_context = octave::tree_evaluator::script;
+ 
+@@ -436,21 +440,24 @@ octave_user_function::call (octave::tree
+   if (call_depth >= Vmax_recursion_depth)
+     error ("max_recursion_depth exceeded");
+ 
+   // Save old and set current symbol table context, for
+   // eval_undefined_error().
+ 
+   int context = active_context ();
+ 
+-  octave::call_stack::push (this, local_scope, context);
++  octave::call_stack& cs
++    = octave::__get_call_stack__ ("octave_user_function::call");
++
++  cs.push (this, local_scope, context);
+ 
+   frame.protect_var (Vtrack_line_num);
+   Vtrack_line_num = true;    // update source line numbers, even if debugging
+-  frame.add_fcn (octave::call_stack::pop);
++  frame.add_method (cs, &octave::call_stack::pop);
+ 
+   if (call_depth > 0 && ! is_anonymous_function ())
+     {
+       symbol_table::push_context ();
+ 
+       frame.add_fcn (symbol_table::pop_context);
+     }
+ 
+@@ -532,17 +539,17 @@ octave_user_function::call (octave::tree
+         assert (cmd_list->length () == 1);
+ 
+         octave::tree_statement *stmt = cmd_list->front ();
+ 
+         octave::tree_expression *expr = stmt->expression ();
+ 
+         if (expr)
+           {
+-            octave::call_stack::set_location (stmt->line (), stmt->column ());
++            cs.set_location (stmt->line (), stmt->column ());
+ 
+             retval = tw.evaluate_n (expr, nargout);
+           }
+       }
+     else
+       cmd_list->accept (tw);
+   }
+ 
+@@ -695,18 +702,21 @@ octave_user_function::restore_warning_st
+       if (! val.is_map ())
+         panic_impossible ();
+ 
+       octave_map m = val.map_value ();
+ 
+       Cell ids = m.contents ("identifier");
+       Cell states = m.contents ("state");
+ 
++      octave::interpreter& interp
++        = octave::__get_interpreter__ ("octave_user_function::restore_warning_states");
++
+       for (octave_idx_type i = 0; i < m.numel (); i++)
+-        Fwarning (ovl (states(i), ids(i)));
++        Fwarning (interp, ovl (states(i), ids(i)));
+     }
+ }
+ 
+ DEFUN (nargin, args, ,
+        doc: /* -*- texinfo -*-
+ @deftypefn  {} {} nargin ()
+ @deftypefnx {} {} nargin (@var{fcn})
+ Report the number of input arguments to a function.
+diff --git a/libinterp/parse-tree/bp-table.cc b/libinterp/parse-tree/bp-table.cc
+--- a/libinterp/parse-tree/bp-table.cc
++++ b/libinterp/parse-tree/bp-table.cc
+@@ -38,16 +38,17 @@ along with Octave; see the file COPYING.
+ #include "file-stat.h"
+ #include "singleton-cleanup.h"
+ 
+ #include "bp-table.h"
+ #include "defun-int.h"
+ #include "call-stack.h"
+ #include "error.h"
+ #include "input.h"
++#include "interpreter-private.h"
+ #include "oct-map.h"
+ #include "octave-link.h"
+ #include "ov-usr-fcn.h"
+ #include "ov.h"
+ #include "ovl.h"
+ #include "pager.h"
+ #include "parse.h"
+ #include "pt-eval.h"
+@@ -167,17 +168,21 @@ get_file_line (const std::string& fname,
+ // current call stack.
+ 
+ octave_user_code *
+ get_user_code (const std::string& fname)
+ {
+   octave_user_code *dbg_fcn = nullptr;
+ 
+   if (fname.empty ())
+-    dbg_fcn = octave::call_stack::debug_user_code ();
++    {
++      octave::call_stack& cs = octave::__get_call_stack__ ("get_user_code");
++
++      dbg_fcn = cs.debug_user_code ();
++    }
+   else
+     {
+       std::string name = fname;
+ 
+       if (octave::sys::file_ops::dir_sep_char () != '/' && name[0] == '@')
+         {
+           int len = name.length () - 1;         // -1: can't have trailing '/'
+           for (int i = 2; i < len; i++)         //  2: can't have @/method
+diff --git a/libinterp/parse-tree/oct-parse.in.yy b/libinterp/parse-tree/oct-parse.in.yy
+--- a/libinterp/parse-tree/oct-parse.in.yy
++++ b/libinterp/parse-tree/oct-parse.in.yy
+@@ -4563,18 +4563,18 @@ namespace octave
+             symbol_table::stash_dir_name_for_subfunctions (id, dir_name);
+           }
+       }
+ 
+     return retval;
+   }
+ }
+ 
+-DEFUN (autoload, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (autoload, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {@var{autoload_map} =} autoload ()
+ @deftypefnx {} {} autoload (@var{function}, @var{file})
+ @deftypefnx {} {} autoload (@dots{}, "remove")
+ Define @var{function} to autoload from @var{file}.
+ 
+ The second argument, @var{file}, should be an absolute filename or a file
+ name in the same directory as the function or script from which the autoload
+ command was run.  @var{file} @emph{should not} depend on the Octave load
+@@ -4639,17 +4639,19 @@ not loaded anymore during the current Oc
+   else
+     {
+       string_vector argv = args.make_argv ("autoload");
+ 
+       std::string nm = argv[2];
+ 
+       if (! octave::sys::env::absolute_pathname (nm))
+         {
+-          octave_user_code *fcn = octave::call_stack::caller_user_code ();
++          octave::call_stack& cs = interp.get_call_stack ();
++
++          octave_user_code *fcn = cs.caller_user_code ();
+ 
+           bool found = false;
+ 
+           if (fcn)
+             {
+               std::string fname = fcn->fcn_file_name ();
+ 
+               if (! fname.empty ())
+@@ -4742,24 +4744,26 @@ namespace octave
+ 
+     source_call_depth[file_full_name]++;
+ 
+     if (source_call_depth[file_full_name] >= Vmax_recursion_depth)
+       error ("max_recursion_depth exceeded");
+ 
+     if (! context.empty ())
+       {
++        octave::call_stack& cs = octave::__get_call_stack__ ("source_file");
++
+         if (context == "caller")
+-          octave::call_stack::goto_caller_frame ();
++          cs.goto_caller_frame ();
+         else if (context == "base")
+-          octave::call_stack::goto_base_frame ();
++          cs.goto_base_frame ();
+         else
+           error ("source: context must be \"caller\" or \"base\"");
+ 
+-        frame.add_fcn (octave::call_stack::pop);
++        frame.add_method (cs, &octave::call_stack::pop);
+       }
+ 
+     octave_function *fcn = 0;
+     // Don't delete a function already in symbol_table
+     bool delete_fcn = false;
+ 
+     // Find symbol name that would be in symbol_table, if it were loaded.
+     size_t dir_end = file_name.find_last_of (octave::sys::file_ops::dir_sep_chars ());
+@@ -4828,18 +4832,18 @@ namespace octave
+       std::cout << "done." << std::endl;
+ 
+     // Delete scripts not on the path, so they don't shadow ones that are.
+     if (delete_fcn)
+       delete fcn;
+   }
+ }
+ 
+-DEFUN (mfilename, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (mfilename, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} mfilename ()
+ @deftypefnx {} {} mfilename ("fullpath")
+ @deftypefnx {} {} mfilename ("fullpathext")
+ Return the name of the currently executing file.
+ 
+ When called from outside an m-file return the empty string.
+ 
+ Given the argument @qcode{"fullpath"}, include the directory part of the
+@@ -4858,17 +4862,19 @@ the filename and the extension.
+ 
+   std::string arg;
+ 
+   if (nargin == 1)
+     arg = args(0).xstring_value ("mfilename: argument must be a string");
+ 
+   std::string fname;
+ 
+-  octave_user_code *fcn = octave::call_stack::caller_user_code ();
++  octave::call_stack& cs = interp.get_call_stack ();
++
++  octave_user_code *fcn = cs.caller_user_code ();
+ 
+   if (fcn)
+     {
+       fname = fcn->fcn_file_name ();
+ 
+       if (fname.empty ())
+         fname = fcn->name ();
+     }
+@@ -5371,41 +5377,43 @@ does.
+ %!test
+ %! [a,] = gcd (1,2);
+ %! [a,b,] = gcd (1, 2);
+ 
+ %!error eval ("switch = 13;")
+ 
+ */
+ 
+-DEFUN (assignin, args, ,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (assignin, interp, args, ,
++           doc: /* -*- texinfo -*-
+ @deftypefn {} {} assignin (@var{context}, @var{varname}, @var{value})
+ Assign @var{value} to @var{varname} in context @var{context}, which
+ may be either @qcode{"base"} or @qcode{"caller"}.
+ @seealso{evalin}
+ @end deftypefn */)
+ {
+   octave_value_list retval;
+ 
+   if (args.length () != 3)
+     print_usage ();
+ 
+   std::string context = args(0).xstring_value ("assignin: CONTEXT must be a string");
+ 
+   octave::unwind_protect frame;
+ 
++  octave::call_stack& cs = interp.get_call_stack ();
++
+   if (context == "caller")
+-    octave::call_stack::goto_caller_frame ();
++    cs.goto_caller_frame ();
+   else if (context == "base")
+-    octave::call_stack::goto_base_frame ();
++    cs.goto_base_frame ();
+   else
+     error ("assignin: CONTEXT must be \"caller\" or \"base\"");
+ 
+-  frame.add_fcn (octave::call_stack::pop);
++  frame.add_method (cs, &octave::call_stack::pop);
+ 
+   std::string nm = args(1).xstring_value ("assignin: VARNAME must be a string");
+ 
+   if (valid_identifier (nm))
+     {
+       // Put the check here so that we don't slow down assignments
+       // generally.  Any that go through Octave's parser should have
+       // already been checked.
+@@ -5422,18 +5430,18 @@ may be either @qcode{"base"} or @qcode{"
+ }
+ 
+ /*
+ 
+ %!error assignin ("base", "switch", "13")
+ 
+ */
+ 
+-DEFUN (evalin, args, nargout,
+-       doc: /* -*- texinfo -*-
++DEFMETHOD (evalin, interp, args, nargout,
++           doc: /* -*- texinfo -*-
+ @deftypefn  {} {} evalin (@var{context}, @var{try})
+ @deftypefnx {} {} evalin (@var{context}, @var{try}, @var{catch})
+ Like @code{eval}, except that the expressions are evaluated in the context
+ @var{context}, which may be either @qcode{"caller"} or @qcode{"base"}.
+ @seealso{eval, assignin}
+ @end deftypefn */)
+ {
+   octave_value_list retval;
+@@ -5442,24 +5450,26 @@ Like @code{eval}, except that the expres
+ 
+   if (nargin < 2)
+     print_usage ();
+ 
+   std::string context = args(0).xstring_value ("evalin: CONTEXT must be a string");
+ 
+   octave::unwind_protect frame;
+ 
++  octave::call_stack& cs = interp.get_call_stack ();
++
+   if (context == "caller")
+-    octave::call_stack::goto_caller_frame ();
++    cs.goto_caller_frame ();
+   else if (context == "base")
+-    octave::call_stack::goto_base_frame ();
++    cs.goto_base_frame ();
+   else
+     error ("evalin: CONTEXT must be \"caller\" or \"base\"");
+ 
+-  frame.add_fcn (octave::call_stack::pop);
++  frame.add_method (cs, &octave::call_stack::pop);
+ 
+   if (nargin > 2)
+     {
+       frame.protect_var (buffer_error_messages);
+       buffer_error_messages++;
+     }
+ 
+   int parse_status = 0;
+diff --git a/libinterp/parse-tree/pt-eval.cc b/libinterp/parse-tree/pt-eval.cc
+--- a/libinterp/parse-tree/pt-eval.cc
++++ b/libinterp/parse-tree/pt-eval.cc
+@@ -104,17 +104,17 @@ namespace octave
+                              symbol_table::current_context ());
+ 
+     octave_user_function *uf
+       = new octave_user_function (new_scope,
+                                   param_list ? param_list->dup (new_scope, 0) : 0,
+                                   ret_list ? ret_list->dup (new_scope, 0) : 0,
+                                   cmd_list ? cmd_list->dup (new_scope, 0) : 0);
+ 
+-    octave_function *curr_fcn = octave::call_stack::current ();
++    octave_function *curr_fcn = m_call_stack.current ();
+ 
+     if (curr_fcn)
+       {
+         // FIXME: maybe it would be better to just stash curr_fcn
+         // instead of individual bits of info about it?
+ 
+         uf->stash_parent_fcn_name (curr_fcn->name ());
+         uf->stash_dir_name (curr_fcn->dir_name ());
+@@ -1026,17 +1026,17 @@ namespace octave
+   void
+   tree_evaluator::visit_if_command_list (tree_if_command_list& lst)
+   {
+     for (tree_if_clause *tic : lst)
+       {
+         tree_expression *expr = tic->condition ();
+ 
+         if (statement_context == function || statement_context == script)
+-          octave::call_stack::set_location (tic->line (), tic->column ());
++          m_call_stack.set_location (tic->line (), tic->column ());
+ 
+         if (debug_mode && ! tic->is_else_clause ())
+           do_breakpoint (tic->is_breakpoint (true));
+ 
+         if (tic->is_else_clause () || is_logically_true (expr, "if"))
+           {
+             tree_statement_list *stmt_lst = tic->commands ();
+ 
+@@ -1919,18 +1919,17 @@ namespace octave
+   void
+   tree_evaluator::visit_return_command (tree_return_command& cmd)
+   {
+     if (debug_mode)
+       do_breakpoint (cmd.is_breakpoint (true));
+ 
+     // Act like dbcont.
+ 
+-    if (Vdebugging
+-        && octave::call_stack::current_frame () == current_frame)
++    if (Vdebugging && m_call_stack.current_frame () == current_frame)
+       {
+         Vdebugging = false;
+ 
+         reset_debug_state ();
+       }
+     else if (statement_context == function || statement_context == script
+              || in_loop_command)
+       tree_return_command::returning = 1;
+@@ -2032,21 +2031,21 @@ namespace octave
+     if (cmd || expr)
+       {
+         if (statement_context == function || statement_context == script)
+           {
+             // Skip commands issued at a debug> prompt to avoid disturbing
+             // the state of the program we are debugging.
+ 
+             if (Vtrack_line_num)
+-              octave::call_stack::set_location (stmt.line (), stmt.column ());
++              m_call_stack.set_location (stmt.line (), stmt.column ());
+ 
+             if ((statement_context == script
+                  && ((Vecho_executing_commands & ECHO_SCRIPTS
+-                      && octave::call_stack::all_scripts ())
++                      && m_call_stack.all_scripts ())
+                      || Vecho_executing_commands & ECHO_FUNCTIONS))
+                 || (statement_context == function
+                     && Vecho_executing_commands & ECHO_FUNCTIONS))
+               stmt.echo_code ();
+           }
+ 
+         try
+           {
+@@ -2272,20 +2271,21 @@ namespace octave
+   {
+     octave::unwind_protect frame;
+ 
+     frame.protect_var (octave_interrupt_state);
+     octave_interrupt_state = 0;
+ 
+     // We want to preserve the last location info for possible
+     // backtracking.
+-    frame.add_fcn (octave::call_stack::set_line,
+-                   octave::call_stack::current_line ());
+-    frame.add_fcn (octave::call_stack::set_column,
+-                   octave::call_stack::current_column ());
++
++    frame.add_method (m_call_stack, &octave::call_stack::set_line,
++                      m_call_stack.current_line ());
++    frame.add_method (m_call_stack, &octave::call_stack::set_column,
++                      m_call_stack.current_column ());
+ 
+     // Similarly, if we have seen a return or break statement, allow all
+     // the cleanup code to run before returning or handling the break.
+     // We don't have to worry about continue statements because they can
+     // only occur in loops.
+ 
+     frame.protect_var (tree_return_command::returning);
+     tree_return_command::returning = 0;
+@@ -2449,17 +2449,17 @@ namespace octave
+           loop_body->accept (*this);
+ 
+         if (quit_loop_now ())
+           break;
+ 
+         if (debug_mode)
+           do_breakpoint (cmd.is_breakpoint (true));
+ 
+-        octave::call_stack::set_location (until_line, until_column);
++        m_call_stack.set_location (until_line, until_column);
+ 
+         if (is_logically_true (expr, "do-until"))
+           break;
+       }
+   }
+ 
+   void
+   tree_evaluator::do_breakpoint (tree_statement& stmt) const
+@@ -2474,29 +2474,29 @@ namespace octave
+     bool break_on_this_statement = false;
+ 
+     if (octave_debug_on_interrupt_state)
+       {
+         break_on_this_statement = true;
+ 
+         octave_debug_on_interrupt_state = false;
+ 
+-        current_frame = octave::call_stack::current_frame ();
++        current_frame = m_call_stack.current_frame ();
+       }
+     else if (is_breakpoint)
+       {
+         break_on_this_statement = true;
+ 
+         dbstep_flag = 0;
+ 
+-        current_frame = octave::call_stack::current_frame ();
++        current_frame = m_call_stack.current_frame ();
+       }
+     else if (dbstep_flag > 0)
+       {
+-        if (octave::call_stack::current_frame () == current_frame)
++        if (m_call_stack.current_frame () == current_frame)
+           {
+             if (dbstep_flag == 1 || is_end_of_fcn_or_script)
+               {
+                 // We get here if we are doing a "dbstep" or a "dbstep N" and the
+                 // count has reached 1 so that we must stop and return to debug
+                 // prompt.  Alternatively, "dbstep N" has been used but the end
+                 // of the frame has been reached so we stop at the last line and
+                 // return to prompt.
+@@ -2509,47 +2509,47 @@ namespace octave
+               {
+                 // Executing "dbstep N".  Decrease N by one and continue.
+ 
+                 dbstep_flag--;
+               }
+ 
+           }
+         else if (dbstep_flag == 1
+-                 && octave::call_stack::current_frame () < current_frame)
++                 && m_call_stack.current_frame () < current_frame)
+           {
+             // We stepped out from the end of a function.
+ 
+-            current_frame = octave::call_stack::current_frame ();
++            current_frame = m_call_stack.current_frame ();
+ 
+             break_on_this_statement = true;
+ 
+             dbstep_flag = 0;
+           }
+       }
+     else if (dbstep_flag == -1)
+       {
+         // We get here if we are doing a "dbstep in".
+ 
+         break_on_this_statement = true;
+ 
+         dbstep_flag = 0;
+ 
+-        current_frame = octave::call_stack::current_frame ();
++        current_frame = m_call_stack.current_frame ();
+       }
+     else if (dbstep_flag == -2)
+       {
+         // We get here if we are doing a "dbstep out".  Check for end of
+         // function and whether the current frame is the same as the
+         // cached value because we want to step out from the frame where
+         // "dbstep out" was evaluated, not from any functions called from
+         // that frame.
+ 
+         if (is_end_of_fcn_or_script
+-            && octave::call_stack::current_frame () == current_frame)
++            && m_call_stack.current_frame () == current_frame)
+           dbstep_flag = -1;
+       }
+ 
+     if (break_on_this_statement)
+       do_keyboard ();
+ 
+   }
+ 
+diff --git a/libinterp/parse-tree/pt-eval.h b/libinterp/parse-tree/pt-eval.h
+--- a/libinterp/parse-tree/pt-eval.h
++++ b/libinterp/parse-tree/pt-eval.h
+@@ -24,16 +24,17 @@ along with Octave; see the file COPYING.
+ #define octave_pt_eval_h 1
+ 
+ #include "octave-config.h"
+ 
+ #include <list>
+ #include <stack>
+ #include <string>
+ 
++#include "call-stack.h"
+ #include "comment-list.h"
+ #include "ovl.h"
+ #include "pt-exp.h"
+ #include "pt-walk.h"
+ 
+ namespace octave
+ {
+   class tree_decl_elt;
+@@ -99,17 +100,17 @@ namespace octave
+ 
+       std::stack<T> m_stack;
+     };
+ 
+     typedef void (*decl_elt_init_fcn) (tree_decl_elt&);
+ 
+     tree_evaluator (interpreter& interp)
+       : m_value_stack (), m_lvalue_list_stack (), m_nargout_stack (),
+-        m_interpreter (interp)
++        m_call_stack (interp), m_interpreter (interp)
+     { }
+ 
+     // No copying!
+ 
+     tree_evaluator (const tree_evaluator&) = delete;
+ 
+     tree_evaluator& operator = (const tree_evaluator&) = delete;
+ 
+@@ -201,17 +202,16 @@ namespace octave
+ 
+     void visit_try_catch_command (tree_try_catch_command&);
+ 
+     void do_unwind_protect_cleanup_code (tree_statement_list *list);
+ 
+     void visit_unwind_protect_command (tree_unwind_protect_command&);
+ 
+     void visit_while_command (tree_while_command&);
+-
+     void visit_do_until_command (tree_do_until_command&);
+ 
+     static void reset_debug_state (void);
+ 
+     static bool statement_printing_enabled (void);
+ 
+     // If > 0, stop executing at the (N-1)th stopping point, counting
+     //         from the the current execution point in the current frame.
+@@ -287,16 +287,18 @@ namespace octave
+     convert_parameter_list_to_const_vector
+       (tree_parameter_list *param_list, int nargout, const Cell& varargout);
+ 
+     bool eval_decl_elt (tree_decl_elt *elt);
+ 
+     bool switch_case_label_matches (tree_switch_case *expr,
+                                     const octave_value& val);
+ 
++    call_stack& get_call_stack (void) { return m_call_stack; }
++
+   private:
+ 
+     void do_breakpoint (tree_statement& stmt) const;
+ 
+     void do_breakpoint (bool is_breakpoint,
+                         bool is_end_of_fcn_or_script = false) const;
+ 
+     virtual octave_value
+@@ -312,16 +314,18 @@ namespace octave
+     std::list<octave_lvalue> make_lvalue_list (tree_argument_list *);
+ 
+     value_stack<octave_value_list> m_value_stack;
+ 
+     value_stack<const std::list<octave_lvalue>*> m_lvalue_list_stack;
+ 
+     value_stack<int> m_nargout_stack;
+ 
++    call_stack m_call_stack;
++
+     interpreter& m_interpreter;
+   };
+ }
+ 
+ // Maximum nesting level for functions, scripts, or sourced files called
+ // recursively.
+ extern int Vmax_recursion_depth;
+ 

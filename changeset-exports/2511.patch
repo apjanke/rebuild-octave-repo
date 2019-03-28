@@ -1,0 +1,378 @@
+# HG changeset patch
+# User jwe
+# Date 847940412 0
+#      Thu Nov 14 03:00:12 1996 +0000
+# Node ID 9b0dd36714ebf48ba432e389578ca63291e79a50
+# Parent  0be4639a6c13f289759d88e1c62232ab6598d6b3
+[project @ 1996-11-14 02:57:33 by jwe]
+
+diff --git a/NEWS b/NEWS
+--- a/NEWS
++++ b/NEWS
+@@ -19,16 +19,21 @@ Summary of changes for version 2.0:
+     has also been added.  Usage of the *printf functions that was
+     allowed in previous versions of Octave should still work.
+     However, there is no way to make the new versions of the *scanf
+     functions compatible with Matlab *and* previous versions of
+     Octave.  An optional argument to the *scanf functions is now
+     available to make them behave in a way that is compatible with
+     previous versions of Octave.
+ 
++  * Octave can now read files that contain columns of numbers only,
++    with no header information.  The name of the loaded variable is
++    constructed from the file name.  Each line in the file must have
++    the same number of elements.
++
+   * The interface to the pager has changed.  The new built-in variable
+     `page_output_immediately' controls when Octave sends output to the
+     pager.  If it is nonzero, Octave sends output to the pager as soon
+     as it is available.  Otherwise, Octave buffers its output and
+     waits until just before the prompt is printed to flush it to the
+     pager.
+ 
+   * Expressions of the form
+diff --git a/PROJECTS b/PROJECTS
+--- a/PROJECTS
++++ b/PROJECTS
+@@ -159,19 +159,16 @@ Graphical User Interface:
+ Input/Output:
+ ------------
+ 
+   * Make fread and fwrite work for complex data.  Iostreams based
+     versions of these functions would also be nice, and if you are
+     working on them, it would be good to support other size
+     specifications (integer*2, etc.).
+ 
+-  * Make load work to read files that contain numbers only, and put
+-    the values in a matrix named after the file.
+-
+   * Make load and save work for structures.
+ 
+   * Make load and save look for <file>.mat if only given <file>.
+ 
+   * Move some pr-output stuff to liboctave.
+ 
+   * Make the cutoff point for changing to packed storage a
+     user-preference variable with default value 8192.
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,10 +1,17 @@
+ Wed Nov 13 11:13:22 1996  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
++	* load-save.cc (read_mat_ascii_matrix, get_lines_and_columns,
++	get_complete_line): New functions, for reading headless text files.
++	(load_save_format): Add LS_MAT_ASCII, for headless text files.
++	(do_load): Handle LS_MAT_ASCII files.
++	Thanks to Mel Melchner <mjm@research.att.com> for initial version
++	of this code.
++
+ 	* sysdep.cc: Conditionally include ieeefp.h.
+ 	(BSD_init, SCO_init): New functions.
+ 	(sysdep_init): Conditionally call them here.
+ 
+ Tue Nov 12 00:14:56 1996  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* pt-plot.cc (open_plot_stream): Don't block SIGCHLD.
+ 
+diff --git a/src/load-save.cc b/src/load-save.cc
+--- a/src/load-save.cc
++++ b/src/load-save.cc
+@@ -68,16 +68,17 @@ static int Vsave_precision;
+ #ifndef OCT_RBV
+ #define OCT_RBV DBL_MAX / 100.0
+ #endif
+ 
+ enum load_save_format
+   {
+     LS_ASCII,
+     LS_BINARY,
++    LS_MAT_ASCII,
+     LS_MAT_BINARY,
+     LS_UNKNOWN,
+   };
+ 
+ // XXX FIXME XXX -- shouldn't this be implemented in terms of other
+ // functions that are already available?
+ 
+ // Install a variable with name NAME and the value specified TC in the
+@@ -904,16 +905,162 @@ read_binary_data (istream& is, int swap,
+       delete [] name;
+       name = 0;
+       break;
+     }
+ 
+   return name;
+ }
+ 
++// Get a complete line of input.
++
++static string
++get_complete_line (istream& is)
++{
++  string retval;
++
++  ostrstream buf;
++
++  char c;
++
++  while (is.get (c))
++    {
++      if (c == '\n')
++	break;
++
++      buf << c;
++    }
++
++  buf << ends;
++
++  char *tmp = buf.str ();
++
++  retval = tmp;
++
++  delete [] tmp;
++
++  return retval;
++}
++
++static void
++get_lines_and_columns (istream& is, const string& filename, int& nr, int& nc)
++{
++  streampos pos = is.tellg ();
++
++  int file_line_number = 0;
++
++  nr = 0;
++  nc = 0;
++
++  while (! (is.eof () || error_state))
++    {
++      string line = get_complete_line (is);
++
++      file_line_number++;
++
++      size_t beg = line.find_first_not_of (" \t");
++
++      if (beg != NPOS)
++	{
++	  int tmp_nc = 0;
++
++	  while (beg != NPOS)
++	    {
++	      tmp_nc++;
++
++	      size_t end = line.find_first_of (" \t", beg);
++
++	      if (end != NPOS)
++		beg = line.find_first_not_of (" \t", end);
++	      else
++		break;
++	    }
++
++	  if (nc == 0)
++	    {
++	      nc = tmp_nc;
++	      nr++;
++	    }
++	  else if (nc == tmp_nc)
++	    nr++;
++	  else
++	    error ("load: %s: inconsistent number of columns near line %d",
++		   filename.c_str (), file_line_number);
++	}
++    }
++
++  if (nr == 0 || nc == 0)
++    error ("load: file `%s' seems to be empty!", filename.c_str ());
++
++  is.clear ();
++  is.seekg (pos, ios::beg);
++}
++
++// Extract a matrix from a file of numbers only.
++//
++// Comments are not allowed.  The file should only have numeric values.
++//
++// Reads the file twice.  Once to find the number of rows and columns,
++// and once to extract the matrix.
++//
++// FILENAME is used for error messages.
++//
++// This format provides no way to tag the data as global.
++
++static char *
++read_mat_ascii_data (istream& is, const string& filename,
++		     octave_value& tc)
++{
++  char *name = 0;
++
++  string varname;
++
++  size_t pos = filename.find ('.');
++
++  if (pos != NPOS)
++    varname = filename.substr (0, pos);
++  else
++    varname = filename;
++
++  if (valid_identifier (varname.c_str ()))
++    {
++      int nr = 0;
++      int nc = 0;
++
++      get_lines_and_columns (is, filename, nr, nc);
++
++      if (! error_state)
++	{
++	  // NR and NC must be greater than zero if we end up here.
++
++	  Matrix tmp (nr, nc);
++
++	  is >> tmp;
++
++	  if (is)
++	    {
++	      tc = tmp;
++
++	      name = strsave (varname.c_str ());
++	    }
++	  else
++	    error ("load: failed to read matrix from file `%s'",
++		   filename.c_str ());
++	}
++      else
++	error ("load: unable to extract matrix size from file `%s'",
++	       filename.c_str ());
++    }
++  else
++    error ("load: unable to convert filename `%s' to valid identifier",
++	   filename.c_str ());
++
++  return name;
++}
++
+ // Read LEN elements of data from IS in the format specified by
+ // PRECISION, placing the result in DATA.  If SWAP is nonzero, swap
+ // the bytes of each element before copying to DATA.  FLT_FMT
+ // specifies the format of the data if we are reading floating point
+ // numbers.
+ 
+ static void
+ read_mat_binary_data (istream& is, double *data, int precision,
+@@ -1282,25 +1429,38 @@ get_file_format (const string& fname, co
+       FOUR_BYTE_INT mopt, nr, nc, imag, len;
+ 
+       int err = read_mat_file_header (file, swap, mopt, nr, nc, imag, len, 1);
+ 
+       if (! err)
+ 	retval = LS_MAT_BINARY;
+       else
+ 	{
++	  file.clear ();
+ 	  file.seekg (0, ios::beg);
+ 
+ 	  char *tmp = extract_keyword (file, "name");
+ 
+ 	  if (tmp)
+ 	    {
+ 	      retval = LS_ASCII;
++
+ 	      delete [] tmp;
+ 	    }
++	  else
++	    {
++	      // Try reading the file as numbers only, determining the
++	      // number of rows and columns from the data.  We don't
++	      // even bother to check to see if the first item in the
++	      // file is a number, so that get_complete_line() can
++	      // skip any comments that might appear at the top of the
++	      // file.
++
++	      retval = LS_MAT_ASCII;
++	    }
+ 	}
+     }
+ 
+   file.close ();
+ 
+   if (retval == LS_UNKNOWN)
+     error ("load: unable to determine file format for `%s'",
+ 	   orig_fname.c_str ());
+@@ -1332,29 +1492,34 @@ do_load (istream& stream, const string& 
+ 	  name = read_ascii_data (stream, orig_fname, global, tc);
+ 	  break;
+ 
+ 	case LS_BINARY:
+ 	  name = read_binary_data (stream, swap, flt_fmt, orig_fname,
+ 				   global, tc, doc);
+ 	  break;
+ 
++	case LS_MAT_ASCII:
++	  name = read_mat_ascii_data (stream, orig_fname, tc);
++	  break;
++
+ 	case LS_MAT_BINARY:
+ 	  name = read_mat_binary_data (stream, orig_fname, tc);
+ 	  break;
+ 
+ 	default:
+ 	  gripe_unrecognized_data_fmt ("load");
+ 	  break;
+ 	}
+ 
+       if (error_state || stream.eof () || ! name)
+ 	{
+ 	  delete [] name;
+ 	  delete [] doc;
++
+ 	  break;
+ 	}
+       else if (! error_state && name)
+ 	{
+ 	  if (tc.is_defined ())
+ 	    {
+ 	      if (argv_idx == argc
+ 		  || matches_patterns (argv, argv_idx, argc, name))
+@@ -1377,33 +1542,39 @@ do_load (istream& stream, const string& 
+ 			}
+ 		      output_buf << name << "\n";
+ 		    }
+ 		  else
+ 		    {
+ 		      install_loaded_variable (force, name, tc, global, doc);
+ 		    }
+ 		}
++
++	      delete [] name;
++	      delete [] doc;
++
++	      // Only attempt to read one item from a headless text file.
++
++	      if (format == LS_MAT_ASCII)
++		break;
+ 	    }
+ 	  else
+ 	    error ("load: unable to load variable `%s'", name);
+ 	}
+       else
+ 	{
+ 	  if (count == 0)
+ 	    error ("load: are you sure `%s' is an Octave data file?",
+ 		   orig_fname.c_str ());
+ 
+ 	  delete [] name;
+ 	  delete [] doc;
++
+ 	  break;
+ 	}
+-
+-      delete [] name;
+-      delete [] doc;
+     }
+ 
+   if (list_only && count)
+     {
+       output_buf << ends;
+ 
+       char *msg = output_buf.str ();
+ 

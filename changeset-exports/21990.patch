@@ -1,0 +1,543 @@
+# HG changeset patch
+# User Lachlan Andrew <lachlanbis@gmail.com>
+# Date 1467215409 25200
+#      Wed Jun 29 08:50:09 2016 -0700
+# Node ID efce657ceb861472f55f70e867e5c5364e3e1f72
+# Parent  6bce4d23af6b6e62dcc5d7c91db5b7c030065c18
+Provide a warning when an array is used in an if/while/until (bug #43098).
+
+* errwarn.{cc,h} (warn_array_as_logical,
+                  reset_first_array_as_logical_since_keyboard): New functions
+
+* error.cc (initialize_default_warning_state):
+  Disable Octave:array-as-logical by default
+
+* warning_ids.m: Add new warning Octave:array-as-logical.
+
+* input.cc (interactive_input):
+  Reset first_array_as_logical_since_keyboard.
+
+* ov-base-mat.cc (octave_base_matrix<MT>::is_true):
+  Call warn_array_as_logical if > 1x1.
+
+* ov-base-diag.cc (octave_base_diag<DMT, MT>::is_true):
+  Call warn_array_as_logical if > 1x1.  Optimise calculation.
+
+* ov-perm.cc (octave_perm_matrix::do_index_op):
+  Call warn_array_as_logical if > 1x1.  Optimise calculation.
+
+* ov-range.cc (octave_range::is_true):
+  Call warn_array_as_logical if > 1x1.  Optimise calculation.
+
+* ov-base-sparse (octave_base_sparse<T>::is_true)
+  Call warn_array_as_logical if > 1x1.  Check for NaN/NA.
+
+* Sparse.cc (Sparse<T>::SparseRep::any_element_is_nan): New function.
+
+* Sparse.h (Sparse<T>::SparseRep::any_element_is_nan,
+            Sparse<T>::any_element_is_nan): New functions.
+
+* Sparse-b.cc (Sparse<bool>::SparseRep::any_element_is_nan):
+  New function, specialization of the above.
+
+* if.tst: New built-in self tests.
+
+diff --git a/libinterp/corefcn/error.cc b/libinterp/corefcn/error.cc
+--- a/libinterp/corefcn/error.cc
++++ b/libinterp/corefcn/error.cc
+@@ -1775,16 +1775,17 @@ disable_warning (const std::string& id)
+ 
+ void
+ initialize_default_warning_state (void)
+ {
+   initialize_warning_options ("on");
+ 
+   // Most people will want to have the following disabled.
+ 
++  disable_warning ("Octave:array-as-logical");
+   disable_warning ("Octave:array-to-scalar");
+   disable_warning ("Octave:array-to-vector");
+   disable_warning ("Octave:imag-to-real");
+   disable_warning ("Octave:language-extension");
+   disable_warning ("Octave:missing-semicolon");
+   disable_warning ("Octave:neg-dim-as-zero");
+   disable_warning ("Octave:resize-on-range-error");
+   disable_warning ("Octave:separator-insert");
+diff --git a/libinterp/corefcn/errwarn.cc b/libinterp/corefcn/errwarn.cc
+--- a/libinterp/corefcn/errwarn.cc
++++ b/libinterp/corefcn/errwarn.cc
+@@ -268,16 +268,33 @@ err_wrong_type_arg_for_binary_op (const 
+ void
+ err_wrong_type_arg_for_unary_op (const octave_value& op)
+ {
+   std::string type = op.type_name ();
+   error ("invalid operand '%s' for unary operator", type.c_str ());
+ }
+ 
+ void
++warn_array_as_logical (const dim_vector& dv)
++{
++  warning_with_id ("Octave:array-as-logical",
++                   "Using an object of size %s as "
++                   "a boolean value implies all().",
++                   dv.str ().c_str ());
++}
++
++/*
++%!warning <boolean value implies all>
++%! warning ("on", "Octave:array-as-logical");
++%! if ([1 1 0])
++%!   assert (false);
++%! endif
++*/
++
++void
+ warn_complex_cmp (void)
+ {
+   warning_with_id ("Octave:language-extension",
+                    "comparing complex numbers is not supported in Matlab");
+ }
+ 
+ void
+ warn_data_file_in_path (const std::string& fcn, const std::string& file)
+diff --git a/libinterp/corefcn/errwarn.h b/libinterp/corefcn/errwarn.h
+--- a/libinterp/corefcn/errwarn.h
++++ b/libinterp/corefcn/errwarn.h
+@@ -140,16 +140,19 @@ err_wrong_type_arg (octave_execution_exc
+ 
+ OCTAVE_NORETURN OCTINTERP_API extern void
+ err_wrong_type_arg_for_binary_op (const octave_value& op);
+ 
+ OCTAVE_NORETURN OCTINTERP_API extern void
+ err_wrong_type_arg_for_unary_op (const octave_value& op);
+ 
+ OCTINTERP_API extern void
++warn_array_as_logical (const dim_vector& dv);
++
++OCTINTERP_API extern void
+ warn_complex_cmp (void);
+ 
+ OCTINTERP_API extern void
+ warn_data_file_in_path (const std::string& fcn, const std::string& file);
+ 
+ OCTINTERP_API extern void
+ warn_disabled_feature (const std::string& fcn, const std::string& feature,
+                        const std::string& pkg = "Octave");
+diff --git a/libinterp/octave-value/ov-base-diag.cc b/libinterp/octave-value/ov-base-diag.cc
+--- a/libinterp/octave-value/ov-base-diag.cc
++++ b/libinterp/octave-value/ov-base-diag.cc
+@@ -268,21 +268,30 @@ octave_base_diag<DMT, MT>::resize (const
+       rm.resize (dv(0), dv(1));
+       retval = rm;
+     }
+   else
+     retval = to_dense ().resize (dv, fill);
+   return retval;
+ }
+ 
++// Return true if this matrix has all true elements (non-zero, not NA/NaN).
+ template <typename DMT, typename MT>
+ bool
+ octave_base_diag<DMT, MT>::is_true (void) const
+ {
+-  return to_dense ().is_true ();
++  if (dims ().numel () > 1)
++    {
++      warn_array_as_logical (dims ());
++      // Throw error if any NaN or NA by calling is_true().
++      octave_value (matrix.extract_diag ()).is_true ();
++      return false;                 // > 1x1 diagonal always has zeros
++    }
++  else
++    return to_dense ().is_true ();  // 0x0 or 1x1, handle NaN etc.
+ }
+ 
+ // FIXME: This should be achieveable using ::real
+ template <typename T> inline T helper_getreal (T x) { return x; }
+ template <typename T> inline T helper_getreal (std::complex<T> x)
+ { return x.real (); }
+ // FIXME: We really need some traits so that ad hoc hooks like this
+ //        are not necessary.
+diff --git a/libinterp/octave-value/ov-base-mat.cc b/libinterp/octave-value/ov-base-mat.cc
+--- a/libinterp/octave-value/ov-base-mat.cc
++++ b/libinterp/octave-value/ov-base-mat.cc
+@@ -25,16 +25,17 @@ along with Octave; see the file COPYING.
+ // C++ source files that should have included config.h before including
+ // this file.
+ 
+ #include <iostream>
+ 
+ #include "Array-util.h"
+ 
+ #include "Cell.h"
++#include "errwarn.h"
+ #include "ovl.h"
+ #include "oct-map.h"
+ #include "ov-base.h"
+ #include "ov-base-mat.h"
+ #include "ov-base-scalar.h"
+ #include "pr-output.h"
+ 
+ template <typename MT>
+@@ -396,31 +397,35 @@ octave_base_matrix<MT>::resize (const di
+   MT retval (matrix);
+   if (fill)
+     retval.resize (dv, 0);
+   else
+     retval.resize (dv);
+   return retval;
+ }
+ 
++// Return true if this matrix has all true elements (non-zero, not NA/NaN).
+ template <typename MT>
+ bool
+ octave_base_matrix<MT>::is_true (void) const
+ {
+   bool retval = false;
+   dim_vector dv = matrix.dims ();
+   int nel = dv.numel ();
+ 
+   if (nel > 0)
+     {
+       MT t1 (matrix.reshape (dim_vector (nel, 1)));
+ 
+       if (t1.any_element_is_nan ())
+         err_nan_to_logical_conversion ();
+ 
++      if (nel > 1)
++        warn_array_as_logical (dv);
++
+       boolNDArray t2 = t1.all ();
+ 
+       retval = t2(0);
+     }
+ 
+   return retval;
+ }
+ 
+diff --git a/libinterp/octave-value/ov-base-sparse.cc b/libinterp/octave-value/ov-base-sparse.cc
+--- a/libinterp/octave-value/ov-base-sparse.cc
++++ b/libinterp/octave-value/ov-base-sparse.cc
+@@ -295,23 +295,32 @@ template <typename T>
+ bool
+ octave_base_sparse<T>::is_true (void) const
+ {
+   bool retval = false;
+   dim_vector dv = matrix.dims ();
+   octave_idx_type nel = dv.numel ();
+   octave_idx_type nz = nnz ();
+ 
+-  if (nz == nel && nel > 0)
++  if (nel > 0)
+     {
+       T t1 (matrix.reshape (dim_vector (nel, 1)));
+ 
+-      SparseBoolMatrix t2 = t1.all ();
++      if (t1.any_element_is_nan ())
++        err_nan_to_logical_conversion ();
++
++      if (nel > 1)
++        warn_array_as_logical (dv);
+ 
+-      retval = t2(0);
++      if (nz == nel)
++        {
++          SparseBoolMatrix t2 = t1.all ();
++
++          retval = t2(0);
++        }
+     }
+ 
+   return retval;
+ }
+ 
+ template <typename T>
+ bool
+ octave_base_sparse<T>::print_as_scalar (void) const
+diff --git a/libinterp/octave-value/ov-perm.cc b/libinterp/octave-value/ov-perm.cc
+--- a/libinterp/octave-value/ov-perm.cc
++++ b/libinterp/octave-value/ov-perm.cc
+@@ -126,20 +126,28 @@ octave_perm_matrix::do_index_op (const o
+         retval = matrix.checkelem (idx0(0), idx1(0));
+       else
+         retval = to_dense ().do_index_op (idx, resize_ok);
+     }
+ 
+   return retval;
+ }
+ 
++// Return true if this matrix has all true elements (non-zero, not NaN/NA).
++// A permutation cannot have NaN/NA.
+ bool
+ octave_perm_matrix::is_true (void) const
+ {
+-  return to_dense ().is_true ();
++  if (dims ().numel () > 1)
++    {
++      warn_array_as_logical (dims ());
++      return false;    // > 1x1 permutation always has zeros, and no NaN.
++    }
++  else
++    return dims ().numel ();    // 1x1 is [1] == true, 0x0 == false.
+ }
+ 
+ double
+ octave_perm_matrix::double_value (bool) const
+ {
+   double retval = lo_ieee_nan_value ();
+ 
+   if (is_empty ())
+diff --git a/libinterp/octave-value/ov-range.cc b/libinterp/octave-value/ov-range.cc
+--- a/libinterp/octave-value/ov-range.cc
++++ b/libinterp/octave-value/ov-range.cc
+@@ -259,27 +259,49 @@ octave_range::diag (octave_idx_type k) c
+ octave_value
+ octave_range::diag (octave_idx_type m, octave_idx_type n) const
+ {
+   Matrix mat = range.matrix_value ();
+ 
+   return mat.diag (m, n);
+ }
+ 
++// Return true if this range has all true elements (non-zero, not NaN/NA).
++// A range cannot have NaN/NA.
+ bool
+ octave_range::is_true (void) const
+ {
+   bool retval = false;
+ 
+   if (! range.is_empty ())
+     {
+-      // FIXME: this is a potential waste of memory.
+-      Matrix m ((range.matrix_value ().all ()).all ());
++      if (dims ().numel () > 1)
++        warn_array_as_logical (dims ());
++
++      Range r = range_value ();
++      double base = r.base ();
++      double limit = r.limit ();
+ 
+-      retval = (m.rows () == 1 && m.columns () == 1 && m (0, 0) != 0.0);
++      // Can't be zero if we start and finish on the same size of 0
++      if (((base > 0 && limit > 0) || (base < 0 && limit < 0)) && numel () > 0)
++        retval = true;
++      else
++        {
++          /*
++          // This tells us whether one element is 0, if arithmetic is exact.
++          double steps_to_zero = base / r.inc ();
++
++          retval = (steps_to_zero != floor (steps_to_zero));
++          */
++
++          // FIXME: this is a waste of memory.
++          Matrix m ((range.matrix_value ().all ()).all ());
++
++          retval = ! m.is_empty () && m(0, 0) != 0.0;
++        }
+     }
+ 
+   return retval;
+ }
+ 
+ Complex
+ octave_range::complex_value (bool) const
+ {
+diff --git a/libinterp/octave-value/ov.cc b/libinterp/octave-value/ov.cc
+--- a/libinterp/octave-value/ov.cc
++++ b/libinterp/octave-value/ov.cc
+@@ -1406,17 +1406,27 @@ octave_value::is_equal (const octave_val
+   // If there is no op_eq for these types, we can't compare values.
+ 
+   if (rows () == test.rows () && columns () == test.columns ())
+     {
+       octave_value tmp = do_binary_op (octave_value::op_eq, *this, test);
+ 
+       // Empty array also means a match.
+       if (tmp.is_defined ())
+-        retval = tmp.is_true () || tmp.is_empty ();
++        {
++          if (tmp.is_empty ())
++            retval = true;
++          else
++            {
++              // Reshape into a vector and call all() explicitly,
++              // to avoid Octave:array-as-logical warning.
++              tmp = tmp.reshape (dim_vector (tmp.numel (), 1));
++              retval = tmp.all ().is_true ();
++            }
++        }
+     }
+ 
+   return retval;
+ }
+ 
+ // Define the idx_type_value function here instead of in ov.h to avoid
+ // needing definitions for the SIZEOF_X macros in ov.h.
+ 
+diff --git a/liboctave/array/Sparse-b.cc b/liboctave/array/Sparse-b.cc
+--- a/liboctave/array/Sparse-b.cc
++++ b/liboctave/array/Sparse-b.cc
+@@ -25,13 +25,20 @@ along with Octave; see the file COPYING.
+ #  include "config.h"
+ #endif
+ 
+ // Instantiate Sparse matrix of double values.
+ 
+ #include "Sparse.h"
+ #include "Sparse.cc"
+ 
++template <>
++bool
++Sparse<bool>::SparseRep::any_element_is_nan (void) const
++{
++  return false;
++}
++
+ INSTANTIATE_SPARSE (bool, OCTAVE_API);
+ 
+ #if 0
+ template std::ostream& operator << (std::ostream&, const Sparse<bool>&);
+ #endif
+diff --git a/liboctave/array/Sparse.cc b/liboctave/array/Sparse.cc
+--- a/liboctave/array/Sparse.cc
++++ b/liboctave/array/Sparse.cc
+@@ -188,16 +188,29 @@ Sparse<T>::SparseRep::change_length (oct
+ template <typename T>
+ bool
+ Sparse<T>::SparseRep::indices_ok (void) const
+ {
+   return sparse_indices_ok (r, c, nrows, ncols, nnz ());
+ }
+ 
+ template <typename T>
++bool
++Sparse<T>::SparseRep::any_element_is_nan (void) const
++{
++  octave_idx_type nz = nnz ();
++
++  for (octave_idx_type i = 0; i < nz; i++)
++    if (octave::math::isnan (d[i]))
++      return true;
++
++  return false;
++}
++
++template <typename T>
+ Sparse<T>::Sparse (octave_idx_type nr, octave_idx_type nc, T val)
+   : rep (0), dimensions (dim_vector (nr, nc))
+ {
+   if (val != T ())
+     {
+       rep = new typename Sparse<T>::SparseRep (nr, nc, dimensions.safe_numel ());
+ 
+       octave_idx_type ii = 0;
+diff --git a/liboctave/array/Sparse.h b/liboctave/array/Sparse.h
+--- a/liboctave/array/Sparse.h
++++ b/liboctave/array/Sparse.h
+@@ -131,16 +131,18 @@ protected:
+     octave_idx_type ccidx (octave_idx_type i) const { return c[i]; }
+ 
+     void maybe_compress (bool remove_zeros);
+ 
+     void change_length (octave_idx_type nz);
+ 
+     bool indices_ok (void) const;
+ 
++    bool any_element_is_nan (void) const;
++
+   private:
+ 
+     // No assignment!
+ 
+     SparseRep& operator = (const SparseRep& a);
+   };
+ 
+   //--------------------------------------------------------------------
+@@ -687,16 +689,19 @@ public:
+   { return map<U, U (&) (T)> (fcn); }
+ 
+   template <typename U>
+   Sparse<U>
+   map (U (&fcn) (const T&)) const
+   { return map<U, U (&) (const T&)> (fcn); }
+ 
+   bool indices_ok (void) const { return rep->indices_ok (); }
++
++  bool any_element_is_nan (void) const
++  { return rep->any_element_is_nan (); }
+ };
+ 
+ template <typename T>
+ std::istream&
+ read_sparse_matrix (std::istream& is, Sparse<T>& a,
+                     T (*read_fcn) (std::istream&));
+ 
+ #endif
+diff --git a/scripts/help/warning_ids.m b/scripts/help/warning_ids.m
+--- a/scripts/help/warning_ids.m
++++ b/scripts/help/warning_ids.m
+@@ -18,16 +18,22 @@
+ 
+ ## -*- texinfo -*-
+ ## @cindex warning ids
+ ##
+ ## @table @code
+ ## @item Octave:abbreviated-property-match
+ ## By default, the @code{Octave:abbreviated-property-match} warning is enabled.
+ ##
++## @item Octave:array-as-logical
++## If the @code{Octave:array-to-scalar} warning is enabled,
++## Octave will warn when an array of size greater than 1x1 is used
++## as a truth value in an if, while or until statement.
++## By default, the @code{Octave:array-as-logical} warning is disabled.
++##
+ ## @item Octave:array-to-scalar
+ ## If the @code{Octave:array-to-scalar} warning is enabled, Octave will
+ ## warn when an implicit conversion from an array to a scalar value is
+ ## attempted.
+ ## By default, the @code{Octave:array-to-scalar} warning is disabled.
+ ##
+ ## @item Octave:array-to-vector
+ ## If the @code{Octave:array-to-vector} warning is enabled, Octave will
+diff --git a/test/if.tst b/test/if.tst
+--- a/test/if.tst
++++ b/test/if.tst
+@@ -94,8 +94,37 @@
+ %! if (0)
+ %!   x = 42;
+ %! elseif (1)
+ %!   'foo';
+ %!   x = 13;
+ %! endif
+ %! assert (x, 13);
+ 
++## test "is_true" of different data types
++%!error diag (NaN) || 0;
++%!test
++%! d1 = diag ([])    || 0;
++%! d2 = diag (1)     || 0;
++%! d3 = diag ([1 2]) || 0;
++%! assert ([d1 d2 d3], [false true false]);
++
++%!error sparse (NaN) || 0;
++%!error sparse ([1 1 ; 1 NaN]) || 0;
++%!test
++%! s1 = sparse ([])  || 0;
++%! s2 = sparse (1)   || 0;
++%! s3 = sparse ([1 0 ; 0 2])   || 0;
++%! s4 = sparse ([1 1 ; 1 1])   || 0;
++%! assert ([s1 s2 s3 s4], [false true false true]);
++
++%!test
++%! r1 = (1:10) || 0;
++%! r2 = (-10:-1) || 0;
++%! r3 = (-1:1) || 0;
++%! assert ([r1 r2 r3], [true true false]);
++
++%!test
++%! c1 = [2i 4i] || 0;
++%! c2 = [22 4i] || 0;
++%! c3 = i || 0;
++%! c4 = complex(0) || 0;
++%! assert ([c1 c2 c3 c4], [true true true false]);

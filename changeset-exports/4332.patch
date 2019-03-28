@@ -1,0 +1,359 @@
+# HG changeset patch
+# User jwe
+# Date 1045617359 0
+#      Wed Feb 19 01:15:59 2003 +0000
+# Node ID e41906608e0fcc7fc1074a64ff51e47a18b7203f
+# Parent  d3278845f764a90bc1f19a5ace521ec67ac2937e
+[project @ 2003-02-19 01:15:59 by jwe]
+
+diff --git a/src/ChangeLog b/src/ChangeLog
+--- a/src/ChangeLog
++++ b/src/ChangeLog
+@@ -1,8 +1,15 @@
++2003-02-18  Roger Banks <rbanks@colsa.com>
++
++	* load-save.cc (read_ascii_data, read_ascii_data,
++	read_mat5_binary_element, save_mat5_binary_element,
++	save_ascii_data): Handle cell arrays.
++	(write_mat5_cell_array): New function.
++
+ 2003-02-18  John W. Eaton  <jwe@bevo.che.wisc.edu>
+ 
+ 	* Makefile.in (DLD_XSRC): Delete log.cc from the list.
+ 	Add sqrtm.cc to the list.
+ 
+ 	* DLD-FUNCTIONS/log.cc: Delete.
+ 
+ 2003-02-18  Paul Kienzle <pkienzle@users.sf.net>
+diff --git a/src/load-save.cc b/src/load-save.cc
+--- a/src/load-save.cc
++++ b/src/load-save.cc
+@@ -49,22 +49,24 @@ Software Foundation, 59 Temple Place - S
+ #include "lo-mappers.h"
+ #include "lo-sstream.h"
+ #include "mach-info.h"
+ #include "oct-env.h"
+ #include "oct-time.h"
+ #include "quit.h"
+ #include "str-vec.h"
+ 
++#include "Cell.h"
+ #include "defun.h"
+ #include "error.h"
+ #include "gripes.h"
+ #include "load-save.h"
+ #include "oct-obj.h"
+ #include "oct-map.h"
++#include "ov-cell.h"
+ #include "pager.h"
+ #include "pt-exp.h"
+ #include "symtab.h"
+ #include "sysdep.h"
+ #include "unwind-prot.h"
+ #include "utils.h"
+ #include "variables.h"
+ #include "version.h"
+@@ -89,16 +91,18 @@ static std::string Vsave_header_format_s
+ static int Vsave_precision;
+ 
+ // Used when converting Inf to something that gnuplot can read.
+ 
+ #ifndef OCT_RBV
+ #define OCT_RBV DBL_MAX / 100.0
+ #endif
+ 
++#define CELL_ELT_TAG "<cell-element>"
++
+ enum arrayclasstype
+   {
+     mxCELL_CLASS=1,		// cell array
+     mxSTRUCT_CLASS,		// structure
+     mxOBJECT_CLASS,		// object
+     mxCHAR_CLASS,		// character array
+     mxSPARSE_CLASS,		// sparse array
+     mxDOUBLE_CLASS,		// double precision array
+@@ -124,16 +128,21 @@ enum mat5_data_type
+     miDOUBLE,			// IEEE 754 double precision float
+     miRESERVE2,
+     miRESERVE3,
+     miINT64,			// 64 bit signed
+     miUINT64,			// 64 bit unsigned
+     miMATRIX			// MATLAB array
+   };
+ 
++static bool
++save_mat5_binary_element (std::ostream& os,
++			  const octave_value& tc, const std::string& name,
++			  bool mark_as_global, bool save_as_floats);
++
+ #ifdef HAVE_HDF5
+ // this is only used for HDF5 import
+ // try to convert s into a valid identifier, replacing invalid chars with "_":
+ static void
+ make_valid_identifier (char *s)
+ {
+   if (s)
+     {
+@@ -537,17 +546,21 @@ read_ascii_data (std::istream& is, const
+     {
+       if (count == 0)
+ 	error ("load: empty name keyword or no data found in file `%s'",
+ 	       filename.c_str ());
+ 
+       return std::string ();
+     }
+ 
+-  if (! valid_identifier (name))
++  if (name == CELL_ELT_TAG)
++    {
++      // This is OK -- name won't be used.
++    }
++  else if (! valid_identifier (name))
+     {
+       error ("load: bogus identifier `%s' found in file `%s'",
+ 	     name.c_str (), filename.c_str ());
+       return std::string ();
+     }
+ 
+   // Look for type keyword.
+ 
+@@ -595,16 +608,66 @@ read_ascii_data (std::istream& is, const
+ 	      else if (nr == 0 || nc == 0)
+ 		tc = Matrix (nr, nc);
+ 	      else
+ 		panic_impossible ();
+ 	    }
+ 	  else
+ 	    error ("load: failed to extract number of rows and columns");
+ 	}
++      else if (SUBSTRING_COMPARE_EQ (typ, 0, 4, "cell"))
++	{
++	  int nr = 0;
++	  int nc = 0;
++
++	  if (extract_keyword (is, "rows",    nr) && nr >= 0
++	      && extract_keyword (is, "columns", nc) && nc >= 0)
++	    {
++	      if (nr > 0 && nc > 0)
++		{
++		  Cell tmp (nr, nc);
++
++		  for (int j = 0; j < nc; j++)
++		    {
++		      for (int i = 0; i < nr; i++)
++			{
++			  octave_value t2;
++
++			  // recurse to read cell elements
++			  std::string nm
++			    = read_ascii_data (is, filename, global, t2, count);
++
++			  if (nm == CELL_ELT_TAG)
++			    {
++			      if (is)
++				tmp.elem (i, j) = t2;
++			    }
++			  else
++			    {
++			      error ("load: cell array element had unexpected name");
++			      goto cell_read_error;
++			    }
++			}
++		    }
++
++		cell_read_error:
++
++		  if (is)
++		    tc = tmp;
++		  else
++		    error ("load: failed to load cell element");
++		}
++	      else if (nr == 0 || nc == 0)
++		tc = Cell (nr, nc);
++	      else
++		panic_impossible ();
++	    }
++	  else
++	    error ("load: failed to extract number of rows and columns for cell array");
++	}
+       else if (SUBSTRING_COMPARE_EQ (typ, 0, 14, "complex scalar"))
+ 	{
+ 	  Complex tmp = octave_read_complex (is);
+ 	  if (is)
+ 	    tc = tmp;
+ 	  else
+ 	    error ("load: failed to load complex scalar constant");
+ 	}
+@@ -2620,18 +2683,41 @@ read_mat5_binary_element (std::istream& 
+     {
+       error ("load: multidimension arrays are not implemented");
+       goto skip_ahead;
+     }
+ 
+   switch (arrayclass)
+     {
+     case mxCELL_CLASS:
+-      warning ("load: cell arrays are not implemented");
+-      goto skip_ahead;
++      {
++	Cell cell_array (nr, nc);
++
++	for (int j = 0; j < nc; j++)
++	  {
++	    for (int i = 0; i < nr; i++)
++	      {
++		octave_value tc2;
++
++		std::string nm
++		  = read_mat5_binary_element (is, filename, swap, global, tc2);
++
++		if (! is || error_state)
++		  {
++		    error ("load: reading cell data for `%s'", nm.c_str ());
++		    goto data_read_error;
++		  }
++
++		cell_array.elem (i, j) = tc2;
++	      }
++	  }
++
++	tc = cell_array;
++      }
++      break;
+ 
+     case mxOBJECT_CLASS:
+       warning ("load: objects are not implemented");
+       goto skip_ahead;
+ 
+     case mxSPARSE_CLASS:
+       warning ("load: sparse arrays are not implemented");
+       goto skip_ahead;
+@@ -4080,16 +4166,41 @@ write_mat5_array (std::ostream& os, Matr
+   }
+   if (PAD (len) > len)
+     {
+       static char buf[9]="\x00\x00\x00\x00\x00\x00\x00\x00";
+       os.write (buf, PAD (len) - len);
+     }
+ }
+ 
++// Write out cell element values in the cell array to OS, preceded by
++// the appropriate tag.
++
++static bool 
++write_mat5_cell_array (std::ostream& os, Cell& cell, bool mark_as_global,
++		       const int save_as_floats)
++{
++  int nr = cell.rows ();
++  int nc = cell.columns ();
++
++  for (int j = 0; j < nc; j++)
++    {
++      for (int i = 0; i < nr; i++)
++	{
++	  octave_value ov = cell.elem (i, j);
++
++	  if (! save_mat5_binary_element (os, ov, "", mark_as_global,
++					  save_as_floats))
++	    return false;
++	}
++    }
++
++  return true;
++}
++
+ // save the data from TC along with the corresponding NAME on stream
+ // OS in the MatLab version 5 binary format.  Return true on success.
+ 
+ static bool
+ save_mat5_binary_element (std::ostream& os,
+ 			  const octave_value& tc, const std::string& name,
+ 			  bool mark_as_global, bool save_as_floats) 
+ {
+@@ -4119,16 +4230,18 @@ save_mat5_binary_element (std::ostream& 
+   else if (tc.is_real_matrix () || tc.is_range ())
+     flags |= mxDOUBLE_CLASS;
+   else if (tc.is_complex_scalar ())
+     flags |= mxDOUBLE_CLASS;
+   else if (tc.is_complex_matrix ())
+     flags |= mxDOUBLE_CLASS;
+   else if (tc.is_map ()) 
+     flags |= mxSTRUCT_CLASS;
++  else if (tc.is_cell ())
++    flags |= mxCELL_CLASS;
+   else
+     {
+       gripe_wrong_type_arg ("save", tc, false);
+       goto error_cleanup;
+     }
+ 
+   os.write ((char *)&flags, 4);
+   os.write ((char *)&junk, 4);
+@@ -4189,16 +4302,23 @@ save_mat5_binary_element (std::ostream& 
+ 	os.write ((char *)buf, paddedlength - len);
+     }
+   else if (tc.is_real_scalar () || tc.is_real_matrix () || tc.is_range ())
+     {
+       Matrix m = tc.matrix_value ();
+ 
+       write_mat5_array (os, m, save_as_floats);
+     }
++  else if (tc.is_cell ())
++    {
++      Cell cell = tc.cell_value ();
++
++      if (! write_mat5_cell_array (os, cell, mark_as_global, save_as_floats))
++	goto error_cleanup;
++    }
+   else if (tc.is_complex_scalar () || tc.is_complex_matrix ()) 
+     {
+       ComplexMatrix m_cmplx = tc.complex_matrix_value ();
+       Matrix m = ::real (m_cmplx);
+ 
+       for (int part=0; part < 2; part++)
+ 	{
+ 	  // real part, then complex part
+@@ -4540,16 +4660,43 @@ save_ascii_data (std::ostream& os, const
+       else if (! infnan_warned && tmp.any_element_is_inf_or_nan ())
+ 	{
+ 	  warning ("save: Inf or NaN values may not be reloadable");
+ 	  infnan_warned = true;
+ 	}
+ 
+       os << tmp;
+     }
++  else if (tc.is_cell ())
++    {
++      ascii_save_type (os, "cell", mark_as_global);
++
++      os << "# rows: " << tc.rows () << "\n"
++	 << "# columns: " << tc.columns () << "\n";
++
++      Cell tmp = tc.cell_value ();
++      
++      for (int j = 0; j < tmp.cols (); j++)
++	{
++	  for (int i = 0; i < tmp.rows (); i++)
++	    {
++	      octave_value o_val = tmp.elem (i, j);
++
++	      // Recurse to print sub-value.
++	      bool b = save_ascii_data (os, o_val, CELL_ELT_TAG,
++					infnan_warned, strip_nan_and_inf,
++					mark_as_global, 0);
++
++	      if (! b)
++		return os;
++	    }
++
++	  os << "\n";
++	}
++    }
+   else if (tc.is_complex_scalar ())
+     {
+       ascii_save_type (os, "complex scalar", mark_as_global);
+ 
+       Complex c = tc.complex_value ();
+ 
+       if (strip_nan_and_inf)
+ 	{

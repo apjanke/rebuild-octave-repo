@@ -1,0 +1,204 @@
+# HG changeset patch
+# User Max Brister <max@2bass.com>
+# Date 1344545159 18000
+#      Thu Aug 09 15:45:59 2012 -0500
+# Node ID bd6bb87e2bea623229b3011776b9b395e65505c1
+# Parent  edae65062740af4158e64a0e2328f0f56c05ad11
+Support sin, cos, and exp with matrix arguments in JIT
+
+* src/interp-core/jit-typeinfo.cc (jit_operation::generate): Remove unused
+parameter name.
+(jit_typeinfo::jit_typeinfo): Create any_call function.
+(jit_typeinfo::register_generic): Implement.
+* src/interp-core/jit-typeinfo.h (jit_typeinfo): New field, any_call.
+
+* src/interp-core/pt-jit.cc: New test.
+
+diff --git a/src/interp-core/jit-typeinfo.cc b/src/interp-core/jit-typeinfo.cc
+--- a/src/interp-core/jit-typeinfo.cc
++++ b/src/interp-core/jit-typeinfo.cc
+@@ -832,17 +832,17 @@ jit_operation::do_generate (const signat
+     }
+ 
+   jit_function *ret = generate (types);
+   generated[new signature_vec (types)] = ret;
+   return ret ? *ret : null_overload;
+ }
+ 
+ jit_function *
+-jit_operation::generate (const signature_vec& types) const
++jit_operation::generate (const signature_vec&) const
+ {
+   return 0;
+ }
+ 
+ bool
+ jit_operation::signature_cmp
+ ::operator() (const signature_vec *lhs, const signature_vec *rhs)
+ {
+@@ -1036,16 +1036,17 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+   complex_ret->setBody (complex_ret_contents);
+ 
+   // create types
+   any = new_type ("any", 0, any_t);
+   matrix = new_type ("matrix", any, matrix_t);
+   complex = new_type ("complex", any, complex_t);
+   scalar = new_type ("scalar", complex, scalar_t);
+   scalar_ptr = new_type ("scalar_ptr", 0, scalar_t->getPointerTo ());
++  any_ptr = new_type ("any_ptr", 0, any_t->getPointerTo ());
+   range = new_type ("range", any, range_t);
+   string = new_type ("string", any, string_t);
+   boolean = new_type ("bool", any, bool_t);
+   index = new_type ("index", any, index_t);
+ 
+   create_int (8);
+   create_int (16);
+   create_int (32);
+@@ -1075,16 +1076,24 @@ jit_typeinfo::jit_typeinfo (llvm::Module
+ 
+   // bind global variables
+   lerror_state = new llvm::GlobalVariable (*module, bool_t, false,
+                                            llvm::GlobalValue::ExternalLinkage,
+                                            0, "error_state");
+   engine->addGlobalMapping (lerror_state,
+                             reinterpret_cast<void *> (&error_state));
+ 
++  // generic call function
++  {
++    jit_type *int_t = intN (sizeof (octave_builtin::fcn) * 8);
++    any_call = create_function (jit_convention::external, "octave_jit_call",
++                                any, int_t, int_t, any_ptr, int_t);
++    any_call.add_mapping (engine, &octave_jit_call);
++  }
++
+   // any with anything is an any op
+   jit_function fn;
+   jit_type *binary_op_type = intN (sizeof (octave_value::binary_op) * 8);
+   llvm::Type *llvm_bo_type = binary_op_type->to_llvm ();
+   jit_function any_binary = create_function (jit_convention::external,
+                                              "octave_jit_binary_any_any",
+                                              any, binary_op_type, any, any);
+   any_binary.add_mapping (engine, &octave_jit_binary_any_any);
+@@ -1969,20 +1978,58 @@ jit_typeinfo::find_builtin (const std::s
+ {
+   // FIXME: Finalize what we want to store in octave_builtin, then add functions
+   // to access these values in octave_value
+   octave_value ov_builtin = symbol_table::find (name);
+   return dynamic_cast<octave_builtin *> (ov_builtin.internal_rep ());
+ }
+ 
+ void
+-jit_typeinfo::register_generic (const std::string&, jit_type *,
+-                                const std::vector<jit_type *>&)
++jit_typeinfo::register_generic (const std::string& name, jit_type *result,
++                                const std::vector<jit_type *>& args)
+ {
+-  // FIXME: Implement
++  octave_builtin *builtin = find_builtin (name);
++  if (! builtin)
++    return;
++
++  std::vector<jit_type *> fn_args (args.size () + 1);
++  fn_args[0] = builtins[name];
++  std::copy (args.begin (), args.end (), fn_args.begin () + 1);
++  jit_function fn = create_function (jit_convention::internal, name, result,
++                                     fn_args);
++  llvm::BasicBlock *block = fn.new_block ();
++  builder.SetInsertPoint (block);
++  llvm::Type *any_t = any->to_llvm ();
++  llvm::ArrayType *array_t = llvm::ArrayType::get (any_t, args.size ());
++  llvm::Value *array = llvm::UndefValue::get (array_t);
++  for (size_t i = 0; i < args.size (); ++i)
++    {
++      llvm::Value *arg = fn.argument (builder, i + 1);
++      jit_function agrab = get_grab (args[i]);
++      llvm::Value *garg = agrab.call (builder, arg);
++      jit_function acast = cast (any, args[i]);
++      array = builder.CreateInsertValue (array, acast.call (builder, garg), i);
++    }
++
++  llvm::Value *array_mem = builder.CreateAlloca (array_t);
++  builder.CreateStore (array, array_mem);
++  array = builder.CreateBitCast (array_mem, any_t->getPointerTo ());
++
++  jit_type *jintTy = intN (sizeof (octave_builtin::fcn) * 8);
++  llvm::Type *intTy = jintTy->to_llvm ();
++  size_t fcn_int = reinterpret_cast<size_t> (builtin->function ());
++  llvm::Value *fcn = llvm::ConstantInt::get (intTy, fcn_int);
++  llvm::Value *nargin = llvm::ConstantInt::get (intTy, args.size ());
++  size_t result_int = reinterpret_cast<size_t> (result);
++  llvm::Value *res_llvm = llvm::ConstantInt::get (intTy, result_int);
++  llvm::Value *ret = any_call.call (builder, fcn, nargin, array, res_llvm);
++
++  jit_function cast_result = cast (result, any);
++  fn.do_return (builder, cast_result.call (builder, ret));
++  paren_subsref_fn.add_overload (fn);
+ }
+ 
+ jit_function
+ jit_typeinfo::mirror_binary (const jit_function& fn)
+ {
+   jit_function ret = create_function (jit_convention::internal,
+                                       fn.name () + "_reverse",
+                                       fn.result (), fn.argument_type (1),
+diff --git a/src/interp-core/jit-typeinfo.h b/src/interp-core/jit-typeinfo.h
+--- a/src/interp-core/jit-typeinfo.h
++++ b/src/interp-core/jit-typeinfo.h
+@@ -719,16 +719,17 @@ private:
+ 
+   llvm::GlobalVariable *lerror_state;
+ 
+   std::vector<jit_type*> id_to_type;
+   jit_type *any;
+   jit_type *matrix;
+   jit_type *scalar;
+   jit_type *scalar_ptr; // a fake type for interfacing with C++
++  jit_type *any_ptr; // a fake type for interfacing with C++
+   jit_type *range;
+   jit_type *string;
+   jit_type *boolean;
+   jit_type *index;
+   jit_type *complex;
+   jit_type *unknown_function;
+   std::map<size_t, jit_type *> ints;
+   std::map<std::string, jit_type *> builtins;
+@@ -744,16 +745,18 @@ private:
+   jit_operation for_index_fn;
+   jit_operation logically_true_fn;
+   jit_operation make_range_fn;
+   jit_paren_subsref paren_subsref_fn;
+   jit_paren_subsasgn paren_subsasgn_fn;
+   jit_operation end1_fn;
+   jit_operation end_fn;
+ 
++  jit_function any_call;
++
+   // type id -> cast function TO that type
+   std::vector<jit_operation> casts;
+ 
+   // type id -> identity function
+   std::vector<jit_function> identities;
+ 
+   llvm::IRBuilderD& builder;
+ };
+diff --git a/src/interp-core/pt-jit.cc b/src/interp-core/pt-jit.cc
+--- a/src/interp-core/pt-jit.cc
++++ b/src/interp-core/pt-jit.cc
+@@ -1935,9 +1935,17 @@ Test some simple cases that compile.
+ %!   m(end, i) = i;
+ %!   m(end - 1, end - i + 1) = i;
+ %! endfor
+ %! m2 = zeros (2, 1001);
+ %! m2(1, :) = fliplr (1:1001);
+ %! m2(2, :) = 1:1001;
+ %! assert (m, m2);
+ 
++%!test
++%! m = [1 2 3];
++%! for i=1:1001
++%!   m = sin (m);
++%!   break;
++%! endfor
++%! assert (m == sin ([1  2 3]));
++
+ */
